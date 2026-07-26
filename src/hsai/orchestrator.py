@@ -7,6 +7,9 @@ record a lesson -> open a linked PR -> merge on green.
 Decision logic (:func:`decide_path`) and PR-body assembly
 (:func:`build_pr_body`) are pure and unit-tested; the orchestration around them
 performs the real side effects through the wrapper modules.
+
+Role definitions are explicit, structured, and first-class (inspired by
+FoundationAgents/MetaGPT role-based agent patterns).
 """
 from __future__ import annotations
 
@@ -21,9 +24,53 @@ from .knowledge import KnowledgeBase, Lesson
 from .models import ModelChoice, Task, select
 from .proc import Runner, run
 
+
+@dataclass(frozen=True)
+class Role:
+    """Explicit role definition with responsibilities and constraints.
+
+    Inspired by FoundationAgents/MetaGPT role-based agent patterns.
+    Each role in the hsai loop has clear responsibilities and produces
+    specific artifacts (e.g., fixed code, new feature, learned lesson).
+    """
+
+    name: str
+    description: str
+    responsibility: str
+    exit_artifact: str
+
+
 HEAL = "heal"
 IMPLEMENT = "implement"
 IMPROVE = "improve"
+
+_ROLES = {
+    HEAL: Role(
+        name="Healer",
+        description="Diagnose and fix CI failures",
+        responsibility="Restore main to a green state",
+        exit_artifact="PR with fix + lesson recorded",
+    ),
+    IMPLEMENT: Role(
+        name="Engineer",
+        description="Implement a ticket from the backlog",
+        responsibility="Deliver a complete, tested change",
+        exit_artifact="PR linked to ticket + lesson recorded",
+    ),
+    IMPROVE: Role(
+        name="Researcher",
+        description="Extract a practice from the reference set and adopt it",
+        responsibility="Learn from top-10 projects and self-improve",
+        exit_artifact="PR with new practice + lesson + citation",
+    ),
+}
+
+def get_role(kind: str) -> Role:
+    """Look up the explicit role definition for a given loop branch."""
+    if kind not in _ROLES:
+        raise ValueError(f"Unknown role: {kind}")
+    return _ROLES[kind]
+
 
 # Serializes the short git-metadata prologue and the ticket claim so parallel
 # workers (threads) never race on git's index lock or grab the same ticket. The
@@ -47,6 +94,7 @@ def build_pr_body(
     lesson_note: str,
     lesson_summary: str,
     ci_summary: str,
+    role: Role | None = None,
     references: tuple[str, ...] = (),
 ) -> str:
     """Assemble a PR body that satisfies the traceability invariants.
@@ -56,11 +104,16 @@ def build_pr_body(
     if not ticket:
         raise ValueError("Every PR must be linked to a ticket (traceability invariant).")
     refs = ", ".join(f"`{r}`" for r in references) or "_(none)_"
+    role_section = (
+        f"\n## Role\n- **name**: {role.name}\n- **responsibility**: {role.responsibility}\n"
+        if role
+        else ""
+    )
     return f"""Closes #{ticket}
 
 ## Model used
 - **model**: `{choice.model}` (tier: `{choice.tier}`)
-- **selection**: {choice.rationale} [strategy: `{choice.strategy}`]
+- **selection**: {choice.rationale} [strategy: `{choice.strategy}`]{role_section}
 
 ## CI
 {ci_summary}
@@ -305,6 +358,7 @@ def run_once(
         lesson_note=lesson.note_name(),
         lesson_summary=lesson.lesson,
         ci_summary=ci_after.summary(),
+        role=get_role(kind),
         references=references,
     )
     pr_num = github.create_pr(

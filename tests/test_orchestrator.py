@@ -11,6 +11,7 @@ from hsai.orchestrator import (
     IMPROVE,
     build_pr_body,
     decide_path,
+    get_role,
     run_once,
 )
 from hsai.proc import Proc
@@ -135,6 +136,31 @@ def test_build_pr_body_contains_traceability():
     assert "kept it small" in body       # lesson present
     assert "[[2026-07-25-do-thing]]" in body
     assert "openai/swarm" in body
+
+
+def test_build_pr_body_includes_role():
+    choice = ModelChoice(tier="standard", model="sonnet", rationale="x")
+    role = get_role(HEAL)
+    body = build_pr_body(
+        ticket=42, choice=choice, lesson_note="2026-07-26-fix",
+        lesson_summary="fixed the CI", ci_summary="CI green (ruff=pass, pytest=pass)",
+        role=role,
+    )
+    assert "## Role" in body
+    assert "Healer" in body
+    assert "Restore main to a green state" in body
+
+
+def test_get_role_retrieves_explicit_roles():
+    heal_role = get_role(HEAL)
+    assert heal_role.name == "Healer"
+    assert "Diagnose and fix" in heal_role.description
+
+    engineer_role = get_role(IMPLEMENT)
+    assert engineer_role.name == "Engineer"
+
+    researcher_role = get_role(IMPROVE)
+    assert researcher_role.name == "Researcher"
 
 
 def test_run_once_dry_run_is_side_effect_free(tmp_path):
