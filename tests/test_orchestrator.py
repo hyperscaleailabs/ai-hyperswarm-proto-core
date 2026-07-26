@@ -199,6 +199,21 @@ def test_run_once_heal_path_with_fake_runner(tmp_path):
     assert all(c[0] in {"git", "gh", "ruff", "pytest", "claude"} for c in runner.calls)
 
 
+WELL_FORMED_BODY = """## Problem
+Widget missing.
+
+## Proposal
+Build the widget.
+
+## Acceptance criteria
+- [ ] widget builds
+- [ ] widget tested
+
+## Verification plan
+- [ ] pytest green
+"""
+
+
 def test_run_once_implement_path_with_fake_runner(tmp_path):
     cfg = load_config()
     open_issues = [
@@ -207,7 +222,7 @@ def test_run_once_implement_path_with_fake_runner(tmp_path):
             "title": "add widget",
             "labels": [{"name": "priority:P2"}],
             "assignees": [],
-            "body": "Implement the widget end to end.",
+            "body": WELL_FORMED_BODY,
         }
     ]
     runner = FakeRunner(
@@ -297,7 +312,7 @@ def test_run_once_recovers_when_remote_ci_fails(tmp_path):
             "title": "add widget",
             "labels": [{"name": "priority:P2"}],
             "assignees": [],
-            "body": "Implement the widget.",
+            "body": WELL_FORMED_BODY,
         }
     ]
     runner = FakeRunner(
@@ -331,7 +346,7 @@ def test_workflow_edits_are_reverted(tmp_path):
             "title": "add widget",
             "labels": [{"name": "priority:P2"}],
             "assignees": [],
-            "body": "Implement the widget.",
+            "body": WELL_FORMED_BODY,
         }
     ]
     runner = FakeRunner(
@@ -348,3 +363,65 @@ def test_workflow_edits_are_reverted(tmp_path):
     assert any(c[:3] == ["git", "checkout", "HEAD"] for c in runner.calls)
     assert any(c[:2] == ["git", "clean"] for c in runner.calls)
     assert any("reverted workflow edits" in n for n in result.notes)
+
+
+def test_completeness_guard_blocks_knowledge_only_diff_on_code_ticket(tmp_path):
+    cfg = load_config()
+    open_issues = [
+        {
+            "number": 9,
+            "title": "feat: add widget",
+            "labels": [{"name": "priority:P2"}],
+            "assignees": [],
+            "body": WELL_FORMED_BODY,
+        }
+    ]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+        worktree_status="?? knowledge/lessons/2026-07-26-fake.md\n",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    # knowledge-only diff on a feat: ticket -> recovered, never a PR
+    assert result.recovered is True
+    assert result.pr is None
+    assert result.merged is False
+    assert any("completeness guard" in n for n in result.notes)
+    assert not any(c[:3] == ["gh", "pr", "create"] for c in runner.calls)
+    # ticket returned to backlog with an attempt recorded
+    assert any(
+        c[:3] == ["gh", "issue", "edit"] and "--remove-assignee" in c for c in runner.calls
+    )
+
+
+def test_malformed_ticket_is_refused_and_labeled(tmp_path):
+    cfg = load_config()
+    open_issues = [
+        {
+            "number": 11,
+            "title": "feat: vague wish",
+            "labels": [{"name": "priority:P2"}],
+            "assignees": [],
+            "body": "make everything better somehow",
+        }
+    ]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    # the vague ticket was not implemented; loop fell through to self-improve
+    assert result.kind == IMPROVE
+    labeled = [
+        c for c in runner.calls
+        if c[:3] == ["gh", "issue", "edit"] and "needs-refinement" in c and "11" in c
+    ]
+    assert labeled, "vague ticket should be labeled needs-refinement"

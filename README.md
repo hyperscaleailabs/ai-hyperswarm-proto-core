@@ -79,6 +79,28 @@ MIT/Apache-2.0. Full list with notes lives in `core.yaml`.
 langchain · MetaGPT · crewAI · llama_index · ChatDev · gpt-researcher ·
 semantic-kernel · JARVIS · **openai/swarm** · **SWE-agent**
 
+## Governance: three streams, one architect
+
+The loop is governed, not just autonomous - see [docs/SDLC.md](docs/SDLC.md) and
+[ADR-0001](docs/adr/0001-two-phase-engine-and-governance-rhythm.md):
+
+1. **Steering** - `governance/DIRECTION.md` (Now / Issues Map / Direction) is the
+   single-entrance steering doc. Each block ends with a review issue; the
+   architect runs `/review-next` twice daily - feedback becomes ADRs in
+   `docs/adr/` plus refined tickets, closed with a merged PR.
+2. **Quality** - a five-phase SDLC (Plan → Implement → Verify → QA → Integrate),
+   each phase leaving CI-checked evidence. Vague tickets are refused
+   (`needs-refinement`); code tickets cannot merge with code-free diffs.
+3. **Scheduled cycles** - `hsai cycle` runs the two-phase engine: heavy-model
+   **synthesis** (combining practices from >= 3 reference projects, with an
+   explicit reflection pass) files substantial tickets; cheaper agents implement
+   them in a sequential block; the block ships a whitepaper + persona articles
+   (CTO / architect / DevOps) + a refreshed DIRECTION.md. Install the
+   twice-daily schedule with `scripts/install_cycles_launchd.sh`.
+
+Whitepapers are ingested by [agentic-atlas](https://github.com/hyperscaleailabs/agentic-atlas)
+via its own pipeline (pull-based publishing).
+
 ## Development
 
 ```bash

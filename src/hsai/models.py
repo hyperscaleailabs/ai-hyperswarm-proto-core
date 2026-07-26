@@ -136,12 +136,21 @@ def select(task: Task, cfg: CoreConfig) -> ModelChoice:
     """
     score = _score(task)
 
+    # Size labels (set by the synthesis planner) override keyword scoring:
+    # substantial tickets must never fall to the light tier.
+    if "size:L" in task.labels:
+        tier, why = "heavy", "size:L label - large synthesized change"
+    elif "size:M" in task.labels:
+        tier, why = cfg.default_tier, "size:M label - substantial synthesized change"
     # Tier thresholds; calibrated by iterating and comparing against
     # actual task complexity over multiple runs.
-    if score >= 5:
+    elif score >= 5:
         tier = "heavy"
         why = "high-complexity signals (architecture, hard bug, large refactor)"
-    elif score <= -3:
+    elif score <= -3 and task.est_files <= 2:
+        # Light tier is reserved for genuinely mechanical, narrow edits. A
+        # haiku worker once "completed" a feature ticket with a code-free
+        # diff - broad or feature-shaped work never routes light again.
         tier = "light"
         why = "low-complexity signals (docs, format, mechanical edit)"
     else:

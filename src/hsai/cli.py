@@ -75,6 +75,41 @@ def cmd_reindex(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_cycle(args: argparse.Namespace) -> int:
+    from .cycle import run_cycle
+
+    cfg = _load(args)
+    res = run_cycle(cfg, repo_dir=".", cycle_index=args.index)
+    print(f"cycle: synthesized={res.report.synthesized} merged={res.report.merged_prs} "
+          f"recovered={res.report.recovered_prs}")
+    print(f"whitepaper={res.report.whitepaper or '-'} articles={len(res.report.articles)}")
+    print(f"review issue: #{res.review_issue}  governance PR: #{res.governance_pr}")
+    for line in res.report.iterations:
+        print(f"  {line}")
+    return 0
+
+
+def cmd_synthesize(args: argparse.Namespace) -> int:
+    from .synthesis import synthesize
+
+    cfg = _load(args)
+    res = synthesize(cfg, cycle_index=args.index)
+    print(f"studied: {', '.join(res.studied)}")
+    print(f"filed tickets: {res.filed or 'none'}")
+    if res.error:
+        print(f"error: {res.error}")
+    return 0 if res.ok else 1
+
+
+def cmd_brief(args: argparse.Namespace) -> int:
+    from .governance import write_direction
+
+    cfg = _load(args)
+    path = write_direction(cfg, repo_root=".")
+    print(f"refreshed {path}")
+    return 0
+
+
 def cmd_run_once(args: argparse.Namespace) -> int:
     cfg = _load(args)
     results = run_loop(cfg, repo_dir=".", max_iterations=1, dry_run=args.dry_run)
@@ -123,6 +158,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     ri = sub.add_parser("reindex", help="rebuild knowledge-base MOCs")
     ri.set_defaults(func=cmd_reindex)
+
+    cy = sub.add_parser("cycle", help="run one half-day governance block")
+    cy.add_argument("--index", type=int, default=None, help="cycle index (default: derived)")
+    cy.set_defaults(func=cmd_cycle)
+
+    sy = sub.add_parser("synthesize", help="heavy-model synthesis: file substantial tickets")
+    sy.add_argument("--index", type=int, default=0, help="rotation index for reference subset")
+    sy.set_defaults(func=cmd_synthesize)
+
+    br = sub.add_parser("brief", help="refresh governance/DIRECTION.md")
+    br.set_defaults(func=cmd_brief)
 
     return p
 

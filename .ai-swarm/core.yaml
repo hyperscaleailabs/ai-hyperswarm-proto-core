@@ -108,6 +108,43 @@ models:
   default_tier: standard
   selection_strategy: heuristic-v1   # improved over time; tracked as a backlog skill
 
+# Governance: the architect steering loop (three streams).
+# Stream 1: steering  - DIRECTION.md + review briefs + /review-next sessions -> ADRs
+# Stream 2: quality   - SDLC phases with evidence, enforced by CI + orchestrator guards
+# Stream 3: scheduled - twice-daily cycles: synthesize -> implement block -> whitepaper
+#                       -> persona articles -> review brief
+governance:
+  direction_doc: governance/DIRECTION.md
+  adr_dir: docs/adr
+  review_label: review
+  reviews_per_day: 2
+
+cycle:
+  block_size: 5                # sequential implementations per half-day block
+  sequential: true             # protect the local machine; no parallel workers in cycles
+  backlog_low_watermark: 4     # run synthesis when fewer well-formed tickets than this
+  whitepaper_per_block: true   # one whitepaper per block => two per day
+
+synthesis:
+  tier: heavy                  # substantial cross-project synthesis needs the big model
+  timeout_seconds: 2400
+  refs_per_cycle: 3            # rotating subset of the top-10 analyzed per cycle
+  ideas_target: 10             # candidate ideas generated before reflection
+  file_top: 3                  # tickets actually filed after critique + prioritization
+  min_projects_combined: 3     # an idea must combine practices from >= N reference projects
+
+personas:                      # article targets generated from each whitepaper
+  - id: cto
+    audience: CTO level - business impact, risk posture, strategic direction
+  - id: architect
+    audience: Architect level - system design, tradeoffs, patterns adopted
+  - id: devops
+    audience: DevOps level - CI/CD, automation mechanics, operational lessons
+
+publish:
+  mode: atlas-pull             # agentic-atlas ingests our whitepapers via its own pipeline
+  atlas_repo: hyperscaleailabs/agentic-atlas
+
 constraints:
   # Hard rules the orchestrator enforces at runtime.
   subscription_only: true            # NEVER use the metered API.
