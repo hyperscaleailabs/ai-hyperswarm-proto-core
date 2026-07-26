@@ -9,6 +9,7 @@ updated: 2026-07-26
 
 Up: [[Knowledge Base MOC]]
 
-Periodic syntheses of accumulated lessons. Total: **1**.
+Periodic syntheses of accumulated lessons. Total: **2**.
 
 - [[2026-07-25-founding-study-top-10-ai-swarm-projects]]
+- [[2026-07-26-synthesis-after-14-lessons]]
