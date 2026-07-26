@@ -57,6 +57,7 @@ class Lesson:
     references: tuple[str, ...] = ()  # reference-set repos that informed the work
     tags: tuple[str, ...] = ()
     created: str = field(default_factory=_today)
+    remote_ci: str = ""  # SUCCESS | FAILURE | TIMEOUT, filled in once gh checks conclude
 
     def note_name(self) -> str:
         return f"{self.created}-{slugify(self.title)}"
@@ -290,6 +291,7 @@ class KnowledgeBase:
 | ticket | {ticket} |
 | pull request | {pr} |
 | model | `{lesson.model}` |
+| remote CI | {lesson.remote_ci or "_(pending)_"} |
 
 ## Context
 {lesson.context}

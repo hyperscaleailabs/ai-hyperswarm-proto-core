@@ -69,10 +69,14 @@ and `main`; green-gated auto-merge serializes the actual integration.
 
 ## Reliability: CI parity, remote truth, and recovery
 
-- **Remote CI is the source of truth.** After opening a PR and enabling
-  auto-merge, `run_once` calls `ci.wait_remote`, which polls the PR's real
-  GitHub check rollup until it concludes. Local `run_local` (ruff+pytest) is
-  only a fast pre-flight; the merge decision follows the remote result.
+- **Remote CI is the source of truth.** After opening a PR, `run_once` calls
+  `ci.wait_remote`, which polls the PR's real GitHub check rollup until it
+  concludes - this is an explicit pre-merge gate, checked *before* auto-merge
+  is ever armed. Local `run_local` (ruff+pytest) is only a fast pre-flight;
+  the merge decision follows the remote result. The remote conclusion is
+  written back into the lesson (and pushed as a follow-up commit) so the
+  knowledge base records the true CI outcome for every PR, not just the
+  local approximation.
 - **Local == remote by construction.** A task must not change the CI checks, or
   local and remote would diverge. The orchestrator reverts any edits under
   `.github/workflows/**` before committing (and notes it in the lesson), so a
