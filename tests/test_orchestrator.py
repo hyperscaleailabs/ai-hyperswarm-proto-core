@@ -31,10 +31,12 @@ class FakeRunner:
         repo_root: str,
         ci_sequence: list[bool],
         open_issues: list[dict] | None = None,
+        remote_conclusion: str = "success",
     ) -> None:
         self.repo_root = repo_root
         self.ci_sequence = ci_sequence
         self.open_issues = open_issues or []
+        self.remote_conclusion = remote_conclusion
         self.calls: list[list[str]] = []
         self._ci_round = 0
         self._issue_seq = 100
@@ -65,6 +67,8 @@ class FakeRunner:
             ok = self.ci_sequence[self._ci_round]
             self._ci_round += 1
             return Proc(cmd, 0 if ok else 1, "", "" if ok else "pytest: fake test failure\n")
+        if cmd[:2] == ["gh", "api"] and "check-runs" in cmd[2]:
+            return Proc(cmd, 0, f"{self.remote_conclusion}\n", "")
         if cmd[:3] == ["gh", "issue", "list"]:
             return Proc(cmd, 0, json.dumps(self.open_issues), "")
         if cmd[:3] == ["gh", "issue", "create"]:
@@ -157,10 +161,52 @@ def test_run_once_heal_path_with_fake_runner(tmp_path):
     assert result.model in body
     assert "Lesson learned" in body
 
+    # remote CI was polled and the conclusion recorded on the result + lesson
+    assert result.remote_ci == "success"
+    assert result.remote_ci_ok is True
+    assert "success" in Path(result.lesson_path).read_text()
+    assert any(c[:2] == ["gh", "api"] and "check-runs" in c[2] for c in runner.calls)
+
     # exactly one headless claude invocation, no real subprocess ever ran
     claude_calls = [c for c in runner.calls if c[:1] == ["claude"]]
     assert len(claude_calls) == 1
     assert all(c[0] in {"git", "gh", "ruff", "pytest", "claude"} for c in runner.calls)
+
+
+def test_run_once_withholds_merge_when_remote_ci_fails(tmp_path):
+    """The remote CI gate is explicit: a red `gh checks` result blocks the
+    merge even though the local ruff+pytest run and the agent both succeeded.
+    """
+    cfg = load_config()
+    open_issues = [
+        {
+            "number": 7,
+            "title": "add widget",
+            "labels": [{"name": "priority:P2"}],
+            "assignees": [],
+            "body": "Implement the widget end to end.",
+        }
+    ]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+        remote_conclusion="failure",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.ci_after is True                # local run was green
+    assert result.remote_ci == "failure"
+    assert result.remote_ci_ok is False
+    assert result.pr is not None                   # PR is still opened, linked + traceable
+    assert result.merged is False                  # but merge is withheld
+    assert not any(c[:3] == ["gh", "pr", "merge"] for c in runner.calls)
+
+    lesson_text = Path(result.lesson_path).read_text()
+    assert "outcome/fail" in lesson_text
+    assert "failure" in lesson_text
 
 
 def test_run_once_implement_path_with_fake_runner(tmp_path):
@@ -206,6 +252,10 @@ def test_run_once_implement_path_with_fake_runner(tmp_path):
     assert "Closes #7" in body
     assert result.model in body
     assert "Lesson learned" in body
+
+    # remote CI conclusion is recorded too
+    assert result.remote_ci == "success"
+    assert result.remote_ci_ok is True
 
     claude_calls = [c for c in runner.calls if c[:1] == ["claude"]]
     assert len(claude_calls) == 1

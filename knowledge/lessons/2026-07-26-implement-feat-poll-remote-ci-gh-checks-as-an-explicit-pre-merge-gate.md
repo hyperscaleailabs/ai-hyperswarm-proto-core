@@ -1,0 +1,35 @@
+---
+tags:
+  - lesson
+  - outcome/fail
+  - kind/implement
+created: 2026-07-26
+iteration: 2
+---
+
+# implement: feat: poll remote CI (gh checks) as an explicit pre-merge gate
+
+> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]
+
+| field | value |
+| --- | --- |
+| outcome | **fail** |
+| kind | implement |
+| iteration | 2 |
+| ticket | #3 |
+| pull request | _(none)_ |
+| model | `sonnet` |
+
+## Context
+Iteration 2. Ticket #3. CI before: CI green (ruff=pass, pytest=pass).
+
+## What happened
+Model `sonnet` (standard) ran the task. Agent ok=True. CI after: CI red (ruff=pass, pytest=FAIL).
+
+## Lesson learned
+Change did not reach green; auto-merge will hold until CI passes. Investigate the failure captured above before the next attempt.
+
+## References (reference-set evidence)
+- `langchain-ai/langchain`
+- `FoundationAgents/MetaGPT`
+- `crewAIInc/crewAI`

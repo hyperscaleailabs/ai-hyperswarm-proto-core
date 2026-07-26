@@ -2,7 +2,8 @@
 
 One iteration = sync main -> CI check -> choose work (heal / implement /
 self-improve) -> ensure a ticket exists -> run a model -> re-check CI ->
-record a lesson -> open a linked PR -> merge on green.
+push -> poll remote CI (gh checks) as the pre-merge gate -> record a lesson ->
+open a linked PR -> merge only if the remote gate passed.
 
 Decision logic (:func:`decide_path`) and PR-body assembly
 (:func:`build_pr_body`) are pure and unit-tested; the orchestration around them
@@ -48,6 +49,7 @@ def build_pr_body(
     lesson_summary: str,
     ci_summary: str,
     references: tuple[str, ...] = (),
+    remote_ci: str = "",
 ) -> str:
     """Assemble a PR body that satisfies the traceability invariants.
 
@@ -56,6 +58,7 @@ def build_pr_body(
     if not ticket:
         raise ValueError("Every PR must be linked to a ticket (traceability invariant).")
     refs = ", ".join(f"`{r}`" for r in references) or "_(none)_"
+    remote_line = f"\nremote CI (gh checks): `{remote_ci}`" if remote_ci else ""
     return f"""Closes #{ticket}
 
 ## Model used
@@ -63,7 +66,7 @@ def build_pr_body(
 - **selection**: {choice.rationale} [strategy: `{choice.strategy}`]
 
 ## CI
-{ci_summary}
+{ci_summary}{remote_line}
 
 ## Lesson learned
 {lesson_summary}
@@ -86,6 +89,8 @@ class IterationResult:
     model: str = ""
     ci_before: bool = False
     ci_after: bool = False
+    remote_ci: str = ""
+    remote_ci_ok: bool | None = None
     merged: bool = False
     lesson_path: str = ""
     notes: list[str] = field(default_factory=list)
@@ -97,6 +102,7 @@ class IterationResult:
             f"pr={self.pr}",
             f"model={self.model}",
             f"ci:{self.ci_before}->{self.ci_after}",
+            f"remote_ci={self.remote_ci or 'n/a'}",
             f"merged={self.merged}",
         ]
         return "iteration(" + ", ".join(parts) + ")"
@@ -234,8 +240,28 @@ def run_once(
     ci_after = ci.run_local(cwd=wt, runner=runner) if not dry_run else ci_before
     result.ci_after = ci_after.ok
 
-    # 7. lesson (ALWAYS, pass or fail)
-    outcome = "pass" if (agent_ok and ci_after.ok) else "fail"
+    # 7. commit + push the agent's change so GitHub has a commit to check.
+    # Remote CI cannot be observed before the branch exists on origin, so this
+    # push happens before we poll for the remote gate.
+    if not dry_run:
+        commit_msg = f"{kind}: {ticket_title}\n\nRefs #{ticket_num}\nModel: {choice.model}"
+        gitops.commit_all(commit_msg, cwd=wt, runner=runner)
+        gitops.push_branch(branch, cwd=wt, runner=runner)
+
+    # 8. poll remote CI (gh checks) - the ground truth GitHub recorded for this
+    # branch, used as an explicit pre-merge gate rather than trusting the local
+    # run or GitHub's own auto-merge wait silently.
+    if dry_run:
+        remote_ci = ""
+        remote_ci_ok = True
+    else:
+        remote_ci = ci.poll_remote_status(repo, branch, runner=runner)
+        remote_ci_ok = ci.remote_ok(remote_ci)
+    result.remote_ci = remote_ci
+    result.remote_ci_ok = remote_ci_ok
+
+    # 9. lesson (ALWAYS, pass or fail) - records the true remote CI outcome
+    outcome = "pass" if (agent_ok and ci_after.ok and remote_ci_ok) else "fail"
     kb = KnowledgeBase.from_config(cfg, wt)
     references = tuple(r.repo for r in cfg.reference_top10[:3])
     lesson = Lesson(
@@ -245,18 +271,21 @@ def run_once(
         context=f"Iteration {iteration}. Ticket #{ticket_num}. CI before: {ci_before.summary()}.",
         what_happened=(
             f"Model `{choice.model}` ({choice.tier}) ran the task. "
-            f"Agent ok={agent_ok}. CI after: {ci_after.summary()}."
+            f"Agent ok={agent_ok}. CI after: {ci_after.summary()}. "
+            f"Remote CI (gh checks): `{remote_ci or 'n/a'}` "
+            f"(gate {'passed' if remote_ci_ok else 'failed'})."
             + (f"\n\nAgent error:\n```\n{agent_err[:800]}\n```" if agent_err else "")
         ),
         lesson=(
-            "Change merged cleanly under a green build."
+            "Change merged cleanly under a green local and remote build."
             if outcome == "pass"
-            else "Change did not reach green; auto-merge will hold until CI passes. "
+            else "Change did not reach green; merge was withheld until CI passes. "
             "Investigate the failure captured above before the next attempt."
         ),
         iteration=iteration,
         ticket=ticket_num,
         model=choice.model,
+        remote_ci=remote_ci,
         references=references,
     )
     # Each PR commits ONLY its own uniquely-named lesson file. The MOC indexes
@@ -271,11 +300,12 @@ def run_once(
         result.notes.append("dry-run: skipped commit/push/PR/merge")
         return result
 
-    # 8-11. commit, push, PR (linked + model + lesson), merge on green
-    commit_msg = f"{kind}: {ticket_title}\n\nRefs #{ticket_num}\nModel: {choice.model}"
-    gitops.commit_all(commit_msg, cwd=wt, runner=runner)
+    # 10. commit + push the lesson note, now that the remote outcome is known
+    gitops.commit_all(f"docs: record lesson for {kind} #{ticket_num}", cwd=wt, runner=runner)
     gitops.push_branch(branch, cwd=wt, runner=runner)
 
+    # 11. open the linked PR (ticket + model + lesson), merge only on a full
+    # green outcome - agent, local CI, and the remote CI gate all passed
     pr_body = build_pr_body(
         ticket=ticket_num or 0,
         choice=choice,
@@ -283,6 +313,7 @@ def run_once(
         lesson_summary=lesson.lesson,
         ci_summary=ci_after.summary(),
         references=references,
+        remote_ci=remote_ci,
     )
     pr_num = github.create_pr(
         repo, branch, f"{kind}: {ticket_title}"[:120], pr_body,
@@ -290,9 +321,14 @@ def run_once(
     )
     result.pr = pr_num
 
-    merge = github.merge_pr(repo, pr_num, auto=True, runner=runner)
-    result.merged = merge.ok
-    result.notes.append(f"merge queued ok={merge.ok}")
+    if outcome == "pass":
+        merge = github.merge_pr(repo, pr_num, auto=True, runner=runner)
+        result.merged = merge.ok
+        result.notes.append(f"merge queued ok={merge.ok}")
+    elif not remote_ci_ok:
+        result.notes.append(f"merge withheld: remote CI gate failed ({remote_ci or 'n/a'})")
+    else:
+        result.notes.append("merge withheld: agent or local CI did not reach green")
 
     # 12. cleanup worktree (branch lives on until merged/deleted by gh)
     gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)

@@ -2,10 +2,15 @@
 
 ``run_local`` mirrors what the GitHub Actions workflow does (ruff + pytest) so
 the loop can pre-flight a change before it ever opens a PR. ``remote_status``
-checks the actual check-run result GitHub recorded for a branch.
+checks the actual check-run result GitHub recorded for a branch, and
+``poll_remote_status`` polls it until every check run has concluded so the
+orchestrator can use the real remote outcome as an explicit pre-merge gate
+instead of only trusting the local run.
 """
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .proc import Runner, run
@@ -50,3 +55,39 @@ def remote_status(repo: str, branch: str, *, runner: Runner = run) -> str:
         ]
     )
     return p.stdout.strip()
+
+
+def _is_pending(status: str) -> bool:
+    """True while any check run in ``status`` has not concluded yet."""
+    parts = status.split(",") if status else [""]
+    return any(p in ("", "null") for p in parts)
+
+
+def remote_ok(status: str) -> bool:
+    """True if every concluded check run in ``status`` succeeded (or none ran)."""
+    parts = [p for p in status.split(",") if p and p != "null"]
+    return all(p in ("success", "skipped", "neutral") for p in parts)
+
+
+def poll_remote_status(
+    repo: str,
+    branch: str,
+    *,
+    runner: Runner = run,
+    max_attempts: int = 30,
+    interval: float = 10.0,
+    sleep: Callable[[float], None] = time.sleep,
+) -> str:
+    """Poll :func:`remote_status` until every check run has concluded.
+
+    Stops early once nothing is pending; otherwise gives up after
+    ``max_attempts`` polls and returns whatever the last poll observed (still
+    useful - a lingering pending run is itself a signal worth recording).
+    """
+    status = remote_status(repo, branch, runner=runner)
+    attempts = 1
+    while _is_pending(status) and attempts < max_attempts:
+        sleep(interval)
+        status = remote_status(repo, branch, runner=runner)
+        attempts += 1
+    return status

@@ -37,6 +37,7 @@ class Lesson:
     ticket: int | None = None
     pr: int | None = None
     model: str = ""
+    remote_ci: str = ""  # GitHub's rollup check-run conclusion for the branch
     references: tuple[str, ...] = ()  # reference-set repos that informed the work
     tags: tuple[str, ...] = ()
     created: str = field(default_factory=_today)
@@ -155,6 +156,7 @@ class KnowledgeBase:
 | ticket | {ticket} |
 | pull request | {pr} |
 | model | `{lesson.model}` |
+| remote CI | `{lesson.remote_ci or "n/a"}` |
 
 ## Context
 {lesson.context}
