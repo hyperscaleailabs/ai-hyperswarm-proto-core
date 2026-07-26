@@ -31,3 +31,14 @@ jobs:
 
       - name: Test (pytest)
         run: pytest
+
+      - name: SDLC evidence (PR body)
+        if: github.event_name == 'pull_request'
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          fail=0
+          echo "$PR_BODY" | grep -qiE 'closes #[0-9]+' || { echo "::error::PR body missing 'Closes #N' ticket link"; fail=1; }
+          echo "$PR_BODY" | grep -qi '## Model used'    || { echo "::error::PR body missing '## Model used' section"; fail=1; }
+          echo "$PR_BODY" | grep -qi '## Lesson learned' || { echo "::error::PR body missing '## Lesson learned' section"; fail=1; }
+          exit $fail

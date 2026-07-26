@@ -50,6 +50,10 @@ class CoreConfig:
     constraints: dict[str, Any]
     knowledge: dict[str, Any]
     reference_top10: tuple[ReferenceRepo, ...]
+    governance: dict[str, Any]
+    cycle: dict[str, Any]
+    synthesis: dict[str, Any]
+    personas: tuple[dict[str, Any], ...]
 
     # --- convenience accessors -------------------------------------------------
     @property
@@ -132,6 +136,10 @@ def load_config(path: str | Path | None = None) -> CoreConfig:
         constraints=data.get("constraints", {}),
         knowledge=data.get("knowledge", {}),
         reference_top10=top10,
+        governance=data.get("governance", {}),
+        cycle=data.get("cycle", {}),
+        synthesis=data.get("synthesis", {}),
+        personas=tuple(data.get("personas", [])),
     )
 
 

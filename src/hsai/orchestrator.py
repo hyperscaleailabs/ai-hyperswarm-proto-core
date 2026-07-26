@@ -20,6 +20,7 @@ from .config import CoreConfig
 from .knowledge import KnowledgeBase, Lesson
 from .models import ModelChoice, Task, select
 from .proc import Runner, run
+from .tickets import NEEDS_REFINEMENT, issue_well_formed
 
 HEAL = "heal"
 IMPLEMENT = "implement"
@@ -120,11 +121,23 @@ def _task_prompt(kind: str, cfg: CoreConfig, ticket_title: str, ticket_body: str
             f"Ticket: {ticket_title}\n{ticket_body}"
         )
     if kind == IMPLEMENT:
-        return f"{common}\nImplement this ticket end to end.\nTicket: {ticket_title}\n{ticket_body}"
+        return (
+            f"{common}\nImplement this ticket END TO END. Satisfy EVERY checkbox in "
+            "its Acceptance criteria and execute its Verification plan, adding tests "
+            "as evidence. A knowledge-only or docs-only diff on a feat/skill/refactor "
+            "ticket is an automatic failure - real code must change.\n"
+            f"Ticket: {ticket_title}\n{ticket_body}"
+        )
     return (
         f"{common}\nImplement this self-improvement, learning from the reference set "
         f"pinned in .ai-swarm/core.yaml.\nTicket: {ticket_title}\n{ticket_body}"
     )
+
+
+def _requires_code(ticket_title: str) -> bool:
+    """Tickets whose titles promise code must produce code."""
+    lowered = ticket_title.strip().lower()
+    return lowered.startswith(("feat:", "fix:", "skill:", "refactor:", "perf:", "test:"))
 
 
 def _improvement_idea(cfg: CoreConfig) -> tuple[str, str]:
@@ -190,13 +203,24 @@ def run_once(
             ticket_title, ticket_body = _improvement_idea(cfg)
         elif kind == HEAL:
             ticket_title, ticket_body = "ci: main is red - auto-heal", "dry-run"
-    else:
+    idle_reason = ""
+    if not dry_run:
         with _SERIAL:
-            # Consider only UNASSIGNED, non-blocked tickets; claiming = assigning.
-            open_unassigned = [
-                i for i in github.list_open_issues(repo, runner=runner)
+            all_open = github.list_open_issues(repo, runner=runner)
+            # Consider only UNASSIGNED, non-blocked, non-review tickets.
+            candidates = [
+                i for i in all_open
                 if not i.assignees and not i.is_blocked
+                and "review" not in i.labels and NEEDS_REFINEMENT not in i.labels
             ]
+            # Quality gate: vague tickets are refused, not implemented badly.
+            open_unassigned = []
+            for i in candidates:
+                wf = issue_well_formed(i)
+                if wf.ok:
+                    open_unassigned.append(i)
+                else:
+                    github.edit_labels(repo, i.number, add=[NEEDS_REFINEMENT], runner=runner)
             kind = decide_path(ci_before.ok, has_tickets=bool(open_unassigned))
             if kind == HEAL:
                 ticket_title = "ci: main is red - auto-heal"
@@ -214,13 +238,36 @@ def run_once(
                 github.assign(repo, top.number, login, runner=runner)
             else:  # IMPROVE - file a ticket FIRST so the PR has one
                 ticket_title, ticket_body = _improvement_idea(cfg)
-                ticket_num = github.create_issue(
-                    repo, ticket_title, ticket_body, ["priority:P3", "self-improve", "hsai"],
-                    assignee=login, runner=runner,
-                )
+                # Dedupe: never spam the backlog with copies of the same idea
+                # (a stranded run once filed nine identical chore tickets).
+                existing = next((i for i in all_open if i.title == ticket_title), None)
+                if existing is not None:
+                    if existing.assignees or existing.is_blocked:
+                        idle_reason = (
+                            f"idle: improvement #{existing.number} already in flight/blocked"
+                        )
+                    else:
+                        ticket_num = existing.number
+                        ticket_body = existing.body
+                        claimed_issue = existing
+                        github.assign(repo, existing.number, login, runner=runner)
+                else:
+                    ticket_num = github.create_issue(
+                        repo, ticket_title, ticket_body,
+                        ["priority:P3", "self-improve", "hsai"],
+                        assignee=login, runner=runner,
+                    )
+
+    if idle_reason:
+        res = IterationResult(kind=kind, ci_before=ci_before.ok)
+        res.notes.append(idle_reason)
+        gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
+        return res
 
     # 4. model selection (recorded for audit)
-    task = Task(kind=kind, title=ticket_title, body=ticket_body)
+    task = Task(kind=kind, title=ticket_title, body=ticket_body, labels=(
+        tuple(claimed_issue.labels) if claimed_issue else ()
+    ))
     choice = select(task, cfg)
 
     result = IterationResult(
@@ -248,6 +295,23 @@ def run_once(
         if reverted_workflows:
             gitops.restore_pathspec(".github/workflows", cwd=wt, runner=runner)
             result.notes.append(f"reverted workflow edits: {reverted_workflows}")
+
+        # Completeness guard: a code ticket (feat/skill/refactor/fix) cannot be
+        # satisfied by a knowledge-only diff. PR #17 once "closed" a feature
+        # ticket by committing nothing but its own lesson file - never again.
+        if _requires_code(ticket_title):
+            touched = gitops.changed_paths(cwd=wt, runner=runner)
+            code_files = [p for p in touched if not p.startswith("knowledge/")]
+            if not code_files:
+                result.notes.append("completeness guard: knowledge-only diff on a code ticket")
+                _recover_failed(
+                    cfg, repo, 0, kind=kind, ticket_num=ticket_num,
+                    claimed_issue=claimed_issue, login=login,
+                    remote="INCOMPLETE", runner=runner,
+                )
+                result.recovered = True
+                gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
+                return result
 
     # 6. re-check CI
     ci_after = ci.run_local(cwd=wt, runner=runner) if not dry_run else ci_before
@@ -363,13 +427,14 @@ def _recover_failed(
     remote: str,
     runner: Runner,
 ) -> None:
-    """A PR did not go green: close it, and either return the ticket to the
-    backlog for another attempt or mark it ``blocked`` for a human."""
-    github.close_pr(
-        repo, pr_num,
-        comment=f"Remote CI concluded {remote}; closing per retry policy.",
-        delete_branch=True, runner=runner,
-    )
+    """A PR did not go green (or never got one): close it, and either return the
+    ticket to the backlog for another attempt or mark it ``blocked``."""
+    if pr_num:
+        github.close_pr(
+            repo, pr_num,
+            comment=f"Remote CI concluded {remote}; closing per retry policy.",
+            delete_branch=True, runner=runner,
+        )
     if not ticket_num:
         return
 
