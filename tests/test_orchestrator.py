@@ -31,10 +31,14 @@ class FakeRunner:
         repo_root: str,
         ci_sequence: list[bool],
         open_issues: list[dict] | None = None,
+        remote_ci: str = "SUCCESS",
+        worktree_status: str = "",
     ) -> None:
         self.repo_root = repo_root
         self.ci_sequence = ci_sequence
         self.open_issues = open_issues or []
+        self.remote_ci = remote_ci
+        self.worktree_status = worktree_status
         self.calls: list[list[str]] = []
         self._ci_round = 0
         self._issue_seq = 100
@@ -56,7 +60,11 @@ class FakeRunner:
             return Proc(cmd, 0, f"{self.repo_root}\n", "")
         if cmd[:3] in (["git", "worktree", "add"], ["git", "worktree", "remove"]):
             return Proc(cmd, 0, "", "")
+        if cmd[:2] == ["git", "status"]:
+            return Proc(cmd, 0, self.worktree_status, "")
         if cmd[:2] in (["git", "add"], ["git", "commit"], ["git", "push"]):
+            return Proc(cmd, 0, "", "")
+        if cmd[:2] in (["git", "checkout"], ["git", "clean"]):
             return Proc(cmd, 0, "", "")
         if cmd[:2] == ["ruff", "check"]:
             ok = self.ci_sequence[self._ci_round]
@@ -79,6 +87,23 @@ class FakeRunner:
             return Proc(cmd, 0, f"https://github.com/o/r/pull/{self._pr_seq}\n", "")
         if cmd[:3] == ["gh", "pr", "merge"]:
             return Proc(cmd, 0, "", "")
+        if cmd[:3] == ["gh", "pr", "view"]:
+            concl = "SUCCESS" if self.remote_ci == "SUCCESS" else "FAILURE"
+            rollup = {
+                "statusCheckRollup": [
+                    {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": concl}
+                ]
+            }
+            return Proc(cmd, 0, json.dumps(rollup), "")
+        if cmd[:3] == ["gh", "pr", "close"]:
+            return Proc(cmd, 0, "", "")
+        if cmd[:3] == ["gh", "issue", "view"]:
+            num = int(cmd[3])
+            match = next((i for i in self.open_issues if i.get("number") == num), None)
+            data = match or {
+                "number": num, "title": "", "labels": [], "assignees": [], "body": ""
+            }
+            return Proc(cmd, 0, json.dumps(data), "")
         raise AssertionError(f"FakeRunner: unhandled command {cmd!r}")
 
 
@@ -210,3 +235,64 @@ def test_run_once_implement_path_with_fake_runner(tmp_path):
     claude_calls = [c for c in runner.calls if c[:1] == ["claude"]]
     assert len(claude_calls) == 1
     assert all(c[0] in {"git", "gh", "ruff", "pytest", "claude"} for c in runner.calls)
+
+
+def test_run_once_recovers_when_remote_ci_fails(tmp_path):
+    cfg = load_config()
+    open_issues = [
+        {
+            "number": 7,
+            "title": "add widget",
+            "labels": [{"name": "priority:P2"}],
+            "assignees": [],
+            "body": "Implement the widget.",
+        }
+    ]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=open_issues, remote_ci="FAILURE",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.kind == IMPLEMENT
+    assert result.remote == "FAILURE"
+    assert result.merged is False
+    assert result.recovered is True
+    # PR closed and the ticket returned to the backlog (#11)
+    assert any(c[:3] == ["gh", "pr", "close"] for c in runner.calls)
+    assert any(
+        c[:3] == ["gh", "issue", "edit"] and "--remove-assignee" in c for c in runner.calls
+    )
+    # retry counter bumped (attempts:1, below max_ticket_attempts=2)
+    assert any("attempts:1" in c for c in runner.calls)
+
+
+def test_workflow_edits_are_reverted(tmp_path):
+    cfg = load_config()
+    open_issues = [
+        {
+            "number": 7,
+            "title": "add widget",
+            "labels": [{"name": "priority:P2"}],
+            "assignees": [],
+            "body": "Implement the widget.",
+        }
+    ]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+        worktree_status=" M .github/workflows/ci.yml\n?? src/hsai/new.py\n",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    # #12: workflow edits are restored so local CI can't diverge from remote
+    assert any(c[:3] == ["git", "checkout", "HEAD"] for c in runner.calls)
+    assert any(c[:2] == ["git", "clean"] for c in runner.calls)
+    assert any("reverted workflow edits" in n for n in result.notes)

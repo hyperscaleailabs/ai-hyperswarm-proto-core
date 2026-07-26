@@ -42,6 +42,9 @@ class CoreConfig:
     worktrees_dir: str
     permission_mode: str
     agent_timeout: float | None
+    ci_remote_timeout: float
+    ci_poll_interval: float
+    max_ticket_attempts: int
     tiers: dict[str, ModelTier]
     default_tier: str
     constraints: dict[str, Any]
@@ -121,6 +124,9 @@ def load_config(path: str | Path | None = None) -> CoreConfig:
         worktrees_dir=execution.get("worktrees_dir", ".hsai/worktrees"),
         permission_mode=execution.get("permission_mode", "acceptEdits"),
         agent_timeout=execution.get("agent_timeout_seconds"),
+        ci_remote_timeout=float(execution.get("ci_remote_timeout_seconds", 300)),
+        ci_poll_interval=float(execution.get("ci_poll_interval_seconds", 10)),
+        max_ticket_attempts=int(execution.get("max_ticket_attempts", 2)),
         tiers=tiers,
         default_tier=models.get("default_tier", "standard"),
         constraints=data.get("constraints", {}),

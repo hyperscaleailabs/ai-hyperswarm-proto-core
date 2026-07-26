@@ -1,14 +1,25 @@
 """Continuous-integration gate.
 
 ``run_local`` mirrors what the GitHub Actions workflow does (ruff + pytest) so
-the loop can pre-flight a change before it ever opens a PR. ``remote_status``
-checks the actual check-run result GitHub recorded for a branch.
+the loop can pre-flight a change before it ever opens a PR. ``wait_remote``
+blocks until a PR's real GitHub checks conclude - that remote result is the
+source of truth for whether a change may merge.
 """
 from __future__ import annotations
 
+import json
+import time
 from dataclasses import dataclass, field
 
 from .proc import Runner, run
+
+# Rollup outcomes returned by wait_remote / _rollup_result.
+SUCCESS = "SUCCESS"
+FAILURE = "FAILURE"
+PENDING = "PENDING"
+TIMEOUT = "TIMEOUT"
+
+_PASS_CONCLUSIONS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 
 
 @dataclass
@@ -40,13 +51,53 @@ def run_local(*, cwd: str | None = None, runner: Runner = run) -> CIResult:
     return CIResult(ok=all(steps.values()), steps=steps, log="\n\n".join(logs))
 
 
-def remote_status(repo: str, branch: str, *, runner: Runner = run) -> str:
-    """Return GitHub's rollup check state for ``branch`` (e.g. SUCCESS/FAILURE/PENDING)."""
+def _rollup_result(rollup: list[dict]) -> str:
+    """Reduce a PR's statusCheckRollup array to SUCCESS / FAILURE / PENDING."""
+    if not rollup:
+        return PENDING
+    for item in rollup:
+        # CheckRun (GitHub Actions) uses status/conclusion; StatusContext uses state.
+        if item.get("__typename") == "StatusContext" or "state" in item and "status" not in item:
+            state = (item.get("state") or "").upper()
+            if state in ("PENDING", "EXPECTED", ""):
+                return PENDING
+            if state not in _PASS_CONCLUSIONS:
+                return FAILURE
+        else:
+            if (item.get("status") or "").upper() != "COMPLETED":
+                return PENDING
+            if (item.get("conclusion") or "").upper() not in _PASS_CONCLUSIONS:
+                return FAILURE
+    return SUCCESS
+
+
+def poll_remote(pr_number: int, repo: str, *, runner: Runner = run) -> str:
+    """One-shot: reduce a PR's current check rollup to SUCCESS/FAILURE/PENDING."""
     p = runner(
-        [
-            "gh", "api",
-            f"repos/{repo}/commits/{branch}/check-runs",
-            "--jq", "[.check_runs[].conclusion] | join(\",\")",
-        ]
+        ["gh", "pr", "view", str(pr_number), "--repo", repo, "--json", "statusCheckRollup"]
     )
-    return p.stdout.strip()
+    try:
+        rollup = json.loads(p.stdout or "{}").get("statusCheckRollup", []) or []
+    except json.JSONDecodeError:
+        rollup = []
+    return _rollup_result(rollup)
+
+
+def wait_remote(
+    pr_number: int,
+    repo: str,
+    *,
+    timeout: float = 300,
+    interval: float = 10,
+    runner: Runner = run,
+    sleep=time.sleep,
+) -> str:
+    """Block until a PR's remote checks conclude. Returns SUCCESS/FAILURE/TIMEOUT."""
+    deadline = time.monotonic() + timeout
+    while True:
+        result = poll_remote(pr_number, repo, runner=runner)
+        if result != PENDING:
+            return result
+        if time.monotonic() >= deadline:
+            return TIMEOUT
+        sleep(interval)

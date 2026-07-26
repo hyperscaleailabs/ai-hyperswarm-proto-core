@@ -59,6 +59,26 @@ def has_changes(*, cwd: str, runner: Runner = run) -> bool:
     return bool(p.stdout.strip())
 
 
+def changed_paths(*, cwd: str, runner: Runner = run) -> list[str]:
+    """Paths changed in the worktree (modified, added, or untracked)."""
+    p = _git(["status", "--porcelain"], cwd=cwd, runner=runner)
+    paths: list[str] = []
+    for line in p.stdout.splitlines():
+        entry = line[3:] if len(line) > 3 else line.strip()
+        if "->" in entry:  # rename: "old -> new"
+            entry = entry.split("->", 1)[1]
+        entry = entry.strip().strip('"')
+        if entry:
+            paths.append(entry)
+    return paths
+
+
+def restore_pathspec(pathspec: str, *, cwd: str, runner: Runner = run) -> None:
+    """Discard both tracked edits and new files under ``pathspec``."""
+    _git(["checkout", "HEAD", "--", pathspec], cwd=cwd, runner=runner)
+    _git(["clean", "-fd", pathspec], cwd=cwd, runner=runner)
+
+
 def commit_all(message: str, *, cwd: str, runner: Runner = run) -> Proc:
     _git(["add", "-A"], cwd=cwd, runner=runner)
     return _git(["commit", "-m", message], cwd=cwd, runner=runner)
