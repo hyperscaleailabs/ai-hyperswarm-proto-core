@@ -58,6 +58,7 @@ class Lesson:
     tags: tuple[str, ...] = ()
     created: str = field(default_factory=_today)
     remote_ci: str = ""  # SUCCESS | FAILURE | TIMEOUT, filled in once gh checks conclude
+    repro_evidence: str = ""  # heal/bugfix only: failing-then-passing reproduction proof
 
     def note_name(self) -> str:
         return f"{self.created}-{slugify(self.title)}"
@@ -277,6 +278,7 @@ class KnowledgeBase:
         refs = "\n".join(f"- `{r}`" for r in lesson.references) or "- _(none cited)_"
         ticket = f"#{lesson.ticket}" if lesson.ticket else "_(none)_"
         pr = f"#{lesson.pr}" if lesson.pr else "_(none)_"
+        repro = lesson.repro_evidence or "_(not applicable: not a heal/bugfix ticket)_"
         return f"""{fm}
 
 # {lesson.title}
@@ -301,6 +303,9 @@ class KnowledgeBase:
 
 ## Lesson learned
 {lesson.lesson}
+
+## Reproduction evidence
+{repro}
 
 ## References (reference-set evidence)
 {refs}
