@@ -12,7 +12,9 @@ from hsai.orchestrator import (
     IMPLEMENT,
     IMPROVE,
     _format_error_with_context,
+    _format_phase_capabilities,
     _phase_artifacts,
+    _phase_capabilities,
     build_pr_body,
     decide_path,
     run_once,
@@ -164,6 +166,41 @@ def test_phase_artifacts_improve():
     assert "Lesson recorded" in artifacts
 
 
+def test_phase_capabilities_heal():
+    caps = _phase_capabilities(HEAL)
+    assert "read_ci_logs" in caps
+    assert "analyze_build_errors" in caps
+    assert "add_regression_tests" in caps
+    assert "commit_and_push" in caps
+
+
+def test_phase_capabilities_implement():
+    caps = _phase_capabilities(IMPLEMENT)
+    assert "read_ticket_details" in caps
+    assert "read_source_code" in caps
+    assert "write_tests" in caps
+    assert "add_documentation" in caps
+    assert "commit_and_push" in caps
+
+
+def test_phase_capabilities_improve():
+    caps = _phase_capabilities(IMPROVE)
+    assert "read_reference_projects" in caps
+    assert "extract_practices" in caps
+    assert "implement_patterns" in caps
+    assert "write_lessons" in caps
+    assert "commit_and_push" in caps
+
+
+def test_format_phase_capabilities():
+    formatted = _format_phase_capabilities(HEAL)
+    assert "read_ci_logs:" in formatted
+    assert "Access and analyze CI" in formatted
+    assert "analyze_build_errors:" in formatted
+    lines = formatted.split("\n")
+    assert len(lines) == 6  # HEAL has 6 capabilities
+
+
 def test_build_pr_body_requires_ticket():
     choice = ModelChoice(tier="standard", model="sonnet", rationale="x")
     with pytest.raises(ValueError):
@@ -208,12 +245,25 @@ def test_build_pr_body_includes_phase_artifacts():
     assert "Feature/fix implemented" in body
     assert "Tests added" in body
 
+    # Test with IMPROVE phase - should include capabilities
+    body = build_pr_body(
+        ticket=13, choice=choice, lesson_note="2026-07-26-test",
+        lesson_summary="test", ci_summary="green",
+        kind=IMPROVE,
+    )
+    assert "## Phase artifacts" in body
+    assert "practice extracted" in body
+    assert "## Phase capabilities" in body
+    assert "read_reference_projects:" in body
+    assert "extract_practices:" in body
+
     # Without kind, artifacts should not appear
     body = build_pr_body(
         ticket=12, choice=choice, lesson_note="2026-07-26-test",
         lesson_summary="test", ci_summary="green",
     )
     assert "## Phase artifacts" not in body
+    assert "## Phase capabilities" not in body
 
 
 def test_run_once_dry_run_is_side_effect_free(tmp_path):

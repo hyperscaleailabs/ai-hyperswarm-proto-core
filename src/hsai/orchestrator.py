@@ -26,6 +26,27 @@ HEAL = "heal"
 IMPLEMENT = "implement"
 IMPROVE = "improve"
 
+# Capability registry adopted from langchain-ai/langchain tool definitions.
+# Maps capability names to descriptions for transparency and auditability.
+_CAPABILITY_REGISTRY = {
+    "read_ci_logs": "Access and analyze CI build output and error logs",
+    "run_local_tests": "Execute test suite locally to verify changes",
+    "analyze_build_errors": "Diagnose root causes of build/CI failures",
+    "modify_source_code": "Edit source code files in the working directory",
+    "add_regression_tests": "Write tests to prevent reoccurrence of bugs",
+    "read_ticket_details": "Access ticket description, acceptance criteria, and context",
+    "read_source_code": "Read and analyze existing codebase",
+    "write_tests": "Create new test files and test cases",
+    "add_documentation": "Write or update documentation and docstrings",
+    "commit_and_push": "Create commits and push to remote repository",
+    "read_reference_projects": "Study and analyze reference-set projects",
+    "read_codebase": "Explore and understand the full codebase",
+    "extract_practices": "Identify concrete practices from reference projects",
+    "implement_patterns": "Implement extracted patterns in the codebase",
+    "write_lessons": "Document lessons learned in knowledge base",
+    "add_tests": "Add or modify tests for new code",
+}
+
 # Serializes the short git-metadata prologue and the ticket claim so parallel
 # workers (threads) never race on git's index lock or grab the same ticket. The
 # slow work (agent run, CI, push, PR, merge) happens outside this lock.
@@ -79,6 +100,60 @@ def _phase_artifacts(kind: str) -> str:
         )
 
 
+def _phase_capabilities(kind: str) -> tuple[str, ...]:
+    """Return explicit capabilities available to each phase.
+
+    Adopted from langchain-ai/langchain and microsoft/semantic-kernel: systems
+    with explicit capability definitions are more transparent and auditable.
+    Each phase declares what tools/operations it can perform, supporting G2
+    (auditability) and enabling better debugging of phase constraints.
+    """
+    if kind == HEAL:
+        return (
+            "read_ci_logs",
+            "run_local_tests",
+            "analyze_build_errors",
+            "modify_source_code",
+            "add_regression_tests",
+            "commit_and_push",
+        )
+    elif kind == IMPLEMENT:
+        return (
+            "read_ticket_details",
+            "read_source_code",
+            "run_local_tests",
+            "write_tests",
+            "modify_source_code",
+            "add_documentation",
+            "commit_and_push",
+        )
+    else:  # IMPROVE
+        return (
+            "read_reference_projects",
+            "read_codebase",
+            "extract_practices",
+            "implement_patterns",
+            "write_lessons",
+            "add_tests",
+            "modify_source_code",
+            "commit_and_push",
+        )
+
+
+def _format_phase_capabilities(kind: str) -> str:
+    """Format phase capabilities for display in PR body.
+
+    Provides transparency about what operations each phase can perform,
+    supporting auditable decision-making and constraint tracking.
+    """
+    caps = _phase_capabilities(kind)
+    formatted = []
+    for cap in caps:
+        desc = _CAPABILITY_REGISTRY.get(cap, cap)
+        formatted.append(f"- {cap}: {desc}")
+    return "\n".join(formatted)
+
+
 def decide_path(ci_green: bool, has_tickets: bool) -> str:
     """Map current state to the branch of the loop to execute."""
     if not ci_green:
@@ -107,11 +182,18 @@ def build_pr_body(
     refs = ", ".join(f"`{r}`" for r in references) or "_(none)_"
     artifacts = _phase_artifacts(kind) if kind else ""
     artifacts_section = f"\n## Phase artifacts\n{artifacts}\n" if artifacts else ""
+
+    # Include phase capabilities in IMPROVE mode to show learning context
+    capabilities_section = ""
+    if kind == IMPROVE:
+        caps = _format_phase_capabilities(kind)
+        capabilities_section = f"\n## Phase capabilities\n{caps}\n"
+
     return f"""Closes #{ticket}
 
 ## Model used
 - **model**: `{choice.model}` (tier: `{choice.tier}`)
-- **selection**: {choice.rationale} [strategy: `{choice.strategy}`]{artifacts_section}
+- **selection**: {choice.rationale} [strategy: `{choice.strategy}`]{artifacts_section}{capabilities_section}
 
 ## CI
 {ci_summary}
