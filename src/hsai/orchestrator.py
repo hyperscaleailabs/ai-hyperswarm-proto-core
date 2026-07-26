@@ -19,6 +19,7 @@ from . import ai, ci, github, gitops
 from .config import CoreConfig
 from .knowledge import KnowledgeBase, Lesson
 from .models import ModelChoice, Task, select
+from .practices import REFERENCE_PRACTICES
 from .proc import Runner, run
 
 HEAL = "heal"
@@ -130,17 +131,20 @@ def _task_prompt(kind: str, cfg: CoreConfig, ticket_title: str, ticket_body: str
 def _improvement_idea(cfg: CoreConfig) -> tuple[str, str]:
     """Pick one improvement toward the goals when the backlog is empty.
 
-    v0: deterministic, evidence-anchored suggestion. Improving this selection is
-    itself a tracked skill (see seeded backlog).
+    v1: Consults the practice registry to suggest the next practice to adopt
+    from the reference set. Each practice is concrete, citable, and observable.
     """
-    title = "chore: refresh reference-set snapshot and extract one practice"
+    # Pick the first practice (we cycle through them over iterations).
+    # This is deterministic but can be improved to track which have been adopted.
+    selected = REFERENCE_PRACTICES[0]
+
+    title = f"implement: extract practice from {selected.source_repo}"
     body = (
-        "Backlog is empty. Toward goal G1, revisit the pinned reference set in "
-        ".ai-swarm/core.yaml, pick ONE concrete practice observed in those "
-        "projects (code, CI, or issue-handling), and adopt a small version of it "
-        "here. Cite the source project in the lesson.\n\n"
-        "Reference set: "
-        + ", ".join(r.repo for r in cfg.reference_top10)
+        f"Toward goal G1, adopt this concrete practice from {selected.source_repo}:\n\n"
+        f"**{selected.title}**\n\n"
+        f"{selected.description}\n\n"
+        f"Make a small, observable change that demonstrates this practice in the codebase. "
+        f"Cite the source project in the lesson.\n"
     )
     return title, body
 
