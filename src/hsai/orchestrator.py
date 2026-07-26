@@ -10,8 +10,10 @@ performs the real side effects through the wrapper modules.
 """
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
+from uuid import uuid4
 
 from . import ai, ci, github, gitops, knowledge
 from .config import CoreConfig
@@ -22,6 +24,11 @@ from .proc import Runner, run
 HEAL = "heal"
 IMPLEMENT = "implement"
 IMPROVE = "improve"
+
+# Serializes the short git-metadata prologue and the ticket claim so parallel
+# workers (threads) never race on git's index lock or grab the same ticket. The
+# slow work (agent run, CI, push, PR, merge) happens outside this lock.
+_SERIAL = threading.Lock()
 
 
 def decide_path(ci_green: bool, has_tickets: bool) -> str:
@@ -147,13 +154,16 @@ def run_once(
     repo = cfg.repo_slug
     login = github.current_login(runner=runner) if not dry_run else "hsai-bot"
 
-    # 1. sync main + fresh worktree
-    branch = f"hsai/iter-{int(time.time())}"
+    # 1. sync main + fresh worktree (serialized: touches shared .git)
+    # Branch name is unique per worker even within the same second.
+    branch = f"hsai/iter-{int(time.time())}-{iteration}-{uuid4().hex[:6]}"
     if not dry_run:
-        gitops.sync_main(cfg.default_branch, cwd=repo_dir, runner=runner)
-        _, wt = gitops.create_worktree(
-            cfg.worktrees_dir, branch, base=cfg.default_branch, cwd=repo_dir, runner=runner
-        )
+        with _SERIAL:
+            gitops.sync_main(cfg.default_branch, cwd=repo_dir, runner=runner)
+            _, wt = gitops.create_worktree(
+                cfg.worktrees_dir, branch,
+                base=f"origin/{cfg.default_branch}", cwd=repo_dir, runner=runner,
+            )
     else:
         wt = repo_dir
 
@@ -164,36 +174,43 @@ def run_once(
         else ci.CIResult(ok=True, steps={}, log="dry-run")
     )
 
-    # 3. choose work
-    tickets = github.list_open_issues(repo, runner=runner) if not dry_run else []
-    kind = decide_path(ci_before.ok, bool(tickets))
-
+    # 3. choose work + claim a ticket (serialized so workers never collide)
     ticket_num: int | None = None
     ticket_title = ""
     ticket_body = ""
-    labels_priority = "priority:P2"
 
-    if kind == HEAL:
-        ticket_title = "ci: main is red - auto-heal"
-        ticket_body = f"CI failing on {cfg.default_branch}.\n\n```\n{ci_before.summary()}\n```"
-        labels_priority = "priority:P0"
-        if not dry_run:
-            ticket_num = github.create_issue(
-                repo, ticket_title, ticket_body, [labels_priority, "ci", "hsai"],
-                assignee=login, runner=runner,
-            )
-    elif kind == IMPLEMENT:
-        top = tickets[0]
-        ticket_num, ticket_title, ticket_body = top.number, top.title, top.body
-        if not dry_run:
-            github.assign(repo, top.number, login, runner=runner)
-    else:  # IMPROVE - file a ticket FIRST so the PR has one
-        ticket_title, ticket_body = _improvement_idea(cfg)
-        if not dry_run:
-            ticket_num = github.create_issue(
-                repo, ticket_title, ticket_body, ["priority:P3", "self-improve", "hsai"],
-                assignee=login, runner=runner,
-            )
+    if dry_run:
+        kind = decide_path(ci_before.ok, has_tickets=False)
+        if kind == IMPROVE:
+            ticket_title, ticket_body = _improvement_idea(cfg)
+        elif kind == HEAL:
+            ticket_title, ticket_body = "ci: main is red - auto-heal", "dry-run"
+    else:
+        with _SERIAL:
+            # Only consider UNASSIGNED tickets; claiming = assigning to us.
+            open_unassigned = [
+                i for i in github.list_open_issues(repo, runner=runner) if not i.assignees
+            ]
+            kind = decide_path(ci_before.ok, has_tickets=bool(open_unassigned))
+            if kind == HEAL:
+                ticket_title = "ci: main is red - auto-heal"
+                ticket_body = (
+                    f"CI failing on {cfg.default_branch}.\n\n```\n{ci_before.summary()}\n```"
+                )
+                ticket_num = github.create_issue(
+                    repo, ticket_title, ticket_body, ["priority:P0", "ci", "hsai"],
+                    assignee=login, runner=runner,
+                )
+            elif kind == IMPLEMENT:
+                top = open_unassigned[0]
+                ticket_num, ticket_title, ticket_body = top.number, top.title, top.body
+                github.assign(repo, top.number, login, runner=runner)
+            else:  # IMPROVE - file a ticket FIRST so the PR has one
+                ticket_title, ticket_body = _improvement_idea(cfg)
+                ticket_num = github.create_issue(
+                    repo, ticket_title, ticket_body, ["priority:P3", "self-improve", "hsai"],
+                    assignee=login, runner=runner,
+                )
 
     # 4. model selection (recorded for audit)
     task = Task(kind=kind, title=ticket_title, body=ticket_body)

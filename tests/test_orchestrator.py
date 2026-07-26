@@ -50,7 +50,7 @@ class FakeRunner:
     def _dispatch(self, cmd: list[str]) -> Proc:
         if cmd[:3] == ["gh", "api", "user"]:
             return Proc(cmd, 0, "hsai-bot\n", "")
-        if cmd[:2] in (["git", "checkout"], ["git", "pull"]):
+        if cmd[:2] in (["git", "checkout"], ["git", "pull"], ["git", "fetch"]):
             return Proc(cmd, 0, "", "")
         if cmd[:3] == ["git", "rev-parse", "--show-toplevel"]:
             return Proc(cmd, 0, f"{self.repo_root}\n", "")

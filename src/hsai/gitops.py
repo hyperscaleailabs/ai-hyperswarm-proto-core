@@ -19,16 +19,20 @@ def repo_root(cwd: str | None = None, runner: Runner = run) -> str:
 
 
 def sync_main(default_branch: str, *, cwd: str | None = None, runner: Runner = run) -> Proc:
-    """Fast-forward the local default branch from origin."""
-    _git(["checkout", default_branch], cwd=cwd, runner=runner)
-    return _git(["pull", "--ff-only", "origin", default_branch], cwd=cwd, runner=runner)
+    """Fetch the latest default branch from origin.
+
+    Deliberately does NOT check out or mutate the shared working tree: workers
+    create their worktrees from ``origin/<default_branch>``, which is what makes
+    running several workers against one clone safe.
+    """
+    return _git(["fetch", "origin", default_branch], cwd=cwd, runner=runner)
 
 
 def create_worktree(
     worktrees_dir: str,
     branch: str,
     *,
-    base: str = "main",
+    base: str = "origin/main",
     cwd: str | None = None,
     runner: Runner = run,
 ) -> tuple[Proc, str]:
