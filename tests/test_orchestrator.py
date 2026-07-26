@@ -237,6 +237,47 @@ def test_run_once_implement_path_with_fake_runner(tmp_path):
     assert all(c[0] in {"git", "gh", "ruff", "pytest", "claude"} for c in runner.calls)
 
 
+def test_run_once_records_remote_ci_in_lesson_before_merging(tmp_path):
+    cfg = load_config()
+    open_issues = [
+        {
+            "number": 7,
+            "title": "add widget",
+            "labels": [{"name": "priority:P2"}],
+            "assignees": [],
+            "body": "Implement the widget end to end.",
+        }
+    ]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+        remote_ci="SUCCESS",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.remote == "SUCCESS"
+    assert result.merged is True
+
+    # the lesson written to disk carries the true remote CI conclusion (#14)
+    lesson_text = Path(result.lesson_path).read_text()
+    assert "| remote CI | SUCCESS |" in lesson_text
+
+    # the explicit poll (gh pr view) is the pre-merge gate: it happens before
+    # auto-merge is armed (gh pr merge), not the other way around
+    view_idx = next(i for i, c in enumerate(runner.calls) if c[:3] == ["gh", "pr", "view"])
+    merge_idx = next(i for i, c in enumerate(runner.calls) if c[:3] == ["gh", "pr", "merge"])
+    assert view_idx < merge_idx
+
+    # the lesson update is pushed to the branch before the merge is armed
+    commit_msgs = [
+        c[c.index("-m") + 1] for c in runner.calls if c[:2] == ["git", "commit"]
+    ]
+    assert any("record remote CI outcome" in m for m in commit_msgs)
+
+
 def test_run_once_recovers_when_remote_ci_fails(tmp_path):
     cfg = load_config()
     open_issues = [

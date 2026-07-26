@@ -313,18 +313,29 @@ def run_once(
     )
     result.pr = pr_num
 
-    github.merge_pr(repo, pr_num, auto=True, runner=runner)
-
-    # 12. Wait for the REAL (remote) CI to conclude - it is the source of truth
-    # for whether the change may merge. Then either let auto-merge complete, or
-    # recover the ticket so a failure never strands it.
+    # 12. Poll the REAL (remote) CI to conclusion BEFORE relying on auto-merge -
+    # it is the source of truth for whether the change may merge, and arming
+    # auto-merge first (as opposed to gating on this poll) raced GitHub's own
+    # merge against our recovery bookkeeping.
     remote = ci.wait_remote(
         pr_num, repo,
         timeout=cfg.ci_remote_timeout, interval=cfg.ci_poll_interval, runner=runner,
     )
     result.remote = remote
     result.notes.append(f"remote CI={remote}")
+
+    # Record the true remote outcome in the lesson itself, then push that
+    # update so it lands in the knowledge base once the PR merges.
+    lesson.remote_ci = remote
+    kb.write_lesson(lesson)
+    gitops.commit_all(
+        f"docs: record remote CI outcome ({remote}) in lesson\n\nRefs #{ticket_num}",
+        cwd=wt, runner=runner,
+    )
+    gitops.push_branch(branch, cwd=wt, runner=runner)
+
     if remote == ci.SUCCESS:
+        github.merge_pr(repo, pr_num, auto=True, runner=runner)
         result.merged = True
     else:
         result.merged = False

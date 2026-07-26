@@ -6,6 +6,27 @@ def test_slugify():
     assert slugify("  ") == "untitled"
 
 
+def test_lesson_records_remote_ci_conclusion(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    lesson = Lesson(
+        title="implement: poll remote CI",
+        outcome="pass",
+        kind="implement",
+        context="ctx",
+        what_happened="did the thing",
+        lesson="gate on remote truth",
+        ticket=7,
+    )
+    # before the remote check concludes, the lesson notes it as pending
+    path = kb.write_lesson(lesson)
+    assert "_(pending)_" in path.read_text()
+
+    # once the orchestrator learns the true remote outcome, it is rewritten
+    lesson.remote_ci = "SUCCESS"
+    kb.write_lesson(lesson)
+    assert "SUCCESS" in path.read_text()
+
+
 def test_write_lesson_and_reindex(tmp_path):
     kb = KnowledgeBase(tmp_path)
     lesson = Lesson(
