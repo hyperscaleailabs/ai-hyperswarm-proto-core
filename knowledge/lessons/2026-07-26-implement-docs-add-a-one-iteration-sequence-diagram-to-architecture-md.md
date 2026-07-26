@@ -19,7 +19,7 @@ iteration: 2
 | ticket | #6 |
 | pull request | _(none)_ |
 | model | `sonnet` |
-| remote CI | _(pending)_ |
+| remote CI | SUCCESS |
 
 ## Context
 Iteration 2. Ticket #6. CI before: CI green (ruff=pass, pytest=pass).
