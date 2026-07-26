@@ -230,6 +230,8 @@ def run_once(
     # 5. run the agent (subscription-only)
     agent_ok = True
     agent_err = ""
+    agent_output = ""
+    trace_path = ""
     reverted_workflows: list[str] = []
     if not dry_run:
         prompt = _task_prompt(kind, cfg, ticket_title, ticket_body)
@@ -237,6 +239,11 @@ def run_once(
             prompt, choice, cfg, cwd=wt, runner=ai_runner, timeout=cfg.agent_timeout
         )
         agent_ok, agent_err = ares.ok, ares.error
+        agent_output = ares.output
+
+        # Save execution trace for auditability (learned from SWE-agent/SWE-agent)
+        kb_temp = KnowledgeBase.from_config(cfg, wt)
+        trace_path = str(kb_temp.write_execution_trace(iteration, ticket_num, agent_output).relative_to(wt))
 
         # Guard: a task must not change the CI checks, or local and remote CI
         # would diverge (as happened once when a worker added mypy). Revert any
@@ -257,6 +264,7 @@ def run_once(
     outcome = "pass" if (agent_ok and ci_after.ok) else "fail"
     kb = KnowledgeBase.from_config(cfg, wt)
     references = tuple(r.repo for r in cfg.reference_top10[:3])
+    trace_ref = f"Full execution trace: [[{trace_path}]]" if trace_path else ""
     lesson = Lesson(
         title=f"{kind}: {ticket_title}"[:120],
         outcome=outcome,
@@ -270,6 +278,7 @@ def run_once(
                 if reverted_workflows else ""
             )
             + (f"\n\nAgent error:\n```\n{agent_err[:800]}\n```" if agent_err else "")
+            + (f"\n\n{trace_ref}" if trace_ref else "")
         ),
         lesson=(
             "Change merged cleanly under a green build."

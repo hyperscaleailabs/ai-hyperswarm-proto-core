@@ -99,14 +99,16 @@ class KnowledgeBase:
         lessons_dir: str = "knowledge/lessons",
         whitepapers_dir: str = "knowledge/whitepapers",
         mocs_dir: str = "knowledge/MOCs",
+        logs_dir: str = "knowledge/logs",
         whitepaper_every: int = 10,
     ) -> None:
         self.root = Path(root)
         self.lessons_dir = self.root / lessons_dir
         self.whitepapers_dir = self.root / whitepapers_dir
         self.mocs_dir = self.root / mocs_dir
+        self.logs_dir = self.root / logs_dir
         self.whitepaper_every = whitepaper_every
-        for d in (self.lessons_dir, self.whitepapers_dir, self.mocs_dir):
+        for d in (self.lessons_dir, self.whitepapers_dir, self.mocs_dir, self.logs_dir):
             d.mkdir(parents=True, exist_ok=True)
 
     @classmethod
@@ -117,6 +119,7 @@ class KnowledgeBase:
             lessons_dir=k.get("lessons_dir", "knowledge/lessons"),
             whitepapers_dir=k.get("whitepapers_dir", "knowledge/whitepapers"),
             mocs_dir=k.get("mocs_dir", "knowledge/MOCs"),
+            logs_dir=k.get("logs_dir", "knowledge/logs"),
             whitepaper_every=int(k.get("whitepaper_every_lessons", 10)),
         )
 
@@ -129,6 +132,13 @@ class KnowledgeBase:
     def write_whitepaper(self, paper: Whitepaper) -> Path:
         path = self.whitepapers_dir / f"{paper.note_name()}.md"
         path.write_text(self._render_whitepaper(paper))
+        return path
+
+    def write_execution_trace(self, iteration: int, ticket: int | None, output: str) -> Path:
+        """Save the full agent execution output for debugging and learning."""
+        filename = f"iter-{iteration}-ticket-{ticket or 'none'}-trace.log"
+        path = self.logs_dir / filename
+        path.write_text(output)
         return path
 
     # --- counting -------------------------------------------------------------
