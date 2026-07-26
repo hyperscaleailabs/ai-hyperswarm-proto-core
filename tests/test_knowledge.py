@@ -1,4 +1,4 @@
-from hsai.knowledge import KnowledgeBase, Lesson, Whitepaper, slugify
+from hsai.knowledge import KnowledgeBase, Lesson, LessonRecord, Whitepaper, slugify
 
 
 def test_slugify():
@@ -55,3 +55,72 @@ def test_whitepaper_cadence(tmp_path):
     )
     assert p.exists()
     assert "[[Whitepapers MOC]]" in p.read_text()
+
+
+def test_read_lessons_round_trips_written_lessons(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    kb.write_lesson(
+        Lesson(
+            title="implement: add status command",
+            outcome="pass",
+            kind="implement",
+            context="ctx",
+            what_happened="did the thing",
+            lesson="small steps win",
+        )
+    )
+    records = kb.read_lessons()
+    assert len(records) == 1
+    r = records[0]
+    assert isinstance(r, LessonRecord)
+    assert r.title == "implement: add status command"
+    assert r.outcome == "pass"
+    assert r.kind == "implement"
+    assert r.lesson_text == "small steps win"
+    assert r.what_happened == "did the thing"
+
+
+def test_synthesize_whitepaper_groups_outcomes_and_surfaces_recurring_failures(tmp_path):
+    kb = KnowledgeBase(tmp_path, whitepaper_every=4)
+    kb.write_lesson(
+        Lesson(
+            title="heal: fix flaky retry",
+            outcome="fail",
+            kind="heal",
+            context="c",
+            what_happened="w",
+            lesson="Timeout handling was missing around the retry loop.",
+        )
+    )
+    kb.write_lesson(
+        Lesson(
+            title="heal: fix another timeout",
+            outcome="fail",
+            kind="heal",
+            context="c",
+            what_happened="w",
+            lesson="Another timeout surfaced because retry logic was incomplete.",
+        )
+    )
+    kb.write_lesson(
+        Lesson(
+            title="implement: add feature",
+            outcome="pass",
+            kind="implement",
+            context="c",
+            what_happened="w",
+            lesson="Small, well-tested changes shipped cleanly.",
+        )
+    )
+    paper = kb.synthesize_whitepaper()
+    assert paper.covers_lessons == tuple(kb.lesson_notes())
+    assert "| fail | 2 |" in paper.body
+    assert "| pass | 1 |" in paper.body
+    assert "| heal | 2 |" in paper.body
+    assert "| implement | 1 |" in paper.body
+    assert "Recurring failures" in paper.body
+    assert "timeout" in paper.body.lower()
+    assert "retry" in paper.body.lower()
+
+    path = kb.write_whitepaper(paper)
+    assert "[[Whitepapers MOC]]" in path.read_text()

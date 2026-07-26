@@ -8,6 +8,7 @@ so that cloning the repo and opening it as a vault yields a connected graph.
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -15,6 +16,22 @@ from pathlib import Path
 from .config import CoreConfig
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
+_TAG_RE = re.compile(r"^\s*-\s+(\S.*)$", re.MULTILINE)
+_FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
+_TITLE_RE = re.compile(r"^# (.+)$", re.MULTILINE)
+_SECTION_RE = re.compile(r"^## (.+)$", re.MULTILINE)
+_WORD_RE = re.compile(r"[a-zA-Z][a-zA-Z-]{3,}")
+_STOPWORDS = {
+    "this", "that", "with", "from", "have", "been", "were", "will", "which",
+    "their", "there", "these", "those", "about", "would", "could", "should",
+    "being", "into", "when", "what", "while", "where", "before", "after",
+    "between", "over", "under", "more", "most", "some", "such", "than",
+    "then", "them", "they", "also", "each", "only", "just", "like", "need",
+    "needs", "keep", "keeps", "make", "makes", "made", "gets",
+    "using", "used", "uses", "here", "isnt", "doesnt", "wasnt",
+    "very", "even", "still", "much", "many", "both", "either", "without",
+    "through", "because", "same", "part", "kind", "lesson", "lessons",
+}
 
 
 def slugify(text: str) -> str:
@@ -43,6 +60,19 @@ class Lesson:
 
     def note_name(self) -> str:
         return f"{self.created}-{slugify(self.title)}"
+
+
+@dataclass
+class LessonRecord:
+    """A lesson as parsed back off disk - the read-side counterpart of `Lesson`."""
+
+    note_name: str
+    title: str
+    outcome: str
+    kind: str
+    tags: tuple[str, ...]
+    lesson_text: str
+    what_happened: str = ""
 
 
 @dataclass
@@ -110,6 +140,111 @@ class KnowledgeBase:
     def should_write_whitepaper(self) -> bool:
         n = len(self.lesson_notes())
         return n > 0 and n % self.whitepaper_every == 0
+
+    # --- reading ----------------------------------------------------------------
+    def read_lessons(self) -> list[LessonRecord]:
+        """Parse every lesson note on disk back into structured records, oldest first."""
+        return [self._parse_lesson(name) for name in self.lesson_notes()]
+
+    def _parse_lesson(self, note_name: str) -> LessonRecord:
+        text = (self.lessons_dir / f"{note_name}.md").read_text()
+        fm_match = _FRONTMATTER_RE.match(text)
+        fm = fm_match.group(1) if fm_match else ""
+        tags = tuple(m.group(1).strip() for m in _TAG_RE.finditer(fm))
+        outcome = next((t.split("/", 1)[1] for t in tags if t.startswith("outcome/")), "unknown")
+        kind = next((t.split("/", 1)[1] for t in tags if t.startswith("kind/")), "unknown")
+        title_match = _TITLE_RE.search(text)
+        title = title_match.group(1).strip() if title_match else note_name
+        sections = self._split_sections(text)
+        return LessonRecord(
+            note_name=note_name,
+            title=title,
+            outcome=outcome,
+            kind=kind,
+            tags=tags,
+            lesson_text=sections.get("lesson learned", ""),
+            what_happened=sections.get("what happened", ""),
+        )
+
+    @staticmethod
+    def _split_sections(text: str) -> dict[str, str]:
+        parts = _SECTION_RE.split(text)
+        # parts[0] is the preamble; the rest alternates heading, body, heading, body...
+        sections: dict[str, str] = {}
+        for i in range(1, len(parts), 2):
+            heading = parts[i].strip().lower()
+            body = parts[i + 1] if i + 1 < len(parts) else ""
+            sections[heading] = body.strip()
+        return sections
+
+    def synthesize_whitepaper(self, n: int | None = None) -> Whitepaper:
+        """Synthesize a whitepaper by grouping the last `n` lessons by outcome/kind
+        and surfacing themes that recur across more than one of them.
+        """
+        window = n if n is not None else self.whitepaper_every
+        all_lessons = self.read_lessons()
+        covered = all_lessons[-window:] if window else all_lessons
+
+        outcome_counts = Counter(r.outcome for r in covered)
+        kind_counts = Counter(r.kind for r in covered)
+        failures = [r for r in covered if r.outcome == "fail"]
+
+        word_sources: dict[str, set[str]] = {}
+        for r in covered:
+            words = {w.lower() for w in _WORD_RE.findall(r.lesson_text)} - _STOPWORDS
+            for w in words:
+                word_sources.setdefault(w, set()).add(r.note_name)
+        recurring_themes = sorted(
+            (w for w, notes in word_sources.items() if len(notes) >= 2),
+            key=lambda w: (-len(word_sources[w]), w),
+        )[:5]
+
+        outcome_table = "\n".join(f"| {k} | {v} |" for k, v in sorted(outcome_counts.items())) or "| _(none)_ | 0 |"
+        kind_table = "\n".join(f"| {k} | {v} |" for k, v in sorted(kind_counts.items())) or "| _(none)_ | 0 |"
+
+        if failures:
+            failure_lines = "\n".join(
+                f"- [[{r.note_name}]] ({r.kind}): "
+                f"{r.lesson_text.splitlines()[0] if r.lesson_text else '_(no lesson text recorded)_'}"
+                for r in failures
+            )
+        else:
+            failure_lines = "_No failures in this window - the loop stayed green throughout._"
+
+        if recurring_themes:
+            theme_lines = "\n".join(
+                f"- **{w}** - appears in {len(word_sources[w])} lessons" for w in recurring_themes
+            )
+        else:
+            theme_lines = "_Not enough repeated vocabulary yet to call out a theme._"
+
+        body = f"""## Outcomes in this window
+| outcome | count |
+| --- | --- |
+{outcome_table}
+
+## Work by kind
+| kind | count |
+| --- | --- |
+{kind_table}
+
+## Recurring failures
+{failure_lines}
+
+## Recurring themes
+{theme_lines}"""
+
+        summary = (
+            f"Synthesis of the last {len(covered)} lesson(s): "
+            f"{outcome_counts.get('pass', 0)} pass / {outcome_counts.get('fail', 0)} fail, "
+            f"across kinds {', '.join(sorted(kind_counts)) or '(none)'}."
+        )
+        return Whitepaper(
+            title=f"Synthesis after {len(all_lessons)} lessons",
+            summary=summary,
+            body=body,
+            covers_lessons=tuple(r.note_name for r in covered),
+        )
 
     # --- indexing -------------------------------------------------------------
     def reindex_mocs(self) -> list[Path]:
