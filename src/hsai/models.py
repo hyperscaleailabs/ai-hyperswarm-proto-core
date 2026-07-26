@@ -63,6 +63,7 @@ class Task:
     body: str = ""
     labels: tuple[str, ...] = ()
     est_files: int = 1
+    domain: str = ""  # code | docs | test | infrastructure | refactor (inferred if empty)
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,41 @@ class ModelChoice:
     model: str
     rationale: str
     strategy: str = "heuristic-v1"
+
+
+def classify_domain(task: Task) -> str:
+    """Infer the work domain from task title, body, and labels.
+
+    Inspired by MetaGPT's explicit role/domain decomposition. Returns one of:
+    "code", "docs", "test", "infrastructure", "refactor", or "" if ambiguous.
+
+    This classification is used to improve task routing and provide explicit
+    visibility into work types for future improvements.
+    """
+    text = f"{task.title}\n{task.body}\n{' '.join(task.labels)}".lower()
+
+    # Explicit markers for each domain
+    docs_markers = ("doc", "readme", "comment", "documentation", "guide", "example")
+    test_markers = ("test", "pytest", "coverage", "unit test", "integration")
+    infra_markers = ("ci", "workflow", "github", "deploy", "docker", "build", "config")
+    refactor_markers = ("refactor", "refactoring", "reorgan", "simplif", "cleanup")
+    code_markers = ("feat", "feature", "implement", "function", "method", "class", "algorithm")
+
+    # Score each domain by marker matches
+    scores = {
+        "docs": sum(1 for m in docs_markers if m in text),
+        "test": sum(1 for m in test_markers if m in text),
+        "infrastructure": sum(1 for m in infra_markers if m in text),
+        "refactor": sum(1 for m in refactor_markers if m in text),
+        "code": sum(1 for m in code_markers if m in text),
+    }
+
+    # Return the highest-scoring domain, or "" if there's a tie or no matches
+    max_score = max(scores.values())
+    if max_score == 0:
+        return ""
+    top_domains = [d for d, s in scores.items() if s == max_score]
+    return top_domains[0] if len(top_domains) == 1 else ""
 
 
 def _score(task: Task) -> int:
@@ -133,8 +169,12 @@ def select(task: Task, cfg: CoreConfig) -> ModelChoice:
     - Heavy (>= 5): Architecture, migrations, hard bugs, large refactors
     - Light (<= -3): Docs, formatting, trivial edits, chores
     - Standard: Everything else (features, small bugfixes, simple refactors)
+
+    Incorporates explicit domain classification (inspired by MetaGPT) for
+    auditable task routing.
     """
     score = _score(task)
+    domain = classify_domain(task)
 
     # Tier thresholds; calibrated by iterating and comparing against
     # actual task complexity over multiple runs.
@@ -153,5 +193,6 @@ def select(task: Task, cfg: CoreConfig) -> ModelChoice:
         tier = cfg.default_tier
 
     model = cfg.tiers[tier].model
-    rationale = f"score={score} -> {tier} ({why})"
+    domain_note = f" domain={domain}" if domain else ""
+    rationale = f"score={score} -> {tier} ({why}){domain_note}"
     return ModelChoice(tier=tier, model=model, rationale=rationale, strategy="heuristic-v1")

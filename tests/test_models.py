@@ -1,5 +1,5 @@
 from hsai.config import load_config
-from hsai.models import Task, select
+from hsai.models import Task, select, classify_domain
 
 
 def _cfg():
@@ -204,3 +204,44 @@ class TestEdgeCases:
         )
         choice = select(task, cfg)
         assert choice.tier == "standard"
+
+
+class TestDomainClassification:
+    """Verify task domain classification (inspired by MetaGPT's role-based work decomposition)."""
+
+    def test_docs_domain_recognition(self):
+        task = Task(kind="implement", title="docs: update README")
+        assert classify_domain(task) == "docs"
+
+    def test_test_domain_recognition(self):
+        task = Task(kind="implement", title="test: add integration tests", body="pytest coverage")
+        assert classify_domain(task) == "test"
+
+    def test_infrastructure_domain_recognition(self):
+        task = Task(kind="implement", title="ci: add GitHub Actions workflow", labels=("ci",))
+        assert classify_domain(task) == "infrastructure"
+
+    def test_refactor_domain_recognition(self):
+        task = Task(kind="improve", title="refactor: simplify orchestrator logic")
+        assert classify_domain(task) == "refactor"
+
+    def test_code_domain_recognition(self):
+        task = Task(kind="implement", title="implement: add new feature", labels=("feature",))
+        assert classify_domain(task) == "code"
+
+    def test_ambiguous_domain_returns_empty(self):
+        task = Task(kind="implement", title="update something", est_files=2)
+        domain = classify_domain(task)
+        assert domain == "" or domain in ("code", "docs", "test", "infrastructure", "refactor")
+
+    def test_domain_visible_in_selection_rationale(self):
+        cfg = _cfg()
+        task = Task(kind="implement", title="test: add pytest coverage")
+        choice = select(task, cfg)
+        assert "domain=test" in choice.rationale
+
+    def test_docs_domain_in_rationale_when_selected(self):
+        cfg = _cfg()
+        task = Task(kind="implement", title="docs: add API documentation", est_files=1)
+        choice = select(task, cfg)
+        assert "domain=docs" in choice.rationale
