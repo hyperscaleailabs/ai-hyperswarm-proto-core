@@ -9,6 +9,7 @@ from hsai.orchestrator import (
     HEAL,
     IMPLEMENT,
     IMPROVE,
+    _format_error_with_context,
     build_pr_body,
     decide_path,
     run_once,
@@ -112,6 +113,16 @@ def test_decide_path():
     assert decide_path(ci_green=False, has_tickets=False) == HEAL
     assert decide_path(ci_green=True, has_tickets=True) == IMPLEMENT
     assert decide_path(ci_green=True, has_tickets=False) == IMPROVE
+
+
+def test_format_error_with_context():
+    error = "connection timeout after 30s"
+    result = _format_error_with_context(error, "implement", 42)
+    assert result == "[phase=implement, ticket=#42] connection timeout after 30s"
+
+    # without ticket
+    result = _format_error_with_context(error, "heal", None)
+    assert result == "[phase=heal] connection timeout after 30s"
 
 
 def test_build_pr_body_requires_ticket():

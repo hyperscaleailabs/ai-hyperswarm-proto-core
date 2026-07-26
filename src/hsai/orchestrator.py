@@ -31,6 +31,22 @@ IMPROVE = "improve"
 _SERIAL = threading.Lock()
 
 
+def _format_error_with_context(
+    error: str, phase: str, ticket: int | None
+) -> str:
+    """Format an error with execution context for better traceability.
+
+    Adopted from openai/swarm: lightweight orchestration systems include phase
+    context with errors so failures can be traced to which step failed and why.
+    See: openai/swarm lightweight agent orchestration patterns.
+    """
+    context_parts = [f"phase={phase}"]
+    if ticket:
+        context_parts.append(f"ticket=#{ticket}")
+    context = ", ".join(context_parts)
+    return f"[{context}] {error}"
+
+
 def decide_path(ci_green: bool, has_tickets: bool) -> str:
     """Map current state to the branch of the loop to execute."""
     if not ci_green:
@@ -237,6 +253,8 @@ def run_once(
             prompt, choice, cfg, cwd=wt, runner=ai_runner, timeout=cfg.agent_timeout
         )
         agent_ok, agent_err = ares.ok, ares.error
+        if agent_err:
+            agent_err = _format_error_with_context(agent_err, kind, ticket_num)
 
         # Guard: a task must not change the CI checks, or local and remote CI
         # would diverge (as happened once when a worker added mypy). Revert any
