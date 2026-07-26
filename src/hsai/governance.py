@@ -17,6 +17,7 @@ from pathlib import Path
 from . import github
 from .config import CoreConfig
 from .knowledge import KnowledgeBase
+from .ledger import BlockAggregate
 from .proc import Runner, run
 
 NOTES_START = "<!-- architect-notes:start -->"
@@ -43,6 +44,7 @@ class BlockReport:
     recovered_prs: list[int] = field(default_factory=list)
     whitepaper: str = ""                                   # note name
     articles: list[str] = field(default_factory=list)      # file paths
+    cost: BlockAggregate | None = None                     # quota-ledger aggregate
     notes: list[str] = field(default_factory=list)
 
 
@@ -128,6 +130,13 @@ def write_direction(cfg: CoreConfig, *, repo_root: str | Path, runner: Runner = 
     return path
 
 
+def _cost_summary(cost: BlockAggregate | None) -> str:
+    """One-line block economics for the review brief (empty ledger -> note)."""
+    if cost is None or cost.iterations == 0:
+        return "_no ledger records for this block_"
+    return cost.summary()
+
+
 def render_brief(cfg: CoreConfig, report: BlockReport) -> str:
     """The review-issue body for one block: everything clickable in one place."""
     repo = cfg.repo_slug
@@ -145,6 +154,7 @@ def render_brief(cfg: CoreConfig, report: BlockReport) -> str:
     ) or "_none_"
     paper = f"`knowledge/whitepapers/{report.whitepaper}.md`" if report.whitepaper else "_none_"
     articles = "\n".join(f"- `{a}`" for a in report.articles) or "_none_"
+    cost = _cost_summary(report.cost)
     extra = "\n".join(f"- {n}" for n in report.notes)
     return f"""# Block review - cycle {report.cycle_index}
 
@@ -163,6 +173,9 @@ sequentially, records your feedback as ADRs, and ends with a merged PR.
 
 ## PRs recovered (failed the gate)
 {recovered}
+
+## Cost this block (quota ledger)
+{cost}
 
 ## Knowledge produced
 - Whitepaper: {paper}
