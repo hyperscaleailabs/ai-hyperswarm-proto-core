@@ -14,7 +14,7 @@ import sys
 
 from . import __version__, ai
 from .config import CoreConfig, load_config, validate
-from .knowledge import KnowledgeBase
+from .knowledge import KnowledgeBase, Whitepaper
 from .orchestrator import run_loop
 from .swarm import run_parallel
 
@@ -60,8 +60,22 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def cmd_reindex(args: argparse.Namespace) -> int:
+    """Serialized knowledge maintenance: whitepaper cadence + MOC rebuild.
+
+    Kept out of the parallel workers so PRs never collide on derived index files.
+    """
     cfg = _load(args)
     kb = KnowledgeBase.from_config(cfg, ".")
+    if kb.should_write_whitepaper():
+        p = kb.write_whitepaper(
+            Whitepaper(
+                title=f"Synthesis after {len(kb.lesson_notes())} lessons",
+                summary="Periodic synthesis of accumulated lessons.",
+                body="_Auto-scaffolded; a future iteration should deepen this analysis._",
+                covers_lessons=tuple(kb.lesson_notes()),
+            )
+        )
+        print(f"wrote whitepaper {p}")
     written = kb.reindex_mocs()
     for p in written:
         print(f"reindexed {p}")
