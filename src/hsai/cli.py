@@ -10,9 +10,10 @@ Commands:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
-from . import __version__, ai
+from . import __version__, ai, repro
 from .config import CoreConfig, load_config, validate
 from .knowledge import KnowledgeBase
 from .orchestrator import run_loop
@@ -101,6 +102,26 @@ def cmd_synthesize(args: argparse.Namespace) -> int:
     return 0 if res.ok else 1
 
 
+def cmd_repro_check(args: argparse.Namespace) -> int:
+    """Remote-CI counterpart of the orchestrator's reproduce-before-fix guard.
+
+    Runs as a pre-merge gate on GitHub: for heal/bugfix PRs, proves the
+    added/modified test fails on ``--base-ref`` (pre-fix) and passes on the
+    checked-out PR branch. Exempt tickets (docs/chore, or non heal/bugfix)
+    pass immediately.
+    """
+    cfg = _load(args)
+    pr_title = args.pr_title or os.environ.get("PR_TITLE", "")
+    result = repro.evaluate_pr(
+        pr_title=pr_title, repo_dir=".", base_ref=args.base_ref,
+        worktrees_dir=cfg.worktrees_dir,
+    )
+    print(f"repro-check: {'PASS' if result.ok else 'BLOCKED'} - {result.reason}")
+    if result.log:
+        print(result.log)
+    return 0 if result.ok else 1
+
+
 def cmd_brief(args: argparse.Namespace) -> int:
     from .governance import write_direction
 
@@ -169,6 +190,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     br = sub.add_parser("brief", help="refresh governance/DIRECTION.md")
     br.set_defaults(func=cmd_brief)
+
+    rc = sub.add_parser(
+        "repro-check", help="reproduce-before-fix guard for heal/bugfix PRs (CI gate)"
+    )
+    rc.add_argument("--pr-title", default=None, help="PR title (default: $PR_TITLE)")
+    rc.add_argument(
+        "--base-ref", default="origin/main", help="pre-fix ref to diff/checkout against"
+    )
+    rc.set_defaults(func=cmd_repro_check)
 
     return p
 

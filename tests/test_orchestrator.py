@@ -1,8 +1,10 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from hsai import orchestrator
 from hsai.config import load_config
 from hsai.models import ModelChoice
 from hsai.orchestrator import (
@@ -34,12 +36,19 @@ class FakeRunner:
         open_issues: list[dict] | None = None,
         remote_ci: str = "SUCCESS",
         worktree_status: str = "",
+        repro_fix_ok: bool = True,
+        repro_parent_ok: bool = False,
     ) -> None:
         self.repo_root = repo_root
         self.ci_sequence = ci_sequence
         self.open_issues = open_issues or []
         self.remote_ci = remote_ci
         self.worktree_status = worktree_status
+        # Controls the targeted `pytest <files>` runs the repro guard makes:
+        # `repro_fix_ok` is the outcome on the fix branch, `repro_parent_ok`
+        # the outcome on the detached pre-fix (parent) worktree.
+        self.repro_fix_ok = repro_fix_ok
+        self.repro_parent_ok = repro_parent_ok
         self.calls: list[list[str]] = []
         self._ci_round = 0
         self._issue_seq = 100
@@ -50,15 +59,17 @@ class FakeRunner:
     ) -> Proc:
         cmd = list(cmd)
         self.calls.append(cmd)
-        return self._dispatch(cmd)
+        return self._dispatch(cmd, cwd)
 
-    def _dispatch(self, cmd: list[str]) -> Proc:
+    def _dispatch(self, cmd: list[str], cwd: str | None = None) -> Proc:
         if cmd[:3] == ["gh", "api", "user"]:
             return Proc(cmd, 0, "hsai-bot\n", "")
         if cmd[:2] in (["git", "checkout"], ["git", "pull"], ["git", "fetch"]):
             return Proc(cmd, 0, "", "")
         if cmd[:3] == ["git", "rev-parse", "--show-toplevel"]:
             return Proc(cmd, 0, f"{self.repo_root}\n", "")
+        if cmd[:2] == ["git", "merge-base"]:
+            return Proc(cmd, 0, "parentsha\n", "")
         if cmd[:3] in (["git", "worktree", "add"], ["git", "worktree", "remove"]):
             return Proc(cmd, 0, "", "")
         if cmd[:2] == ["git", "status"]:
@@ -74,6 +85,12 @@ class FakeRunner:
             ok = self.ci_sequence[self._ci_round]
             self._ci_round += 1
             return Proc(cmd, 0 if ok else 1, "", "" if ok else "pytest: fake test failure\n")
+        if cmd[:1] == ["pytest"]:
+            # Targeted repro-guard run: distinguish fix-branch from the
+            # detached pre-fix (parent) worktree by its cwd.
+            is_parent = bool(cwd) and "repro-check-" in cwd
+            ok = self.repro_parent_ok if is_parent else self.repro_fix_ok
+            return Proc(cmd, 0 if ok else 1, "", "" if ok else "pytest: fake failure\n")
         if cmd[:3] == ["gh", "issue", "list"]:
             return Proc(cmd, 0, json.dumps(self.open_issues), "")
         if cmd[:3] == ["gh", "issue", "create"]:
@@ -160,9 +177,31 @@ def test_run_once_dry_run_is_side_effect_free(tmp_path):
     assert result.merged is False
 
 
-def test_run_once_heal_path_with_fake_runner(tmp_path):
+class _FixedUUID:
+    hex = "abc123abc123abc123abc123abc123a"
+
+
+def _pin_worktree_path(monkeypatch, tmp_path, cfg, branch_iteration: int = 1) -> Path:
+    """Make the worktree path `run_once` will create deterministic, so a test
+    can pre-seed a regression-test file into it before the guard runs."""
+    monkeypatch.setattr("hsai.orchestrator.uuid4", lambda: _FixedUUID())
+    monkeypatch.setattr(orchestrator, "time", SimpleNamespace(time=lambda: 1700000000))
+    branch = f"hsai/iter-1700000000-{branch_iteration}-{_FixedUUID.hex[:6]}"
+    return tmp_path / cfg.worktrees_dir / branch
+
+
+def test_run_once_heal_path_with_fake_runner(tmp_path, monkeypatch):
     cfg = load_config()
-    runner = FakeRunner(repo_root=str(tmp_path), ci_sequence=[False, True])
+    wt = _pin_worktree_path(monkeypatch, tmp_path, cfg)
+    (wt / "tests").mkdir(parents=True)
+    (wt / "tests" / "test_regression.py").write_text(
+        "def test_regression():\n    assert True\n"
+    )
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[False, True],
+        worktree_status="?? tests/test_regression.py\n",
+        repro_fix_ok=True, repro_parent_ok=False,
+    )
 
     result = run_once(
         cfg, repo_dir=str(tmp_path), dry_run=False,
@@ -178,9 +217,17 @@ def test_run_once_heal_path_with_fake_runner(tmp_path):
     assert result.pr is not None
     assert result.merged is True
 
+    # the heal ticket added a regression test that reproduces the bug: the
+    # repro guard approved and recorded the transition
+    assert any(n.startswith("repro guard: reproduced") for n in result.notes)
+    assert result.recovered is False
+
     # a lesson is always written
     assert result.lesson_path
     assert Path(result.lesson_path).exists()
+    lesson_text = Path(result.lesson_path).read_text()
+    assert "tests/test_regression.py" in lesson_text
+    assert "reproduced" in lesson_text
 
     # heal files its own ticket, never picks up an existing one
     assert any(c[:3] == ["gh", "issue", "create"] for c in runner.calls)
@@ -197,6 +244,51 @@ def test_run_once_heal_path_with_fake_runner(tmp_path):
     claude_calls = [c for c in runner.calls if c[:1] == ["claude"]]
     assert len(claude_calls) == 1
     assert all(c[0] in {"git", "gh", "ruff", "pytest", "claude"} for c in runner.calls)
+
+
+def test_repro_guard_blocks_heal_without_regression_test(tmp_path):
+    cfg = load_config()
+    runner = FakeRunner(repo_root=str(tmp_path), ci_sequence=[False, True])
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    # heal ticket added no test at all -> the guard blocks before a PR opens
+    assert result.kind == HEAL
+    assert result.recovered is True
+    assert result.pr is None
+    assert result.merged is False
+    assert any("repro guard" in n and "no test file" in n for n in result.notes)
+    assert not any(c[:3] == ["gh", "pr", "create"] for c in runner.calls)
+
+
+def test_repro_guard_blocks_when_new_test_also_passes_on_pre_fix_tree(tmp_path, monkeypatch):
+    cfg = load_config()
+    wt = _pin_worktree_path(monkeypatch, tmp_path, cfg)
+    (wt / "tests").mkdir(parents=True)
+    (wt / "tests" / "test_regression.py").write_text(
+        "def test_regression():\n    assert True\n"
+    )
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[False, True],
+        worktree_status="?? tests/test_regression.py\n",
+        # The "new" test passes even on the pre-fix tree -> no real bug proven.
+        repro_fix_ok=True, repro_parent_ok=True,
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.kind == HEAL
+    assert result.recovered is True
+    assert result.pr is None
+    assert result.merged is False
+    assert any("does not reproduce a real bug" in n for n in result.notes)
+    assert not any(c[:3] == ["gh", "pr", "create"] for c in runner.calls)
 
 
 WELL_FORMED_BODY = """## Problem

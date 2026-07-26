@@ -54,6 +54,37 @@ def remove_worktree(wt_path: str, *, cwd: str | None = None, runner: Runner = ru
     return _git(["worktree", "remove", "--force", wt_path], cwd=cwd, runner=runner)
 
 
+def create_detached_worktree(
+    worktrees_dir: str,
+    name: str,
+    ref: str,
+    *,
+    cwd: str | None = None,
+    runner: Runner = run,
+) -> tuple[Proc, str]:
+    """Create a detached worktree pinned at ``ref``.
+
+    Used to inspect a pre-fix (parent) state without touching any branch - the
+    reproduce-before-fix guard checks the new/modified test out of the fix
+    branch and runs it here to prove the bug was real.
+    """
+    root = repo_root(cwd=cwd, runner=runner) or (cwd or ".")
+    wt_path = str(Path(root) / worktrees_dir / name)
+    proc = _git(["worktree", "add", "--detach", wt_path, ref], cwd=cwd, runner=runner)
+    return proc, wt_path
+
+
+def merge_base(a: str, b: str, *, cwd: str | None = None, runner: Runner = run) -> str:
+    p = _git(["merge-base", a, b], cwd=cwd, runner=runner)
+    return p.stdout.strip()
+
+
+def diff_paths(base_ref: str, *, cwd: str | None = None, runner: Runner = run) -> list[str]:
+    """Paths that differ between ``base_ref`` and HEAD."""
+    p = _git(["diff", "--name-only", f"{base_ref}...HEAD"], cwd=cwd, runner=runner)
+    return [line.strip() for line in p.stdout.splitlines() if line.strip()]
+
+
 def has_changes(*, cwd: str, runner: Runner = run) -> bool:
     p = _git(["status", "--porcelain"], cwd=cwd, runner=runner)
     return bool(p.stdout.strip())
