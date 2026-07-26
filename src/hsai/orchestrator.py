@@ -10,6 +10,7 @@ performs the real side effects through the wrapper modules.
 """
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
@@ -20,6 +21,8 @@ from .config import CoreConfig
 from .knowledge import KnowledgeBase, Lesson
 from .models import ModelChoice, Task, select
 from .proc import Runner, run
+
+logger = logging.getLogger(__name__)
 
 HEAL = "heal"
 IMPLEMENT = "implement"
@@ -158,6 +161,15 @@ def run_once(
     repo = cfg.repo_slug
     login = github.current_login(runner=runner) if not dry_run else "hsai-bot"
 
+    logger.info(
+        "iteration_start",
+        extra={
+            "iteration": iteration,
+            "repo": repo,
+            "dry_run": dry_run,
+        },
+    )
+
     # 1. sync main + fresh worktree (serialized: touches shared .git)
     # Branch name is unique per worker even within the same second.
     branch = f"hsai/iter-{int(time.time())}-{iteration}-{uuid4().hex[:6]}"
@@ -176,6 +188,11 @@ def run_once(
         ci.run_local(cwd=wt, runner=runner)
         if not dry_run
         else ci.CIResult(ok=True, steps={}, log="dry-run")
+    )
+
+    logger.info(
+        "ci_check_complete",
+        extra={"ci_ok": ci_before.ok, "branch": branch},
     )
 
     # 3. choose work + claim a ticket (serialized so workers never collide)
@@ -198,6 +215,13 @@ def run_once(
                 if not i.assignees and not i.is_blocked
             ]
             kind = decide_path(ci_before.ok, has_tickets=bool(open_unassigned))
+            logger.info(
+                "path_decided",
+                extra={
+                    "path": kind,
+                    "open_tickets": len(open_unassigned),
+                },
+            )
             if kind == HEAL:
                 ticket_title = "ci: main is red - auto-heal"
                 ticket_body = (
@@ -223,6 +247,15 @@ def run_once(
     task = Task(kind=kind, title=ticket_title, body=ticket_body)
     choice = select(task, cfg)
 
+    logger.info(
+        "model_selected",
+        extra={
+            "model": choice.model,
+            "tier": choice.tier,
+            "ticket": ticket_num,
+        },
+    )
+
     result = IterationResult(
         kind=kind, ticket=ticket_num, model=choice.model, ci_before=ci_before.ok
     )
@@ -238,6 +271,15 @@ def run_once(
         )
         agent_ok, agent_err = ares.ok, ares.error
 
+        logger.info(
+            "agent_complete",
+            extra={
+                "agent_ok": agent_ok,
+                "ticket": ticket_num,
+                "error_present": bool(agent_err),
+            },
+        )
+
         # Guard: a task must not change the CI checks, or local and remote CI
         # would diverge (as happened once when a worker added mypy). Revert any
         # workflow edits before they are committed and note it in the lesson.
@@ -252,6 +294,11 @@ def run_once(
     # 6. re-check CI
     ci_after = ci.run_local(cwd=wt, runner=runner) if not dry_run else ci_before
     result.ci_after = ci_after.ok
+
+    logger.info(
+        "ci_recheck_complete",
+        extra={"ci_ok": ci_after.ok, "ticket": ticket_num},
+    )
 
     # 7. lesson (ALWAYS, pass or fail)
     outcome = "pass" if (agent_ok and ci_after.ok) else "fail"
@@ -337,6 +384,15 @@ def run_once(
     if remote == ci.SUCCESS:
         github.merge_pr(repo, pr_num, auto=True, runner=runner)
         result.merged = True
+        logger.info(
+            "iteration_complete",
+            extra={
+                "ticket": ticket_num,
+                "pr": pr_num,
+                "merged": True,
+                "outcome": "success",
+            },
+        )
     else:
         result.merged = False
         _recover_failed(
@@ -345,6 +401,16 @@ def run_once(
         )
         result.recovered = True
         result.notes.append("recovered: closed PR, returned ticket to backlog")
+        logger.info(
+            "iteration_complete",
+            extra={
+                "ticket": ticket_num,
+                "pr": pr_num,
+                "merged": False,
+                "outcome": "failed",
+                "remote_ci": remote,
+            },
+        )
 
     # 13. cleanup worktree
     gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
