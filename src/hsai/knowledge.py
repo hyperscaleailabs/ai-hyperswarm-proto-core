@@ -58,6 +58,7 @@ class Lesson:
     tags: tuple[str, ...] = ()
     created: str = field(default_factory=_today)
     remote_ci: str = ""  # SUCCESS | FAILURE | TIMEOUT, filled in once gh checks conclude
+    spec_alignment: str = ""  # off-spec guard result (#13): "ok: ..." | "FLAGGED: ..."
 
     def note_name(self) -> str:
         return f"{self.created}-{slugify(self.title)}"
@@ -292,6 +293,7 @@ class KnowledgeBase:
 | pull request | {pr} |
 | model | `{lesson.model}` |
 | remote CI | {lesson.remote_ci or "_(pending)_"} |
+| spec alignment | {lesson.spec_alignment or "_(not checked)_"} |
 
 ## Context
 {lesson.context}

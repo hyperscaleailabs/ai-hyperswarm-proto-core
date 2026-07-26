@@ -9,6 +9,7 @@ from hsai.orchestrator import (
     HEAL,
     IMPLEMENT,
     IMPROVE,
+    assess_spec_alignment,
     build_pr_body,
     decide_path,
     run_once,
@@ -337,3 +338,102 @@ def test_workflow_edits_are_reverted(tmp_path):
     assert any(c[:3] == ["git", "checkout", "HEAD"] for c in runner.calls)
     assert any(c[:2] == ["git", "clean"] for c in runner.calls)
     assert any("reverted workflow edits" in n for n in result.notes)
+
+
+# --- off-spec guard (#13) ----------------------------------------------------
+
+
+def test_assess_spec_alignment_flags_no_changes():
+    aligned, reason = assess_spec_alignment("add widget", "Implement the widget.", [])
+    assert aligned is False
+    assert "no file changes" in reason
+
+
+def test_assess_spec_alignment_flags_unrelated_diff():
+    # This is the PR #9 / ticket #4 shape: the ticket is about a widget, but
+    # the diff only touches something with no textual relation to it.
+    aligned, reason = assess_spec_alignment(
+        "add widget", "Implement the widget end to end.",
+        [".github/workflows/ci.yml"],
+    )
+    assert aligned is False
+    assert "no keyword overlap" in reason
+
+
+def test_assess_spec_alignment_passes_on_keyword_overlap():
+    aligned, reason = assess_spec_alignment(
+        "add widget", "Implement the widget end to end.",
+        ["src/hsai/widget.py"],
+    )
+    assert aligned is True
+    assert "widget" in reason
+
+
+def test_assess_spec_alignment_requires_named_path_when_given():
+    body = "Implement this in `src/hsai/miner.py` per the design."
+    # Ticket names a specific path; touching something else doesn't satisfy it
+    # even though "design" might coincidentally overlap elsewhere.
+    aligned, reason = assess_spec_alignment("chore: miner", body, ["src/hsai/other.py"])
+    assert aligned is False
+    assert "src/hsai/miner.py" in reason
+
+    aligned, reason = assess_spec_alignment("chore: miner", body, ["src/hsai/miner.py"])
+    assert aligned is True
+
+
+def test_run_once_flags_off_spec_diff_in_lesson(tmp_path):
+    cfg = load_config()
+    open_issues = [
+        {
+            "number": 7,
+            "title": "add widget",
+            "labels": [{"name": "priority:P2"}],
+            "assignees": [],
+            "body": "Implement the widget end to end.",
+        }
+    ]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+        worktree_status="?? src/hsai/mypy_config.py\n",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    # A green build does not excuse an off-spec diff (the PR #9 lesson): the
+    # guard flags it non-blockingly, so the PR still merges on green CI...
+    assert result.off_spec is True
+    assert any("spec-alignment: FLAGGED" in n for n in result.notes)
+    assert result.merged is True
+
+    # ...but the flag is recorded in the lesson so a human can review it.
+    lesson_text = Path(result.lesson_path).read_text()
+    assert "FLAGGED" in lesson_text
+    assert "spec alignment" in lesson_text.lower()
+
+
+def test_run_once_passes_spec_check_on_relevant_diff(tmp_path):
+    cfg = load_config()
+    open_issues = [
+        {
+            "number": 7,
+            "title": "add widget",
+            "labels": [{"name": "priority:P2"}],
+            "assignees": [],
+            "body": "Implement the widget end to end.",
+        }
+    ]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+        worktree_status="?? src/hsai/widget.py\n",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.off_spec is False
+    assert any("spec-alignment: ok" in n for n in result.notes)

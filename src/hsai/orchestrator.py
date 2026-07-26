@@ -4,14 +4,17 @@ One iteration = sync main -> CI check -> choose work (heal / implement /
 self-improve) -> ensure a ticket exists -> run a model -> re-check CI ->
 record a lesson -> open a linked PR -> merge on green.
 
-Decision logic (:func:`decide_path`) and PR-body assembly
-(:func:`build_pr_body`) are pure and unit-tested; the orchestration around them
-performs the real side effects through the wrapper modules.
+Decision logic (:func:`decide_path`), PR-body assembly (:func:`build_pr_body`),
+and the off-spec guard (:func:`assess_spec_alignment`) are pure and
+unit-tested; the orchestration around them performs the real side effects
+through the wrapper modules.
 """
 from __future__ import annotations
 
+import re
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from uuid import uuid4
 
@@ -78,6 +81,68 @@ _Filed automatically by the `hsai` loop. Model usage is on the Claude subscripti
 """
 
 
+_EXPECTED_PATH_RE = re.compile(r"`([\w./-]+\.[A-Za-z0-9]+)`")
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+# Words too generic (English stopwords, or terms that appear in nearly every
+# ticket/path in this repo) to count as evidence of relevance either way.
+_SPEC_STOPWORDS = frozenset({
+    "the", "a", "an", "and", "or", "to", "of", "in", "for", "on", "with",
+    "is", "are", "be", "will", "that", "this", "these", "those", "as", "at",
+    "by", "from", "into", "it", "its", "you", "your", "we", "our", "their",
+    "not", "but", "if", "so", "then", "end", "one", "via",
+    "chore", "feat", "fix", "docs", "ci", "loop", "hsai", "src", "py",
+    "tests", "test", "implement", "ticket", "goal", "task", "change",
+    "addresses",
+})
+
+
+def _spec_tokens(text: str) -> set[str]:
+    return {
+        t for t in _TOKEN_RE.findall(text.lower())
+        if len(t) > 2 and t not in _SPEC_STOPWORDS
+    }
+
+
+def assess_spec_alignment(
+    ticket_title: str, ticket_body: str, changed_paths: Sequence[str],
+) -> tuple[bool, str]:
+    """Lightweight off-spec guard: does the diff plausibly address the ticket?
+
+    PR #9's worker ignored ticket #4 (reference-set miner) and added a mypy
+    step to CI instead - local CI was green, but the change had nothing to do
+    with the ticket. This heuristic checks for two signals, cheapest first:
+
+    1. If the ticket body names specific paths (backticked, e.g. `` `src/x.py` ``),
+       the diff must touch at least one of them.
+    2. Otherwise, the diff's changed paths must share at least one non-generic
+       keyword with the ticket title/body (e.g. ``miner`` in both the ticket
+       title and a new ``reference_miner.py``).
+
+    This is a heuristic, not a model call, so it is deliberately non-blocking:
+    a false positive must never strand a real change. Callers should record
+    the result (aligned or not, with the reason) in the lesson/PR rather than
+    fail the iteration on it.
+    """
+    if not changed_paths:
+        return False, "agent left no file changes"
+
+    expected = _EXPECTED_PATH_RE.findall(ticket_body)
+    if expected:
+        if any(p in changed_paths for p in expected):
+            return True, f"touches ticket-named path(s): {', '.join(expected)}"
+        return False, f"ticket names {', '.join(expected)} but diff touches none of them"
+
+    keywords = _spec_tokens(f"{ticket_title} {ticket_body}")
+    if not keywords:
+        return True, "ticket has no distinctive keywords to check against"
+
+    path_text = " ".join(changed_paths).replace("/", " ").replace("_", " ").replace(".", " ")
+    overlap = keywords & _spec_tokens(path_text)
+    if overlap:
+        return True, f"keyword overlap with changed paths: {', '.join(sorted(overlap))}"
+    return False, "no keyword overlap between ticket text and changed paths"
+
+
 @dataclass
 class IterationResult:
     kind: str
@@ -90,6 +155,7 @@ class IterationResult:
     remote: str = ""
     recovered: bool = False
     lesson_path: str = ""
+    off_spec: bool = False
     notes: list[str] = field(default_factory=list)
 
     def describe(self) -> str:
@@ -99,6 +165,7 @@ class IterationResult:
             f"pr={self.pr}",
             f"model={self.model}",
             f"ci:{self.ci_before}->{self.ci_after}",
+            f"off_spec={self.off_spec}",
             f"remote={self.remote or '-'}",
             f"merged={self.merged}",
             f"recovered={self.recovered}",
@@ -231,6 +298,7 @@ def run_once(
     agent_ok = True
     agent_err = ""
     reverted_workflows: list[str] = []
+    spec_ok, spec_reason = True, "dry-run: not checked"
     if not dry_run:
         prompt = _task_prompt(kind, cfg, ticket_title, ticket_body)
         ares = ai.run_agent(
@@ -248,6 +316,17 @@ def run_once(
         if reverted_workflows:
             gitops.restore_pathspec(".github/workflows", cwd=wt, runner=runner)
             result.notes.append(f"reverted workflow edits: {reverted_workflows}")
+
+        # Off-spec guard (#13): does the remaining diff plausibly address the
+        # ticket, or did the worker drift (as PR #9 did on ticket #4)? A
+        # heuristic, so it only flags - it never blocks the PR on its own.
+        spec_ok, spec_reason = assess_spec_alignment(
+            ticket_title, ticket_body, gitops.changed_paths(cwd=wt, runner=runner),
+        )
+        result.off_spec = not spec_ok
+        result.notes.append(
+            f"spec-alignment: {'ok' if spec_ok else 'FLAGGED'} ({spec_reason})"
+        )
 
     # 6. re-check CI
     ci_after = ci.run_local(cwd=wt, runner=runner) if not dry_run else ci_before
@@ -272,15 +351,24 @@ def run_once(
             + (f"\n\nAgent error:\n```\n{agent_err[:800]}\n```" if agent_err else "")
         ),
         lesson=(
-            "Change merged cleanly under a green build."
-            if outcome == "pass"
-            else "Change did not reach green; auto-merge will hold until CI passes. "
-            "Investigate the failure captured above before the next attempt."
+            ("Change merged cleanly under a green build." if outcome == "pass"
+             else "Change did not reach green; auto-merge will hold until CI passes. "
+             "Investigate the failure captured above before the next attempt.")
+            + (
+                f"\n\nOff-spec guard FLAGGED this change: {spec_reason}. Green CI does "
+                "not guarantee the diff addressed the ticket (see PR #9 / ticket #4) - "
+                "a human should confirm this PR before trusting the merge."
+                if not dry_run and not spec_ok else ""
+            )
         ),
         iteration=iteration,
         ticket=ticket_num,
         model=choice.model,
         references=references,
+        spec_alignment=(
+            "not checked (dry-run)" if dry_run
+            else f"{'ok' if spec_ok else 'FLAGGED'}: {spec_reason}"
+        ),
     )
     # Each PR commits ONLY its own uniquely-named lesson file. The MOC indexes
     # and whitepapers are regenerated by the serialized `hsai reindex`
