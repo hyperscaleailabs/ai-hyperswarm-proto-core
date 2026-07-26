@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-hyperswarm-proto-core"
+version = "0.1.0"
+description = "Self-improving prototype core for AI swarms, driven by the hsai autonomous loop."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "hyperscaleailabs" }]
+keywords = ["ai", "swarm", "multi-agent", "autonomous", "orchestration", "self-improving"]
+dependencies = [
+  "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.6",
+]
+
+[project.scripts]
+hsai = "hsai.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/hyperscaleailabs/ai-hyperswarm-proto-core"
+Repository = "https://github.com/hyperscaleailabs/ai-hyperswarm-proto-core"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "W"]
+ignore = ["E501"]  # line length handled pragmatically; long strings allowed

@@ -1,0 +1,173 @@
+"""GitHub operations via the `gh` CLI: labels, issues (tickets), and PRs.
+
+Priority is expressed with labels ``priority:P0`` .. ``priority:P3`` (P0 highest).
+"""
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+
+from .proc import Proc, Runner, run
+
+PRIORITY_LABELS = ["priority:P0", "priority:P1", "priority:P2", "priority:P3"]
+STANDARD_LABELS = {
+    "priority:P0": ("b60205", "Critical / broken main"),
+    "priority:P1": ("d93f0b", "High priority"),
+    "priority:P2": ("fbca04", "Normal priority"),
+    "priority:P3": ("0e8a16", "Low priority / nice to have"),
+    "hsai": ("5319e7", "Filed or handled by the hsai loop"),
+    "ci": ("1d76db", "Continuous integration / build health"),
+    "self-improve": ("0052cc", "Improvement toward core.yaml goals"),
+    "skill": ("bfd4f2", "A learnable orchestrator capability"),
+}
+
+
+@dataclass
+class Issue:
+    number: int
+    title: str
+    labels: tuple[str, ...]
+    assignees: tuple[str, ...]
+    body: str = ""
+
+    def priority_rank(self) -> int:
+        for i, lbl in enumerate(PRIORITY_LABELS):
+            if lbl in self.labels:
+                return i
+        return len(PRIORITY_LABELS)  # unlabeled sorts last
+
+
+def _gh(args: list[str], *, cwd: str | None = None, runner: Runner = run) -> Proc:
+    return runner(["gh", *args], cwd=cwd)
+
+
+def current_login(*, runner: Runner = run) -> str:
+    p = _gh(["api", "user", "--jq", ".login"], runner=runner)
+    return p.stdout.strip()
+
+
+def ensure_labels(repo: str, *, runner: Runner = run) -> None:
+    """Create the standard label set (idempotent)."""
+    for name, (color, desc) in STANDARD_LABELS.items():
+        _gh(
+            [
+                "label", "create", name,
+                "--repo", repo,
+                "--color", color,
+                "--description", desc,
+                "--force",
+            ],
+            runner=runner,
+        )
+
+
+def create_issue(
+    repo: str,
+    title: str,
+    body: str,
+    labels: list[str],
+    *,
+    assignee: str | None = None,
+    runner: Runner = run,
+) -> int:
+    """Create an issue and return its number (0 if it could not be parsed)."""
+    args = ["issue", "create", "--repo", repo, "--title", title, "--body", body]
+    for lbl in labels:
+        args += ["--label", lbl]
+    if assignee:
+        args += ["--assignee", assignee]
+    p = _gh(args, runner=runner)
+    return _parse_issue_number(p.stdout)
+
+
+def list_open_issues(repo: str, *, runner: Runner = run) -> list[Issue]:
+    """List open issues, highest priority first."""
+    p = _gh(
+        [
+            "issue", "list", "--repo", repo, "--state", "open",
+            "--limit", "100",
+            "--json", "number,title,labels,assignees,body",
+        ],
+        runner=runner,
+    )
+    try:
+        data = json.loads(p.stdout or "[]")
+    except json.JSONDecodeError:
+        return []
+    issues = [
+        Issue(
+            number=item["number"],
+            title=item.get("title", ""),
+            labels=tuple(lb["name"] for lb in item.get("labels", [])),
+            assignees=tuple(a["login"] for a in item.get("assignees", [])),
+            body=item.get("body", "") or "",
+        )
+        for item in data
+    ]
+    issues.sort(key=lambda i: (i.priority_rank(), i.number))
+    return issues
+
+
+def next_ticket(repo: str, *, runner: Runner = run) -> Issue | None:
+    issues = list_open_issues(repo, runner=runner)
+    return issues[0] if issues else None
+
+
+def assign(repo: str, number: int, login: str, *, runner: Runner = run) -> Proc:
+    return _gh(
+        ["issue", "edit", str(number), "--repo", repo, "--add-assignee", login],
+        runner=runner,
+    )
+
+
+def create_pr(
+    repo: str,
+    head: str,
+    title: str,
+    body: str,
+    *,
+    base: str = "main",
+    runner: Runner = run,
+) -> int:
+    p = _gh(
+        [
+            "pr", "create", "--repo", repo,
+            "--head", head, "--base", base,
+            "--title", title, "--body", body,
+        ],
+        runner=runner,
+    )
+    return _parse_pr_number(p.stdout)
+
+
+def merge_pr(
+    repo: str,
+    number: int,
+    *,
+    auto: bool = True,
+    method: str = "squash",
+    runner: Runner = run,
+) -> Proc:
+    """Merge a PR. With ``auto`` the merge waits for required checks to pass."""
+    args = ["pr", "merge", str(number), "--repo", repo, f"--{method}", "--delete-branch"]
+    if auto:
+        args.append("--auto")
+    return _gh(args, runner=runner)
+
+
+# --- parsing helpers ----------------------------------------------------------
+def _parse_issue_number(text: str) -> int:
+    return _trailing_number(text)
+
+
+def _parse_pr_number(text: str) -> int:
+    return _trailing_number(text)
+
+
+def _trailing_number(text: str) -> int:
+    """gh prints the created issue/PR URL; the number is the last path segment."""
+    for token in reversed(text.strip().split()):
+        tail = token.rstrip("/").split("/")[-1]
+        if tail.isdigit():
+            return int(tail)
+    return 0
