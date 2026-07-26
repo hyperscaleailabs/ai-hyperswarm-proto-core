@@ -20,6 +20,7 @@ _TAG_RE = re.compile(r"^\s*-\s+(\S.*)$", re.MULTILINE)
 _FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
 _TITLE_RE = re.compile(r"^# (.+)$", re.MULTILINE)
 _SECTION_RE = re.compile(r"^## (.+)$", re.MULTILINE)
+_MODEL_RE = re.compile(r"^\|\s*model\s*\|\s*`([^`]*)`\s*\|", re.MULTILINE)
 _WORD_RE = re.compile(r"[a-zA-Z][a-zA-Z-]{3,}")
 _STOPWORDS = {
     "this", "that", "with", "from", "have", "been", "were", "will", "which",
@@ -74,6 +75,7 @@ class LessonRecord:
     tags: tuple[str, ...]
     lesson_text: str
     what_happened: str = ""
+    model: str = ""  # the model alias recorded in the lesson table (e.g. haiku)
 
 
 @dataclass
@@ -156,6 +158,8 @@ class KnowledgeBase:
         kind = next((t.split("/", 1)[1] for t in tags if t.startswith("kind/")), "unknown")
         title_match = _TITLE_RE.search(text)
         title = title_match.group(1).strip() if title_match else note_name
+        model_match = _MODEL_RE.search(text)
+        model = model_match.group(1).strip() if model_match else ""
         sections = self._split_sections(text)
         return LessonRecord(
             note_name=note_name,
@@ -165,6 +169,7 @@ class KnowledgeBase:
             tags=tags,
             lesson_text=sections.get("lesson learned", ""),
             what_happened=sections.get("what happened", ""),
+            model=model,
         )
 
     @staticmethod

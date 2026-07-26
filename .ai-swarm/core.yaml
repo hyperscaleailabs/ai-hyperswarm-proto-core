@@ -106,7 +106,16 @@ models:
       model: opus
       use_for: [architecture, hard-bug, large-refactor, design]
   default_tier: standard
-  selection_strategy: heuristic-v1   # improved over time; tracked as a backlog skill
+  selection_strategy: heuristic-v2   # learned from the lesson corpus; v1 is the sparse-data fallback
+  # heuristic-v2 calibration knobs (read by src/hsai/calibration.py). Versioned
+  # here so the learned selector's bounds stay auditable. Conservative gates keep
+  # a tiny or biased lesson corpus from collapsing routing onto a single tier.
+  calibration:
+    min_labeled: 5        # global: labeled lessons required before v2 engages
+    min_per_tier: 3       # per-tier: samples required before that boundary moves
+    max_delta: 2          # clamp: a threshold moves at most this far from v1
+    max_share: 0.7        # no tier may exceed this routing share without its gate
+    target_success: 0.8   # per-tier success rate the calibration steers toward
 
 # Governance: the architect steering loop (three streams).
 # Stream 1: steering  - DIRECTION.md + review briefs + /review-next sessions -> ADRs

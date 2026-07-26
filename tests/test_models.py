@@ -1,5 +1,9 @@
+from hsai.calibration import CalibrationParams
 from hsai.config import load_config
 from hsai.models import Task, select
+
+# Tier ordering, lightest to heaviest, for "strictly higher" assertions.
+_RANK = {"light": 0, "standard": 1, "heavy": 2}
 
 
 def _cfg():
@@ -204,3 +208,79 @@ class TestEdgeCases:
         )
         choice = select(task, cfg)
         assert choice.tier == "standard"
+
+
+class TestEscalateOnRetry:
+    """A retried ticket (attempt > 1) must escalate one tier per prior failure."""
+
+    def test_retry_selects_strictly_higher_tier(self):
+        cfg = _cfg()
+        task = Task(kind="implement", title="add a status subcommand", est_files=2)
+        first = select(task, cfg, attempt=1)
+        retry = select(task, cfg, attempt=2)
+        assert first.tier == "standard"
+        assert _RANK[retry.tier] > _RANK[first.tier]
+        assert retry.tier == "heavy"
+        assert retry.signal == "escalate-retry"
+
+    def test_light_task_escalates_step_by_step(self):
+        cfg = _cfg()
+        task = Task(kind="implement", title="docs: update README", est_files=1)
+        assert select(task, cfg, attempt=1).tier == "light"
+        assert select(task, cfg, attempt=2).tier == "standard"
+        assert select(task, cfg, attempt=3).tier == "heavy"
+
+    def test_retry_rationale_names_the_escalation(self):
+        cfg = _cfg()
+        task = Task(kind="implement", title="add a status subcommand", est_files=2)
+        choice = select(task, cfg, attempt=2)
+        assert "escalate-on-retry" in choice.rationale
+
+    def test_heavy_task_cannot_escalate_past_heavy(self):
+        cfg = _cfg()
+        task = Task(
+            kind="heal",
+            title="architecture: redesign the orchestrator core",
+            est_files=10,
+        )
+        assert select(task, cfg, attempt=1).tier == "heavy"
+        assert select(task, cfg, attempt=3).tier == "heavy"
+
+    def test_first_attempt_is_never_escalated(self):
+        cfg = _cfg()
+        task = Task(kind="implement", title="add a status subcommand", est_files=2)
+        choice = select(task, cfg, attempt=1)
+        assert choice.signal != "escalate-retry"
+
+
+class TestCalibratedParamsAndSignal:
+    """select() honors learned params and exposes a machine-readable signal."""
+
+    def test_signal_is_populated_for_every_branch(self):
+        cfg = _cfg()
+        cases = {
+            "size-label": Task(kind="implement", title="x", labels=("size:L",)),
+            "score-light": Task(kind="implement", title="docs: readme", est_files=1),
+            "score-heavy": Task(kind="heal", title="architecture redesign", est_files=10),
+            "default": Task(kind="implement", title="add a widget", est_files=2),
+        }
+        for expected, task in cases.items():
+            assert select(task, cfg).signal == expected
+
+    def test_calibrated_heavy_threshold_shifts_selection(self):
+        cfg = _cfg()
+        task = Task(kind="implement", title="add a caching helper", est_files=4)
+        # Under v1 (heavy_threshold=5) this scores standard; a calibrated lower
+        # threshold routes the very same task to heavy.
+        assert select(task, cfg).tier == "standard"
+        lowered = CalibrationParams(
+            heavy_threshold=1, light_threshold=-3, strategy="heuristic-v2"
+        )
+        assert select(task, cfg, params=lowered).tier == "heavy"
+
+    def test_strategy_reflects_supplied_params(self):
+        cfg = _cfg()
+        task = Task(kind="implement", title="add feature", est_files=2)
+        v2 = CalibrationParams(heavy_threshold=5, light_threshold=-3, strategy="heuristic-v2")
+        assert select(task, cfg, params=v2).strategy == "heuristic-v2"
+        assert select(task, cfg).strategy == "heuristic-v1"

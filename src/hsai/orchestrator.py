@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 from uuid import uuid4
 
-from . import ai, ci, github, gitops
+from . import ai, calibration, ci, github, gitops
 from .config import CoreConfig
 from .knowledge import KnowledgeBase, Lesson
 from .models import ModelChoice, Task, select
@@ -77,7 +77,8 @@ def build_pr_body(
 
 ## Model used
 - **model**: `{choice.model}` (tier: `{choice.tier}`)
-- **selection**: {choice.rationale} [strategy: `{choice.strategy}`]
+- **selection**: {choice.rationale}
+- **signal**: `{choice.signal}` (strategy: `{choice.strategy}`)
 
 ## CI
 {ci_summary}
@@ -280,11 +281,15 @@ def run_once(
         gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
         return res
 
-    # 4. model selection (recorded for audit)
+    # 4. model selection (recorded for audit). Thresholds are calibrated from
+    # the lesson corpus (heuristic-v2, falling back to v1 when sparse); a retried
+    # ticket escalates one tier per prior failed attempt.
     task = Task(kind=kind, title=ticket_title, body=ticket_body, labels=(
         tuple(claimed_issue.labels) if claimed_issue else ()
     ))
-    choice = select(task, cfg)
+    params = calibration.load_params(cfg, wt)
+    attempt = (claimed_issue.attempts() + 1) if claimed_issue else 1
+    choice = select(task, cfg, attempt=attempt, params=params)
 
     result = IterationResult(
         kind=kind, ticket=ticket_num, model=choice.model, ci_before=ci_before.ok
