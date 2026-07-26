@@ -56,9 +56,22 @@ _LIGHT_SIGNALS = (
 
 @dataclass(frozen=True)
 class Task:
-    """A unit of work the orchestrator is about to hand to a model."""
+    """Immutable unit of work the orchestrator hands to a model.
 
-    kind: str  # heal | implement | improve
+    Frozen to prevent accidental mutation during selection heuristics. Captures
+    the decision inputs (title, body, labels, estimated scope) so model selection
+    can reason about complexity. Pattern inspired by multi-agent frameworks
+    (MetaGPT, semantic-kernel) that use immutable task objects.
+
+    Attributes:
+        kind: "heal" | "implement" | "improve" - which branch of the loop created this.
+        title: Human-readable work description (e.g., "refactor: simplify CI polling").
+        body: Optional detailed context or requirements.
+        labels: GitHub labels attached to the issue (for signal extraction).
+        est_files: Estimated number of files the change will touch (structural signal).
+    """
+
+    kind: str
     title: str
     body: str = ""
     labels: tuple[str, ...] = ()
@@ -67,6 +80,20 @@ class Task:
 
 @dataclass(frozen=True)
 class ModelChoice:
+    """Immutable record of a model selection decision.
+
+    Frozen to preserve the decision for audit and learning. Every PR records a
+    ModelChoice in its body, enabling post-hoc analysis of selection quality and
+    iterative improvement of the heuristic.
+
+    Attributes:
+        tier: "light" | "standard" | "heavy" - model tier chosen based on complexity.
+        model: Model alias ("haiku", "sonnet", "opus") resolved from tier.
+        rationale: Human-readable explanation (e.g., "score=6 -> heavy (architecture)").
+        strategy: Heuristic version used ("heuristic-v1", "heuristic-v2", etc.); enables
+                  learning as strategy improves.
+    """
+
     tier: str
     model: str
     rationale: str

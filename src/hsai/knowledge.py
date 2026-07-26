@@ -42,11 +42,34 @@ def _today() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-@dataclass
+@dataclass(frozen=True)
 class Lesson:
+    """An immutable record of one iteration: what happened, outcome, and lessons learned.
+
+    Frozen to prevent accidental mutation after creation. Each field is required
+    at construction; optional fields use defaults. The lesson is serialized to
+    Obsidian-ready markdown with YAML frontmatter and wikilinks.
+
+    Attributes:
+        title: Human-readable title for the iteration (e.g., "fix: race condition in CI polling").
+        outcome: "pass" | "fail" - whether the change merged or encountered a blocker.
+        kind: "heal" | "implement" | "improve" - which branch of the loop was taken.
+        context: Setup state before work (e.g., "Iteration 5. Ticket #12. CI before: green").
+        what_happened: Factual account of execution and any errors encountered.
+        lesson: Key insight or decision point captured for future reference.
+        iteration: Loop iteration number (for traceability).
+        ticket: GitHub issue number linked to this work (traceability invariant).
+        pr: GitHub PR number if a change was proposed (else None).
+        model: Model name used (e.g., "haiku", "sonnet", "opus").
+        references: Tuple of reference-set repos that informed or validated this work.
+        tags: Obsidian tags for categorization (#outcome/pass, #kind/implement, etc.).
+        created: ISO date when the lesson was recorded (defaults to today).
+        remote_ci: CI result after merge attempt ("SUCCESS", "FAILURE", "TIMEOUT").
+    """
+
     title: str
-    outcome: str  # "pass" | "fail"
-    kind: str  # heal | implement | improve
+    outcome: str
+    kind: str
     context: str
     what_happened: str
     lesson: str
@@ -54,12 +77,13 @@ class Lesson:
     ticket: int | None = None
     pr: int | None = None
     model: str = ""
-    references: tuple[str, ...] = ()  # reference-set repos that informed the work
+    references: tuple[str, ...] = ()
     tags: tuple[str, ...] = ()
     created: str = field(default_factory=_today)
-    remote_ci: str = ""  # SUCCESS | FAILURE | TIMEOUT, filled in once gh checks conclude
+    remote_ci: str = ""
 
     def note_name(self) -> str:
+        """Generate the filename slug for this lesson (date-based, idempotent)."""
         return f"{self.created}-{slugify(self.title)}"
 
 

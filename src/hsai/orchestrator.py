@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from uuid import uuid4
 
 from . import ai, ci, github, gitops
@@ -80,6 +80,26 @@ _Filed automatically by the `hsai` loop. Model usage is on the Claude subscripti
 
 @dataclass
 class IterationResult:
+    """Mutable summary of one orchestrator iteration, accumulated during execution.
+
+    Used for logging, progress reporting, and recovery status. Fields are populated
+    progressively through the iteration lifecycle and should not be mutated after
+    the iteration completes. See :class:`Lesson` for the immutable outcome record.
+
+    Attributes:
+        kind: "heal" | "implement" | "improve" - which decision path was taken.
+        ticket: GitHub issue number claimed and worked on (or None if none available).
+        pr: GitHub PR number opened (or None if work did not reach PR stage).
+        model: Model tier used ("haiku", "sonnet", "opus").
+        ci_before: True if CI was green before the work started.
+        ci_after: True if CI was green after the work completed.
+        merged: True if the PR was auto-merged by GitHub.
+        remote: Remote CI result ("SUCCESS", "FAILURE", "TIMEOUT", or "").
+        recovered: True if a failed ticket was recovered and retried.
+        lesson_path: Filesystem path to the lesson note written to disk.
+        notes: Diagnostic notes accumulated during execution (error messages, recovery details).
+    """
+
     kind: str
     ticket: int | None = None
     pr: int | None = None
@@ -93,6 +113,7 @@ class IterationResult:
     notes: list[str] = field(default_factory=list)
 
     def describe(self) -> str:
+        """Return a compact single-line summary of this result."""
         parts = [
             f"kind={self.kind}",
             f"ticket={self.ticket}",
@@ -326,7 +347,7 @@ def run_once(
 
     # Record the true remote outcome in the lesson itself, then push that
     # update so it lands in the knowledge base once the PR merges.
-    lesson.remote_ci = remote
+    lesson = replace(lesson, remote_ci=remote)
     kb.write_lesson(lesson)
     gitops.commit_all(
         f"docs: record remote CI outcome ({remote}) in lesson\n\nRefs #{ticket_num}",
