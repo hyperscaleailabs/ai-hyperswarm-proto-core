@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import github, gitops
+from . import github, gitops, ledger
 from .ai import run_agent
 from .config import CoreConfig
 from .governance import BlockReport, open_review_issue, write_direction
@@ -105,18 +105,38 @@ def run_cycle(
         if not sres.ok:
             report.notes.append(f"synthesis produced no tickets: {sres.error}")
 
-    # 2. Sequential implementation block.
+    # 2. Sequential implementation block, under the quota budget gate. Before
+    # starting each iteration we grade the block's spend so far: a soft breach
+    # biases the next selection toward cheaper tiers; a hard breach stops
+    # starting NEW work (any already-running PR keeps merging - the gate never
+    # aborts in-flight work and never bypasses the green-merge gate).
+    ledger_file = ledger.ledger_path(cfg, repo_root)
     block = int(cfg.cycle.get("block_size", 5))
     for i in range(block):
+        spent = ledger.aggregate_block(ledger.read_records(ledger_file), idx)
+        decision = ledger.evaluate_budget(spent, cfg.budget)
+        if decision.halt:
+            report.notes.append(
+                f"budget: hard breach after {spent.summary()} - halting new work "
+                f"for the block ({decision.reason})"
+            )
+            break
+        if decision.demote:
+            report.notes.append(
+                f"budget: soft breach ({decision.reason}) - biasing selection cheaper"
+            )
         res = run_once(
             cfg, repo_dir=str(repo_root), runner=runner, ai_runner=ai_runner,
-            iteration=idx * 100 + i + 1,
+            iteration=idx * 100 + i + 1, demote_tier=decision.demote,
         )
         report.iterations.append(res.describe())
         if res.merged and res.pr:
             report.merged_prs.append(res.pr)
         elif res.recovered and res.pr:
             report.recovered_prs.append(res.pr)
+
+    # Fold the block's ledger records into the summary the review brief surfaces.
+    report.cost = ledger.aggregate_block(ledger.read_records(ledger_file), idx)
 
     # 3. Sync main so knowledge produced by merged PRs is present locally.
     gitops.sync_main(cfg.default_branch, cwd=str(repo_root), runner=runner)

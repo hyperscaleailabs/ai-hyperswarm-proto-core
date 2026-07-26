@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 from uuid import uuid4
 
-from . import ai, ci, github, gitops, repro
+from . import ai, ci, github, gitops, ledger, repro
 from .config import CoreConfig
 from .knowledge import KnowledgeBase, Lesson
 from .models import ModelChoice, Task, select
@@ -182,10 +182,18 @@ def run_once(
     runner: Runner = run,
     ai_runner: Runner = run,
     iteration: int = 0,
+    demote_tier: bool = False,
 ) -> IterationResult:
-    """Execute a single iteration of the loop."""
+    """Execute a single iteration of the loop.
+
+    ``demote_tier`` is set by the caller's budget gate on a soft breach: it
+    biases model selection one tier cheaper so a block that is burning quota
+    keeps progressing instead of halting. Regardless of it, every iteration that
+    runs a model appends a cost record to the quota ledger.
+    """
     repo = cfg.repo_slug
     login = github.current_login(runner=runner) if not dry_run else "hsai-bot"
+    started = time.time()
 
     # 1. sync main + fresh worktree (serialized: touches shared .git)
     # Branch name is unique per worker even within the same second.
@@ -280,15 +288,41 @@ def run_once(
         gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
         return res
 
-    # 4. model selection (recorded for audit)
+    # 4. model selection (recorded for audit); a soft budget breach biases it
+    # one tier cheaper.
     task = Task(kind=kind, title=ticket_title, body=ticket_body, labels=(
         tuple(claimed_issue.labels) if claimed_issue else ()
     ))
-    choice = select(task, cfg)
+    choice = select(task, cfg, demote=demote_tier)
 
     result = IterationResult(
         kind=kind, ticket=ticket_num, model=choice.model, ci_before=ci_before.ok
     )
+
+    # Quota ledger: every iteration that runs a model appends one cost record.
+    # Written to the repo root (not the ephemeral worktree) so the block-level
+    # aggregate and budget gate can read across iterations; the governance PR
+    # later commits it so the economics stay auditable.
+    attempts = (claimed_issue.attempts() if claimed_issue else 0) + 1
+    tokens: tuple[int, int] | None = None
+
+    def _record_cost(outcome: str) -> None:
+        ledger.append_record(
+            ledger.ledger_path(cfg, repo_dir),
+            ledger.LedgerRecord(
+                iteration=iteration,
+                block=iteration // 100,
+                ticket=ticket_num,
+                kind=kind,
+                tier=choice.tier,
+                model=choice.model,
+                wall_clock_seconds=round(max(0.0, time.time() - started), 3),
+                attempts=attempts,
+                outcome=outcome,
+                input_tokens=tokens[0] if tokens else None,
+                output_tokens=tokens[1] if tokens else None,
+            ),
+        )
 
     # 5. run the agent (subscription-only)
     agent_ok = True
@@ -301,6 +335,7 @@ def run_once(
             prompt, choice, cfg, cwd=wt, runner=ai_runner, timeout=cfg.agent_timeout
         )
         agent_ok, agent_err = ares.ok, ares.error
+        tokens = ledger.parse_tokens(ares.output)
         if agent_err:
             agent_err = _format_error_with_context(agent_err, kind, ticket_num)
 
@@ -329,6 +364,7 @@ def run_once(
                     remote="INCOMPLETE", runner=runner,
                 )
                 result.recovered = True
+                _record_cost("incomplete")
                 gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
                 return result
 
@@ -355,6 +391,7 @@ def run_once(
                     remote="NO_REPRO", runner=runner,
                 )
                 result.recovered = True
+                _record_cost("no_repro")
                 gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
                 return result
 
@@ -402,6 +439,7 @@ def run_once(
 
     if dry_run:
         result.notes.append("dry-run: skipped commit/push/PR/merge")
+        _record_cost(outcome)
         return result
 
     # 8-11. commit, push, PR (linked + model + lesson), merge on green
@@ -455,6 +493,8 @@ def run_once(
         )
         result.recovered = True
         result.notes.append("recovered: closed PR, returned ticket to backlog")
+
+    _record_cost("merged" if result.merged else "recovered")
 
     # 13. cleanup worktree
     gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)

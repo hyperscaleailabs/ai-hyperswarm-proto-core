@@ -126,13 +126,17 @@ def _score(task: Task) -> int:
     return score
 
 
-def select(task: Task, cfg: CoreConfig) -> ModelChoice:
+def select(task: Task, cfg: CoreConfig, *, demote: bool = False) -> ModelChoice:
     """Pick a tier for ``task`` and resolve it to a concrete model alias.
 
     Thresholds calibrated to reflect observed task complexity distribution:
     - Heavy (>= 5): Architecture, migrations, hard bugs, large refactors
     - Light (<= -3): Docs, formatting, trivial edits, chores
     - Standard: Everything else (features, small bugfixes, simple refactors)
+
+    ``demote`` biases the choice one tier cheaper (heavy->standard->light). The
+    budget gate sets it on a soft breach so a block that is burning quota keeps
+    making progress on cheaper tiers instead of halting outright.
     """
     score = _score(task)
 
@@ -156,6 +160,16 @@ def select(task: Task, cfg: CoreConfig) -> ModelChoice:
     else:
         tier = cfg.default_tier
         why = "no strong signal; using default tier"
+
+    # Soft budget breach: bias one tier cheaper so the block keeps progressing
+    # without burning more heavy-tier quota.
+    if demote:
+        from .ledger import demote_tier
+
+        cheaper = demote_tier(tier)
+        if cheaper != tier:
+            why = f"{why}; demoted {tier}->{cheaper} under soft budget breach"
+            tier = cheaper
 
     # Fall back gracefully if a tier is not configured.
     if tier not in cfg.tiers:

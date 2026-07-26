@@ -133,6 +133,16 @@ synthesis:
   file_top: 3                  # tickets actually filed after critique + prioritization
   min_projects_combined: 3     # an idea must combine practices from >= N reference projects
 
+# Quota/cost budget for one half-day block (subscription-only: purely local
+# measurement, never a metered API call). The ledger aggregates each block's
+# spend; this gate warns then halts NEW work when a ceiling is crossed. It never
+# aborts an in-flight PR and never relaxes the green-merge / ticket / lesson
+# invariants. Unset a ceiling to disable that dimension.
+budget:
+  max_heavy_iterations_per_block: 3   # heavy-tier (opus) runs before halting new work
+  max_seconds_per_block: 5400         # cumulative wall-clock across the block (90 min)
+  soft_ratio: 0.8                     # fraction of a ceiling that triggers a soft breach
+
 personas:                      # article targets generated from each whitepaper
   - id: cto
     audience: CTO level - business impact, risk posture, strategic direction

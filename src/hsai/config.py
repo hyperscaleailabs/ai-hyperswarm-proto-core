@@ -53,6 +53,7 @@ class CoreConfig:
     governance: dict[str, Any]
     cycle: dict[str, Any]
     synthesis: dict[str, Any]
+    budget: dict[str, Any]
     personas: tuple[dict[str, Any], ...]
 
     # --- convenience accessors -------------------------------------------------
@@ -139,6 +140,7 @@ def load_config(path: str | Path | None = None) -> CoreConfig:
         governance=data.get("governance", {}),
         cycle=data.get("cycle", {}),
         synthesis=data.get("synthesis", {}),
+        budget=data.get("budget", {}),
         personas=tuple(data.get("personas", [])),
     )
 

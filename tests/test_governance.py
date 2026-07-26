@@ -9,6 +9,7 @@ from hsai.governance import (
     render_brief,
     render_direction,
 )
+from hsai.ledger import BlockAggregate
 from hsai.proc import Proc
 
 
@@ -59,3 +60,22 @@ def test_brief_links_everything(tmp_path):
 
 def test_preserved_notes_default_when_missing(tmp_path):
     assert "never overwritten" in preserved_notes(tmp_path / "nope.md")
+
+
+def test_brief_renders_block_cost_summary():
+    cfg = load_config()
+    cost = BlockAggregate(
+        block=7, iterations=3, heavy_iterations=2, total_seconds=180.0,
+        total_attempts=4, tier_counts={"heavy": 2, "standard": 1},
+    )
+    report = BlockReport(cycle_index=7, cost=cost)
+    body = render_brief(cfg, report)
+    assert "## Cost this block (quota ledger)" in body
+    assert "heavy-tier=2" in body
+    assert "180s wall-clock" in body
+
+
+def test_brief_cost_note_when_no_ledger_records():
+    cfg = load_config()
+    body = render_brief(cfg, BlockReport(cycle_index=7))
+    assert "_no ledger records for this block_" in body
