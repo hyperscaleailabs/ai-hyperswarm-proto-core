@@ -4,7 +4,7 @@ tags:
   - outcome/pass
   - kind/improve
 created: 2026-07-26
-iteration: 2
+iteration: 104
 ---
 
 # improve: chore: refresh reference-set snapshot and extract one practice
@@ -15,14 +15,14 @@ iteration: 2
 | --- | --- |
 | outcome | **pass** |
 | kind | improve |
-| iteration | 2 |
-| ticket | #37 |
+| iteration | 104 |
+| ticket | #48 |
 | pull request | _(none)_ |
 | model | `haiku` |
 | remote CI | SUCCESS |
 
 ## Context
-Iteration 2. Ticket #37. CI before: CI green (ruff=pass, pytest=pass).
+Iteration 104. Ticket #48. CI before: CI green (ruff=pass, pytest=pass).
 
 ## What happened
 Model `haiku` (light) ran the task. Agent ok=True. CI after: CI green (ruff=pass, pytest=pass).

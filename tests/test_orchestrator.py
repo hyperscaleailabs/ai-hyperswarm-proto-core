@@ -12,6 +12,7 @@ from hsai.orchestrator import (
     IMPLEMENT,
     IMPROVE,
     _format_error_with_context,
+    _phase_artifacts,
     build_pr_body,
     decide_path,
     run_once,
@@ -142,6 +143,27 @@ def test_format_error_with_context():
     assert result == "[phase=heal] connection timeout after 30s"
 
 
+def test_phase_artifacts_heal():
+    artifacts = _phase_artifacts(HEAL)
+    assert "Root cause" in artifacts
+    assert "Regression test" in artifacts
+    assert "CI returned to green" in artifacts
+
+
+def test_phase_artifacts_implement():
+    artifacts = _phase_artifacts(IMPLEMENT)
+    assert "Feature/fix implemented" in artifacts
+    assert "Tests added" in artifacts
+    assert "Linting and tests passing" in artifacts
+
+
+def test_phase_artifacts_improve():
+    artifacts = _phase_artifacts(IMPROVE)
+    assert "practice extracted" in artifacts
+    assert "reference-set" in artifacts
+    assert "Lesson recorded" in artifacts
+
+
 def test_build_pr_body_requires_ticket():
     choice = ModelChoice(tier="standard", model="sonnet", rationale="x")
     with pytest.raises(ValueError):
@@ -163,6 +185,35 @@ def test_build_pr_body_contains_traceability():
     assert "kept it small" in body       # lesson present
     assert "[[2026-07-25-do-thing]]" in body
     assert "openai/swarm" in body
+
+
+def test_build_pr_body_includes_phase_artifacts():
+    choice = ModelChoice(tier="standard", model="sonnet", rationale="x")
+    body = build_pr_body(
+        ticket=10, choice=choice, lesson_note="2026-07-26-test",
+        lesson_summary="test", ci_summary="green",
+        kind=HEAL,
+    )
+    assert "## Phase artifacts" in body
+    assert "Root cause" in body
+    assert "Regression test" in body
+
+    # Test with IMPLEMENT phase
+    body = build_pr_body(
+        ticket=11, choice=choice, lesson_note="2026-07-26-test",
+        lesson_summary="test", ci_summary="green",
+        kind=IMPLEMENT,
+    )
+    assert "## Phase artifacts" in body
+    assert "Feature/fix implemented" in body
+    assert "Tests added" in body
+
+    # Without kind, artifacts should not appear
+    body = build_pr_body(
+        ticket=12, choice=choice, lesson_note="2026-07-26-test",
+        lesson_summary="test", ci_summary="green",
+    )
+    assert "## Phase artifacts" not in body
 
 
 def test_run_once_dry_run_is_side_effect_free(tmp_path):

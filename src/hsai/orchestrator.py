@@ -48,6 +48,37 @@ def _format_error_with_context(
     return f"[{context}] {error}"
 
 
+def _phase_artifacts(kind: str) -> str:
+    """Document explicit outputs for each phase.
+
+    Adopted from FoundationAgents/MetaGPT: multi-agent systems benefit from
+    explicit role-based artifact definitions. Each phase has clear deliverables
+    that can be audited and verified. This supports G2 (auditability) by making
+    the work products of each phase visible in the PR.
+    """
+    if kind == HEAL:
+        return (
+            "- Root cause of build failure identified\n"
+            "- Regression test added or modified to reproduce bug\n"
+            "- Minimal fix applied\n"
+            "- CI returned to green"
+        )
+    elif kind == IMPLEMENT:
+        return (
+            "- Feature/fix implemented end-to-end\n"
+            "- Tests added covering acceptance criteria\n"
+            "- Code change scoped to ticket description\n"
+            "- Linting and tests passing"
+        )
+    else:  # IMPROVE
+        return (
+            "- One practice extracted from reference-set project\n"
+            "- Small, focused implementation of the practice\n"
+            "- Lesson recorded with source citation\n"
+            "- Tests passing, auditable change"
+        )
+
+
 def decide_path(ci_green: bool, has_tickets: bool) -> str:
     """Map current state to the branch of the loop to execute."""
     if not ci_green:
@@ -64,6 +95,7 @@ def build_pr_body(
     lesson_note: str,
     lesson_summary: str,
     ci_summary: str,
+    kind: str = "",
     references: tuple[str, ...] = (),
 ) -> str:
     """Assemble a PR body that satisfies the traceability invariants.
@@ -73,11 +105,13 @@ def build_pr_body(
     if not ticket:
         raise ValueError("Every PR must be linked to a ticket (traceability invariant).")
     refs = ", ".join(f"`{r}`" for r in references) or "_(none)_"
+    artifacts = _phase_artifacts(kind) if kind else ""
+    artifacts_section = f"\n## Phase artifacts\n{artifacts}\n" if artifacts else ""
     return f"""Closes #{ticket}
 
 ## Model used
 - **model**: `{choice.model}` (tier: `{choice.tier}`)
-- **selection**: {choice.rationale} [strategy: `{choice.strategy}`]
+- **selection**: {choice.rationale} [strategy: `{choice.strategy}`]{artifacts_section}
 
 ## CI
 {ci_summary}
@@ -453,6 +487,7 @@ def run_once(
         lesson_note=lesson.note_name(),
         lesson_summary=lesson.lesson,
         ci_summary=ci_after.summary(),
+        kind=kind,
         references=references,
     )
     pr_num = github.create_pr(
