@@ -9,13 +9,19 @@ updated: 2026-07-26
 
 Up: [[Knowledge Base MOC]]
 
-Every hsai iteration leaves a lesson here - pass or fail. Total: **8**.
+Every hsai iteration leaves a lesson here - pass or fail. Total: **14**.
 
 - [[2026-07-25-bootstrap-the-hsai-loop]]
+- [[2026-07-26-architect-steering-quality-over-throughput]]
 - [[2026-07-26-first-3-parallel-swarm-run]]
+- [[2026-07-26-implement-add-structured-execution-context-to-error-messages]]
 - [[2026-07-26-implement-chore-reference-set-miner-extract-one-practice-from-a-top-10-project-s-history]]
+- [[2026-07-26-implement-docs-add-a-one-iteration-sequence-diagram-to-architecture-md]]
 - [[2026-07-26-implement-feat-deepen-the-whitepaper-synthesizer]]
 - [[2026-07-26-implement-feat-poll-remote-ci-gh-checks-as-an-explicit-pre-merge-gate]]
+- [[2026-07-26-implement-feat-quota-cost-telemetry-ledger-with-a-warn-then-halt-per-block-budget-gate]]
+- [[2026-07-26-implement-feat-reproduce-before-fix-regression-guard-for-heal-and-bugfix-tickets]]
 - [[2026-07-26-implement-skill-task-complexity-based-model-selection-learned]]
 - [[2026-07-26-implement-test-fake-runner-integration-tests-for-orchestrator-run-once-heal-implement-paths]]
+- [[2026-07-26-improve-chore-refresh-reference-set-snapshot-and-extract-one-practice]]
 - [[2026-07-26-loop-reliability-retry-and-ci-parity]]
