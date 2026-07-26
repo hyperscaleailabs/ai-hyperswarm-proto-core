@@ -11,7 +11,7 @@ The living memory of **ai-hyperswarm-proto-core**. Open this repo as an Obsidian
 vault and use the graph view to explore how lessons connect.
 
 ## Maps
-- [[Lessons MOC]] - 4 lesson(s)
+- [[Lessons MOC]] - 5 lesson(s)
 - [[Whitepapers MOC]] - 1 whitepaper(s)
 
 ## How this is maintained

@@ -87,6 +87,8 @@ class IterationResult:
     ci_before: bool = False
     ci_after: bool = False
     merged: bool = False
+    remote: str = ""
+    recovered: bool = False
     lesson_path: str = ""
     notes: list[str] = field(default_factory=list)
 
@@ -97,7 +99,9 @@ class IterationResult:
             f"pr={self.pr}",
             f"model={self.model}",
             f"ci:{self.ci_before}->{self.ci_after}",
+            f"remote={self.remote or '-'}",
             f"merged={self.merged}",
+            f"recovered={self.recovered}",
         ]
         return "iteration(" + ", ".join(parts) + ")"
 
@@ -178,6 +182,7 @@ def run_once(
     ticket_num: int | None = None
     ticket_title = ""
     ticket_body = ""
+    claimed_issue: github.Issue | None = None
 
     if dry_run:
         kind = decide_path(ci_before.ok, has_tickets=False)
@@ -187,9 +192,10 @@ def run_once(
             ticket_title, ticket_body = "ci: main is red - auto-heal", "dry-run"
     else:
         with _SERIAL:
-            # Only consider UNASSIGNED tickets; claiming = assigning to us.
+            # Consider only UNASSIGNED, non-blocked tickets; claiming = assigning.
             open_unassigned = [
-                i for i in github.list_open_issues(repo, runner=runner) if not i.assignees
+                i for i in github.list_open_issues(repo, runner=runner)
+                if not i.assignees and not i.is_blocked
             ]
             kind = decide_path(ci_before.ok, has_tickets=bool(open_unassigned))
             if kind == HEAL:
@@ -204,6 +210,7 @@ def run_once(
             elif kind == IMPLEMENT:
                 top = open_unassigned[0]
                 ticket_num, ticket_title, ticket_body = top.number, top.title, top.body
+                claimed_issue = top
                 github.assign(repo, top.number, login, runner=runner)
             else:  # IMPROVE - file a ticket FIRST so the PR has one
                 ticket_title, ticket_body = _improvement_idea(cfg)
@@ -223,12 +230,24 @@ def run_once(
     # 5. run the agent (subscription-only)
     agent_ok = True
     agent_err = ""
+    reverted_workflows: list[str] = []
     if not dry_run:
         prompt = _task_prompt(kind, cfg, ticket_title, ticket_body)
         ares = ai.run_agent(
             prompt, choice, cfg, cwd=wt, runner=ai_runner, timeout=cfg.agent_timeout
         )
         agent_ok, agent_err = ares.ok, ares.error
+
+        # Guard: a task must not change the CI checks, or local and remote CI
+        # would diverge (as happened once when a worker added mypy). Revert any
+        # workflow edits before they are committed and note it in the lesson.
+        reverted_workflows = [
+            p for p in gitops.changed_paths(cwd=wt, runner=runner)
+            if p.startswith(".github/workflows/")
+        ]
+        if reverted_workflows:
+            gitops.restore_pathspec(".github/workflows", cwd=wt, runner=runner)
+            result.notes.append(f"reverted workflow edits: {reverted_workflows}")
 
     # 6. re-check CI
     ci_after = ci.run_local(cwd=wt, runner=runner) if not dry_run else ci_before
@@ -246,6 +265,10 @@ def run_once(
         what_happened=(
             f"Model `{choice.model}` ({choice.tier}) ran the task. "
             f"Agent ok={agent_ok}. CI after: {ci_after.summary()}."
+            + (
+                f"\n\nReverted off-spec workflow edits: {reverted_workflows}."
+                if reverted_workflows else ""
+            )
             + (f"\n\nAgent error:\n```\n{agent_err[:800]}\n```" if agent_err else "")
         ),
         lesson=(
@@ -290,13 +313,74 @@ def run_once(
     )
     result.pr = pr_num
 
-    merge = github.merge_pr(repo, pr_num, auto=True, runner=runner)
-    result.merged = merge.ok
-    result.notes.append(f"merge queued ok={merge.ok}")
+    github.merge_pr(repo, pr_num, auto=True, runner=runner)
 
-    # 12. cleanup worktree (branch lives on until merged/deleted by gh)
+    # 12. Wait for the REAL (remote) CI to conclude - it is the source of truth
+    # for whether the change may merge. Then either let auto-merge complete, or
+    # recover the ticket so a failure never strands it.
+    remote = ci.wait_remote(
+        pr_num, repo,
+        timeout=cfg.ci_remote_timeout, interval=cfg.ci_poll_interval, runner=runner,
+    )
+    result.remote = remote
+    result.notes.append(f"remote CI={remote}")
+    if remote == ci.SUCCESS:
+        result.merged = True
+    else:
+        result.merged = False
+        _recover_failed(
+            cfg, repo, pr_num, kind=kind, ticket_num=ticket_num,
+            claimed_issue=claimed_issue, login=login, remote=remote, runner=runner,
+        )
+        result.recovered = True
+        result.notes.append("recovered: closed PR, returned ticket to backlog")
+
+    # 13. cleanup worktree
     gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
     return result
+
+
+def _recover_failed(
+    cfg: CoreConfig,
+    repo: str,
+    pr_num: int,
+    *,
+    kind: str,
+    ticket_num: int | None,
+    claimed_issue: github.Issue | None,
+    login: str,
+    remote: str,
+    runner: Runner,
+) -> None:
+    """A PR did not go green: close it, and either return the ticket to the
+    backlog for another attempt or mark it ``blocked`` for a human."""
+    github.close_pr(
+        repo, pr_num,
+        comment=f"Remote CI concluded {remote}; closing per retry policy.",
+        delete_branch=True, runner=runner,
+    )
+    if not ticket_num:
+        return
+
+    # Determine how many attempts this ticket has already had.
+    issue = claimed_issue or github.get_issue(repo, ticket_num, runner=runner)
+    prior = issue.attempts() if issue else 0
+    nxt = prior + 1
+
+    if nxt >= cfg.max_ticket_attempts:
+        github.edit_labels(
+            repo, ticket_num, add=["blocked"], remove=[f"attempts:{prior}"] if prior else None,
+            runner=runner,
+        )
+        # Leave it unassigned but blocked so no worker retries it.
+        github.unassign(repo, ticket_num, login, runner=runner)
+    else:
+        github.edit_labels(
+            repo, ticket_num,
+            add=[f"attempts:{nxt}"], remove=[f"attempts:{prior}"] if prior else None,
+            runner=runner,
+        )
+        github.unassign(repo, ticket_num, login, runner=runner)
 
 
 def run_loop(

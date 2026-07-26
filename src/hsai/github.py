@@ -19,6 +19,10 @@ STANDARD_LABELS = {
     "ci": ("1d76db", "Continuous integration / build health"),
     "self-improve": ("0052cc", "Improvement toward core.yaml goals"),
     "skill": ("bfd4f2", "A learnable orchestrator capability"),
+    "blocked": ("000000", "Exhausted auto-retries; needs a human"),
+    "attempts:1": ("ededed", "hsai retry counter"),
+    "attempts:2": ("d4c5f9", "hsai retry counter"),
+    "attempts:3": ("c2a3f5", "hsai retry counter"),
 }
 
 
@@ -35,6 +39,21 @@ class Issue:
             if lbl in self.labels:
                 return i
         return len(PRIORITY_LABELS)  # unlabeled sorts last
+
+    @property
+    def is_blocked(self) -> bool:
+        return "blocked" in self.labels
+
+    def attempts(self) -> int:
+        """Read the current retry count from an ``attempts:N`` label (0 if none)."""
+        best = 0
+        for lbl in self.labels:
+            if lbl.startswith("attempts:"):
+                try:
+                    best = max(best, int(lbl.split(":", 1)[1]))
+                except ValueError:
+                    continue
+        return best
 
 
 def _gh(args: list[str], *, cwd: str | None = None, runner: Runner = run) -> Proc:
@@ -118,6 +137,68 @@ def assign(repo: str, number: int, login: str, *, runner: Runner = run) -> Proc:
         ["issue", "edit", str(number), "--repo", repo, "--add-assignee", login],
         runner=runner,
     )
+
+
+def unassign(repo: str, number: int, login: str, *, runner: Runner = run) -> Proc:
+    return _gh(
+        ["issue", "edit", str(number), "--repo", repo, "--remove-assignee", login],
+        runner=runner,
+    )
+
+
+def edit_labels(
+    repo: str,
+    number: int,
+    *,
+    add: list[str] | None = None,
+    remove: list[str] | None = None,
+    runner: Runner = run,
+) -> Proc:
+    args = ["issue", "edit", str(number), "--repo", repo]
+    for lbl in add or []:
+        args += ["--add-label", lbl]
+    for lbl in remove or []:
+        args += ["--remove-label", lbl]
+    return _gh(args, runner=runner)
+
+
+def get_issue(repo: str, number: int, *, runner: Runner = run) -> Issue | None:
+    p = _gh(
+        [
+            "issue", "view", str(number), "--repo", repo,
+            "--json", "number,title,labels,assignees,body",
+        ],
+        runner=runner,
+    )
+    try:
+        item = json.loads(p.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    if not item:
+        return None
+    return Issue(
+        number=item["number"],
+        title=item.get("title", ""),
+        labels=tuple(lb["name"] for lb in item.get("labels", [])),
+        assignees=tuple(a["login"] for a in item.get("assignees", [])),
+        body=item.get("body", "") or "",
+    )
+
+
+def close_pr(
+    repo: str,
+    number: int,
+    *,
+    comment: str | None = None,
+    delete_branch: bool = True,
+    runner: Runner = run,
+) -> Proc:
+    args = ["pr", "close", str(number), "--repo", repo]
+    if delete_branch:
+        args.append("--delete-branch")
+    if comment:
+        args += ["--comment", comment]
+    return _gh(args, runner=runner)
 
 
 def create_pr(
