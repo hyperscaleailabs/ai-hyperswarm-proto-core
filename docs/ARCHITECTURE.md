@@ -19,6 +19,36 @@ so the decision logic stays pure and unit-tested.
 | `hsai.swarm` | run N iterations concurrently | threads |
 | `hsai.cli` | `hsai` entry point | - |
 
+## One iteration, sequence
+
+```mermaid
+sequenceDiagram
+    participant O as orchestrator
+    participant G as gitops
+    participant C as ci
+    participant H as github
+    participant A as ai (agent)
+    participant K as knowledge
+
+    O->>G: sync_main + create_worktree
+    O->>C: run_local (CI before)
+    O->>H: claim ticket (heal / implement / improve)
+    O->>A: run_agent(prompt, model choice)
+    A-->>O: ok / error
+    O->>C: run_local (CI after)
+    O->>K: write_lesson (always, pass or fail)
+    O->>G: commit_all + push_branch
+    O->>H: create_pr (linked to ticket, model, lesson)
+    O->>C: wait_remote (poll real GitHub checks)
+    C-->>O: success / failure
+    alt remote CI success
+        O->>H: merge_pr (auto)
+    else remote CI failure
+        O->>H: close_pr + return ticket to backlog
+    end
+    O->>G: remove_worktree
+```
+
 ## Testability
 
 Every wrapper takes an injectable `runner` (default: real subprocess). Tests
