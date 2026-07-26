@@ -41,6 +41,7 @@ class CoreConfig:
     default_branch: str
     worktrees_dir: str
     permission_mode: str
+    agent_timeout: float | None
     tiers: dict[str, ModelTier]
     default_tier: str
     constraints: dict[str, Any]
@@ -119,6 +120,7 @@ def load_config(path: str | Path | None = None) -> CoreConfig:
         default_branch=execution.get("default_branch", "main"),
         worktrees_dir=execution.get("worktrees_dir", ".hsai/worktrees"),
         permission_mode=execution.get("permission_mode", "acceptEdits"),
+        agent_timeout=execution.get("agent_timeout_seconds"),
         tiers=tiers,
         default_tier=models.get("default_tier", "standard"),
         constraints=data.get("constraints", {}),

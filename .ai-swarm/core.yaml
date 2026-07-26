@@ -87,6 +87,7 @@ execution:
   default_branch: main
   worktrees_dir: .hsai/worktrees
   permission_mode: acceptEdits   # headless claude permission mode; see docs/ARCHITECTURE.md
+  agent_timeout_seconds: 1200    # hard cap per claude -p worker so a hang cannot stall the loop
 
 # Model-size selection is a first-class, LEARNED capability (see backlog).
 # The orchestrator picks a tier per task; tiers map to `claude --model` aliases.

@@ -208,7 +208,9 @@ def run_once(
     agent_err = ""
     if not dry_run:
         prompt = _task_prompt(kind, cfg, ticket_title, ticket_body)
-        ares = ai.run_agent(prompt, choice, cfg, cwd=wt, runner=ai_runner)
+        ares = ai.run_agent(
+            prompt, choice, cfg, cwd=wt, runner=ai_runner, timeout=cfg.agent_timeout
+        )
         agent_ok, agent_err = ares.ok, ares.error
 
     # 6. re-check CI
