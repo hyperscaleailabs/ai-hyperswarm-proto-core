@@ -103,7 +103,7 @@ models:
       model: opus
       use_for: [architecture, hard-bug, large-refactor, design]
   default_tier: standard
-  selection_strategy: heuristic-v0   # improved over time; tracked as a backlog skill
+  selection_strategy: heuristic-v1   # improved over time; tracked as a backlog skill
 
 constraints:
   # Hard rules the orchestrator enforces at runtime.
