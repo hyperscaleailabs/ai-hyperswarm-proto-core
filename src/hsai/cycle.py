@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import github, gitops, ledger
+from . import calibration, github, gitops, ledger
 from .ai import run_agent
 from .config import CoreConfig
 from .governance import BlockReport, open_review_issue, write_direction
@@ -152,6 +152,14 @@ def run_cycle(
             cfg, kb, report.whitepaper, repo_root=repo_root, ai_runner=ai_runner
         )
     kb.reindex_mocs()
+
+    # Close the learning loop: fold this block's lessons back into the
+    # model-selection params so the next block selects on fresher evidence. Done
+    # here (serialized, after the block) so parallel workers never race on the
+    # artifact, and shipped through the governance PR below for auditability.
+    params = calibration.recalibrate(cfg, repo_root)
+    report.notes.append(f"model-selection: {params.summary()}")
+
     write_direction(cfg, repo_root=repo_root, runner=runner)
 
     # 5. Governance PR: ship the block artifacts through the same gate as code.

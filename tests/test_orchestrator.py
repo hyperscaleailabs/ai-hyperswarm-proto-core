@@ -4,7 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from hsai import orchestrator
+from hsai import calibration, orchestrator
+from hsai.calibration import V2, CalibrationParams
 from hsai.config import load_config
 from hsai.models import ModelChoice
 from hsai.orchestrator import (
@@ -214,6 +215,63 @@ def test_build_pr_body_includes_phase_artifacts():
         lesson_summary="test", ci_summary="green",
     )
     assert "## Phase artifacts" not in body
+
+
+def test_build_pr_body_records_the_machine_readable_selection():
+    """G2: the reason a tier was chosen must be recoverable from the PR itself."""
+    choice = ModelChoice(
+        tier="heavy", model="opus", rationale="score=6 -> heavy",
+        strategy=V2, score=6, attempt=2,
+        signals=("score>=5", "retry-escalation:attempt=2"),
+    )
+    body = build_pr_body(
+        ticket=7, choice=choice, lesson_note="2026-07-26-x",
+        lesson_summary="s", ci_summary="green",
+    )
+    assert "(tier: `heavy`)" in body
+    payload = json.loads(body.split("**signals**: `")[1].split("`")[0])
+    assert payload["tier"] == "heavy"
+    assert payload["strategy"] == V2
+    assert payload["attempt"] == 2
+    assert "retry-escalation:attempt=2" in payload["signals"]
+
+
+def _selection(result) -> dict:
+    note = next(n for n in result.notes if n.startswith("selection: "))
+    return json.loads(note[len("selection: "):])
+
+
+def test_run_once_records_a_stable_selection_rationale(tmp_path):
+    cfg = load_config()
+    result = run_once(cfg, repo_dir=str(tmp_path), dry_run=True, iteration=1)
+
+    payload = _selection(result)
+    assert payload["tier"] in cfg.tiers
+    assert payload["model"] == result.model
+    assert payload["signals"]
+    assert payload["attempt"] == 1
+
+    # the same signals are carried into the lesson, which is what calibration
+    # later learns from
+    lesson_text = Path(result.lesson_path).read_text()
+    assert f"| tier | {payload['tier']} |" in lesson_text
+    assert "| attempt | 1 |" in lesson_text
+
+
+def test_run_once_selects_with_the_calibrated_params_artifact(tmp_path):
+    """The persisted params artifact - not the v1 constants - drives selection."""
+    cfg = load_config()
+    calibration.save_params(
+        CalibrationParams(strategy=V2, heavy_threshold=-99, light_threshold=-100),
+        cfg, tmp_path,
+    )
+
+    result = run_once(cfg, repo_dir=str(tmp_path), dry_run=True, iteration=1)
+
+    payload = _selection(result)
+    assert payload["strategy"] == V2
+    assert payload["tier"] == "heavy"          # threshold this low catches everything
+    assert payload["signals"][0] == "score>=-99"
 
 
 def test_run_once_dry_run_is_side_effect_free(tmp_path):

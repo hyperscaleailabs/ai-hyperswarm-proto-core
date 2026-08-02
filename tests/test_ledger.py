@@ -13,6 +13,7 @@ from hsai.ledger import (
     evaluate_budget,
     ledger_path,
     parse_tokens,
+    promote_tier,
     read_records,
 )
 from hsai.models import Task, select
@@ -140,6 +141,18 @@ def test_demote_tier_steps_down_and_floors():
     assert demote_tier("standard") == "light"
     assert demote_tier("light") == "light"
     assert demote_tier("unknown") == "unknown"
+    assert demote_tier("heavy", steps=2) == "light"
+    assert demote_tier("heavy", steps=99) == "light"
+
+
+def test_promote_tier_steps_up_and_ceilings():
+    assert promote_tier("light") == "standard"
+    assert promote_tier("standard") == "heavy"
+    assert promote_tier("heavy") == "heavy"
+    assert promote_tier("unknown") == "unknown"
+    assert promote_tier("light", steps=2) == "heavy"
+    assert promote_tier("light", steps=99) == "heavy"
+    assert promote_tier("light", steps=0) == "light"
 
 
 def test_select_demote_biases_toward_cheaper_tier():
