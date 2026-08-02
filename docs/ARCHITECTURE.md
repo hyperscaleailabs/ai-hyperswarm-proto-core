@@ -15,6 +15,7 @@ so the decision logic stays pure and unit-tested.
 | `hsai.github` | tickets, labels, PRs, merge | gh |
 | `hsai.ci` | local CI gate (ruff+pytest) + remote status | subprocess |
 | `hsai.knowledge` | lessons, whitepapers, MOC reindex (Obsidian) | write files |
+| `hsai.practices` | evidence cards: validate, cite, resolve, index | read/write files |
 | `hsai.orchestrator` | one iteration; `decide_path`, `build_pr_body` (pure) | composes above |
 | `hsai.swarm` | run N iterations concurrently | threads |
 | `hsai.cli` | `hsai` entry point | - |

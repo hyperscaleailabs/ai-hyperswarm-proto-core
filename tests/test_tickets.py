@@ -23,6 +23,25 @@ def test_spec_renders_all_required_sections():
     assert wf.ok, wf.reasons
 
 
+def test_spec_renders_its_practice_citation():
+    spec = TicketSpec(
+        title="feat: thing",
+        problem="p",
+        proposal="pp",
+        acceptance_criteria=("a", "b"),
+        verification_plan=("pytest",),
+        practice_ids=("PR-0003", "PR-0004"),
+    )
+    body = spec.render()
+    assert "## Practices\n- PR-0003\n- PR-0004" in body
+    assert check_well_formed(spec.title, body).ok
+    # an uncited spec renders no empty section at all
+    assert "## Practices" not in TicketSpec(
+        title="feat: thing", problem="p", proposal="pp",
+        acceptance_criteria=("a", "b"), verification_plan=("pytest",),
+    ).render()
+
+
 def test_vague_feature_ticket_is_malformed():
     wf = check_well_formed("feat: make it better", "please improve things")
     assert not wf.ok

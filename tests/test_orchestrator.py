@@ -354,6 +354,9 @@ Build the widget.
 
 ## Verification plan
 - [ ] pytest green
+
+## Synthesis rationale
+Combines openai/swarm with SWE-agent/SWE-agent.
 """
 
 
@@ -539,6 +542,110 @@ def test_completeness_guard_blocks_knowledge_only_diff_on_code_ticket(tmp_path):
     assert any(
         c[:3] == ["gh", "issue", "edit"] and "--remove-assignee" in c for c in runner.calls
     )
+
+
+CITING_BODY = """## Problem
+Every PR claims the same three repos as evidence.
+
+## Proposal
+Resolve provenance from the ticket's practice citation.
+
+## Acceptance criteria
+- [ ] references come from the cited card
+- [ ] the pinned top-3 triple is gone
+
+## Verification plan
+- [ ] pytest green
+
+## Practices
+- PR-0003
+"""
+
+# The repos the old hardcode stamped on every PR regardless of content.
+_OLD_HARDCODED_TRIPLE = ("langchain-ai/langchain", "FoundationAgents/MetaGPT", "crewAIInc/crewAI")
+
+
+def _seed_practice_cards(wt: Path) -> None:
+    """Copy the real vault's practice cards into the fake worktree."""
+    src = Path(__file__).resolve().parents[1] / "knowledge" / "practices"
+    dst = wt / "knowledge" / "practices"
+    dst.mkdir(parents=True)
+    for card in src.glob("*.md"):
+        (dst / card.name).write_text(card.read_text())
+
+
+def test_pr_and_lesson_cite_the_tickets_practice_card_not_the_pinned_triple(
+    tmp_path, monkeypatch
+):
+    cfg = load_config()
+    wt = _pin_worktree_path(monkeypatch, tmp_path, cfg)
+    _seed_practice_cards(wt)
+    open_issues = [
+        {
+            "number": 21,
+            "title": "feat: resolve evidence from practice cards",
+            "labels": [{"name": "priority:P2"}],
+            "assignees": [],
+            "body": CITING_BODY,
+        }
+    ]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+        worktree_status="?? src/hsai/practices.py\n",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.kind == IMPLEMENT
+    assert result.ticket == 21
+    assert any("evidence: practices" in n for n in result.notes)
+
+    # PR-0003 was observed in microsoft/JARVIS - that, and only that, is what
+    # the PR and the lesson may claim as reference-set evidence.
+    pr_create = next(c for c in runner.calls if c[:3] == ["gh", "pr", "create"])
+    pr_body = pr_create[pr_create.index("--body") + 1]
+    lesson_text = Path(result.lesson_path).read_text()
+
+    for text in (pr_body, lesson_text):
+        assert "microsoft/JARVIS" in text
+        for stale in _OLD_HARDCODED_TRIPLE:
+            assert stale not in text, f"{stale} was stamped on unrelated work"
+
+    # the lesson links back to the card itself, so the graph connects
+    assert "[[PR-0003-a-controller-routes-each-task-to-the-cheapest-capable-model]]" in lesson_text
+
+
+def test_code_ticket_without_a_resolvable_citation_is_labeled_needs_refinement(tmp_path):
+    cfg = load_config()
+    open_issues = [
+        {
+            "number": 22,
+            "title": "feat: well-formed but uncited",
+            "labels": [{"name": "priority:P2"}],
+            "assignees": [],
+            # Well-formed, but names no practice card and no pinned repo.
+            "body": "## Acceptance criteria\n- [ ] a\n- [ ] b\n\n## Verification plan\n- [ ] pytest",
+        }
+    ]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    # refused rather than implemented on invented provenance
+    assert result.kind == IMPROVE
+    assert result.ticket != 22
+    assert [
+        c for c in runner.calls
+        if c[:3] == ["gh", "issue", "edit"] and "needs-refinement" in c and "22" in c
+    ]
 
 
 def test_malformed_ticket_is_refused_and_labeled(tmp_path):
