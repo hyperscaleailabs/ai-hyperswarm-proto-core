@@ -47,6 +47,44 @@ def test_repro_check_command_blocks_and_exits_nonzero(monkeypatch, capsys):
     assert "blocked for testing" in out
 
 
+def test_practices_validate_passes_on_the_real_vault(capsys):
+    rc = main(["practices", "--validate"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "0 problem(s)" in out
+    assert "PR-0001" in out
+
+
+def test_practices_validate_exits_nonzero_on_an_unpinned_card(monkeypatch, capsys):
+    bad = cli_module.practices.PracticeCard(
+        id="PR-0099", title="Invented", source_repo="acme/not-a-reference",
+        artifact_kind="code", artifact_ref="src/x.py", observed_on="2026-08-02",
+        note_name="PR-0099-invented",
+    )
+    monkeypatch.setattr(cli_module.practices, "load_cards", lambda *a, **k: [bad])
+    rc = main(["practices", "--validate"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "not in the pinned reference set" in out
+
+
+def test_evidence_check_command_blocks_and_exits_nonzero(capsys):
+    rc = main(["evidence-check", "--pr-title", "implement: feat: x", "--pr-body", "Closes #1"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "BLOCKED" in out
+
+
+def test_evidence_check_command_passes_a_cited_pr(capsys):
+    rc = main([
+        "evidence-check", "--pr-title", "implement: feat: x",
+        "--pr-body", "Closes #1\n\n## Reference-set evidence\n`openai/swarm`\n",
+    ])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "PASS" in out
+
+
 def test_repro_check_command_passes_and_exits_zero(monkeypatch, capsys):
     monkeypatch.setattr(
         cli_module.repro, "evaluate_pr",

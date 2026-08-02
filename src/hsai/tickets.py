@@ -11,6 +11,7 @@ import re
 from dataclasses import dataclass, field
 
 from .github import Issue
+from .practices import render_section
 
 # Sections a substantial ticket must carry.
 ACCEPTANCE_HEADING = re.compile(r"^#{2,3}\s*acceptance criteria\s*$", re.IGNORECASE | re.MULTILINE)
@@ -39,6 +40,7 @@ class TicketSpec:
     size: str = "M"  # S | M | L
     goal_ids: tuple[str, ...] = ()
     synthesis_rationale: str = ""  # which reference projects were combined, and how
+    practice_ids: tuple[str, ...] = ()  # PR-NNNN cards in knowledge/practices/
     labels: tuple[str, ...] = ()
 
     def render(self) -> str:
@@ -50,6 +52,8 @@ class TicketSpec:
             if self.synthesis_rationale
             else ""
         )
+        # The citation the loop resolves into this ticket's PR and lesson.
+        practices = f"\n{render_section(self.practice_ids)}" if self.practice_ids else ""
         return f"""## Problem
 {self.problem}
 
@@ -61,7 +65,7 @@ class TicketSpec:
 
 ## Verification plan
 {vp}
-{synth}
+{synth}{practices}
 ## Meta
 - goals: {goals}
 - size: {self.size}

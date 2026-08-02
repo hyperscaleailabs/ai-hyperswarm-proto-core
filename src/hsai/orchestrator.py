@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 from uuid import uuid4
 
-from . import ai, ci, github, gitops, ledger, repro
+from . import ai, ci, github, gitops, ledger, practices, repro
 from .config import CoreConfig
 from .knowledge import KnowledgeBase, Lesson
 from .models import ModelChoice, Task, select
@@ -190,11 +190,15 @@ def _requires_code(ticket_title: str) -> bool:
     return lowered.startswith(("feat:", "fix:", "skill:", "refactor:", "perf:", "test:"))
 
 
-def _improvement_idea(cfg: CoreConfig) -> tuple[str, str]:
+def _improvement_idea(
+    cfg: CoreConfig, cards: list[practices.PracticeCard], iteration: int = 0
+) -> tuple[str, str]:
     """Pick one improvement toward the goals when the backlog is empty.
 
-    v0: deterministic, evidence-anchored suggestion. Improving this selection is
-    itself a tracked skill (see seeded backlog).
+    v0: deterministic, evidence-anchored suggestion. The registered practice
+    cards are rotated through so the ticket cites the one card it is actually
+    deepening - which is what its PR and lesson will then claim as evidence.
+    Improving this selection is itself a tracked skill (see seeded backlog).
     """
     title = "chore: refresh reference-set snapshot and extract one practice"
     body = (
@@ -205,6 +209,14 @@ def _improvement_idea(cfg: CoreConfig) -> tuple[str, str]:
         "Reference set: "
         + ", ".join(r.repo for r in cfg.reference_top10)
     )
+    if cards:
+        card = cards[iteration % len(cards)]
+        body += (
+            f"\n\nThis cycle deepen {card.wikilink()} - "
+            f"'{card.title}', observed in {card.source_repo} "
+            f"({card.artifact_kind}: {card.artifact_ref}).\n\n"
+            + practices.render_section((card.id,))
+        )
     return title, body
 
 
@@ -254,11 +266,14 @@ def run_once(
     ticket_title = ""
     ticket_body = ""
     claimed_issue: github.Issue | None = None
+    # The evidence registry as it exists on this branch: what a ticket may cite,
+    # and what its PR and lesson are then allowed to claim as provenance.
+    cards = practices.load_cards(wt, cfg)
 
     if dry_run:
         kind = decide_path(ci_before.ok, has_tickets=False)
         if kind == IMPROVE:
-            ticket_title, ticket_body = _improvement_idea(cfg)
+            ticket_title, ticket_body = _improvement_idea(cfg, cards, iteration)
         elif kind == HEAL:
             ticket_title, ticket_body = "ci: main is red - auto-heal", "dry-run"
     idle_reason = ""
@@ -274,11 +289,19 @@ def run_once(
             # Quality gate: vague tickets are refused, not implemented badly.
             open_unassigned = []
             for i in candidates:
-                wf = issue_well_formed(i)
-                if wf.ok:
-                    open_unassigned.append(i)
-                else:
+                if not issue_well_formed(i).ok:
                     github.edit_labels(repo, i.number, add=[NEEDS_REFINEMENT], runner=runner)
+                    continue
+                # Evidence gate: a ticket that promises adopted practice must
+                # name it. Without a resolvable citation the work would ship on
+                # invented provenance, so it is refined rather than implemented.
+                if (
+                    practices.requires_citation(i.title)
+                    and not practices.resolve_citation(i.body, cards, cfg).ok
+                ):
+                    github.edit_labels(repo, i.number, add=[NEEDS_REFINEMENT], runner=runner)
+                    continue
+                open_unassigned.append(i)
             kind = decide_path(ci_before.ok, has_tickets=bool(open_unassigned))
             if kind == HEAL:
                 ticket_title = "ci: main is red - auto-heal"
@@ -295,7 +318,7 @@ def run_once(
                 claimed_issue = top
                 github.assign(repo, top.number, login, runner=runner)
             else:  # IMPROVE - file a ticket FIRST so the PR has one
-                ticket_title, ticket_body = _improvement_idea(cfg)
+                ticket_title, ticket_body = _improvement_idea(cfg, cards, iteration)
                 # Dedupe: never spam the backlog with copies of the same idea
                 # (a stranded run once filed nine identical chore tickets).
                 existing = next((i for i in all_open if i.title == ticket_title), None)
@@ -436,7 +459,13 @@ def run_once(
     # 7. lesson (ALWAYS, pass or fail)
     outcome = "pass" if (agent_ok and ci_after.ok) else "fail"
     kb = KnowledgeBase.from_config(cfg, wt)
-    references = tuple(r.repo for r in cfg.reference_top10[:3])
+    # Provenance comes from what this ticket actually cited - its practice cards,
+    # or failing that the reference repos named in its synthesis rationale. It is
+    # deliberately empty when the ticket cited nothing: an empty evidence section
+    # is honest, whereas the pinned top-3 stamped on every PR was not.
+    citation = practices.resolve_citation(ticket_body, cards, cfg)
+    references = citation.repos
+    result.notes.append(f"evidence: {citation.source} {list(references) or '-'}")
     lesson = Lesson(
         title=f"{kind}: {ticket_title}"[:120],
         outcome=outcome,
@@ -461,6 +490,7 @@ def run_once(
         ticket=ticket_num,
         model=choice.model,
         references=references,
+        practices=citation.notes,
         repro_evidence=repro.render_evidence(repro_result) if repro_result else "",
     )
     # Each PR commits ONLY its own uniquely-named lesson file. The MOC indexes

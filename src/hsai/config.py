@@ -50,6 +50,7 @@ class CoreConfig:
     constraints: dict[str, Any]
     knowledge: dict[str, Any]
     reference_top10: tuple[ReferenceRepo, ...]
+    reference_watchlist: tuple[ReferenceRepo, ...]
     governance: dict[str, Any]
     cycle: dict[str, Any]
     synthesis: dict[str, Any]
@@ -71,6 +72,10 @@ class CoreConfig:
 
     def goal_ids(self) -> list[str]:
         return [str(g.get("id")) for g in self.goals if g.get("id")]
+
+    def pinned_repos(self) -> set[str]:
+        """Every reference repo a practice card is allowed to cite as evidence."""
+        return {r.repo for r in (*self.reference_top10, *self.reference_watchlist)}
 
 
 def _find_core(start: str | Path | None = None) -> Path:
@@ -113,6 +118,16 @@ def load_config(path: str | Path | None = None) -> CoreConfig:
         )
         for r in ref.get("top10", [])
     )
+    watchlist = tuple(
+        ReferenceRepo(
+            rank=r.get("rank", 0),
+            repo=r["repo"],
+            stars=r.get("stars", 0),
+            license=r.get("license", ""),
+            note=r.get("note", ""),
+        )
+        for r in ref.get("watchlist", [])
+    )
 
     return CoreConfig(
         raw=data,
@@ -137,6 +152,7 @@ def load_config(path: str | Path | None = None) -> CoreConfig:
         constraints=data.get("constraints", {}),
         knowledge=data.get("knowledge", {}),
         reference_top10=top10,
+        reference_watchlist=watchlist,
         governance=data.get("governance", {}),
         cycle=data.get("cycle", {}),
         synthesis=data.get("synthesis", {}),

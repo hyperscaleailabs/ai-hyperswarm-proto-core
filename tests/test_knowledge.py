@@ -40,6 +40,7 @@ def test_write_lesson_and_reindex(tmp_path):
         pr=8,
         model="sonnet",
         references=("openai/swarm",),
+        practices=("PR-0008-errors-carry-the-orchestration-context-they-failed-in",),
     )
     path = kb.write_lesson(lesson)
     assert path.exists()
@@ -48,10 +49,14 @@ def test_write_lesson_and_reindex(tmp_path):
     assert "[[Lessons MOC]]" in text  # Obsidian wikilink up to MOC
     assert "openai/swarm" in text
     assert "sonnet" in text
+    # the cited evidence is a working wikilink to the practice card
+    assert "[[PR-0008-errors-carry-the-orchestration-context-they-failed-in]]" in text
 
     written = kb.reindex_mocs()
     names = {p.name for p in written}
-    assert names == {"Lessons MOC.md", "Whitepapers MOC.md", "Knowledge Base MOC.md"}
+    assert names == {
+        "Lessons MOC.md", "Whitepapers MOC.md", "Knowledge Base MOC.md", "Practices MOC.md",
+    }
     lessons_moc = (kb.mocs_dir / "Lessons MOC.md").read_text()
     assert f"[[{lesson.note_name()}]]" in lessons_moc
 

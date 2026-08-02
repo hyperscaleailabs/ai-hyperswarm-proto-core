@@ -31,6 +31,7 @@ Every PR is held to three **traceability invariants**:
 | linked to a ticket | `build_pr_body` refuses to build a body without one |
 | records the model used | model + tier + selection rationale in the PR body |
 | carries a lesson learned (pass **or** fail) | written to `knowledge/lessons/` every iteration |
+| cites the evidence it was built on | `hsai evidence-check` (CI) - a `feat:`/`skill:`/`refactor:` PR must name pinned reference repos, resolved from the ticket's practice cards |
 
 ## Subscription-only, no metered API
 
@@ -52,13 +53,34 @@ Clone the repo and **open the folder as an Obsidian vault** - the committed
 
 ```
 knowledge/
-├── MOCs/          # Maps of Content: Knowledge Base / Lessons / Whitepapers
+├── MOCs/          # Maps of Content: Knowledge Base / Lessons / Whitepapers / Practices
 ├── lessons/       # one article per iteration (pass or fail)
+├── practices/     # one card per practice observed in a reference project
 ├── whitepapers/   # periodic syntheses (every N lessons)
 └── templates/     # note templates
 ```
 
 `hsai reindex` rebuilds the MOCs from what is on disk.
+
+## Evidence: where a change's provenance comes from
+
+Goal G1 says every improvement traces back to something observed in the field,
+so each observation is registered as a **practice card** (`PR-0001`, ...) under
+`knowledge/practices/`: the source repo, the exact artifact it was observed in
+(path / workflow file / commit SHA / issue number), and why it applies here.
+
+Tickets cite those ids in a `## Practices` section. The loop resolves the
+citation into the repos that actually informed the work and stamps *those* onto
+the PR body and the lesson - falling back to the reference repos named in the
+ticket's synthesis rationale. A `feat:`/`skill:`/`refactor:` ticket with no
+resolvable citation is labelled `needs-refinement` instead of implemented.
+
+```bash
+hsai practices              # list the registry
+hsai practices --validate   # schema + "every source repo is pinned in core.yaml"
+hsai practices --validate --resolve   # ...and confirm each artifact exists (needs gh)
+hsai practices --index      # rebuild the Practices MOC + lesson backlinks
+```
 
 ## Quickstart
 

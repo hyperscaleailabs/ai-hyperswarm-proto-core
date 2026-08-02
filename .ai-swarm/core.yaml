@@ -170,6 +170,7 @@ knowledge:
   lessons_dir: knowledge/lessons
   whitepapers_dir: knowledge/whitepapers
   mocs_dir: knowledge/MOCs
+  practices_dir: knowledge/practices  # evidence cards; every citation resolves to one
   templates_dir: knowledge/templates
   whitepaper_every_lessons: 10       # synthesize a whitepaper every N new lessons
   obsidian_ready: true               # wikilinks + committed .obsidian config

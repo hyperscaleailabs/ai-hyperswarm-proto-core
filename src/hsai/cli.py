@@ -6,6 +6,8 @@ Commands:
   hsai status                                                  config + backlog snapshot
   hsai reindex                                                 rebuild knowledge MOCs
   hsai doctor                                                  verify environment + invariants
+  hsai practices [--validate] [--index] [--resolve]            the evidence registry
+  hsai evidence-check                                          reference-set evidence CI gate
 """
 from __future__ import annotations
 
@@ -13,7 +15,7 @@ import argparse
 import os
 import sys
 
-from . import __version__, ai, repro
+from . import __version__, ai, practices, repro
 from .config import CoreConfig, load_config, validate
 from .knowledge import KnowledgeBase
 from .orchestrator import run_loop
@@ -122,6 +124,60 @@ def cmd_repro_check(args: argparse.Namespace) -> int:
     return 0 if result.ok else 1
 
 
+def cmd_practices(args: argparse.Namespace) -> int:
+    """Inspect, validate and index the practice-card registry.
+
+    ``--validate`` is the offline contract: schema plus "every source repo is
+    pinned in .ai-swarm/core.yaml". ``--resolve`` adds the online half - asking
+    GitHub whether each cited artifact actually exists - and is opt-in because
+    it needs network and a `gh` login.
+    """
+    cfg = _load(args)
+    k = cfg.knowledge or {}
+    cards = practices.load_cards(".", cfg)
+    rc = 0
+
+    if not args.index or args.validate:
+        problems = [p for c in cards for p in practices.validate_card(c, cfg)]
+        if args.resolve:
+            problems += [
+                f"{c.note_name}: artifact_ref does not resolve ({c.api_path()})"
+                for c in cards
+                if not practices.resolve_artifact(c)
+            ]
+        for c in cards:
+            print(f"  {c.id}  {c.source_repo:<32} {c.artifact_kind}: {c.artifact_ref}")
+        for p in problems:
+            print(f"  ERR: {p}")
+        print(f"practices: {len(cards)} card(s), {len(problems)} problem(s)")
+        rc = 1 if problems else 0
+
+    if args.index:
+        for path in practices.reindex(
+            ".",
+            lessons_dir=k.get("lessons_dir", "knowledge/lessons"),
+            mocs_dir=k.get("mocs_dir", "knowledge/MOCs"),
+            practices_dir=k.get("practices_dir", practices.PRACTICES_DIR),
+        ):
+            print(f"indexed {path}")
+    return rc
+
+
+def cmd_evidence_check(args: argparse.Namespace) -> int:
+    """Required-check gate: a code PR must cite pinned reference-set evidence.
+
+    Mirrors the citation the orchestrator resolved when it built the PR body, so
+    the invariant is enforced by CI rather than trusted from the writer
+    (microsoft/semantic-kernel's merge-gatekeeper discipline; see [[PR-0004]]).
+    """
+    cfg = _load(args)
+    pr_title = args.pr_title if args.pr_title is not None else os.environ.get("PR_TITLE", "")
+    pr_body = args.pr_body if args.pr_body is not None else os.environ.get("PR_BODY", "")
+    result = practices.evaluate_pr_evidence(pr_title, pr_body, cfg)
+    print(f"evidence-check: {'PASS' if result.ok else 'BLOCKED'} - {result.reason}")
+    return 0 if result.ok else 1
+
+
 def cmd_brief(args: argparse.Namespace) -> int:
     from .governance import write_direction
 
@@ -187,6 +243,21 @@ def build_parser() -> argparse.ArgumentParser:
     sy = sub.add_parser("synthesize", help="heavy-model synthesis: file substantial tickets")
     sy.add_argument("--index", type=int, default=0, help="rotation index for reference subset")
     sy.set_defaults(func=cmd_synthesize)
+
+    pc = sub.add_parser("practices", help="the evidence registry behind every citation")
+    pc.add_argument("--validate", action="store_true", help="schema + pinned-repo checks")
+    pc.add_argument("--index", action="store_true", help="rebuild the Practices MOC + backlinks")
+    pc.add_argument(
+        "--resolve", action="store_true", help="also confirm each artifact_ref exists (needs gh)"
+    )
+    pc.set_defaults(func=cmd_practices)
+
+    ev = sub.add_parser(
+        "evidence-check", help="reference-set evidence gate for code PRs (CI gate)"
+    )
+    ev.add_argument("--pr-title", default=None, help="PR title (default: $PR_TITLE)")
+    ev.add_argument("--pr-body", default=None, help="PR body (default: $PR_BODY)")
+    ev.set_defaults(func=cmd_evidence_check)
 
     br = sub.add_parser("brief", help="refresh governance/DIRECTION.md")
     br.set_defaults(func=cmd_brief)
