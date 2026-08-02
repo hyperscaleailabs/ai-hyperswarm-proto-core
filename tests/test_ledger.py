@@ -93,6 +93,33 @@ def test_aggregate_block_folds_only_matching_block():
     assert "heavy-tier=2" in agg.summary()
 
 
+def test_aggregate_block_folds_review_cost_and_verdicts():
+    records = [
+        _rec(block=1, review_verdict="PASS", review_tier="light", review_seconds=8.0),
+        _rec(block=1, review_verdict="FAIL", review_tier="light", review_seconds=6.5),
+        _rec(block=1, review_verdict="PASS", review_tier="light", review_seconds=5.5),
+        _rec(block=1),  # an iteration with no review at all
+        _rec(block=2, review_verdict="PASS", review_seconds=99.0),  # other block
+    ]
+    agg = aggregate_block(records, block=1)
+    assert agg.review_seconds == 20.0
+    assert agg.review_verdicts == {"PASS": 2, "FAIL": 1}
+    assert "review[FAIL=1, PASS=2] 20s" in agg.summary()
+
+
+def test_records_without_review_fields_still_parse(tmp_path):
+    """Ledger lines written before the review gate existed remain readable."""
+    path = tmp_path / "ledger.jsonl"
+    path.write_text(json.dumps({
+        "iteration": 1, "block": 0, "ticket": 3, "kind": "implement",
+        "tier": "standard", "model": "sonnet", "wall_clock_seconds": 4.0,
+        "attempts": 1, "outcome": "merged", "created": "2026-07-01T00:00:00+00:00",
+    }) + "\n")
+    records = read_records(path)
+    assert records[0].review_verdict is None
+    assert aggregate_block(records, block=0).review_verdicts == {}
+
+
 # --- budget gate transitions ------------------------------------------------
 
 BUDGET = {"max_heavy_iterations_per_block": 3, "max_seconds_per_block": 100, "soft_ratio": 0.8}

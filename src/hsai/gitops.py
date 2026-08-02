@@ -110,8 +110,24 @@ def restore_pathspec(pathspec: str, *, cwd: str, runner: Runner = run) -> None:
     _git(["clean", "-fd", pathspec], cwd=cwd, runner=runner)
 
 
+def stage_all(*, cwd: str, runner: Runner = run) -> Proc:
+    """Stage every edit, addition and deletion in the worktree."""
+    return _git(["add", "-A"], cwd=cwd, runner=runner)
+
+
+def staged_diff(base_ref: str, *, cwd: str, runner: Runner = run) -> str:
+    """The staged tree's diff against ``base_ref``.
+
+    Used by the acceptance-review gate, which inspects the worker's change
+    *before* it is committed - so untracked new files must be staged first
+    (see :func:`stage_all`) or they would be invisible.
+    """
+    p = _git(["diff", "--cached", base_ref], cwd=cwd, runner=runner)
+    return p.stdout
+
+
 def commit_all(message: str, *, cwd: str, runner: Runner = run) -> Proc:
-    _git(["add", "-A"], cwd=cwd, runner=runner)
+    stage_all(cwd=cwd, runner=runner)
     return _git(["commit", "-m", message], cwd=cwd, runner=runner)
 
 

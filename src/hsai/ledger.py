@@ -64,6 +64,12 @@ class LedgerRecord:
     outcome: str
     input_tokens: int | None = None
     output_tokens: int | None = None
+    # Acceptance-review spend: the reviewer runs inside this iteration, so its
+    # seconds are already inside ``wall_clock_seconds``. These fields break that
+    # total out so a block can see what review costs and whether it is blocking.
+    review_verdict: str | None = None
+    review_tier: str | None = None
+    review_seconds: float | None = None
     created: str = field(default_factory=_now)
 
     def to_json(self) -> str:
@@ -138,15 +144,24 @@ class BlockAggregate:
     input_tokens: int = 0
     output_tokens: int = 0
     tier_counts: dict[str, int] = field(default_factory=dict)
+    review_seconds: float = 0.0
+    review_verdicts: dict[str, int] = field(default_factory=dict)
 
     def summary(self) -> str:
         tiers = ", ".join(f"{t}={self.tier_counts[t]}" for t in sorted(self.tier_counts))
         toks = self.input_tokens + self.output_tokens
+        verdicts = ", ".join(
+            f"{v}={self.review_verdicts[v]}" for v in sorted(self.review_verdicts)
+        )
         return (
             f"{self.iterations} iterations, heavy-tier={self.heavy_iterations}, "
             f"{self.total_seconds:.0f}s wall-clock, {self.total_attempts} attempts"
             + (f", tiers[{tiers}]" if tiers else "")
             + (f", {toks} tokens" if toks else "")
+            + (
+                f", review[{verdicts}] {self.review_seconds:.0f}s"
+                if verdicts else ""
+            )
         )
 
 
@@ -164,7 +179,13 @@ def aggregate_block(records: list[LedgerRecord], block: int) -> BlockAggregate:
             agg.heavy_iterations += 1
         agg.input_tokens += r.input_tokens or 0
         agg.output_tokens += r.output_tokens or 0
+        agg.review_seconds += r.review_seconds or 0.0
+        if r.review_verdict:
+            agg.review_verdicts[r.review_verdict] = (
+                agg.review_verdicts.get(r.review_verdict, 0) + 1
+            )
     agg.total_seconds = round(agg.total_seconds, 3)
+    agg.review_seconds = round(agg.review_seconds, 3)
     return agg
 
 

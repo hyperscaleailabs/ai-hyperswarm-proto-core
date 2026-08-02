@@ -1,10 +1,11 @@
+import dataclasses
 import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from hsai import orchestrator
+from hsai import orchestrator, review
 from hsai.config import load_config
 from hsai.models import ModelChoice
 from hsai.orchestrator import (
@@ -39,12 +40,21 @@ class FakeRunner:
         worktree_status: str = "",
         repro_fix_ok: bool = True,
         repro_parent_ok: bool = False,
+        review_output: str = "",
+        review_code: int = 0,
+        diff_text: str = "+++ b/src/hsai/widget.py\n+def widget(): ...\n",
     ) -> None:
         self.repo_root = repo_root
         self.ci_sequence = ci_sequence
         self.open_issues = open_issues or []
         self.remote_ci = remote_ci
         self.worktree_status = worktree_status
+        # The acceptance-review agent is told apart from the worker by its
+        # `--permission-mode plan` (the reviewer reads, it never edits).
+        self.review_output = review_output
+        self.review_code = review_code
+        self.diff_text = diff_text
+        self.review_calls: list[list[str]] = []
         # Controls the targeted `pytest <files>` runs the repro guard makes:
         # `repro_fix_ok` is the outcome on the fix branch, `repro_parent_ok`
         # the outcome on the detached pre-fix (parent) worktree.
@@ -75,6 +85,8 @@ class FakeRunner:
             return Proc(cmd, 0, "", "")
         if cmd[:2] == ["git", "status"]:
             return Proc(cmd, 0, self.worktree_status, "")
+        if cmd[:2] == ["git", "diff"]:
+            return Proc(cmd, 0, self.diff_text, "")
         if cmd[:2] in (["git", "add"], ["git", "commit"], ["git", "push"]):
             return Proc(cmd, 0, "", "")
         if cmd[:2] in (["git", "checkout"], ["git", "clean"]):
@@ -100,6 +112,10 @@ class FakeRunner:
         if cmd[:3] == ["gh", "issue", "edit"]:
             return Proc(cmd, 0, "", "")
         if cmd[:1] == ["claude"]:
+            mode = cmd[cmd.index("--permission-mode") + 1] if "--permission-mode" in cmd else ""
+            if mode == "plan":
+                self.review_calls.append(cmd)
+                return Proc(cmd, self.review_code, self.review_output, "")
             return Proc(cmd, 0, "ok\n", "")
         if cmd[:3] == ["gh", "pr", "create"]:
             self._pr_seq += 1
@@ -401,8 +417,11 @@ def test_run_once_implement_path_with_fake_runner(tmp_path):
     assert result.model in body
     assert "Lesson learned" in body
 
+    # WELL_FORMED_BODY carries acceptance criteria, so the independent reviewer
+    # ran too: one worker call plus one reviewer call.
     claude_calls = [c for c in runner.calls if c[:1] == ["claude"]]
-    assert len(claude_calls) == 1
+    assert len(claude_calls) == 2
+    assert len(runner.review_calls) == 1
     assert all(c[0] in {"git", "gh", "ruff", "pytest", "claude"} for c in runner.calls)
 
 
@@ -539,6 +558,204 @@ def test_completeness_guard_blocks_knowledge_only_diff_on_code_ticket(tmp_path):
     assert any(
         c[:3] == ["gh", "issue", "edit"] and "--remove-assignee" in c for c in runner.calls
     )
+
+
+def _criteria_issue(number: int = 9) -> list[dict]:
+    return [
+        {
+            "number": number,
+            "title": "feat: add widget",
+            "labels": [{"name": "priority:P2"}],
+            "assignees": [],
+            "body": WELL_FORMED_BODY,
+        }
+    ]
+
+
+def _verdict(*, met: list[bool], verdict: str, reasons: list[str] | None = None) -> str:
+    payload = {
+        "verdict": verdict,
+        "criteria": [
+            {"id": f"AC{i + 1}", "met": ok, "evidence": f"src/hsai/widget.py:{i + 1}"}
+            for i, ok in enumerate(met)
+        ],
+        "blocking_reasons": reasons or [],
+    }
+    return "Review complete.\n\n```json\n" + json.dumps(payload) + "\n```\n"
+
+
+def _ledger_records(tmp_path) -> list[dict]:
+    path = tmp_path / "knowledge" / "ledger" / "iterations.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def test_acceptance_review_blocks_an_unmet_criterion_before_a_pr_is_opened(tmp_path):
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=_criteria_issue(),
+        worktree_status="?? src/hsai/widget.py\n",
+        review_output=_verdict(
+            met=[True, False], verdict="FAIL", reasons=["AC2: no test covers the widget"]
+        ),
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    # The gate blocks locally: no PR is ever opened.
+    assert result.review == "FAIL"
+    assert result.recovered is True
+    assert result.pr is None
+    assert result.merged is False
+    assert result.remote == "UNMET_CRITERIA"
+    assert not any(c[:3] == ["gh", "pr", "create"] for c in runner.calls)
+    assert any("acceptance review: FAIL" in n for n in result.notes)
+
+    # The ticket returns UNASSIGNED to the backlog with the attempt recorded.
+    assert any(
+        c[:3] == ["gh", "issue", "edit"] and "--remove-assignee" in c for c in runner.calls
+    )
+    assert any("attempts:1" in c for c in runner.calls)
+
+    # The block's economics see what the review cost and how it ruled.
+    records = _ledger_records(tmp_path)
+    assert len(records) == 1
+    assert records[0]["outcome"] == "unmet_criteria"
+    assert records[0]["review_verdict"] == "FAIL"
+    assert records[0]["review_tier"] == "light"
+    assert records[0]["review_seconds"] is not None
+
+    # A redacted trajectory artifact survives the torn-down worktree.
+    saved = sorted((tmp_path / ".hsai" / "reviews").glob("*.json"))
+    assert len(saved) == 1
+    assert json.loads(saved[0].read_text())["status"] == "FAIL"
+
+
+def test_acceptance_review_pass_puts_the_criterion_table_in_the_pr_body(tmp_path):
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=_criteria_issue(),
+        worktree_status="?? src/hsai/widget.py\n",
+        review_output=_verdict(met=[True, True], verdict="PASS"),
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.review == "PASS"
+    assert result.recovered is False
+    assert result.pr is not None and result.merged is True
+
+    pr_create = next(c for c in runner.calls if c[:3] == ["gh", "pr", "create"])
+    body = pr_create[pr_create.index("--body") + 1]
+    assert "## Acceptance review" in body
+    assert "| AC1 | widget builds | **met** |" in body
+    assert "| AC2 | widget tested | **met** |" in body
+    # ...and the CI evidence gate accepts exactly this body for this ticket.
+    assert review.check_pr_evidence(body, ticket_body=WELL_FORMED_BODY).ok
+
+    # The lesson carries the same table.
+    lesson_text = Path(result.lesson_path).read_text()
+    assert "## Acceptance review" in lesson_text
+    assert "| AC1 | widget builds | **met** |" in lesson_text
+
+    records = _ledger_records(tmp_path)
+    assert records[0]["review_verdict"] == "PASS"
+    assert records[0]["review_tier"] == "light"
+
+
+def test_acceptance_review_fails_open_when_the_reviewer_returns_garbage(tmp_path):
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=_criteria_issue(),
+        worktree_status="?? src/hsai/widget.py\n",
+        review_output="looks fine to me",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    # A broken reviewer never wedges the loop: the iteration proceeds to a PR.
+    assert result.review == "INCONCLUSIVE"
+    assert result.recovered is False
+    assert result.pr is not None
+    lesson_text = Path(result.lesson_path).read_text()
+    assert "inconclusive" in lesson_text and "failed open" in lesson_text
+    assert _ledger_records(tmp_path)[0]["review_verdict"] == "INCONCLUSIVE"
+
+
+def test_acceptance_review_disabled_restores_the_previous_behaviour(tmp_path):
+    """`review.enabled: false` must be a byte-for-byte behavioural rollback."""
+    enabled = load_config()
+    disabled = dataclasses.replace(
+        enabled, review={**enabled.review, "enabled": False}
+    )
+
+    def _run(cfg, root):
+        runner = FakeRunner(
+            repo_root=str(root), ci_sequence=[True, True],
+            open_issues=_criteria_issue(),
+            worktree_status="?? src/hsai/widget.py\n",
+            review_output=_verdict(met=[True, False], verdict="FAIL"),
+        )
+        result = run_once(
+            cfg, repo_dir=str(root), dry_run=False,
+            runner=runner, ai_runner=runner, iteration=1,
+        )
+        return result, runner
+
+    on_result, on_runner = _run(enabled, tmp_path / "on")
+    off_result, off_runner = _run(disabled, tmp_path / "off")
+
+    # Enabled: the same verdict blocks the PR.
+    assert on_result.recovered is True and on_result.pr is None
+
+    # Disabled: no reviewer runs at all, no artifact is written, and the PR
+    # opens and merges exactly as it did before this gate existed.
+    assert off_runner.review_calls == []
+    assert not (tmp_path / "off" / ".hsai" / "reviews").exists()
+    assert off_result.review == "SKIPPED"
+    assert off_result.recovered is False
+    assert off_result.pr is not None and off_result.merged is True
+    assert len([c for c in off_runner.calls if c[:1] == ["claude"]]) == 1
+    assert _ledger_records(tmp_path / "off")[0]["review_verdict"] == "SKIPPED"
+
+
+def test_acceptance_review_is_skipped_for_a_criteria_free_ticket(tmp_path):
+    cfg = load_config()
+    open_issues = [
+        {
+            "number": 8,
+            "title": "chore: tidy up",
+            "labels": [{"name": "priority:P3"}],
+            "assignees": [],
+            "body": "No acceptance criteria here.",
+        }
+    ]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+        worktree_status="?? src/hsai/widget.py\n",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.review == "SKIPPED"
+    assert runner.review_calls == []
+    assert result.pr is not None
 
 
 def test_malformed_ticket_is_refused_and_labeled(tmp_path):

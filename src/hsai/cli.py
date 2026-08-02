@@ -6,14 +6,16 @@ Commands:
   hsai status                                                  config + backlog snapshot
   hsai reindex                                                 rebuild knowledge MOCs
   hsai doctor                                                  verify environment + invariants
+  hsai evidence-check                                          PR-body SDLC evidence gate (CI)
 """
 from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 
-from . import __version__, ai, repro
+from . import __version__, ai, github, repro, review
 from .config import CoreConfig, load_config, validate
 from .knowledge import KnowledgeBase
 from .orchestrator import run_loop
@@ -122,6 +124,34 @@ def cmd_repro_check(args: argparse.Namespace) -> int:
     return 0 if result.ok else 1
 
 
+def cmd_evidence_check(args: argparse.Namespace) -> int:
+    """The SDLC evidence gate, callable from CI.
+
+    Checks the long-standing PR-body invariants (ticket link, model, lesson)
+    and, when the linked ticket carries ``## Acceptance criteria``, that the PR
+    shows an ``## Acceptance review`` section with a row per criterion. The
+    ticket body is fetched from the ``Closes #N`` link unless supplied.
+    """
+    cfg = _load(args)
+    pr_body = args.pr_body if args.pr_body is not None else os.environ.get("PR_BODY", "")
+    ticket_body = args.ticket_body
+    if ticket_body is None:
+        ticket_body = os.environ.get("TICKET_BODY", "")
+    if not ticket_body:
+        m = re.search(r"closes\s+#(\d+)", pr_body, re.IGNORECASE)
+        if m:
+            issue = github.get_issue(cfg.repo_slug, int(m.group(1)))
+            ticket_body = issue.body if issue else ""
+    result = review.check_pr_evidence(pr_body, ticket_body=ticket_body)
+    if result.ok:
+        print("evidence-check: PASS")
+        return 0
+    for reason in result.reasons:
+        print(f"::error::{reason}")
+    print("evidence-check: BLOCKED")
+    return 1
+
+
 def cmd_brief(args: argparse.Namespace) -> int:
     from .governance import write_direction
 
@@ -187,6 +217,16 @@ def build_parser() -> argparse.ArgumentParser:
     sy = sub.add_parser("synthesize", help="heavy-model synthesis: file substantial tickets")
     sy.add_argument("--index", type=int, default=0, help="rotation index for reference subset")
     sy.set_defaults(func=cmd_synthesize)
+
+    ev = sub.add_parser(
+        "evidence-check", help="SDLC PR-body evidence gate incl. acceptance review (CI gate)"
+    )
+    ev.add_argument("--pr-body", default=None, help="PR body (default: $PR_BODY)")
+    ev.add_argument(
+        "--ticket-body", default=None,
+        help="linked ticket body (default: $TICKET_BODY, else fetched from 'Closes #N')",
+    )
+    ev.set_defaults(func=cmd_evidence_check)
 
     br = sub.add_parser("brief", help="refresh governance/DIRECTION.md")
     br.set_defaults(func=cmd_brief)

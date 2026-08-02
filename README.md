@@ -90,7 +90,9 @@ The loop is governed, not just autonomous - see [docs/SDLC.md](docs/SDLC.md) and
    `docs/adr/` plus refined tickets, closed with a merged PR.
 2. **Quality** - a five-phase SDLC (Plan → Implement → Verify → QA → Integrate),
    each phase leaving CI-checked evidence. Vague tickets are refused
-   (`needs-refinement`); code tickets cannot merge with code-free diffs.
+   (`needs-refinement`); code tickets cannot merge with code-free diffs; and an
+   **independent reviewer** - a separate, cheaper agent - must sign off every
+   acceptance criterion with cited evidence before a PR is ever opened.
 3. **Scheduled cycles** - `hsai cycle` runs the two-phase engine: heavy-model
    **synthesis** (combining practices from >= 3 reference projects, with an
    explicit reflection pass) files substantial tickets; cheaper agents implement

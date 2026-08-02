@@ -27,6 +27,27 @@ def test_lesson_records_remote_ci_conclusion(tmp_path):
     assert "SUCCESS" in path.read_text()
 
 
+def test_lesson_carries_the_acceptance_review_section(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    lesson = Lesson(
+        title="implement: add widget",
+        outcome="pass",
+        kind="implement",
+        context="ctx",
+        what_happened="built it",
+        lesson="criteria are a gate",
+        ticket=9,
+    )
+    # Absent a review, the section is still present and says so.
+    text = kb.write_lesson(lesson).read_text()
+    assert "## Acceptance review" in text
+    assert "_(not applicable: no review recorded)_" in text
+
+    lesson.acceptance_review = "| AC1 | widget builds | **met** | src/hsai/widget.py:1 |"
+    text = kb.write_lesson(lesson).read_text()
+    assert "| AC1 | widget builds | **met** | src/hsai/widget.py:1 |" in text
+
+
 def test_write_lesson_and_reindex(tmp_path):
     kb = KnowledgeBase(tmp_path)
     lesson = Lesson(
