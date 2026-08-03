@@ -1,9 +1,17 @@
-from hsai.knowledge import KnowledgeBase, Lesson, LessonRecord, Whitepaper, slugify
+from hsai.knowledge import KnowledgeBase, Lesson, LessonRecord, Whitepaper, format_reference, slugify
 
 
 def test_slugify():
     assert slugify("Hello, World!") == "hello-world"
     assert slugify("  ") == "untitled"
+
+
+def test_format_reference():
+    assert format_reference("langchain-ai/langchain") == "[langchain-ai/langchain](https://github.com/langchain-ai/langchain)"
+    assert format_reference("openai/swarm") == "[openai/swarm](https://github.com/openai/swarm)"
+    assert format_reference("  openai/swarm  ") == "[openai/swarm](https://github.com/openai/swarm)"
+    assert format_reference("invalid") == "`invalid`"
+    assert format_reference("") == "``"
 
 
 def test_lesson_records_remote_ci_conclusion(tmp_path):
@@ -46,7 +54,7 @@ def test_write_lesson_and_reindex(tmp_path):
     text = path.read_text()
     assert "# implement: add status command" in text
     assert "[[Lessons MOC]]" in text  # Obsidian wikilink up to MOC
-    assert "openai/swarm" in text
+    assert "[openai/swarm](https://github.com/openai/swarm)" in text  # links are formatted
     assert "sonnet" in text
 
     written = kb.reindex_mocs()

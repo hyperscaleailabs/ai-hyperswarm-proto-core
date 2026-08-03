@@ -38,6 +38,21 @@ def slugify(text: str) -> str:
     return _SLUG_RE.sub("-", text.lower()).strip("-") or "untitled"
 
 
+def format_reference(repo: str) -> str:
+    """Convert a repo slug to a GitHub markdown link.
+
+    Adopted from gpt-researcher: structured source citations with evidence links
+    make the knowledge base auditable. Instead of plain text repo names, include
+    clickable GitHub links so readers can quickly verify the practice source.
+
+    Example: "langchain-ai/langchain" -> "[langchain-ai/langchain](https://github.com/langchain-ai/langchain)"
+    """
+    repo = repo.strip()
+    if not repo or "/" not in repo:
+        return f"`{repo}`"
+    return f"[{repo}](https://github.com/{repo})"
+
+
 def _today() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
@@ -275,7 +290,7 @@ class KnowledgeBase:
             tags,
             {"created": lesson.created, "iteration": str(lesson.iteration)},
         )
-        refs = "\n".join(f"- `{r}`" for r in lesson.references) or "- _(none cited)_"
+        refs = "\n".join(f"- {format_reference(r)}" for r in lesson.references) or "- _(none cited)_"
         ticket = f"#{lesson.ticket}" if lesson.ticket else "_(none)_"
         pr = f"#{lesson.pr}" if lesson.pr else "_(none)_"
         repro = lesson.repro_evidence or "_(not applicable: not a heal/bugfix ticket)_"
