@@ -164,6 +164,15 @@ constraints:
   require_ticket_per_pr: true
   require_green_ci_to_merge: true
   require_lesson_per_pr: true
+  # Guardrail-bearing surfaces: src/hsai/guard.py reverts edits here unless the
+  # claimed ticket carries the 'approved:invariant-change' label. See
+  # docs/SDLC.md for the escape hatch and why enforcement lives in pytest.
+  protected_paths:
+    - .github/workflows/
+    - .ai-swarm/core.yaml
+    - src/hsai/ai.py
+    - src/hsai/ci.py
+    - src/hsai/guard.py
 
 knowledge:
   root: knowledge                    # Obsidian vault content lives under the repo root

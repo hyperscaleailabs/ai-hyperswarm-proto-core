@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 from uuid import uuid4
 
-from . import ai, ci, github, gitops, ledger, repro
+from . import ai, ci, github, gitops, guard, ledger, repro
 from .config import CoreConfig
 from .knowledge import KnowledgeBase, Lesson
 from .models import ModelChoice, Task, select
@@ -97,6 +97,7 @@ def build_pr_body(
     ci_summary: str,
     kind: str = "",
     references: tuple[str, ...] = (),
+    invariant_gate_opened: tuple[str, ...] = (),
 ) -> str:
     """Assemble a PR body that satisfies the traceability invariants.
 
@@ -107,11 +108,19 @@ def build_pr_body(
     refs = ", ".join(f"`{r}`" for r in references) or "_(none)_"
     artifacts = _phase_artifacts(kind) if kind else ""
     artifacts_section = f"\n## Phase artifacts\n{artifacts}\n" if artifacts else ""
+    gate_section = ""
+    if invariant_gate_opened:
+        paths = ", ".join(f"`{p}`" for p in invariant_gate_opened)
+        gate_section = (
+            "\n## Invariant gate\n"
+            f"Protected paths were touched and the gate was consciously opened via "
+            f"the `{guard.ESCAPE_HATCH_LABEL}` label: {paths}\n"
+        )
     return f"""Closes #{ticket}
 
 ## Model used
 - **model**: `{choice.model}` (tier: `{choice.tier}`)
-- **selection**: {choice.rationale} [strategy: `{choice.strategy}`]{artifacts_section}
+- **selection**: {choice.rationale} [strategy: `{choice.strategy}`]{artifacts_section}{gate_section}
 
 ## CI
 {ci_summary}
@@ -361,7 +370,7 @@ def run_once(
     # 5. run the agent (subscription-only)
     agent_ok = True
     agent_err = ""
-    reverted_workflows: list[str] = []
+    guard_result = guard.GuardResult(protected=(), escaped=False)
     repro_result: repro.ReproResult | None = None
     if not dry_run:
         prompt = _task_prompt(kind, cfg, ticket_title, ticket_body)
@@ -373,16 +382,29 @@ def run_once(
         if agent_err:
             agent_err = _format_error_with_context(agent_err, kind, ticket_num)
 
-        # Guard: a task must not change the CI checks, or local and remote CI
-        # would diverge (as happened once when a worker added mypy). Revert any
-        # workflow edits before they are committed and note it in the lesson.
-        reverted_workflows = [
-            p for p in gitops.changed_paths(cwd=wt, runner=runner)
-            if p.startswith(".github/workflows/")
-        ]
-        if reverted_workflows:
-            gitops.restore_pathspec(".github/workflows", cwd=wt, runner=runner)
-            result.notes.append(f"reverted workflow edits: {reverted_workflows}")
+        # Protected-invariants gate: a task must not weaken the guardrail-bearing
+        # surfaces the loop relies on (CI workflows, this config, the
+        # subscription/CI enforcement modules, the gate itself) - a diff that
+        # does would still report green, and nothing else would notice. Revert
+        # any such edits unless the claimed ticket carries the escape-hatch
+        # label, in which case the gate is consciously opened and recorded.
+        labels = tuple(claimed_issue.labels) if claimed_issue else ()
+        guard_result = guard.classify(
+            gitops.changed_paths(cwd=wt, runner=runner),
+            guard.protected_paths_for(cfg),
+            labels,
+        )
+        if guard_result.should_revert:
+            for p in guard_result.protected:
+                gitops.restore_pathspec(p, cwd=wt, runner=runner)
+            result.notes.append(
+                f"reverted protected-path edits: {list(guard_result.protected)}"
+            )
+        elif guard_result.escaped:
+            result.notes.append(
+                f"invariant gate opened via '{guard.ESCAPE_HATCH_LABEL}' label: "
+                f"{list(guard_result.protected)}"
+            )
 
         # Completeness guard: a code ticket (feat/skill/refactor/fix) cannot be
         # satisfied by a knowledge-only diff. PR #17 once "closed" a feature
@@ -446,8 +468,13 @@ def run_once(
             f"Model `{choice.model}` ({choice.tier}) ran the task. "
             f"Agent ok={agent_ok}. CI after: {ci_after.summary()}."
             + (
-                f"\n\nReverted off-spec workflow edits: {reverted_workflows}."
-                if reverted_workflows else ""
+                f"\n\nReverted protected-path edits: {list(guard_result.protected)}."
+                if guard_result.should_revert else ""
+            )
+            + (
+                f"\n\nInvariant gate opened via '{guard.ESCAPE_HATCH_LABEL}': "
+                f"{list(guard_result.protected)}."
+                if guard_result.escaped else ""
             )
             + (f"\n\nAgent error:\n```\n{agent_err[:800]}\n```" if agent_err else "")
         ),
@@ -489,6 +516,7 @@ def run_once(
         ci_summary=ci_after.summary(),
         kind=kind,
         references=references,
+        invariant_gate_opened=guard_result.protected if guard_result.escaped else (),
     )
     pr_num = github.create_pr(
         repo, branch, f"{kind}: {ticket_title}"[:120], pr_body,
