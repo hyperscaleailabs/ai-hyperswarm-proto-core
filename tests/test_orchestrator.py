@@ -505,7 +505,81 @@ def test_workflow_edits_are_reverted(tmp_path):
     # #12: workflow edits are restored so local CI can't diverge from remote
     assert any(c[:3] == ["git", "checkout", "HEAD"] for c in runner.calls)
     assert any(c[:2] == ["git", "clean"] for c in runner.calls)
-    assert any("reverted workflow edits" in n for n in result.notes)
+    assert any("reverted protected-path edits" in n for n in result.notes)
+
+
+def test_protected_path_edit_is_reverted(tmp_path):
+    """guard.classify (not a hardcoded .github/workflows/ prefix check) flags
+    edits to any guardrail-bearing surface, e.g. src/hsai/ai.py."""
+    cfg = load_config()
+    open_issues = [
+        {
+            "number": 7,
+            "title": "add widget",
+            "labels": [{"name": "priority:P2"}],
+            "assignees": [],
+            "body": WELL_FORMED_BODY,
+        }
+    ]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+        worktree_status=" M src/hsai/ai.py\n?? src/hsai/new.py\n",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert any(
+        c[:3] == ["git", "checkout", "HEAD"] and "src/hsai/ai.py" in c for c in runner.calls
+    )
+    assert any(
+        "reverted protected-path edits" in n and "src/hsai/ai.py" in n for n in result.notes
+    )
+    lesson_text = Path(result.lesson_path).read_text()
+    assert "src/hsai/ai.py" in lesson_text
+
+
+def test_protected_path_edit_allowed_with_escape_hatch_label(tmp_path):
+    """A ticket carrying 'approved:invariant-change' consciously opens the
+    gate: the protected edit stands, and the PR body records that fact."""
+    cfg = load_config()
+    open_issues = [
+        {
+            "number": 7,
+            "title": "add widget",
+            "labels": [
+                {"name": "priority:P2"},
+                {"name": "approved:invariant-change"},
+            ],
+            "assignees": [],
+            "body": WELL_FORMED_BODY,
+        }
+    ]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+        worktree_status=" M src/hsai/ai.py\n?? src/hsai/new.py\n",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    # not reverted: no git checkout HEAD -- <protected path> was issued
+    assert not any(
+        c[:3] == ["git", "checkout", "HEAD"] and "src/hsai/ai.py" in c for c in runner.calls
+    )
+    assert any(
+        "invariant gate opened" in n and "src/hsai/ai.py" in n for n in result.notes
+    )
+
+    pr_create = next(c for c in runner.calls if c[:3] == ["gh", "pr", "create"])
+    body = pr_create[pr_create.index("--body") + 1]
+    assert "## Invariant gate" in body
+    assert "approved:invariant-change" in body
+    assert "src/hsai/ai.py" in body
 
 
 def test_completeness_guard_blocks_knowledge_only_diff_on_code_ticket(tmp_path):

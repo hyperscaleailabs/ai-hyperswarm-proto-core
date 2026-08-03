@@ -6,6 +6,7 @@ Commands:
   hsai status                                                  config + backlog snapshot
   hsai reindex                                                 rebuild knowledge MOCs
   hsai doctor                                                  verify environment + invariants
+  hsai verify-invariants                                        pass/fail table of gate invariants
 """
 from __future__ import annotations
 
@@ -122,6 +123,24 @@ def cmd_repro_check(args: argparse.Namespace) -> int:
     return 0 if result.ok else 1
 
 
+def cmd_verify_invariants(args: argparse.Namespace) -> int:
+    """Assert the safety invariants the protected-invariants gate defends.
+
+    Same checks the `hsai.invariants` module runs under pytest, exposed here
+    for the architect and for local pre-flight before a change is pushed.
+    """
+    from .invariants import run_all
+
+    cfg = _load(args)
+    results = run_all(cfg)
+    ok = True
+    for r in results:
+        status = "PASS" if r.ok else "FAIL"
+        print(f"[{status}] {r.name}" + (f" - {r.error}" if r.error else ""))
+        ok = ok and r.ok
+    return 0 if ok else 1
+
+
 def cmd_brief(args: argparse.Namespace) -> int:
     from .governance import write_direction
 
@@ -190,6 +209,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     br = sub.add_parser("brief", help="refresh governance/DIRECTION.md")
     br.set_defaults(func=cmd_brief)
+
+    vi = sub.add_parser(
+        "verify-invariants", help="assert the protected-invariants gate's invariants hold"
+    )
+    vi.set_defaults(func=cmd_verify_invariants)
 
     rc = sub.add_parser(
         "repro-check", help="reproduce-before-fix guard for heal/bugfix PRs (CI gate)"
