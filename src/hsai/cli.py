@@ -17,6 +17,7 @@ from . import __version__, ai, repro
 from .config import CoreConfig, load_config, validate
 from .knowledge import KnowledgeBase
 from .orchestrator import run_loop
+from .practices import STATUSES, PracticeRegistry
 from .swarm import run_parallel
 
 
@@ -87,6 +88,28 @@ def cmd_cycle(args: argparse.Namespace) -> int:
     print(f"review issue: #{res.review_issue}  governance PR: #{res.governance_pr}")
     for line in res.report.iterations:
         print(f"  {line}")
+    return 0
+
+
+def cmd_practices(args: argparse.Namespace) -> int:
+    cfg = _load(args)
+    practices_dir = (cfg.knowledge or {}).get("practices_dir", "knowledge/practices")
+    registry = PracticeRegistry(".", practices_dir=practices_dir)
+    records = registry.read_all()
+    if not records:
+        print("no practices recorded yet")
+        return 0
+    grouped: dict[str, list] = {}
+    for r in records:
+        grouped.setdefault(r.status, []).append(r)
+    for status in STATUSES:
+        recs = grouped.get(status, [])
+        if not recs:
+            continue
+        print(f"{status} ({len(recs)}):")
+        for r in recs:
+            ticket = f"#{r.ticket}" if r.ticket else "-"
+            print(f"  - {r.title} [{ticket}] <- {r.source_repo or 'unknown'}")
     return 0
 
 
@@ -187,6 +210,9 @@ def build_parser() -> argparse.ArgumentParser:
     sy = sub.add_parser("synthesize", help="heavy-model synthesis: file substantial tickets")
     sy.add_argument("--index", type=int, default=0, help="rotation index for reference subset")
     sy.set_defaults(func=cmd_synthesize)
+
+    pr = sub.add_parser("practices", help="list the practice registry grouped by status")
+    pr.set_defaults(func=cmd_practices)
 
     br = sub.add_parser("brief", help="refresh governance/DIRECTION.md")
     br.set_defaults(func=cmd_brief)

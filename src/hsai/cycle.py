@@ -21,6 +21,7 @@ from .governance import BlockReport, open_review_issue, write_direction
 from .knowledge import KnowledgeBase
 from .models import ModelChoice
 from .orchestrator import run_once
+from .practices import reconcile_registry
 from .proc import Runner, run
 from .synthesis import synthesize
 from .tickets import issue_well_formed
@@ -100,8 +101,11 @@ def run_cycle(
     # 1. Synthesize substantial tickets when the well-formed backlog is thin.
     low_water = int(cfg.cycle.get("backlog_low_watermark", 4))
     if _well_formed_backlog(cfg, runner=runner) < low_water:
-        sres = synthesize(cfg, cycle_index=idx, runner=runner, ai_runner=ai_runner)
+        sres = synthesize(
+            cfg, cycle_index=idx, repo_dir=str(repo_root), runner=runner, ai_runner=ai_runner
+        )
         report.synthesized = sres.filed
+        report.synthesis_skipped = [s.describe() for s in sres.skipped]
         if not sres.ok:
             report.notes.append(f"synthesis produced no tickets: {sres.error}")
 
@@ -141,6 +145,12 @@ def run_cycle(
     # 3. Sync main so knowledge produced by merged PRs is present locally.
     gitops.sync_main(cfg.default_branch, cwd=str(repo_root), runner=runner)
     runner(["git", "merge", "--ff-only", f"origin/{cfg.default_branch}"], cwd=str(repo_root))
+
+    # 3b. Reconcile the practice registry against this block's ticket outcomes:
+    # a proposed practice whose ticket closed (merged PR) becomes adopted; one
+    # labelled blocked becomes rejected.
+    flipped = reconcile_registry(cfg, repo_root, runner=runner)
+    report.notes.extend(f"practice: {line}" for line in flipped)
 
     # 4. Block whitepaper + persona articles + MOCs + DIRECTION refresh.
     kb = KnowledgeBase.from_config(cfg, repo_root)

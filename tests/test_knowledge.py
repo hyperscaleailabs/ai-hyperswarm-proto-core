@@ -1,4 +1,5 @@
 from hsai.knowledge import KnowledgeBase, Lesson, LessonRecord, Whitepaper, slugify
+from hsai.practices import Practice, PracticeRegistry
 
 
 def test_slugify():
@@ -51,9 +52,13 @@ def test_write_lesson_and_reindex(tmp_path):
 
     written = kb.reindex_mocs()
     names = {p.name for p in written}
-    assert names == {"Lessons MOC.md", "Whitepapers MOC.md", "Knowledge Base MOC.md"}
+    assert names == {
+        "Lessons MOC.md", "Whitepapers MOC.md", "Practices MOC.md", "Knowledge Base MOC.md",
+    }
     lessons_moc = (kb.mocs_dir / "Lessons MOC.md").read_text()
     assert f"[[{lesson.note_name()}]]" in lessons_moc
+    root_moc = (kb.mocs_dir / "Knowledge Base MOC.md").read_text()
+    assert "[[Practices MOC]]" in root_moc
 
 
 def test_whitepaper_cadence(tmp_path):
@@ -145,3 +150,25 @@ def test_synthesize_whitepaper_groups_outcomes_and_surfaces_recurring_failures(t
 
     path = kb.write_whitepaper(paper)
     assert "[[Whitepapers MOC]]" in path.read_text()
+
+
+def test_reindex_emits_practices_moc_grouped_by_status(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    registry = PracticeRegistry(tmp_path, practices_dir="knowledge/practices")
+    registry.write(
+        Practice(title="feat: a", source_repo="a/b", summary="s", status="proposed", ticket=1)
+    )
+    registry.write(
+        Practice(title="feat: b", source_repo="a/b", summary="s", status="adopted", ticket=2)
+    )
+
+    written = kb.reindex_mocs()
+    practices_moc = next(p for p in written if p.name == "Practices MOC.md")
+    text = practices_moc.read_text()
+    assert "## Proposed (1)" in text
+    assert "## Adopted (1)" in text
+    assert "## Rejected (0)" in text
+    assert "[[Knowledge Base MOC]]" in text
+
+    root_moc = (kb.mocs_dir / "Knowledge Base MOC.md").read_text()
+    assert "[[Practices MOC]] - 2 practice(s)" in root_moc

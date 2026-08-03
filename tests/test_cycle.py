@@ -14,15 +14,17 @@ import json
 from hsai import cycle, ledger
 from hsai.config import load_config
 from hsai.orchestrator import IterationResult
+from hsai.practices import Practice, PracticeRegistry
 from hsai.proc import Proc
 
 
 class _Runner:
     """Answers the git/gh calls run_cycle makes around the implementation loop."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, issues_by_number: dict | None = None) -> None:
         self.review_bodies: list[str] = []
         self._issue = 900
+        self.issues_by_number = issues_by_number or {}
 
     def __call__(self, cmd, *, cwd=None, env=None, timeout=None, input_text=None) -> Proc:
         cmd = list(cmd)
@@ -32,6 +34,12 @@ class _Runner:
             self.review_bodies.append(cmd[cmd.index("--body") + 1])
             self._issue += 1
             return Proc(cmd, 0, f"https://github.com/o/r/issues/{self._issue}\n", "")
+        if cmd[:3] == ["gh", "issue", "view"]:
+            num = int(cmd[3])
+            data = self.issues_by_number.get(num)
+            if data is None:
+                return Proc(cmd, 1, "", "not found")
+            return Proc(cmd, 0, json.dumps(data), "")
         return Proc(cmd, 0, "", "")
 
 
@@ -120,3 +128,41 @@ def test_block_soft_biases_then_hard_halts_but_inflight_merges(tmp_path, monkeyp
     assert len(lines) == 3
     for line in lines:
         json.loads(line)
+
+
+def test_run_cycle_reconciles_the_practice_registry(tmp_path, monkeypatch):
+    """A proposed practice flips to adopted/rejected from its ticket's fate,
+    using a fake gh runner - never the real GitHub API."""
+    cfg = load_config()
+    cfg.cycle["block_size"] = 0  # isolate reconciliation from the implementation loop
+
+    registry = PracticeRegistry(tmp_path)
+    registry.write(
+        Practice(
+            title="feat: adopted via merge", source_repo="a/b", summary="s",
+            status="proposed", ticket=21,
+        )
+    )
+    registry.write(
+        Practice(
+            title="feat: rejected via blocked", source_repo="a/b", summary="s",
+            status="proposed", ticket=22,
+        )
+    )
+
+    runner = _Runner(issues_by_number={
+        21: {"number": 21, "title": "feat: adopted via merge", "labels": [],
+             "assignees": [], "body": "", "state": "CLOSED"},
+        22: {"number": 22, "title": "feat: rejected via blocked",
+             "labels": [{"name": "blocked"}], "assignees": [], "body": "",
+             "state": "OPEN"},
+    })
+
+    monkeypatch.setattr(cycle, "_well_formed_backlog", lambda cfg, *, runner: 999)
+    monkeypatch.setattr(cycle, "_governance_pr", lambda *a, **k: 0)
+
+    cycle.run_cycle(cfg, repo_dir=str(tmp_path), cycle_index=1, runner=runner)
+
+    records = {r.title: r for r in registry.read_all()}
+    assert records["feat: adopted via merge"].status == "adopted"
+    assert records["feat: rejected via blocked"].status == "rejected"

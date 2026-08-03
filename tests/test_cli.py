@@ -56,3 +56,34 @@ def test_repro_check_command_passes_and_exits_zero(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert "PASS" in out
+
+
+def test_parser_practices_command():
+    parser = build_parser()
+    args = parser.parse_args(["practices"])
+    assert args.command == "practices"
+
+
+def test_practices_command_lists_registry_grouped_by_status(tmp_path, monkeypatch, capsys):
+    from hsai.practices import Practice, PracticeRegistry
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".ai-swarm").mkdir()
+    (tmp_path / ".ai-swarm" / "core.yaml").write_text(
+        "identity:\n  name: t\n  owner: o\nmodels:\n  tiers:\n    standard:\n      model: sonnet\n"
+        "  default_tier: standard\n"
+    )
+    registry = PracticeRegistry(tmp_path)
+    registry.write(
+        Practice(title="feat: x", source_repo="a/b", summary="s", status="proposed", ticket=1)
+    )
+    registry.write(
+        Practice(title="feat: y", source_repo="a/b", summary="s", status="adopted", ticket=2)
+    )
+
+    rc = main(["practices"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "proposed (1)" in out
+    assert "adopted (1)" in out
+    assert "feat: x" in out and "feat: y" in out

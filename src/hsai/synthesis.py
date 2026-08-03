@@ -19,16 +19,24 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 
 from . import github
 from .ai import run_agent
 from .config import CoreConfig
 from .models import ModelChoice
+from .practices import Practice, PracticeRegistry
 from .proc import Runner, run
 from .tickets import TicketSpec
 
 _JSON_BLOCK = re.compile(r"```(?:json)?\s*(\[.*?\])\s*```", re.DOTALL)
+_TITLE_PREFIX_RE = re.compile(
+    r"^(feat|fix|chore|refactor|skill|docs|perf|test|improve)\s*:\s*", re.IGNORECASE
+)
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+
+DEFAULT_DEDUPE_THRESHOLD = 0.85
 
 
 @dataclass
@@ -86,12 +94,26 @@ def build_context_pack(
     return ContextPack(repos=repos, sections=sections)
 
 
-def build_prompt(cfg: CoreConfig, pack: ContextPack) -> str:
+def _render_practices_section(registry: PracticeRegistry | None) -> str:
+    """The 'do not re-propose' section: practices already adopted or rejected."""
+    records = registry.non_proposed() if registry is not None else []
+    if not records:
+        return "_(none recorded yet - the registry is empty or everything is still proposed)_"
+    return "\n".join(
+        f"- **{r.title}** - status: {r.status} (source: {r.source_repo or 'unknown'})"
+        for r in records
+    )
+
+
+def build_prompt(
+    cfg: CoreConfig, pack: ContextPack, registry: PracticeRegistry | None = None
+) -> str:
     goals = "\n".join(f"- {g.get('id')}: {g.get('title')} - {g.get('description', '')}"
                       for g in cfg.goals)
     ideas = int(cfg.synthesis.get("ideas_target", 10))
     top = int(cfg.synthesis.get("file_top", 3))
     combine = int(cfg.synthesis.get("min_projects_combined", 3))
+    practices = _render_practices_section(registry)
     return f"""You are the SYNTHESIS planner for ai-hyperswarm-proto-core, an
 autonomous self-improving AI-swarm harness. Your job is NOT to copy one idea
 from one project, but to COMBINE practices across projects into substantial,
@@ -103,6 +125,9 @@ Project goals:
 
 Study digest of reference projects for this cycle:
 {pack.render()}
+
+Practices already adopted or rejected - do not re-propose:
+{practices}
 
 Work in three explicit phases and show them all in your output:
 
@@ -158,23 +183,71 @@ def parse_ticket_specs(output: str) -> list[TicketSpec]:
 
 
 @dataclass
+class SkippedSpec:
+    """A TicketSpec the dedupe gate refused to file."""
+
+    title: str
+    matched_title: str
+    matched_issue: int = 0  # 0 when the match was a practice with no linked ticket
+
+    def describe(self) -> str:
+        target = f"issue #{self.matched_issue}" if self.matched_issue else "an adopted/rejected practice"
+        return f"{self.title!r} (matches {target}: {self.matched_title!r})"
+
+
+@dataclass
 class SynthesisResult:
     ok: bool
     studied: list[str]
     filed: list[int]
     error: str = ""
+    skipped: list[SkippedSpec] = field(default_factory=list)
+
+
+def normalize_title(title: str) -> str:
+    """Strip the kind prefix and punctuation so titles compare on substance,
+    not phrasing - the same normalization discipline crewAI's pr-title.yml
+    applies before matching a PR title against a convention."""
+    lowered = _TITLE_PREFIX_RE.sub("", title.strip().lower())
+    return _NON_ALNUM_RE.sub(" ", lowered).strip()
+
+
+def _find_duplicate(
+    title: str,
+    candidates: list[tuple[str, int]],
+    threshold: float,
+) -> tuple[str, int] | None:
+    """Best match for ``title`` among (title, issue_number) candidates, or None."""
+    norm = normalize_title(title)
+    best: tuple[str, int] | None = None
+    best_ratio = 0.0
+    for cand_title, cand_num in candidates:
+        ratio = SequenceMatcher(None, norm, normalize_title(cand_title)).ratio()
+        if ratio >= threshold and ratio > best_ratio:
+            best, best_ratio = (cand_title, cand_num), ratio
+    return best
 
 
 def synthesize(
     cfg: CoreConfig,
     *,
     cycle_index: int = 0,
+    repo_dir: str = ".",
     runner: Runner = run,
     ai_runner: Runner = run,
 ) -> SynthesisResult:
-    """Run one synthesis pass and file the resulting tickets."""
+    """Run one synthesis pass and file the resulting tickets.
+
+    Before filing, every candidate is checked against a normalized-title
+    dedupe: existing open AND closed GitHub issues, plus any non-``proposed``
+    practice in the registry (already adopted or rejected). A match above
+    ``synthesis.dedupe_threshold`` (default 0.85) is skipped, not filed, and
+    recorded in the result rather than silently dropped. Each ticket actually
+    filed gets a ``proposed`` practice note linked to its ticket number.
+    """
     repos = pick_rotation(cfg, cycle_index)
     pack = build_context_pack(repos, runner=runner)
+    registry = PracticeRegistry(repo_dir)
     tier = cfg.synthesis.get("tier", "heavy")
     model = cfg.tiers[tier].model if tier in cfg.tiers else cfg.tiers[cfg.default_tier].model
     choice = ModelChoice(
@@ -183,7 +256,7 @@ def synthesize(
         strategy="synthesis-v1",
     )
     ares = run_agent(
-        build_prompt(cfg, pack), choice, cfg,
+        build_prompt(cfg, pack, registry), choice, cfg,
         timeout=float(cfg.synthesis.get("timeout_seconds", 2400)),
         runner=ai_runner,
     )
@@ -191,12 +264,36 @@ def synthesize(
         return SynthesisResult(ok=False, studied=repos, filed=[], error=ares.error[:500])
 
     specs = parse_ticket_specs(ares.output)
+
+    existing_issues = github.list_issues(cfg.repo_slug, state="all", limit=200, runner=runner)
+    candidates: list[tuple[str, int]] = [(i.title, i.number) for i in existing_issues]
+    candidates += [(r.title, r.ticket or 0) for r in registry.non_proposed()]
+    threshold = float(cfg.synthesis.get("dedupe_threshold", DEFAULT_DEDUPE_THRESHOLD))
+
     filed: list[int] = []
+    skipped: list[SkippedSpec] = []
     for spec in specs:
+        match = _find_duplicate(spec.title, candidates, threshold)
+        if match is not None:
+            skipped.append(
+                SkippedSpec(title=spec.title, matched_title=match[0], matched_issue=match[1])
+            )
+            continue
         num = github.create_issue(
             cfg.repo_slug, spec.title, spec.render(), spec.all_labels(), runner=runner
         )
         if num:
             filed.append(num)
-    return SynthesisResult(ok=bool(filed), studied=repos, filed=filed,
-                           error="" if specs else "no parseable ticket specs in output")
+            registry.write(
+                Practice(
+                    title=spec.title,
+                    source_repo=", ".join(repos),
+                    summary=spec.synthesis_rationale or spec.problem,
+                    status="proposed",
+                    ticket=num,
+                )
+            )
+    return SynthesisResult(
+        ok=bool(filed), studied=repos, filed=filed, skipped=skipped,
+        error="" if specs else "no parseable ticket specs in output",
+    )

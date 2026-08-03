@@ -14,6 +14,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 from .config import CoreConfig
+from .practices import PracticeRegistry
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _TAG_RE = re.compile(r"^\s*-\s+(\S.*)$", re.MULTILINE)
@@ -100,14 +101,16 @@ class KnowledgeBase:
         lessons_dir: str = "knowledge/lessons",
         whitepapers_dir: str = "knowledge/whitepapers",
         mocs_dir: str = "knowledge/MOCs",
+        practices_dir: str = "knowledge/practices",
         whitepaper_every: int = 10,
     ) -> None:
         self.root = Path(root)
         self.lessons_dir = self.root / lessons_dir
         self.whitepapers_dir = self.root / whitepapers_dir
         self.mocs_dir = self.root / mocs_dir
+        self.practices_dir = self.root / practices_dir
         self.whitepaper_every = whitepaper_every
-        for d in (self.lessons_dir, self.whitepapers_dir, self.mocs_dir):
+        for d in (self.lessons_dir, self.whitepapers_dir, self.mocs_dir, self.practices_dir):
             d.mkdir(parents=True, exist_ok=True)
 
     @classmethod
@@ -118,7 +121,13 @@ class KnowledgeBase:
             lessons_dir=k.get("lessons_dir", "knowledge/lessons"),
             whitepapers_dir=k.get("whitepapers_dir", "knowledge/whitepapers"),
             mocs_dir=k.get("mocs_dir", "knowledge/MOCs"),
+            practices_dir=k.get("practices_dir", "knowledge/practices"),
             whitepaper_every=int(k.get("whitepaper_every_lessons", 10)),
+        )
+
+    def _practice_registry(self) -> PracticeRegistry:
+        return PracticeRegistry(
+            self.root, practices_dir=self.practices_dir.relative_to(self.root).as_posix()
         )
 
     # --- writing --------------------------------------------------------------
@@ -254,6 +263,7 @@ class KnowledgeBase:
         written = [
             self._write_lessons_moc(),
             self._write_whitepapers_moc(),
+            self._write_practices_moc(),
             self._write_root_moc(),
         ]
         return written
@@ -366,10 +376,38 @@ Periodic syntheses of accumulated lessons. Total: **{len(notes)}**.
         path.write_text(content)
         return path
 
+    def _write_practices_moc(self) -> Path:
+        records = self._practice_registry().read_all()
+        fm = self._frontmatter(("moc", "practices"), {"updated": _today()})
+        groups: dict[str, list] = {}
+        for r in records:
+            groups.setdefault(r.status, []).append(r)
+        sections = []
+        for status in ("proposed", "adopted", "rejected", "superseded"):
+            recs = groups.get(status, [])
+            links = "\n".join(f"- [[{r.note_name}]]" for r in recs) or "- _(none)_"
+            sections.append(f"## {status.capitalize()} ({len(recs)})\n{links}")
+        body = "\n\n".join(sections)
+        content = f"""{fm}
+
+# Practices MOC
+
+Up: [[Knowledge Base MOC]]
+
+Durable record of practices extracted from the reference set (G1) and whether
+they were adopted, rejected, or remain proposed. Total: **{len(records)}**.
+
+{body}
+"""
+        path = self.mocs_dir / "Practices MOC.md"
+        path.write_text(content)
+        return path
+
     def _write_root_moc(self) -> Path:
         fm = self._frontmatter(("moc", "index"), {"updated": _today()})
         n_lessons = len(self.lesson_notes())
         n_papers = len(self.whitepaper_notes())
+        n_practices = len(self._practice_registry().notes())
         content = f"""{fm}
 
 # Knowledge Base MOC
@@ -380,6 +418,7 @@ vault and use the graph view to explore how lessons connect.
 ## Maps
 - [[Lessons MOC]] - {n_lessons} lesson(s)
 - [[Whitepapers MOC]] - {n_papers} whitepaper(s)
+- [[Practices MOC]] - {n_practices} practice(s)
 
 ## How this is maintained
 - Each PR the [[hsai]] loop opens contributes exactly one lesson.
