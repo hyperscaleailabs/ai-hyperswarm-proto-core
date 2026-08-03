@@ -1,6 +1,11 @@
+import re
+
 from hsai import cli as cli_module
 from hsai.cli import build_parser, main
 from hsai.repro import ReproResult
+
+# "  <score>  <note-name>  [<outcome>]"
+_RANKED_LINE = re.compile(r"^\s+\d+\.\d+\s+\S+\s+\[\w+\]$", re.MULTILINE)
 
 
 def test_parser_loop_args():
@@ -25,6 +30,29 @@ def test_status_command_returns_zero(capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert "hyperscaleailabs/ai-hyperswarm-proto-core" in out
+
+
+def test_recall_command_ranks_notes_and_exits_zero(capsys):
+    """Acceptance: `hsai recall "ci divergence"` on the repo's own corpus."""
+    rc = main(["recall", "ci divergence"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "query: 'ci divergence'" in out
+    assert _RANKED_LINE.search(out), out  # ranked note names with scores
+
+
+def test_recall_command_surfaces_the_ci_parity_lesson(capsys):
+    rc = main(["recall", "workflow edits diverged local and remote CI", "-k", "3"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "2026-07-26-loop-reliability-retry-and-ci-parity" in out
+
+
+def test_recall_command_handles_a_query_that_matches_nothing(capsys):
+    rc = main(["recall", "zzzqqq nonmatching gibberish"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "no notes matched" in out
 
 
 def test_parser_repro_check_defaults():

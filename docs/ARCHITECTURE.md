@@ -15,6 +15,7 @@ so the decision logic stays pure and unit-tested.
 | `hsai.github` | tickets, labels, PRs, merge | gh |
 | `hsai.ci` | local CI gate (ruff+pytest) + remote status | subprocess |
 | `hsai.knowledge` | lessons, whitepapers, MOC reindex (Obsidian) | write files |
+| `hsai.recall` | BM25 retrieval over past notes (pure stdlib) | none (pure) |
 | `hsai.orchestrator` | one iteration; `decide_path`, `build_pr_body` (pure) | composes above |
 | `hsai.swarm` | run N iterations concurrently | threads |
 | `hsai.cli` | `hsai` entry point | - |
@@ -33,6 +34,7 @@ sequenceDiagram
     O->>G: sync_main + create_worktree
     O->>C: run_local (CI before)
     O->>H: claim ticket (heal / implement / improve)
+    O->>K: recall (BM25 over prior lessons) -> prompt block
     O->>A: run_agent(prompt, model choice)
     A-->>O: ok / error
     O->>C: run_local (CI after)

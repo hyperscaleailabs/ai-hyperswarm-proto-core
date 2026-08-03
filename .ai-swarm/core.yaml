@@ -173,6 +173,10 @@ knowledge:
   templates_dir: knowledge/templates
   whitepaper_every_lessons: 10       # synthesize a whitepaper every N new lessons
   obsidian_ready: true               # wikilinks + committed .obsidian config
+  # Recall: lessons are retrieved (BM25, local, no metered call) back into the
+  # worker and synthesis prompts so the loop stops forgetting its own postmortems.
+  recall_k: 3                        # notes injected per prompt
+  recall_char_budget: 2000           # hard cap on the injected block
 
 # Ranked snapshot pinned on 2026-07-25. Criteria: >= 10k stars, permissive
 # license (MIT or Apache-2.0), quality README, relevance to swarm / multi-agent.

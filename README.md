@@ -60,12 +60,20 @@ knowledge/
 
 `hsai reindex` rebuilds the MOCs from what is on disk.
 
+The vault is **read back, not just written to**: before each iteration the notes
+most relevant to the ticket are retrieved (local BM25, no dependency and no
+metered call) and injected into the worker and synthesis prompts, and the notes
+that were recalled are named in the lesson and the PR body. Inspect the index
+with `hsai recall "<query>"`; tune it via `knowledge.recall_k` and
+`knowledge.recall_char_budget` in `core.yaml`.
+
 ## Quickstart
 
 ```bash
 pip install -e ".[dev]"
 hsai status        # config + invariants
 hsai doctor        # verify subscription-only guard + environment
+hsai recall "ci divergence"   # what the repo already learned about a topic
 hsai loop --dry-run   # a full iteration with no side effects
 hsai loop          # one real iteration (opens & merges a PR on green)
 hsai loop --max-parallel 3 -n 1   # ramp to the swarm (after proving one iteration)

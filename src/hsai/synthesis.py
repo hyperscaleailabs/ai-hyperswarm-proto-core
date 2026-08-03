@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from . import github
 from .ai import run_agent
 from .config import CoreConfig
+from .knowledge import recall_for
 from .models import ModelChoice
 from .proc import Runner, run
 from .tickets import TicketSpec
@@ -86,13 +87,23 @@ def build_context_pack(
     return ContextPack(repos=repos, sections=sections)
 
 
-def build_prompt(cfg: CoreConfig, pack: ContextPack) -> str:
+def _recall_query(cfg: CoreConfig, pack: ContextPack) -> str:
+    """What the planner is about to reason about, as a retrieval query."""
+    goals = " ".join(f"{g.get('title', '')} {g.get('description', '')}" for g in cfg.goals)
+    return f"{cfg.mission} {goals} {' '.join(pack.repos)}"
+
+
+def build_prompt(cfg: CoreConfig, pack: ContextPack, *, repo_dir: str = ".") -> str:
     goals = "\n".join(f"- {g.get('id')}: {g.get('title')} - {g.get('description', '')}"
                       for g in cfg.goals)
     ideas = int(cfg.synthesis.get("ideas_target", 10))
     top = int(cfg.synthesis.get("file_top", 3))
     combine = int(cfg.synthesis.get("min_projects_combined", 3))
-    return f"""You are the SYNTHESIS planner for ai-hyperswarm-proto-core, an
+    # Feed the knowledge base forward: the planner should see what the loop has
+    # already learned rather than re-deriving (or re-proposing) it.
+    prior = recall_for(cfg, repo_dir, _recall_query(cfg, pack)).block
+    prior_section = f"\n{prior}\n" if prior else ""
+    return f"""{prior_section}You are the SYNTHESIS planner for ai-hyperswarm-proto-core, an
 autonomous self-improving AI-swarm harness. Your job is NOT to copy one idea
 from one project, but to COMBINE practices across projects into substantial,
 creative improvements for THIS codebase (a Python CLI orchestrator: worktrees,
