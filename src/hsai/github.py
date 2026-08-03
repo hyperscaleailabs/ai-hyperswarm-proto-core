@@ -38,6 +38,7 @@ class Issue:
     labels: tuple[str, ...]
     assignees: tuple[str, ...]
     body: str = ""
+    state: str = "OPEN"
 
     def priority_rank(self) -> int:
         for i, lbl in enumerate(PRIORITY_LABELS):
@@ -48,6 +49,10 @@ class Issue:
     @property
     def is_blocked(self) -> bool:
         return "blocked" in self.labels
+
+    @property
+    def closed(self) -> bool:
+        return self.state.upper() == "CLOSED"
 
     def attempts(self) -> int:
         """Read the current retry count from an ``attempts:N`` label (0 if none)."""
@@ -104,13 +109,15 @@ def create_issue(
     return _parse_issue_number(p.stdout)
 
 
-def list_open_issues(repo: str, *, runner: Runner = run) -> list[Issue]:
-    """List open issues, highest priority first."""
+def list_issues(
+    repo: str, *, state: str = "open", limit: int = 100, runner: Runner = run
+) -> list[Issue]:
+    """List issues in ``state`` ('open' | 'closed' | 'all'), unsorted."""
     p = _gh(
         [
-            "issue", "list", "--repo", repo, "--state", "open",
-            "--limit", "100",
-            "--json", "number,title,labels,assignees,body",
+            "issue", "list", "--repo", repo, "--state", state,
+            "--limit", str(limit),
+            "--json", "number,title,labels,assignees,body,state",
         ],
         runner=runner,
     )
@@ -118,16 +125,22 @@ def list_open_issues(repo: str, *, runner: Runner = run) -> list[Issue]:
         data = json.loads(p.stdout or "[]")
     except json.JSONDecodeError:
         return []
-    issues = [
+    return [
         Issue(
             number=item["number"],
             title=item.get("title", ""),
             labels=tuple(lb["name"] for lb in item.get("labels", [])),
             assignees=tuple(a["login"] for a in item.get("assignees", [])),
             body=item.get("body", "") or "",
+            state=item.get("state", "OPEN"),
         )
         for item in data
     ]
+
+
+def list_open_issues(repo: str, *, runner: Runner = run) -> list[Issue]:
+    """List open issues, highest priority first."""
+    issues = list_issues(repo, state="open", limit=100, runner=runner)
     issues.sort(key=lambda i: (i.priority_rank(), i.number))
     return issues
 
@@ -171,7 +184,7 @@ def get_issue(repo: str, number: int, *, runner: Runner = run) -> Issue | None:
     p = _gh(
         [
             "issue", "view", str(number), "--repo", repo,
-            "--json", "number,title,labels,assignees,body",
+            "--json", "number,title,labels,assignees,body,state",
         ],
         runner=runner,
     )
@@ -187,6 +200,7 @@ def get_issue(repo: str, number: int, *, runner: Runner = run) -> Issue | None:
         labels=tuple(lb["name"] for lb in item.get("labels", [])),
         assignees=tuple(a["login"] for a in item.get("assignees", [])),
         body=item.get("body", "") or "",
+        state=item.get("state", "OPEN"),
     )
 
 

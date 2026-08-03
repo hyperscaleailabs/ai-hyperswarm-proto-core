@@ -79,3 +79,20 @@ def test_brief_cost_note_when_no_ledger_records():
     cfg = load_config()
     body = render_brief(cfg, BlockReport(cycle_index=7))
     assert "_no ledger records for this block_" in body
+
+
+def test_brief_surfaces_synthesis_skips():
+    cfg = load_config()
+    report = BlockReport(
+        cycle_index=7,
+        synthesis_skipped=["'feat: dupe' (matches issue #13: 'feat: dupe')"],
+    )
+    body = render_brief(cfg, report)
+    assert "## Synthesis skipped (deduped against issues/practices)" in body
+    assert "matches issue #13" in body
+
+
+def test_brief_synthesis_skips_default_note_when_none():
+    cfg = load_config()
+    body = render_brief(cfg, BlockReport(cycle_index=7))
+    assert "no candidate matched an existing issue or decided practice" in body
