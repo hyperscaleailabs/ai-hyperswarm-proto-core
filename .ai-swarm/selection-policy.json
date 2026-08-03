@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "notes": "heuristic-v1's original constants, lifted verbatim out of models.py. Bumped only by `hsai calibrate`, which may move a threshold by at most one step per calibration and may never increase heavy-tier share.",
+  "heavy_threshold": 5,
+  "light_threshold": -3,
+  "heavy_signal_weight": 2,
+  "light_signal_weight": -2,
+  "narrow_docs_delta": -1,
+  "file_buckets": [
+    [
+      8,
+      3
+    ],
+    [
+      4,
+      1
+    ],
+    [
+      2,
+      0
+    ],
+    [
+      0,
+      -1
+    ]
+  ],
+  "kind_weights": {
+    "heal": 2,
+    "improve": 1
+  },
+  "heavy_signals": [
+    "architecture",
+    "redesign",
+    "large refactor",
+    "rearchitect",
+    "hard bug",
+    "race condition",
+    "concurrency",
+    "security",
+    "design",
+    "migration",
+    "refactor",
+    "breaking"
+  ],
+  "light_signals": [
+    "typo",
+    "docs",
+    "documentation",
+    "readme",
+    "format",
+    "lint",
+    "rename",
+    "comment",
+    "index",
+    "chore",
+    "bump",
+    "whitespace"
+  ]
+}

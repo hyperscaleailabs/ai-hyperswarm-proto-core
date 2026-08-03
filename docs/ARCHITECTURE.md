@@ -9,7 +9,9 @@ so the decision logic stays pure and unit-tested.
 | --- | --- | --- |
 | `hsai.config` | load & validate `.ai-swarm/core.yaml` | read file |
 | `hsai.proc` | one subprocess wrapper (`run`) + `Runner` type | subprocess |
-| `hsai.models` | task → model-tier selection (heuristic-v0) | none (pure) |
+| `hsai.models` | task → model-tier selection (heuristic-v2) | none (pure) |
+| `hsai.policy` | versioned `SelectionPolicy` = the tunable half of selection | read/write JSON |
+| `hsai.calibrate` | replay ledger×lessons → bounded policy proposal + report | read ledger, write report |
 | `hsai.ai` | drive `claude -p`; enforce subscription-only | subprocess, env |
 | `hsai.gitops` | worktrees, sync, branch, commit, push | git |
 | `hsai.github` | tickets, labels, PRs, merge | gh |

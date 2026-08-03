@@ -20,6 +20,8 @@ _TAG_RE = re.compile(r"^\s*-\s+(\S.*)$", re.MULTILINE)
 _FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
 _TITLE_RE = re.compile(r"^# (.+)$", re.MULTILINE)
 _SECTION_RE = re.compile(r"^## (.+)$", re.MULTILINE)
+# The `| field | value |` block a lesson renders under its title.
+_FIELD_ROW_RE = re.compile(r"^\|\s*([^|]+?)\s*\|\s*(.*?)\s*\|\s*$", re.MULTILINE)
 _WORD_RE = re.compile(r"[a-zA-Z][a-zA-Z-]{3,}")
 _STOPWORDS = {
     "this", "that", "with", "from", "have", "been", "were", "will", "which",
@@ -36,6 +38,16 @@ _STOPWORDS = {
 
 def slugify(text: str) -> str:
     return _SLUG_RE.sub("-", text.lower()).strip("-") or "untitled"
+
+
+def _as_int(value: str | None) -> int | None:
+    """Read an int out of a lesson table cell: '103' / '#44' / '_(none)_' -> None."""
+    if not value:
+        return None
+    try:
+        return int(re.sub(r"[^0-9-]", "", value))
+    except ValueError:
+        return None
 
 
 def _today() -> str:
@@ -66,7 +78,11 @@ class Lesson:
 
 @dataclass
 class LessonRecord:
-    """A lesson as parsed back off disk - the read-side counterpart of `Lesson`."""
+    """A lesson as parsed back off disk - the read-side counterpart of `Lesson`.
+
+    ``iteration`` and ``ticket`` are the join key the quota ledger shares, so
+    :mod:`hsai.calibrate` can pair an iteration's cost with its outcome.
+    """
 
     note_name: str
     title: str
@@ -75,6 +91,10 @@ class LessonRecord:
     tags: tuple[str, ...]
     lesson_text: str
     what_happened: str = ""
+    iteration: int = 0
+    ticket: int | None = None
+    model: str = ""
+    remote_ci: str = ""
 
 
 @dataclass
@@ -158,6 +178,7 @@ class KnowledgeBase:
         title_match = _TITLE_RE.search(text)
         title = title_match.group(1).strip() if title_match else note_name
         sections = self._split_sections(text)
+        fields = self._field_table(text)
         return LessonRecord(
             note_name=note_name,
             title=title,
@@ -166,7 +187,22 @@ class KnowledgeBase:
             tags=tags,
             lesson_text=sections.get("lesson learned", ""),
             what_happened=sections.get("what happened", ""),
+            iteration=_as_int(fields.get("iteration")) or 0,
+            ticket=_as_int(fields.get("ticket")),
+            model=fields.get("model", ""),
+            remote_ci=fields.get("remote ci", ""),
         )
+
+    @staticmethod
+    def _field_table(text: str) -> dict[str, str]:
+        """Parse the lesson's `| field | value |` table into a plain dict."""
+        fields: dict[str, str] = {}
+        for key, value in _FIELD_ROW_RE.findall(text):
+            key = key.strip().lower()
+            if key in ("field", "---"):  # header + separator rows
+                continue
+            fields[key] = value.strip().strip("`*").strip()
+        return fields
 
     @staticmethod
     def _split_sections(text: str) -> dict[str, str]:

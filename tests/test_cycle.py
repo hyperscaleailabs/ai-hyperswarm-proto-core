@@ -120,3 +120,51 @@ def test_block_soft_biases_then_hard_halts_but_inflight_merges(tmp_path, monkeyp
     assert len(lines) == 3
     for line in lines:
         json.loads(line)
+
+    # The block closed the loop back into model selection: with no lessons to
+    # join against, the calibrator must decline out loud rather than tune.
+    assert "declined to tune" in res.report.calibration
+    assert "insufficient data: policy unchanged" in res.report.calibration
+    assert "## Model selection (calibration)" in brief
+    assert "declined to tune" in brief
+    report_dir = tmp_path / "knowledge" / "reports"
+    assert list(report_dir.glob("selection-calibration-*.md")), "a dated report is always written"
+    # Declining means declining: the block never rewrites the policy file.
+    assert not (tmp_path / ".ai-swarm" / "selection-policy.json").exists()
+
+
+class _PRRunner:
+    """Captures the governance PR body while answering git/gh calls."""
+
+    def __init__(self) -> None:
+        self.pr_bodies: list[str] = []
+        self._issue = 700
+
+    def __call__(self, cmd, *, cwd=None, env=None, timeout=None, input_text=None) -> Proc:
+        cmd = list(cmd)
+        if cmd[:2] == ["git", "status"]:
+            return Proc(cmd, 0, " M knowledge/reports/selection-calibration.md", "")
+        if cmd[:3] == ["gh", "issue", "create"]:
+            self._issue += 1
+            return Proc(cmd, 0, f"https://github.com/o/r/issues/{self._issue}\n", "")
+        if cmd[:3] == ["gh", "pr", "create"]:
+            self.pr_bodies.append(cmd[cmd.index("--body") + 1])
+            return Proc(cmd, 0, "https://github.com/o/r/pull/321\n", "")
+        return Proc(cmd, 0, "", "")
+
+
+def test_governance_pr_states_the_calibration_verdict(tmp_path):
+    """Either a bounded policy diff rides along, or the PR says why it declined."""
+    cfg = load_config()
+    runner = _PRRunner()
+    report = cycle.BlockReport(
+        cycle_index=3,
+        calibration="selection calibration: declined to tune - insufficient data: policy unchanged",
+    )
+
+    pr = cycle._governance_pr(cfg, report, repo_root=tmp_path, runner=runner)
+
+    assert pr == 321
+    body = runner.pr_bodies[-1]
+    assert "## Model selection (calibration)" in body
+    assert "declined to tune" in body

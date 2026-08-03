@@ -1,13 +1,23 @@
 """Task -> model-size selection.
 
-This is a first-class, deliberately-learnable capability (heuristic-v1). The
+This is a first-class, deliberately-learnable capability (heuristic-v2). The
 orchestrator asks :func:`select` which model to run for a given task; the
 returned :class:`ModelChoice` is recorded on the PR for auditability.
 
 The heuristic combines:
 - Keyword signals (architecture, security, docs, etc.)
 - Task structure (files touched, kind: heal/implement/improve)
-- Learned thresholds calibrated over multiple iterations
+- Thresholds that are now *data*: every weight, bucket and threshold lives in
+  the versioned :class:`~hsai.policy.SelectionPolicy` committed at
+  ``.ai-swarm/selection-policy.json`` and is calibrated against the quota ledger
+  by ``hsai calibrate``.
+
+Two surfaces, kept apart on purpose:
+- **Tunable** - the policy file. A calibration may move it, bounded and
+  reviewable as a JSON diff in the governance PR.
+- **Invariant** - the ``size:L``/``size:M`` overrides, the
+  "feature-shaped work never routes light" guard, and the budget-gate demotion.
+  These are enforced here, below the policy, and no calibration can reach them.
 
 Evidence-based and intentionally auditable so improvements can be tracked
 via backlog skills rather than hidden magic.
@@ -22,36 +32,20 @@ import re
 from dataclasses import dataclass
 
 from .config import CoreConfig
+from .policy import SelectionPolicy, load_policy
 
-# Signal words weighted by complexity impact.
-_HEAVY_SIGNALS = (
-    "architecture",
-    "redesign",
-    "large refactor",
-    "rearchitect",
-    "hard bug",
-    "race condition",
-    "concurrency",
-    "security",
-    "design",
-    "migration",
-    "refactor",
-    "breaking",
-)
-_LIGHT_SIGNALS = (
-    "typo",
-    "docs",
-    "documentation",
-    "readme",
-    "format",
-    "lint",
-    "rename",
-    "comment",
-    "index",
-    "chore",
-    "bump",
-    "whitespace",
-)
+STRATEGY = "heuristic-v2"
+
+# INVARIANT (not tunable): the light tier is reserved for genuinely mechanical,
+# narrow edits. A haiku worker once "completed" a feature ticket with a
+# code-free diff - broad or feature-shaped work never routes light again.
+LIGHT_MAX_FILES = 2
+
+# INVARIANT (not tunable): synthesis-planner size labels outrank keyword scoring.
+SIZE_L_LABEL = "size:L"
+SIZE_M_LABEL = "size:M"
+
+_NARROW_DOCS_RE = re.compile(r"\b(doc|docs|readme|comment)\b")
 
 
 @dataclass(frozen=True)
@@ -70,33 +64,33 @@ class ModelChoice:
     tier: str
     model: str
     rationale: str
-    strategy: str = "heuristic-v1"
+    strategy: str = STRATEGY
 
 
-def _score(task: Task) -> int:
+def _score(task: Task, policy: SelectionPolicy | None = None) -> int:
     """Complexity score: positive => heavier, negative => lighter.
 
     Combines keyword signals, structural signals, and task kind into a
-    unified score. Calibrated to distinguish light/standard/heavy across
-    a range of task types.
+    unified score using ``policy``'s weights (heuristic-v1's values by default).
 
-    Score ranges (see thresholds in select()):
-    - [-inf, -3]: Light tasks (docs, trivial edits, formatting)
-    - (-3, 5): Standard tasks (features, small bugfixes, simple refactors)
-    - [5, inf]: Heavy tasks (architecture, hard bugs, migrations)
+    Score ranges (see the policy's thresholds, applied in :func:`decide_tier`):
+    - at or below ``light_threshold``: light tasks (docs, trivial edits)
+    - between the thresholds: standard tasks (features, small bugfixes)
+    - at or above ``heavy_threshold``: heavy tasks (architecture, hard bugs)
     """
+    p = policy or load_policy()
     text = f"{task.title}\n{task.body}\n{' '.join(task.labels)}".lower()
     score = 0
 
     # Keyword-based signals: moderate weight to allow structural signals
     # to shift the tier in edge cases.
-    for w in _HEAVY_SIGNALS:
+    for w in p.heavy_signals:
         if w in text:
-            score += 2
+            score += p.heavy_signal_weight
 
-    for w in _LIGHT_SIGNALS:
+    for w in p.light_signals:
         if w in text:
-            score -= 2
+            score += p.light_signal_weight
 
     # Structural signals: file count is a strong proxy for complexity.
     # Calibrated from observed patterns:
@@ -104,62 +98,64 @@ def _score(task: Task) -> int:
     # - 2-3 files are standard (typical feature/bugfix)
     # - 4-7 files indicate refactor or moderate redesign
     # - 8+ files suggest architectural change or large refactor
-    if task.est_files >= 8:
-        score += 3
-    elif task.est_files >= 4:
-        score += 1
-    elif task.est_files >= 2:
-        score += 0
-    else:
-        score -= 1
+    score += p.file_delta(task.est_files)
 
     # Task kind: heal (failing CI) requires careful reasoning.
-    if task.kind == "heal":
-        score += 2
-    elif task.kind == "improve":
-        score += 1
+    score += p.kind_weight(task.kind)
 
     # Context-aware adjustment: narrow docs tasks (single file) bump down.
-    if re.search(r"\b(doc|docs|readme|comment)\b", text) and task.est_files <= 1:
-        score -= 1
+    if _NARROW_DOCS_RE.search(text) and task.est_files <= 1:
+        score += p.narrow_docs_delta
 
     return score
 
 
-def select(task: Task, cfg: CoreConfig, *, demote: bool = False) -> ModelChoice:
+def decide_tier(
+    task: Task, policy: SelectionPolicy, *, default_tier: str = "standard"
+) -> tuple[int, str, str]:
+    """Pure tier decision: ``(score, tier, why)``.
+
+    The single code path for routing - :func:`select` uses it for live work and
+    :mod:`hsai.calibrate` replays historical work through it, so a proposed
+    policy is always evaluated under the same invariants that will enforce it.
+    """
+    score = _score(task, policy)
+
+    # Size labels (set by the synthesis planner) override keyword scoring:
+    # substantial tickets must never fall to the light tier. INVARIANT.
+    if SIZE_L_LABEL in task.labels:
+        return score, "heavy", "size:L label - large synthesized change"
+    if SIZE_M_LABEL in task.labels:
+        return score, default_tier, "size:M label - substantial synthesized change"
+
+    # Tier thresholds; tunable via the policy file, calibrated against the ledger.
+    if score >= policy.heavy_threshold:
+        return score, "heavy", "high-complexity signals (architecture, hard bug, large refactor)"
+    if score <= policy.light_threshold and task.est_files <= LIGHT_MAX_FILES:
+        return score, "light", "low-complexity signals (docs, format, mechanical edit)"
+    return score, default_tier, "no strong signal; using default tier"
+
+
+def select(
+    task: Task,
+    cfg: CoreConfig,
+    *,
+    demote: bool = False,
+    policy: SelectionPolicy | None = None,
+) -> ModelChoice:
     """Pick a tier for ``task`` and resolve it to a concrete model alias.
 
-    Thresholds calibrated to reflect observed task complexity distribution:
-    - Heavy (>= 5): Architecture, migrations, hard bugs, large refactors
-    - Light (<= -3): Docs, formatting, trivial edits, chores
-    - Standard: Everything else (features, small bugfixes, simple refactors)
+    Thresholds come from the active :class:`~hsai.policy.SelectionPolicy`
+    (``.ai-swarm/selection-policy.json``); the version that produced the routing
+    is reported in :attr:`ModelChoice.strategy` and lands in the PR body.
 
     ``demote`` biases the choice one tier cheaper (heavy->standard->light). The
     budget gate sets it on a soft breach so a block that is burning quota keeps
-    making progress on cheaper tiers instead of halting outright.
+    making progress on cheaper tiers instead of halting outright. INVARIANT: the
+    demotion path is enforced here, outside the tunable policy surface.
     """
-    score = _score(task)
-
-    # Size labels (set by the synthesis planner) override keyword scoring:
-    # substantial tickets must never fall to the light tier.
-    if "size:L" in task.labels:
-        tier, why = "heavy", "size:L label - large synthesized change"
-    elif "size:M" in task.labels:
-        tier, why = cfg.default_tier, "size:M label - substantial synthesized change"
-    # Tier thresholds; calibrated by iterating and comparing against
-    # actual task complexity over multiple runs.
-    elif score >= 5:
-        tier = "heavy"
-        why = "high-complexity signals (architecture, hard bug, large refactor)"
-    elif score <= -3 and task.est_files <= 2:
-        # Light tier is reserved for genuinely mechanical, narrow edits. A
-        # haiku worker once "completed" a feature ticket with a code-free
-        # diff - broad or feature-shaped work never routes light again.
-        tier = "light"
-        why = "low-complexity signals (docs, format, mechanical edit)"
-    else:
-        tier = cfg.default_tier
-        why = "no strong signal; using default tier"
+    p = policy or load_policy()
+    score, tier, why = decide_tier(task, p, default_tier=cfg.default_tier)
 
     # Soft budget breach: bias one tier cheaper so the block keeps progressing
     # without burning more heavy-tier quota.
@@ -177,4 +173,6 @@ def select(task: Task, cfg: CoreConfig, *, demote: bool = False) -> ModelChoice:
 
     model = cfg.tiers[tier].model
     rationale = f"score={score} -> {tier} ({why})"
-    return ModelChoice(tier=tier, model=model, rationale=rationale, strategy="heuristic-v1")
+    return ModelChoice(
+        tier=tier, model=model, rationale=rationale, strategy=f"{STRATEGY} ({p.label()})"
+    )

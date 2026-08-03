@@ -6,6 +6,7 @@ Commands:
   hsai status                                                  config + backlog snapshot
   hsai reindex                                                 rebuild knowledge MOCs
   hsai doctor                                                  verify environment + invariants
+  hsai calibrate [--dry-run]                                   replay the ledger into a policy
 """
 from __future__ import annotations
 
@@ -122,6 +123,32 @@ def cmd_repro_check(args: argparse.Namespace) -> int:
     return 0 if result.ok else 1
 
 
+def cmd_calibrate(args: argparse.Namespace) -> int:
+    """Replay the quota ledger against lesson outcomes into a policy proposal.
+
+    Writes the dated report either way; only writes
+    ``.ai-swarm/selection-policy.json`` when a bounded proposal survives the
+    sample floors, the clamp and the heavy-share constraint (and not at all
+    under ``--dry-run``).
+    """
+    from .calibrate import run_calibration
+
+    cfg = _load(args)
+    res = run_calibration(cfg, repo_root=".", apply=not args.dry_run)
+    report = res.report
+    print(f"samples: {len(report.corpus.samples)} joined "
+          f"({report.corpus.unjoined_records} ledger record(s) without a lesson)")
+    for tier, st in report.stats.items():
+        print(f"  {tier:<9} n={st.n} success={st.success_rate:.0%} "
+              f"median={st.median_seconds:.0f}s retry={st.retry_rate:.0%}")
+    print(f"regret: {report.regret.summary()}")
+    print(f"verdict: {report.proposal.verdict}")
+    print(f"report: {res.report_path}")
+    if res.policy_path:
+        print(f"policy: wrote v{report.proposal.policy.version} to {res.policy_path}")
+    return 0
+
+
 def cmd_brief(args: argparse.Namespace) -> int:
     from .governance import write_direction
 
@@ -187,6 +214,15 @@ def build_parser() -> argparse.ArgumentParser:
     sy = sub.add_parser("synthesize", help="heavy-model synthesis: file substantial tickets")
     sy.add_argument("--index", type=int, default=0, help="rotation index for reference subset")
     sy.set_defaults(func=cmd_synthesize)
+
+    ca = sub.add_parser(
+        "calibrate", help="replay the quota ledger into a bounded selection-policy proposal"
+    )
+    ca.add_argument(
+        "--dry-run", action="store_true",
+        help="write the report but never the policy file",
+    )
+    ca.set_defaults(func=cmd_calibrate)
 
     br = sub.add_parser("brief", help="refresh governance/DIRECTION.md")
     br.set_defaults(func=cmd_brief)

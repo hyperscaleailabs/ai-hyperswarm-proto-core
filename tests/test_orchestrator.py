@@ -187,6 +187,22 @@ def test_build_pr_body_contains_traceability():
     assert "openai/swarm" in body
 
 
+def test_build_pr_body_records_the_policy_version_that_routed_it():
+    """G2: every PR must say which selection policy produced its routing."""
+    from hsai.config import load_config
+    from hsai.models import Task, select
+
+    cfg = load_config()
+    choice = select(Task(kind="implement", title="feat: add a queue", est_files=3), cfg)
+    body = build_pr_body(
+        ticket=42, choice=choice, lesson_note="2026-08-03-do-thing",
+        lesson_summary="kept it small", ci_summary="CI green",
+    )
+    model_section = body.split("## Model used", 1)[1].split("##", 1)[0]
+    assert "heuristic-v2" in model_section
+    assert "policy v" in model_section
+
+
 def test_build_pr_body_includes_phase_artifacts():
     choice = ModelChoice(tier="standard", model="sonnet", rationale="x")
     body = build_pr_body(

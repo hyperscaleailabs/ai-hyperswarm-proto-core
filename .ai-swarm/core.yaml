@@ -106,7 +106,8 @@ models:
       model: opus
       use_for: [architecture, hard-bug, large-refactor, design]
   default_tier: standard
-  selection_strategy: heuristic-v1   # improved over time; tracked as a backlog skill
+  selection_strategy: heuristic-v2   # scored selection over a versioned, calibrated policy
+  selection_policy: .ai-swarm/selection-policy.json  # the tunable surface; see calibration below
 
 # Governance: the architect steering loop (three streams).
 # Stream 1: steering  - DIRECTION.md + review briefs + /review-next sessions -> ADRs
@@ -142,6 +143,20 @@ budget:
   max_heavy_iterations_per_block: 3   # heavy-tier (opus) runs before halting new work
   max_seconds_per_block: 5400         # cumulative wall-clock across the block (90 min)
   soft_ratio: 0.8                     # fraction of a ceiling that triggers a soft breach
+
+# Closing the loop from the quota ledger back into model selection. `hsai
+# calibrate` joins ledger records to lesson outcomes, measures per-tier success
+# / wall-clock / retry rate, and may propose a BOUNDED bump of the selection
+# policy - never one that increases heavy-tier share, never more than
+# clamp_step on a threshold, and never at all below the sample floors. The
+# proposal lands as a reviewable JSON diff in the block's governance PR.
+calibration:
+  policy_file: .ai-swarm/selection-policy.json
+  report_dir: knowledge/reports       # dated, Obsidian-ready calibration notes
+  min_samples_per_tier: 8             # per-tier floor; below it that dimension is frozen
+  min_total_samples: 20               # corpus floor; below it nothing is tuned at all
+  clamp_step: 1                       # max move of a threshold/weight per calibration
+  min_gain: 0.02                      # ignore estimated gains smaller than this (noise)
 
 personas:                      # article targets generated from each whitepaper
   - id: cto

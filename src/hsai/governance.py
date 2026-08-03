@@ -45,6 +45,7 @@ class BlockReport:
     whitepaper: str = ""                                   # note name
     articles: list[str] = field(default_factory=list)      # file paths
     cost: BlockAggregate | None = None                     # quota-ledger aggregate
+    calibration: str = ""                                  # selection-policy verdict
     notes: list[str] = field(default_factory=list)
 
 
@@ -176,6 +177,9 @@ sequentially, records your feedback as ADRs, and ends with a merged PR.
 
 ## Cost this block (quota ledger)
 {cost}
+
+## Model selection (calibration)
+{report.calibration or "_calibration did not run for this block_"}
 
 ## Knowledge produced
 - Whitepaper: {paper}

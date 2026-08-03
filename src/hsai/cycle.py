@@ -142,7 +142,13 @@ def run_cycle(
     gitops.sync_main(cfg.default_branch, cwd=str(repo_root), runner=runner)
     runner(["git", "merge", "--ff-only", f"origin/{cfg.default_branch}"], cwd=str(repo_root))
 
-    # 4. Block whitepaper + persona articles + MOCs + DIRECTION refresh.
+    # 4. Selection calibration: replay this block's ledger against lesson
+    # outcomes. Either it proposes a bounded policy bump (which rides along in
+    # the governance PR as a reviewable selection-policy.json diff) or it says
+    # out loud why it declined.
+    report.calibration = _calibrate(cfg, repo_root=repo_root, notes=report.notes)
+
+    # 5. Block whitepaper + persona articles + MOCs + DIRECTION refresh.
     kb = KnowledgeBase.from_config(cfg, repo_root)
     if cfg.cycle.get("whitepaper_per_block", True) and kb.lesson_notes():
         paper = kb.synthesize_whitepaper(n=block)
@@ -154,12 +160,31 @@ def run_cycle(
     kb.reindex_mocs()
     write_direction(cfg, repo_root=repo_root, runner=runner)
 
-    # 5. Governance PR: ship the block artifacts through the same gate as code.
+    # 6. Governance PR: ship the block artifacts through the same gate as code.
     pr = _governance_pr(cfg, report, repo_root=repo_root, runner=runner)
 
-    # 6. Review issue - the architect's entrance for this block.
+    # 7. Review issue - the architect's entrance for this block.
     review = open_review_issue(cfg, report, runner=runner)
     return CycleResult(report=report, review_issue=review, governance_pr=pr)
+
+
+def _calibrate(cfg: CoreConfig, *, repo_root: Path, notes: list[str]) -> str:
+    """Run the selection calibrator; never let it break a block.
+
+    A calibration failure must not cost the block its whitepaper, brief or PR -
+    the loop degrades to "declined to tune" and records why.
+    """
+    from .calibrate import run_calibration
+
+    try:
+        res = run_calibration(cfg, repo_root=repo_root, apply=True)
+    except Exception as exc:  # noqa: BLE001 - a broken replay must not halt the block
+        note = f"selection calibration: skipped - {type(exc).__name__}: {exc}"
+        notes.append(note)
+        return note
+    note = res.report.governance_note()
+    notes.append(note)
+    return note
 
 
 def _governance_pr(
@@ -183,12 +208,14 @@ def _governance_pr(
         cwd=str(repo_root), runner=runner,
     )
     gitops.push_branch(branch, cwd=str(repo_root), runner=runner)
+    calibration = report.calibration or "_calibration did not run for this block_"
     pr = github.create_pr(
         cfg.repo_slug, branch,
         f"chore: governance artifacts for block {report.cycle_index}",
         f"Closes #{ticket}\n\n## Model used\n- `n/a` - deterministic block artifacts"
         f" (whitepaper/articles generated within the block)\n\n## CI\npre-flight local"
-        f"\n\n## Lesson learned\nBlock artifacts ship through the same gate as code.\n",
+        f"\n\n## Model selection (calibration)\n{calibration}\n"
+        f"\n## Lesson learned\nBlock artifacts ship through the same gate as code.\n",
         base=cfg.default_branch, runner=runner,
     )
     if pr:

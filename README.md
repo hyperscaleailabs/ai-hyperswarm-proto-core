@@ -39,11 +39,34 @@ against your Claude subscription quota. `hsai` strips `ANTHROPIC_API_KEY` from t
 child environment (and refuses to run if it cannot guarantee that), so the
 metered API is never touched. See `hsai doctor`.
 
-## Model-size selection (a learnable skill)
+## Model-size selection (a calibrated skill)
 
 The orchestrator picks a model *tier* per task - `light` (haiku) / `standard`
 (sonnet) / `heavy` (opus) - from complexity signals, and records the choice on
-the PR. Improving this heuristic is itself tracked as a backlog skill.
+the PR together with the policy version that produced it (`heuristic-v2 (policy
+v1)`).
+
+Every weight and threshold lives in the committed, versioned
+[`.ai-swarm/selection-policy.json`](.ai-swarm/selection-policy.json), so routing
+is reviewable data rather than hidden constants:
+
+```bash
+hsai calibrate            # replay the quota ledger against lesson outcomes
+hsai calibrate --dry-run  # report only; never touch the policy file
+```
+
+`hsai calibrate` joins `knowledge/ledger/iterations.jsonl` to the lessons on
+`(iteration, ticket)`, measures per-tier success rate / median wall-clock /
+retry rate plus a regret estimate, and writes a dated report to
+`knowledge/reports/`. It may propose a **bounded** policy bump - never one that
+increases heavy-tier share, never more than one clamp step, and never below the
+sample floors, where it says `insufficient data: policy unchanged` instead. Each
+half-day block runs it, so the governance PR either carries a reviewable
+`selection-policy.json` diff or states why it declined.
+
+The hard rules stay out of reach of any calibration: `size:L` routes heavy,
+`size:M` routes the default tier, feature-shaped work never routes light, and
+the budget gate's demotion is applied after the policy decides.
 
 ## The knowledge base is an Obsidian vault
 

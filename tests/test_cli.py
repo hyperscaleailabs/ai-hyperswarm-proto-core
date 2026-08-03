@@ -1,6 +1,10 @@
+from pathlib import Path
+
 from hsai import cli as cli_module
 from hsai.cli import build_parser, main
 from hsai.repro import ReproResult
+
+CORE_YAML = Path(__file__).resolve().parents[1] / ".ai-swarm" / "core.yaml"
 
 
 def test_parser_loop_args():
@@ -45,6 +49,29 @@ def test_repro_check_command_blocks_and_exits_nonzero(monkeypatch, capsys):
     assert rc == 1
     assert "BLOCKED" in out
     assert "blocked for testing" in out
+
+
+def test_parser_calibrate_defaults():
+    parser = build_parser()
+    args = parser.parse_args(["calibrate"])
+    assert args.command == "calibrate"
+    assert args.dry_run is False
+
+
+def test_calibrate_command_reports_and_writes_nothing_on_a_thin_corpus(tmp_path, monkeypatch, capsys):
+    """End to end in an empty repo: a report is written, the policy is not."""
+    monkeypatch.chdir(tmp_path)
+    rc = main(["--config", str(CORE_YAML), "calibrate", "--dry-run"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "samples: 0 joined" in out
+    assert "insufficient data: policy unchanged" in out
+    for tier in ("light", "standard", "heavy"):
+        assert tier in out
+    reports = list((tmp_path / "knowledge" / "reports").glob("selection-calibration-*.md"))
+    assert len(reports) == 1
+    assert not (tmp_path / ".ai-swarm" / "selection-policy.json").exists()
 
 
 def test_repro_check_command_passes_and_exits_zero(monkeypatch, capsys):

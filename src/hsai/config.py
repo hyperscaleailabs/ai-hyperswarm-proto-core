@@ -54,6 +54,7 @@ class CoreConfig:
     cycle: dict[str, Any]
     synthesis: dict[str, Any]
     budget: dict[str, Any]
+    calibration: dict[str, Any]
     personas: tuple[dict[str, Any], ...]
 
     # --- convenience accessors -------------------------------------------------
@@ -141,6 +142,7 @@ def load_config(path: str | Path | None = None) -> CoreConfig:
         cycle=data.get("cycle", {}),
         synthesis=data.get("synthesis", {}),
         budget=data.get("budget", {}),
+        calibration=data.get("calibration", {}),
         personas=tuple(data.get("personas", [])),
     )
 
