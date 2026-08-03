@@ -13,7 +13,9 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+from . import recall
 from .config import CoreConfig
+from .recall import DEFAULT_CHAR_BUDGET, DEFAULT_K
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _TAG_RE = re.compile(r"^\s*-\s+(\S.*)$", re.MULTILINE)
@@ -55,6 +57,7 @@ class Lesson:
     pr: int | None = None
     model: str = ""
     references: tuple[str, ...] = ()  # reference-set repos that informed the work
+    recalled: tuple[str, ...] = ()  # prior knowledge-base notes retrieved into the prompt
     tags: tuple[str, ...] = ()
     created: str = field(default_factory=_today)
     remote_ci: str = ""  # SUCCESS | FAILURE | TIMEOUT, filled in once gh checks conclude
@@ -148,24 +151,52 @@ class KnowledgeBase:
         """Parse every lesson note on disk back into structured records, oldest first."""
         return [self._parse_lesson(name) for name in self.lesson_notes()]
 
+    def read_whitepapers(self) -> list[LessonRecord]:
+        """Whitepapers in the same record shape as lessons, so both bodies of
+        knowledge can go into one :mod:`hsai.recall` index."""
+        return [
+            self._parse_note(
+                self.whitepapers_dir / f"{name}.md", kind="whitepaper", outcome="synthesis"
+            )
+            for name in self.whitepaper_notes()
+        ]
+
+    def recall(
+        self, query: str, *, k: int = DEFAULT_K, prefer_outcome: str = "fail"
+    ) -> list[tuple[LessonRecord, float]]:
+        """Rank every note on disk (lessons + whitepapers) against ``query``."""
+        corpus = [*self.read_lessons(), *self.read_whitepapers()]
+        return recall.recall(query, corpus, k=k, prefer_outcome=prefer_outcome)
+
     def _parse_lesson(self, note_name: str) -> LessonRecord:
-        text = (self.lessons_dir / f"{note_name}.md").read_text()
+        return self._parse_note(self.lessons_dir / f"{note_name}.md")
+
+    def _parse_note(
+        self, path: Path, *, kind: str | None = None, outcome: str | None = None
+    ) -> LessonRecord:
+        text = path.read_text()
         fm_match = _FRONTMATTER_RE.match(text)
         fm = fm_match.group(1) if fm_match else ""
         tags = tuple(m.group(1).strip() for m in _TAG_RE.finditer(fm))
-        outcome = next((t.split("/", 1)[1] for t in tags if t.startswith("outcome/")), "unknown")
-        kind = next((t.split("/", 1)[1] for t in tags if t.startswith("kind/")), "unknown")
         title_match = _TITLE_RE.search(text)
-        title = title_match.group(1).strip() if title_match else note_name
         sections = self._split_sections(text)
         return LessonRecord(
-            note_name=note_name,
-            title=title,
-            outcome=outcome,
-            kind=kind,
+            note_name=path.stem,
+            title=title_match.group(1).strip() if title_match else path.stem,
+            outcome=outcome
+            or next((t.split("/", 1)[1] for t in tags if t.startswith("outcome/")), "unknown"),
+            kind=kind
+            or next((t.split("/", 1)[1] for t in tags if t.startswith("kind/")), "unknown"),
             tags=tags,
-            lesson_text=sections.get("lesson learned", ""),
-            what_happened=sections.get("what happened", ""),
+            # Whitepapers have no "lesson learned"/"what happened" headings, so
+            # fall back to their summary and to the rest of the body.
+            lesson_text=sections.get("lesson learned") or sections.get("summary", ""),
+            what_happened=sections.get("what happened")
+            or "\n".join(
+                body
+                for heading, body in sections.items()
+                if heading not in ("lesson learned", "summary")
+            ),
         )
 
     @staticmethod
@@ -276,6 +307,7 @@ class KnowledgeBase:
             {"created": lesson.created, "iteration": str(lesson.iteration)},
         )
         refs = "\n".join(f"- `{r}`" for r in lesson.references) or "- _(none cited)_"
+        recalled = render_recalled(lesson.recalled)
         ticket = f"#{lesson.ticket}" if lesson.ticket else "_(none)_"
         pr = f"#{lesson.pr}" if lesson.pr else "_(none)_"
         repro = lesson.repro_evidence or "_(not applicable: not a heal/bugfix ticket)_"
@@ -306,6 +338,9 @@ class KnowledgeBase:
 
 ## Reproduction evidence
 {repro}
+
+## Recalled (prior notes that informed this work)
+{recalled}
 
 ## References (reference-set evidence)
 {refs}
@@ -389,6 +424,41 @@ vault and use the graph view to explore how lessons connect.
         path = self.mocs_dir / "Knowledge Base MOC.md"
         path.write_text(content)
         return path
+
+
+# --- recall integration -------------------------------------------------------
+@dataclass(frozen=True)
+class Recalled:
+    """What prior knowledge informed a piece of work.
+
+    ``block`` goes into the prompt; ``notes`` is the audit trail that the lesson
+    note and the PR body echo, so every change states which notes shaped it (G2).
+    """
+
+    block: str = ""
+    notes: tuple[str, ...] = ()
+
+
+def render_recalled(notes: tuple[str, ...]) -> str:
+    """Render recalled note names as an Obsidian-linked list."""
+    return "\n".join(f"- [[{n}]]" for n in notes) or "- _(nothing in the knowledge base matched)_"
+
+
+def recall_for(cfg: CoreConfig, root: str | Path, query: str) -> Recalled:
+    """Retrieve the knowledge-base notes most relevant to ``query``.
+
+    Budget and depth come from the ``knowledge`` block of core.yaml
+    (``recall_k``, ``recall_char_budget``).
+    """
+    settings = cfg.knowledge or {}
+    hits = KnowledgeBase.from_config(cfg, root).recall(
+        query, k=int(settings.get("recall_k", DEFAULT_K))
+    )
+    budget = int(settings.get("recall_char_budget", DEFAULT_CHAR_BUDGET))
+    return Recalled(
+        block=recall.render_block(hits, char_budget=budget),
+        notes=tuple(record.note_name for record, _ in hits),
+    )
 
 
 def now_iso() -> str:

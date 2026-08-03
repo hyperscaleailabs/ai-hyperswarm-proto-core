@@ -6,6 +6,7 @@ Commands:
   hsai status                                                  config + backlog snapshot
   hsai reindex                                                 rebuild knowledge MOCs
   hsai doctor                                                  verify environment + invariants
+  hsai recall "<query>"                                        rank knowledge-base notes
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ from . import __version__, ai, repro
 from .config import CoreConfig, load_config, validate
 from .knowledge import KnowledgeBase
 from .orchestrator import run_loop
+from .recall import DEFAULT_K, one_line
 from .swarm import run_parallel
 
 
@@ -73,6 +75,21 @@ def cmd_reindex(args: argparse.Namespace) -> int:
     written = kb.reindex_mocs()
     for p in written:
         print(f"reindexed {p}")
+    return 0
+
+
+def cmd_recall(args: argparse.Namespace) -> int:
+    """Inspect the retrieval index the worker and planner prompts are fed from."""
+    cfg = _load(args)
+    k = args.k if args.k is not None else int((cfg.knowledge or {}).get("recall_k", DEFAULT_K))
+    hits = KnowledgeBase.from_config(cfg, ".").recall(args.query, k=k)
+    print(f"query: {args.query!r}  (top {k})")
+    if not hits:
+        print("  no notes matched")
+        return 0
+    for record, score in hits:
+        print(f"  {score:7.3f}  {record.note_name}  [{record.outcome}]")
+        print(f"           {one_line(record.lesson_text or record.what_happened)}")
     return 0
 
 
@@ -179,6 +196,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     ri = sub.add_parser("reindex", help="rebuild knowledge-base MOCs")
     ri.set_defaults(func=cmd_reindex)
+
+    rl = sub.add_parser("recall", help="rank knowledge-base notes against a query")
+    rl.add_argument("query", help='free text, e.g. "ci divergence"')
+    rl.add_argument("-k", type=int, default=None, help="notes to show (default: knowledge.recall_k)")
+    rl.set_defaults(func=cmd_recall)
 
     cy = sub.add_parser("cycle", help="run one half-day governance block")
     cy.add_argument("--index", type=int, default=None, help="cycle index (default: derived)")

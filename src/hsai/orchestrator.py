@@ -17,7 +17,7 @@ from uuid import uuid4
 
 from . import ai, ci, github, gitops, ledger, repro
 from .config import CoreConfig
-from .knowledge import KnowledgeBase, Lesson
+from .knowledge import KnowledgeBase, Lesson, Recalled, recall_for, render_recalled
 from .models import ModelChoice, Task, select
 from .proc import Runner, run
 from .tickets import NEEDS_REFINEMENT, issue_well_formed
@@ -97,6 +97,7 @@ def build_pr_body(
     ci_summary: str,
     kind: str = "",
     references: tuple[str, ...] = (),
+    recalled: tuple[str, ...] = (),
 ) -> str:
     """Assemble a PR body that satisfies the traceability invariants.
 
@@ -105,6 +106,7 @@ def build_pr_body(
     if not ticket:
         raise ValueError("Every PR must be linked to a ticket (traceability invariant).")
     refs = ", ".join(f"`{r}`" for r in references) or "_(none)_"
+    recalled_links = render_recalled(recalled)
     artifacts = _phase_artifacts(kind) if kind else ""
     artifacts_section = f"\n## Phase artifacts\n{artifacts}\n" if artifacts else ""
     return f"""Closes #{ticket}
@@ -120,6 +122,9 @@ def build_pr_body(
 {lesson_summary}
 
 See [[{lesson_note}]] in the knowledge base.
+
+## Prior lessons recalled
+{recalled_links}
 
 ## Reference-set evidence
 {refs}
@@ -157,7 +162,24 @@ class IterationResult:
         return "iteration(" + ", ".join(parts) + ")"
 
 
-def _task_prompt(kind: str, cfg: CoreConfig, ticket_title: str, ticket_body: str) -> str:
+def _task_prompt(
+    kind: str,
+    cfg: CoreConfig,
+    ticket_title: str,
+    ticket_body: str,
+    *,
+    recalled: Recalled | None = None,
+    repo_dir: str = ".",
+) -> str:
+    """Build the worker prompt, prefixed with what the repo already learned.
+
+    ``recalled`` is normally computed once per iteration by :func:`run_once` and
+    passed in; when omitted it is retrieved from ``repo_dir``'s knowledge base.
+    The block is empty (and the section absent) when nothing matched.
+    """
+    if recalled is None:
+        recalled = recall_for(cfg, repo_dir, f"{ticket_title}\n{ticket_body}")
+    prior = f"{recalled.block}\n" if recalled.block else ""
     goals = "; ".join(f"{g.get('id')}:{g.get('title')}" for g in cfg.goals)
     common = (
         "You are a worker in the hsai autonomous loop for ai-hyperswarm-proto-core. "
@@ -166,22 +188,24 @@ def _task_prompt(kind: str, cfg: CoreConfig, ticket_title: str, ticket_body: str
         f"Project goals: {goals}."
     )
     if kind == HEAL:
-        return (
+        task = (
             f"{common}\nThe build is RED. Diagnose and fix it so CI is green. "
             f"Ticket: {ticket_title}\n{ticket_body}"
         )
-    if kind == IMPLEMENT:
-        return (
+    elif kind == IMPLEMENT:
+        task = (
             f"{common}\nImplement this ticket END TO END. Satisfy EVERY checkbox in "
             "its Acceptance criteria and execute its Verification plan, adding tests "
             "as evidence. A knowledge-only or docs-only diff on a feat/skill/refactor "
             "ticket is an automatic failure - real code must change.\n"
             f"Ticket: {ticket_title}\n{ticket_body}"
         )
-    return (
-        f"{common}\nImplement this self-improvement, learning from the reference set "
-        f"pinned in .ai-swarm/core.yaml.\nTicket: {ticket_title}\n{ticket_body}"
-    )
+    else:
+        task = (
+            f"{common}\nImplement this self-improvement, learning from the reference set "
+            f"pinned in .ai-swarm/core.yaml.\nTicket: {ticket_title}\n{ticket_body}"
+        )
+    return prior + task
 
 
 def _requires_code(ticket_title: str) -> bool:
@@ -333,6 +357,13 @@ def run_once(
         kind=kind, ticket=ticket_num, model=choice.model, ci_before=ci_before.ok
     )
 
+    # 4b. Recall: retrieve the lessons this repo already learned about work like
+    # this and feed them forward into the worker prompt, the lesson note, and the
+    # PR body. Computed unconditionally (even in dry-run) so the audit trail is
+    # never missing. Purely local BM25 - no dependency, no metered call.
+    recalled = recall_for(cfg, repo_dir, f"{ticket_title}\n{ticket_body}")
+    result.notes.append(f"recalled: {list(recalled.notes) or 'none'}")
+
     # Quota ledger: every iteration that runs a model appends one cost record.
     # Written to the repo root (not the ephemeral worktree) so the block-level
     # aggregate and budget gate can read across iterations; the governance PR
@@ -364,7 +395,7 @@ def run_once(
     reverted_workflows: list[str] = []
     repro_result: repro.ReproResult | None = None
     if not dry_run:
-        prompt = _task_prompt(kind, cfg, ticket_title, ticket_body)
+        prompt = _task_prompt(kind, cfg, ticket_title, ticket_body, recalled=recalled)
         ares = ai.run_agent(
             prompt, choice, cfg, cwd=wt, runner=ai_runner, timeout=cfg.agent_timeout
         )
@@ -461,6 +492,7 @@ def run_once(
         ticket=ticket_num,
         model=choice.model,
         references=references,
+        recalled=recalled.notes,
         repro_evidence=repro.render_evidence(repro_result) if repro_result else "",
     )
     # Each PR commits ONLY its own uniquely-named lesson file. The MOC indexes
@@ -489,6 +521,7 @@ def run_once(
         ci_summary=ci_after.summary(),
         kind=kind,
         references=references,
+        recalled=recalled.notes,
     )
     pr_num = github.create_pr(
         repo, branch, f"{kind}: {ticket_title}"[:120], pr_body,
