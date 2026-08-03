@@ -29,3 +29,21 @@ def test_ramp_config():
     assert cfg.proven_at == 1
     assert cfg.ramp_target == 3
     assert cfg.max_parallel >= 1
+
+
+def test_review_gate_is_configured_and_on():
+    cfg = load_config()
+    assert cfg.review.get("enabled") is True
+    assert cfg.review.get("fail_open") is True, "a broken reviewer must never wedge the loop"
+    assert int(cfg.review.get("tier_offset")) >= 1
+    assert float(cfg.review.get("timeout_seconds")) > 0
+
+
+def test_review_block_is_optional(tmp_path):
+    """A core.yaml with no `review:` block still loads (gate defaults apply)."""
+    core = tmp_path / "core.yaml"
+    core.write_text(
+        "identity:\n  owner: someone\nmodels:\n  tiers:\n"
+        "    standard:\n      model: sonnet\n  default_tier: standard\n"
+    )
+    assert load_config(core).review == {}

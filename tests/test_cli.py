@@ -56,3 +56,66 @@ def test_repro_check_command_passes_and_exits_zero(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert "PASS" in out
+
+
+TICKET_WITH_CRITERIA = (
+    "## Acceptance criteria\n- [ ] widget builds\n- [ ] widget tested\n\n"
+    "## Verification plan\n- [ ] pytest\n"
+)
+PR_WITH_REVIEW = """Closes #7
+
+## Model used
+`sonnet`
+
+## Acceptance review
+| id | criterion | status | evidence |
+| --- | --- | --- | --- |
+| AC1 | widget builds | **met** | src/hsai/widget.py:1 |
+| AC2 | widget tested | **met** | tests/test_widget.py |
+
+## Lesson learned
+Small and green.
+"""
+
+
+def test_evidence_check_passes_with_a_full_acceptance_review(capsys):
+    rc = main([
+        "evidence-check",
+        "--pr-body", PR_WITH_REVIEW,
+        "--ticket-body", TICKET_WITH_CRITERIA,
+    ])
+    assert rc == 0
+    assert "evidence-check: PASS" in capsys.readouterr().out
+
+
+def test_evidence_check_blocks_a_pr_missing_the_acceptance_review(capsys):
+    body = PR_WITH_REVIEW.split("## Acceptance review")[0] + "## Lesson learned\nx\n"
+    rc = main(["evidence-check", "--pr-body", body, "--ticket-body", TICKET_WITH_CRITERIA])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "::error::" in out and "Acceptance review" in out
+
+
+def test_evidence_check_reads_the_pr_body_from_the_environment(monkeypatch, capsys):
+    monkeypatch.setenv("PR_BODY", PR_WITH_REVIEW)
+    monkeypatch.setenv("TICKET_BODY", TICKET_WITH_CRITERIA)
+    assert main(["evidence-check"]) == 0
+    assert "PASS" in capsys.readouterr().out
+
+
+def test_evidence_check_fetches_the_linked_ticket_when_not_supplied(monkeypatch, capsys):
+    from hsai.github import Issue
+
+    seen = {}
+
+    def fake_get_issue(repo, number, **kwargs):
+        seen["number"] = number
+        return Issue(number=number, title="t", labels=(), assignees=(),
+                     body=TICKET_WITH_CRITERIA)
+
+    monkeypatch.setattr(cli_module.github, "get_issue", fake_get_issue)
+    monkeypatch.delenv("TICKET_BODY", raising=False)
+    rc = main(["evidence-check", "--pr-body", PR_WITH_REVIEW])
+    assert seen["number"] == 7  # taken from the "Closes #7" link
+    assert rc == 0
+    assert "PASS" in capsys.readouterr().out

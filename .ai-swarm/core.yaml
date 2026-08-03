@@ -143,6 +143,19 @@ budget:
   max_seconds_per_block: 5400         # cumulative wall-clock across the block (90 min)
   soft_ratio: 0.8                     # fraction of a ceiling that triggers a soft breach
 
+# Adversarial acceptance-criteria review: an INDEPENDENT reviewer role runs
+# after the worker and before the PR is opened, and grades the diff against the
+# ticket's '## Acceptance criteria' checkboxes. An explicit FAIL blocks the PR
+# and returns the ticket to the backlog; anything unparseable, timed out or
+# errored fails OPEN so a broken reviewer can never wedge the loop.
+# Set enabled: false to restore the pre-review behaviour exactly.
+review:
+  enabled: true
+  tier_offset: 1          # tiers BELOW the implementation tier; heavy is never reachable
+  timeout_seconds: 600    # hard cap on the reviewer so a hang cannot stall the loop
+  fail_open: true         # inconclusive => proceed and record it (never block)
+  permission_mode: plan   # the reviewer reads and judges; it never edits the diff
+
 personas:                      # article targets generated from each whitepaper
   - id: cto
     audience: CTO level - business impact, risk posture, strategic direction

@@ -26,6 +26,21 @@ def test_diff_paths_parses_name_only_output():
     assert runner.calls[0][0] == ["git", "diff", "--name-only", "origin/main...HEAD"]
 
 
+def test_staged_diff_compares_the_index_against_the_base():
+    runner = _fake("+++ b/src/hsai/x.py\n")
+    out = gitops.staged_diff("basesha", cwd="/repo", runner=runner)
+    assert out == "+++ b/src/hsai/x.py\n"
+    assert runner.calls[0][0] == ["git", "diff", "--cached", "basesha"]
+
+
+def test_commit_all_stages_everything_first():
+    runner = _fake()
+    gitops.commit_all("msg", cwd="/repo", runner=runner)
+    assert [c[0] for c in runner.calls] == [
+        ["git", "add", "-A"], ["git", "commit", "-m", "msg"]
+    ]
+
+
 def test_create_detached_worktree_builds_expected_path():
     def runner(cmd, **kwargs):
         cmd = list(cmd)

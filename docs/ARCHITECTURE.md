@@ -15,6 +15,7 @@ so the decision logic stays pure and unit-tested.
 | `hsai.github` | tickets, labels, PRs, merge | gh |
 | `hsai.ci` | local CI gate (ruff+pytest) + remote status | subprocess |
 | `hsai.knowledge` | lessons, whitepapers, MOC reindex (Obsidian) | write files |
+| `hsai.review` | adversarial acceptance-criteria gate before a PR is opened | subprocess, write files |
 | `hsai.orchestrator` | one iteration; `decide_path`, `build_pr_body` (pure) | composes above |
 | `hsai.swarm` | run N iterations concurrently | threads |
 | `hsai.cli` | `hsai` entry point | - |
@@ -28,6 +29,7 @@ sequenceDiagram
     participant C as ci
     participant H as github
     participant A as ai (agent)
+    participant R as review (reviewer)
     participant K as knowledge
 
     O->>G: sync_main + create_worktree
@@ -35,6 +37,11 @@ sequenceDiagram
     O->>H: claim ticket (heal / implement / improve)
     O->>A: run_agent(prompt, model choice)
     A-->>O: ok / error
+    O->>R: run_review (independent agent, one tier cheaper)
+    R-->>O: PASS / FAIL / INCONCLUSIVE
+    alt review FAIL
+        O->>H: return ticket to backlog (no PR is ever opened)
+    end
     O->>C: run_local (CI after)
     O->>K: write_lesson (always, pass or fail)
     O->>G: commit_all + push_branch
@@ -111,6 +118,15 @@ and `main`; green-gated auto-merge serializes the actual integration.
   local and remote would diverge. The orchestrator reverts any edits under
   `.github/workflows/**` before committing (and notes it in the lesson), so a
   worker cannot (accidentally or otherwise) move the goalposts it is judged by.
+- **Acceptance criteria are a gate, not decoration.** Before the PR is opened,
+  `hsai.review` runs an *independent* agent - never the one that wrote the code,
+  never the `heavy` tier - which must return a validated per-criterion JSON
+  verdict. A `FAIL` routes into `_recover_failed` with `UNMET_CRITERIA`: no PR,
+  ticket back to the backlog, attempt counted. Because a reviewer is itself a
+  model call and models break, anything unparseable, timed out or errored fails
+  **open** and is recorded as `INCONCLUSIVE` in the lesson rather than halting
+  the loop. The verdict, reviewer tier and reviewer wall-clock land on the
+  iteration's ledger record so a block can see what review costs.
 - **No ticket is stranded on failure.** If remote CI does not go green,
   `_recover_failed` closes the PR (deleting the branch) and returns the ticket
   to the backlog with an incremented `attempts:N` label. After

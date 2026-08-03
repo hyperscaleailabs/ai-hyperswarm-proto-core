@@ -59,6 +59,7 @@ class Lesson:
     created: str = field(default_factory=_today)
     remote_ci: str = ""  # SUCCESS | FAILURE | TIMEOUT, filled in once gh checks conclude
     repro_evidence: str = ""  # heal/bugfix only: failing-then-passing reproduction proof
+    acceptance_review: str = ""  # independent reviewer's per-criterion verdict table
 
     def note_name(self) -> str:
         return f"{self.created}-{slugify(self.title)}"
@@ -279,6 +280,7 @@ class KnowledgeBase:
         ticket = f"#{lesson.ticket}" if lesson.ticket else "_(none)_"
         pr = f"#{lesson.pr}" if lesson.pr else "_(none)_"
         repro = lesson.repro_evidence or "_(not applicable: not a heal/bugfix ticket)_"
+        review = lesson.acceptance_review or "_(not applicable: no review recorded)_"
         return f"""{fm}
 
 # {lesson.title}
@@ -306,6 +308,9 @@ class KnowledgeBase:
 
 ## Reproduction evidence
 {repro}
+
+## Acceptance review
+{review}
 
 ## References (reference-set evidence)
 {refs}
