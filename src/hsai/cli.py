@@ -5,6 +5,7 @@ Commands:
   hsai run-once [--dry-run]                                    a single iteration
   hsai status                                                  config + backlog snapshot
   hsai reindex                                                 rebuild knowledge MOCs
+  hsai calibrate [--write]                                     learn model-selection params
   hsai doctor                                                  verify environment + invariants
 """
 from __future__ import annotations
@@ -73,6 +74,30 @@ def cmd_reindex(args: argparse.Namespace) -> int:
     written = kb.reindex_mocs()
     for p in written:
         print(f"reindexed {p}")
+    return 0
+
+
+def cmd_calibrate(args: argparse.Namespace) -> int:
+    """Fold the lesson corpus into model-selection params (heuristic-v2).
+
+    Read-only by default so the derived parameters can be inspected before they
+    influence a single selection; ``--write`` persists the artifact.
+    """
+    from . import calibration
+
+    cfg = _load(args)
+    params = calibration.calibrate_repo(cfg, ".")
+    print(params.summary())
+    for s in params.tier_stats:
+        print(f"  {s.tier:8s} samples={s.samples:3d} pass={s.passes:3d} "
+              f"rate={s.success_rate:.0%}")
+    for note in params.notes:
+        print(f"  note: {note}")
+    if args.write:
+        path = calibration.save_params(params, cfg, ".")
+        print(f"wrote {path}")
+    else:
+        print("(dry run - pass --write to persist)")
     return 0
 
 
@@ -179,6 +204,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     ri = sub.add_parser("reindex", help="rebuild knowledge-base MOCs")
     ri.set_defaults(func=cmd_reindex)
+
+    ca = sub.add_parser("calibrate", help="learn model-selection params from lessons")
+    ca.add_argument("--write", action="store_true", help="persist the params artifact")
+    ca.set_defaults(func=cmd_calibrate)
 
     cy = sub.add_parser("cycle", help="run one half-day governance block")
     cy.add_argument("--index", type=int, default=None, help="cycle index (default: derived)")

@@ -54,6 +54,8 @@ class Lesson:
     ticket: int | None = None
     pr: int | None = None
     model: str = ""
+    tier: str = ""  # light | standard | heavy - the labelled signal calibration learns from
+    attempt: int = 1  # 1 = first try; >1 means the ticket was retried
     references: tuple[str, ...] = ()  # reference-set repos that informed the work
     tags: tuple[str, ...] = ()
     created: str = field(default_factory=_today)
@@ -75,6 +77,8 @@ class LessonRecord:
     tags: tuple[str, ...]
     lesson_text: str
     what_happened: str = ""
+    tier: str = ""  # empty for lessons written before the tier row existed
+    attempt: int = 1
 
 
 @dataclass
@@ -158,6 +162,7 @@ class KnowledgeBase:
         title_match = _TITLE_RE.search(text)
         title = title_match.group(1).strip() if title_match else note_name
         sections = self._split_sections(text)
+        attempt_raw = self._table_value(text, "attempt")
         return LessonRecord(
             note_name=note_name,
             title=title,
@@ -166,7 +171,20 @@ class KnowledgeBase:
             tags=tags,
             lesson_text=sections.get("lesson learned", ""),
             what_happened=sections.get("what happened", ""),
+            tier=self._table_value(text, "tier"),
+            attempt=int(attempt_raw) if attempt_raw.isdigit() else 1,
         )
+
+    @staticmethod
+    def _table_value(text: str, field_name: str) -> str:
+        """Read one ``| field | value |`` row from a note's metadata table."""
+        match = re.search(
+            rf"^\|\s*{re.escape(field_name)}\s*\|\s*(.+?)\s*\|\s*$", text, re.MULTILINE
+        )
+        if not match:
+            return ""
+        value = match.group(1).strip().strip("`*").strip()
+        return "" if value.startswith("_(") else value
 
     @staticmethod
     def _split_sections(text: str) -> dict[str, str]:
@@ -293,6 +311,8 @@ class KnowledgeBase:
 | ticket | {ticket} |
 | pull request | {pr} |
 | model | `{lesson.model}` |
+| tier | {lesson.tier or "_(unrecorded)_"} |
+| attempt | {lesson.attempt} |
 | remote CI | {lesson.remote_ci or "_(pending)_"} |
 
 ## Context

@@ -219,10 +219,24 @@ def evaluate_budget(agg: BlockAggregate, budget: dict) -> BudgetDecision:
     return BudgetDecision(OK, "within budget")
 
 
-def demote_tier(tier: str) -> str:
-    """Return the next cheaper tier (or ``tier`` itself if already cheapest)."""
+def demote_tier(tier: str, steps: int = 1) -> str:
+    """Return the ``steps``-cheaper tier (or ``tier`` if already cheapest)."""
     try:
         i = _TIER_ORDER.index(tier)
     except ValueError:
         return tier
-    return _TIER_ORDER[max(0, i - 1)]
+    return _TIER_ORDER[max(0, i - max(0, steps))]
+
+
+def promote_tier(tier: str, steps: int = 1) -> str:
+    """Return the ``steps``-heavier tier (or ``tier`` if already heaviest).
+
+    The escalate-on-retry lever: a ticket that failed on one tier is worth
+    retrying on a stronger model rather than burning its last attempt on the
+    model that already failed it.
+    """
+    try:
+        i = _TIER_ORDER.index(tier)
+    except ValueError:
+        return tier
+    return _TIER_ORDER[min(len(_TIER_ORDER) - 1, i + max(0, steps))]

@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 from uuid import uuid4
 
-from . import ai, ci, github, gitops, ledger, repro
+from . import ai, calibration, ci, github, gitops, ledger, repro
 from .config import CoreConfig
 from .knowledge import KnowledgeBase, Lesson
 from .models import ModelChoice, Task, select
@@ -111,7 +111,8 @@ def build_pr_body(
 
 ## Model used
 - **model**: `{choice.model}` (tier: `{choice.tier}`)
-- **selection**: {choice.rationale} [strategy: `{choice.strategy}`]{artifacts_section}
+- **selection**: {choice.rationale} [strategy: `{choice.strategy}`]
+- **signals**: `{choice.rationale_json()}`{artifacts_section}
 
 ## CI
 {ci_summary}
@@ -322,22 +323,25 @@ def run_once(
         gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
         return res
 
-    # 4. model selection (recorded for audit); a soft budget breach biases it
-    # one tier cheaper.
+    # 4. model selection (recorded for audit). Thresholds come from the learned
+    # params artifact (heuristic-v1 when it is absent or the corpus is sparse);
+    # a retry escalates the tier and a soft budget breach biases it cheaper.
     task = Task(kind=kind, title=ticket_title, body=ticket_body, labels=(
         tuple(claimed_issue.labels) if claimed_issue else ()
     ))
-    choice = select(task, cfg, demote=demote_tier)
+    attempts = (claimed_issue.attempts() if claimed_issue else 0) + 1
+    params = calibration.load_params(cfg, repo_dir)
+    choice = select(task, cfg, demote=demote_tier, attempt=attempts, params=params)
 
     result = IterationResult(
         kind=kind, ticket=ticket_num, model=choice.model, ci_before=ci_before.ok
     )
+    result.notes.append(f"selection: {choice.rationale_json()}")
 
     # Quota ledger: every iteration that runs a model appends one cost record.
     # Written to the repo root (not the ephemeral worktree) so the block-level
     # aggregate and budget gate can read across iterations; the governance PR
     # later commits it so the economics stay auditable.
-    attempts = (claimed_issue.attempts() if claimed_issue else 0) + 1
     tokens: tuple[int, int] | None = None
 
     def _record_cost(outcome: str) -> None:
@@ -443,7 +447,8 @@ def run_once(
         kind=kind,
         context=f"Iteration {iteration}. Ticket #{ticket_num}. CI before: {ci_before.summary()}.",
         what_happened=(
-            f"Model `{choice.model}` ({choice.tier}) ran the task. "
+            f"Model `{choice.model}` ({choice.tier}) ran the task on attempt "
+            f"{choice.attempt}, selected as `{choice.rationale_json()}`. "
             f"Agent ok={agent_ok}. CI after: {ci_after.summary()}."
             + (
                 f"\n\nReverted off-spec workflow edits: {reverted_workflows}."
@@ -460,6 +465,8 @@ def run_once(
         iteration=iteration,
         ticket=ticket_num,
         model=choice.model,
+        tier=choice.tier,
+        attempt=choice.attempt,
         references=references,
         repro_evidence=repro.render_evidence(repro_result) if repro_result else "",
     )

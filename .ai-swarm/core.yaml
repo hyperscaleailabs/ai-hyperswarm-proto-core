@@ -106,7 +106,20 @@ models:
       model: opus
       use_for: [architecture, hard-bug, large-refactor, design]
   default_tier: standard
-  selection_strategy: heuristic-v1   # improved over time; tracked as a backlog skill
+  selection_strategy: heuristic-v2   # calibrated from lessons; falls back to v1 when sparse
+  # Learned calibration (src/hsai/calibration.py). `hsai calibrate` folds the
+  # lesson corpus into params_file; the selector reads that artifact. Every knob
+  # below exists to stop a small or biased corpus from moving selection far.
+  calibration:
+    params_file: .ai-swarm/model-selection.json
+    min_labeled_lessons: 10    # below this, heuristic-v1 is used verbatim
+    min_samples_per_tier: 3    # a tier moves its own threshold only above this
+    max_threshold_delta: 2     # hard clamp on how far a threshold may travel
+    max_tier_share: 0.6        # a tier past this share may not be grown further...
+    share_min_samples: 8       # ...unless it also has this many samples
+    target_success_rate: 0.8   # the pass rate a tier is expected to hold
+    delta_scale: 4.0           # success-rate gap -> threshold steps
+    escalate_on_retry: true    # attempt>1 bumps the tier one level per prior try
 
 # Governance: the architect steering loop (three streams).
 # Stream 1: steering  - DIRECTION.md + review briefs + /review-next sessions -> ADRs

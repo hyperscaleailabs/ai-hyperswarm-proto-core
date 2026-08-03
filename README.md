@@ -42,8 +42,17 @@ metered API is never touched. See `hsai doctor`.
 ## Model-size selection (a learnable skill)
 
 The orchestrator picks a model *tier* per task - `light` (haiku) / `standard`
-(sonnet) / `heavy` (opus) - from complexity signals, and records the choice on
-the PR. Improving this heuristic is itself tracked as a backlog skill.
+(sonnet) / `heavy` (opus) - from complexity signals, and records both the tier
+and a machine-readable rationale on the PR.
+
+The skill actually learns. `hsai calibrate` reads every lesson's recorded tier,
+outcome, kind, and attempt, and derives calibrated thresholds into
+`.ai-swarm/model-selection.json` (heuristic-v2); `hsai cycle` refreshes them
+once per block. Movement is clamped and sample-gated, so a thin or lopsided
+corpus cannot collapse selection onto opus (quota) or haiku (quality) - below
+the minimum corpus size the static heuristic-v1 is used verbatim. A retried
+ticket escalates one tier per prior attempt, so its last attempt is not spent on
+the model that already failed it.
 
 ## The knowledge base is an Obsidian vault
 
@@ -66,6 +75,7 @@ knowledge/
 pip install -e ".[dev]"
 hsai status        # config + invariants
 hsai doctor        # verify subscription-only guard + environment
+hsai calibrate     # learn model-selection params from lessons (--write to persist)
 hsai loop --dry-run   # a full iteration with no side effects
 hsai loop          # one real iteration (opens & merges a PR on green)
 hsai loop --max-parallel 3 -n 1   # ramp to the swarm (after proving one iteration)

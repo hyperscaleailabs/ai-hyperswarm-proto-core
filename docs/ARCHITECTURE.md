@@ -9,7 +9,8 @@ so the decision logic stays pure and unit-tested.
 | --- | --- | --- |
 | `hsai.config` | load & validate `.ai-swarm/core.yaml` | read file |
 | `hsai.proc` | one subprocess wrapper (`run`) + `Runner` type | subprocess |
-| `hsai.models` | task → model-tier selection (heuristic-v0) | none (pure) |
+| `hsai.models` | task → model-tier selection + machine-readable rationale | none (pure) |
+| `hsai.calibration` | learn selection thresholds from lessons (heuristic-v2) | read/write params artifact |
 | `hsai.ai` | drive `claude -p`; enforce subscription-only | subprocess, env |
 | `hsai.gitops` | worktrees, sync, branch, commit, push | git |
 | `hsai.github` | tickets, labels, PRs, merge | gh |
@@ -55,6 +56,28 @@ Every wrapper takes an injectable `runner` (default: real subprocess). Tests
 inject a fake runner or use `dry_run=True`, so CI never touches the network.
 The pure core - `decide_path`, `build_pr_body`, `models.select`, the knowledge
 renderers - is tested directly.
+
+## Model selection, learned
+
+`models.select` scores a task and compares that score against two thresholds.
+Those thresholds are *data*, not constants: `hsai calibrate` folds the lesson
+corpus (tier used, pass/fail, kind, attempt) into
+`.ai-swarm/model-selection.json`, and `hsai cycle` refreshes it once per block
+so the next block selects on fresher evidence.
+
+- **heuristic-v1** - the static keyword+structure heuristic. Still the fallback
+  whenever the artifact is missing, unreadable, or the corpus is too thin.
+- **heuristic-v2** - the same scoring with calibrated thresholds. Movement is
+  clamped (`max_threshold_delta`) and gated on sample counts and per-tier share
+  so a small or biased corpus cannot collapse everything onto `opus` (quota) or
+  `haiku` (quality).
+- **Escalate-on-retry** - attempt > 1 bumps the tier one level per prior
+  attempt, so a ticket's last attempt is not spent on the model that already
+  failed it. A soft budget breach still outranks it.
+
+Every selection records both a human rationale and a machine-readable signal
+list on the PR (`**signals**`) and in the lesson, which is what the next
+calibration reads back.
 
 ## Safety model
 
