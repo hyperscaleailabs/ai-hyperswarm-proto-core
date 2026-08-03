@@ -13,6 +13,7 @@ from hsai.orchestrator import (
     IMPROVE,
     _format_error_with_context,
     _phase_artifacts,
+    _phase_capabilities,
     build_pr_body,
     decide_path,
     run_once,
@@ -164,6 +165,27 @@ def test_phase_artifacts_improve():
     assert "Lesson recorded" in artifacts
 
 
+def test_phase_capabilities_heal():
+    capabilities = _phase_capabilities(HEAL)
+    assert "Diagnose CI failure" in capabilities
+    assert "regression tests" in capabilities
+    assert "minimal" in capabilities
+
+
+def test_phase_capabilities_implement():
+    capabilities = _phase_capabilities(IMPLEMENT)
+    assert "end-to-end" in capabilities
+    assert "comprehensive tests" in capabilities
+    assert "Refactor safely" in capabilities
+
+
+def test_phase_capabilities_improve():
+    capabilities = _phase_capabilities(IMPROVE)
+    assert "reference-set" in capabilities
+    assert "concrete practices" in capabilities
+    assert "document lessons" in capabilities
+
+
 def test_build_pr_body_requires_ticket():
     choice = ModelChoice(tier="standard", model="sonnet", rationale="x")
     with pytest.raises(ValueError):
@@ -187,13 +209,15 @@ def test_build_pr_body_contains_traceability():
     assert "openai/swarm" in body
 
 
-def test_build_pr_body_includes_phase_artifacts():
+def test_build_pr_body_includes_phase_capabilities_and_artifacts():
     choice = ModelChoice(tier="standard", model="sonnet", rationale="x")
     body = build_pr_body(
         ticket=10, choice=choice, lesson_note="2026-07-26-test",
         lesson_summary="test", ci_summary="green",
         kind=HEAL,
     )
+    assert "## Phase capabilities" in body
+    assert "Diagnose CI failure" in body
     assert "## Phase artifacts" in body
     assert "Root cause" in body
     assert "Regression test" in body
@@ -204,15 +228,29 @@ def test_build_pr_body_includes_phase_artifacts():
         lesson_summary="test", ci_summary="green",
         kind=IMPLEMENT,
     )
+    assert "## Phase capabilities" in body
+    assert "end-to-end" in body
     assert "## Phase artifacts" in body
     assert "Feature/fix implemented" in body
     assert "Tests added" in body
 
-    # Without kind, artifacts should not appear
+    # Test with IMPROVE phase
+    body = build_pr_body(
+        ticket=13, choice=choice, lesson_note="2026-07-26-test",
+        lesson_summary="test", ci_summary="green",
+        kind=IMPROVE,
+    )
+    assert "## Phase capabilities" in body
+    assert "reference-set" in body
+    assert "## Phase artifacts" in body
+    assert "practice extracted" in body
+
+    # Without kind, neither should appear
     body = build_pr_body(
         ticket=12, choice=choice, lesson_note="2026-07-26-test",
         lesson_summary="test", ci_summary="green",
     )
+    assert "## Phase capabilities" not in body
     assert "## Phase artifacts" not in body
 
 

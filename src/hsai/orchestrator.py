@@ -48,6 +48,38 @@ def _format_error_with_context(
     return f"[{context}] {error}"
 
 
+def _phase_capabilities(kind: str) -> str:
+    """Declare what each phase is designed to accomplish.
+
+    Adopted from microsoft/semantic-kernel: orchestrated agent systems benefit
+    from explicit, declarative capability definitions. Each phase/role has
+    specific competencies that guide work assignment and validation. This
+    supports G1 (learning from the field) by making role-based capability
+    models from semantic-kernel a first-class concept in the loop.
+    """
+    if kind == HEAL:
+        return (
+            "- Diagnose CI failure root causes\n"
+            "- Write regression tests that reproduce the bug\n"
+            "- Apply minimal, focused fixes\n"
+            "- Verify resolution without side effects"
+        )
+    elif kind == IMPLEMENT:
+        return (
+            "- Implement features end-to-end from acceptance criteria\n"
+            "- Write comprehensive tests covering all criteria\n"
+            "- Refactor safely within ticket scope\n"
+            "- Validate code quality and test coverage"
+        )
+    else:  # IMPROVE
+        return (
+            "- Study reference-set projects for patterns\n"
+            "- Extract small, concrete practices\n"
+            "- Implement focused adoption with evidence\n"
+            "- Document lessons and cite sources"
+        )
+
+
 def _phase_artifacts(kind: str) -> str:
     """Document explicit outputs for each phase.
 
@@ -107,11 +139,13 @@ def build_pr_body(
     refs = ", ".join(f"`{r}`" for r in references) or "_(none)_"
     artifacts = _phase_artifacts(kind) if kind else ""
     artifacts_section = f"\n## Phase artifacts\n{artifacts}\n" if artifacts else ""
+    capabilities = _phase_capabilities(kind) if kind else ""
+    capabilities_section = f"\n## Phase capabilities\n{capabilities}\n" if capabilities else ""
     return f"""Closes #{ticket}
 
 ## Model used
 - **model**: `{choice.model}` (tier: `{choice.tier}`)
-- **selection**: {choice.rationale} [strategy: `{choice.strategy}`]{artifacts_section}
+- **selection**: {choice.rationale} [strategy: `{choice.strategy}`]{capabilities_section}{artifacts_section}
 
 ## CI
 {ci_summary}

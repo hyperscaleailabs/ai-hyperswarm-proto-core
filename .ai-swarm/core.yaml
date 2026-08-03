@@ -174,7 +174,7 @@ knowledge:
   whitepaper_every_lessons: 10       # synthesize a whitepaper every N new lessons
   obsidian_ready: true               # wikilinks + committed .obsidian config
 
-# Ranked snapshot pinned on 2026-07-25. Criteria: >= 10k stars, permissive
+# Ranked snapshot pinned on 2026-08-03. Criteria: >= 10k stars, permissive
 # license (MIT or Apache-2.0), quality README, relevance to swarm / multi-agent.
 # Ranking = stars weighted toward swarm/multi-agent relevance. Refreshed by a
 # periodic chore ticket rather than queried live on every run.
@@ -184,7 +184,7 @@ reference_set:
     licenses: [MIT, Apache-2.0]
     domain: [ai-swarm, multi-agent, autonomous-agents, agent-orchestration]
   learn_from: [source_code, commit_history, ci_cd, issue_history, harness_design, readme]
-  snapshot_date: 2026-07-25
+  snapshot_date: 2026-08-03
   top10:
     - rank: 1
       repo: langchain-ai/langchain
