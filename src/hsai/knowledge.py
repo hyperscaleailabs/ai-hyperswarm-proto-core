@@ -21,6 +21,8 @@ _FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
 _TITLE_RE = re.compile(r"^# (.+)$", re.MULTILINE)
 _SECTION_RE = re.compile(r"^## (.+)$", re.MULTILINE)
 _WORD_RE = re.compile(r"[a-zA-Z][a-zA-Z-]{3,}")
+# Rows of the lesson's metadata table, e.g. `| ticket | #43 |`.
+_META_ROW_RE = re.compile(r"^\|\s*([a-zA-Z ]+?)\s*\|\s*(.+?)\s*\|$", re.MULTILINE)
 _STOPWORDS = {
     "this", "that", "with", "from", "have", "been", "were", "will", "which",
     "their", "there", "these", "those", "about", "would", "could", "should",
@@ -75,6 +77,10 @@ class LessonRecord:
     tags: tuple[str, ...]
     lesson_text: str
     what_happened: str = ""
+    # Read back off the metadata table so the replay corpus miner can join a
+    # lesson to the ticket it came from and the model that actually ran it.
+    ticket: int | None = None
+    model: str = ""
 
 
 @dataclass
@@ -158,6 +164,8 @@ class KnowledgeBase:
         title_match = _TITLE_RE.search(text)
         title = title_match.group(1).strip() if title_match else note_name
         sections = self._split_sections(text)
+        meta = {k.strip().lower(): v.strip() for k, v in _META_ROW_RE.findall(text)}
+        ticket_match = re.search(r"#(\d+)", meta.get("ticket", ""))
         return LessonRecord(
             note_name=note_name,
             title=title,
@@ -166,6 +174,8 @@ class KnowledgeBase:
             tags=tags,
             lesson_text=sections.get("lesson learned", ""),
             what_happened=sections.get("what happened", ""),
+            ticket=int(ticket_match.group(1)) if ticket_match else None,
+            model=meta.get("model", "").strip("`"),
         )
 
     @staticmethod

@@ -49,6 +49,8 @@ class CoreConfig:
     max_ticket_attempts: int
     tiers: dict[str, ModelTier]
     default_tier: str
+    selection_strategy: str
+    replay_min_score: float | None
     constraints: dict[str, Any]
     knowledge: dict[str, Any]
     reference_top10: tuple[ReferenceRepo, ...]
@@ -140,6 +142,11 @@ def load_config(path: str | Path | None = None) -> CoreConfig:
         max_ticket_attempts=int(execution.get("max_ticket_attempts", 2)),
         tiers=tiers,
         default_tier=models.get("default_tier", "standard"),
+        selection_strategy=str(models.get("selection_strategy", "heuristic-v1")),
+        replay_min_score=(
+            None if models.get("replay_min_score") is None
+            else float(models["replay_min_score"])
+        ),
         constraints=data.get("constraints", {}),
         knowledge=data.get("knowledge", {}),
         reference_top10=top10,
@@ -167,6 +174,14 @@ def validate(cfg: CoreConfig) -> ValidationResult:
         errors.append("identity.owner is required")
     if cfg.default_tier not in cfg.tiers:
         errors.append(f"models.default_tier '{cfg.default_tier}' is not a defined tier")
+    # Imported lazily: models imports this module, so a top-level import would cycle.
+    from .models import STRATEGIES
+
+    if cfg.selection_strategy not in STRATEGIES:
+        errors.append(
+            f"models.selection_strategy '{cfg.selection_strategy}' is not a registered "
+            f"strategy (known: {', '.join(sorted(STRATEGIES))})"
+        )
     if cfg.max_parallel < 1:
         errors.append("execution.max_parallel must be >= 1")
     if cfg.proven_at < 1:

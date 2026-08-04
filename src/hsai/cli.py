@@ -8,14 +8,19 @@ Commands:
   hsai doctor                                                  verify environment + invariants
   hsai traj <iteration> [--json]                               print a stored agent run
   hsai replay <iteration> [--json]                             alias of `hsai traj`
+  hsai replay [--strategy S] [--min-score X]                   grade model selection offline
+  hsai corpus-build [--out PATH]                               mine draft benchmark instances
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
+from pathlib import Path
 
-from . import __version__, ai, repro, trajectory
+from . import __version__, ai, models, repro, trajectory
+from . import replay as replay_mod
 from .config import CoreConfig, load_config, validate
 from .knowledge import KnowledgeBase
 from .orchestrator import run_loop
@@ -139,8 +144,84 @@ def _print_trajectory(args: argparse.Namespace, label: str) -> int:
 
 
 def cmd_replay(args: argparse.Namespace) -> int:
-    """Reconstruct a stored agent run (alias of ``hsai traj``)."""
-    return _print_trajectory(args, "replay")
+    """Two offline replays, told apart by whether an iteration was named.
+
+    With an iteration (or a path): reconstruct that stored agent run - the
+    original behaviour, an alias of ``hsai traj``.
+
+    Without one: replay the *selection* decision over the committed corpus,
+    grading a strategy against recorded outcomes. Both forms read only local
+    files - no ``claude``, no ``gh``, no network, no quota.
+    """
+    if args.trajectory_id:
+        return _print_trajectory(args, "replay")
+    return _replay_selection(args)
+
+
+def _replay_selection(args: argparse.Namespace) -> int:
+    """Grade a selection strategy over the committed corpus (a CI gate)."""
+    cfg = _load(args)
+    baseline = None
+    try:
+        corpus = replay_mod.load_corpus(args.corpus, repo_root=args.root)
+        report = replay_mod.replay(corpus, cfg, strategy=args.strategy)
+        if args.compare:
+            baseline = replay_mod.replay(corpus, cfg, strategy=args.compare)
+    except (replay_mod.CorpusError, models.UnknownStrategyError) as exc:
+        print(f"replay: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        payload = report.to_dict()
+        if baseline is not None:
+            payload["baseline"] = baseline.to_dict()
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(report.render())
+        if baseline is not None:
+            print()
+            print(replay_mod.compare(baseline, report))
+
+    threshold = args.min_score if args.min_score is not None else cfg.replay_min_score
+    if threshold is not None and report.score < threshold:
+        print(
+            f"replay: score {report.score:.4f} < min-score {threshold:.4f} - "
+            f"model selection regressed against {report.corpus_path}",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+def cmd_corpus_build(args: argparse.Namespace) -> int:
+    """Mine draft benchmark instances for a human to label.
+
+    The loop proposes; the architect labels. Every emitted row has
+    ``correct_tier: null`` and carries the evidence (observed tier, outcome,
+    attempts, wall-clock) the label should be judged against.
+    """
+    cfg = _load(args)
+    existing = None
+    if not args.include_known:
+        try:
+            existing = replay_mod.load_corpus(repo_root=args.root)
+        except replay_mod.CorpusError:
+            existing = None
+
+    draft = replay_mod.build_draft(
+        cfg, args.root, include_github=not args.no_github, existing=existing
+    )
+    out = args.out or str(Path(args.root) / replay_mod.DRAFT_PATH)
+    path = replay_mod.write_corpus(
+        out, draft.candidates,
+        description="DRAFT - unlabeled candidates from `hsai corpus-build`; "
+                    "set correct_tier on each row, then merge into selection-corpus.jsonl",
+    )
+    print(f"sources: {', '.join(draft.sources)}")
+    for note in draft.notes:
+        print(f"  note: {note}")
+    print(f"wrote {len(draft.candidates)} unlabeled candidate(s) to {path}")
+    return 0
 
 
 def cmd_traj(args: argparse.Namespace) -> int:
@@ -217,16 +298,50 @@ def build_parser() -> argparse.ArgumentParser:
     br = sub.add_parser("brief", help="refresh governance/DIRECTION.md")
     br.set_defaults(func=cmd_brief)
 
-    for name, help_text, func in (
-        ("traj", "print a stored trajectory for a post-mortem", cmd_traj),
-        ("replay", "reconstruct a stored agent run (alias of `traj`)", cmd_replay),
-    ):
-        tp = sub.add_parser(name, help=f"{help_text} (spends no quota)")
-        tp.add_argument("trajectory_id", metavar="iteration",
-                        help="iteration number, or a path to a trajectory file")
-        tp.add_argument("--root", default=".", help="repo root holding .hsai/traj")
-        tp.add_argument("--json", action="store_true", help="print the raw trajectory JSON")
-        tp.set_defaults(func=func)
+    tj = sub.add_parser("traj", help="print a stored trajectory for a post-mortem "
+                                     "(spends no quota)")
+    tj.add_argument("trajectory_id", metavar="iteration",
+                    help="iteration number, or a path to a trajectory file")
+    tj.add_argument("--root", default=".", help="repo root holding .hsai/traj")
+    tj.add_argument("--json", action="store_true", help="print the raw trajectory JSON")
+    tj.set_defaults(func=cmd_traj)
+
+    rp = sub.add_parser(
+        "replay",
+        help="with an iteration: reconstruct a stored agent run (alias of `traj`); "
+             "without one: grade model selection over the committed corpus "
+             "(both offline, no quota)",
+    )
+    rp.add_argument("trajectory_id", metavar="iteration", nargs="?", default=None,
+                    help="iteration number, or a path to a trajectory file")
+    rp.add_argument("--root", default=".", help="repo root holding .hsai/traj and knowledge/")
+    rp.add_argument("--json", action="store_true",
+                    help="print machine-readable JSON instead of the rendered report")
+    rp.add_argument("--strategy", default=None,
+                    help=f"selection strategy to grade (default: models.selection_strategy); "
+                         f"known: {', '.join(sorted(models.STRATEGIES))}")
+    rp.add_argument("--compare", default=None, metavar="STRATEGY",
+                    help="also grade this strategy and print the measured delta")
+    rp.add_argument("--corpus", default=None,
+                    help=f"corpus JSONL (default: {replay_mod.CORPUS_PATH})")
+    rp.add_argument("--min-score", type=float, default=None,
+                    help="fail (exit 1) below this benchmark score "
+                         "(default: models.replay_min_score)")
+    rp.set_defaults(func=cmd_replay)
+
+    cb = sub.add_parser(
+        "corpus-build",
+        help="mine closed issues, the ledger, and lessons into unlabeled "
+             "benchmark candidates for a human to label",
+    )
+    cb.add_argument("--root", default=".", help="repo root to mine")
+    cb.add_argument("--out", default=None,
+                    help=f"draft JSONL to write (default: {replay_mod.DRAFT_PATH})")
+    cb.add_argument("--no-github", action="store_true",
+                    help="skip the `gh` calls and mine local artifacts only")
+    cb.add_argument("--include-known", action="store_true",
+                    help="also emit candidates already present in the committed corpus")
+    cb.set_defaults(func=cmd_corpus_build)
 
     rc = sub.add_parser(
         "repro-check", help="reproduce-before-fix guard for heal/bugfix PRs (CI gate)"
