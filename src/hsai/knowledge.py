@@ -13,7 +13,10 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+from . import practices
 from .config import CoreConfig
+from .practices import PracticeNote
+from .provenance import UNATTRIBUTED, Provenance
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _TAG_RE = re.compile(r"^\s*-\s+(\S.*)$", re.MULTILINE)
@@ -59,6 +62,8 @@ class Lesson:
     created: str = field(default_factory=_today)
     remote_ci: str = ""  # SUCCESS | FAILURE | TIMEOUT, filled in once gh checks conclude
     repro_evidence: str = ""  # heal/bugfix only: failing-then-passing reproduction proof
+    provenance: Provenance | None = None  # the practice adopted, and from where
+    provenance_note: str = ""  # the gate's verdict on that claim
 
     def note_name(self) -> str:
         return f"{self.created}-{slugify(self.title)}"
@@ -100,13 +105,18 @@ class KnowledgeBase:
         lessons_dir: str = "knowledge/lessons",
         whitepapers_dir: str = "knowledge/whitepapers",
         mocs_dir: str = "knowledge/MOCs",
+        practices_dir: str = "knowledge/practices",
         whitepaper_every: int = 10,
+        reference_repos: tuple[str, ...] = (),
     ) -> None:
         self.root = Path(root)
         self.lessons_dir = self.root / lessons_dir
         self.whitepapers_dir = self.root / whitepapers_dir
         self.mocs_dir = self.root / mocs_dir
+        self.practices_dir = self.root / practices_dir
         self.whitepaper_every = whitepaper_every
+        # Which projects the coverage table has a row for, even at zero.
+        self.reference_repos = reference_repos
         for d in (self.lessons_dir, self.whitepapers_dir, self.mocs_dir):
             d.mkdir(parents=True, exist_ok=True)
 
@@ -118,7 +128,9 @@ class KnowledgeBase:
             lessons_dir=k.get("lessons_dir", "knowledge/lessons"),
             whitepapers_dir=k.get("whitepapers_dir", "knowledge/whitepapers"),
             mocs_dir=k.get("mocs_dir", "knowledge/MOCs"),
+            practices_dir=k.get("practices_dir", "knowledge/practices"),
             whitepaper_every=int(k.get("whitepaper_every_lessons", 10)),
+            reference_repos=tuple(r.repo for r in cfg.reference_top10),
         )
 
     # --- writing --------------------------------------------------------------
@@ -138,6 +150,31 @@ class KnowledgeBase:
 
     def whitepaper_notes(self) -> list[str]:
         return sorted(p.stem for p in self.whitepapers_dir.glob("*.md"))
+
+    def practice_notes(self) -> list[str]:
+        return sorted(p.stem for p in self.practices_dir.glob("*/*.md"))
+
+    # --- adopted-practice registry --------------------------------------------
+    def registry(self) -> list[PracticeNote]:
+        """Index the lessons on disk into the adopted-practice registry."""
+        return practices.build_registry(
+            (
+                (name, (self.lessons_dir / f"{name}.md").read_text())
+                for name in self.lesson_notes()
+            ),
+            self.reference_repos,
+        )
+
+    def write_practices(self) -> list[Path]:
+        """Write one note per adopted practice, under ``<practices>/<repo>/``."""
+        written: list[Path] = []
+        for note in self.registry():
+            directory = self.practices_dir / note.repo_slug()
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / f"{note.note_name()}.md"
+            path.write_text(practices.render_note(note, created=_today()))
+            written.append(path)
+        return written
 
     def should_write_whitepaper(self) -> bool:
         n = len(self.lesson_notes())
@@ -254,6 +291,7 @@ class KnowledgeBase:
         written = [
             self._write_lessons_moc(),
             self._write_whitepapers_moc(),
+            self._write_practices_moc(),
             self._write_root_moc(),
         ]
         return written
@@ -275,10 +313,15 @@ class KnowledgeBase:
             tags,
             {"created": lesson.created, "iteration": str(lesson.iteration)},
         )
-        refs = "\n".join(f"- `{r}`" for r in lesson.references) or "- _(none cited)_"
+        # An unresolved citation is stated as unknown, never backfilled with a
+        # plausible-looking default: an invented trace is worse than none.
+        refs = "\n".join(f"- `{r}`" for r in lesson.references) or f"- {UNATTRIBUTED}"
         ticket = f"#{lesson.ticket}" if lesson.ticket else "_(none)_"
         pr = f"#{lesson.pr}" if lesson.pr else "_(none)_"
         repro = lesson.repro_evidence or "_(not applicable: not a heal/bugfix ticket)_"
+        practice = lesson.provenance.render() if lesson.provenance else UNATTRIBUTED
+        if lesson.provenance_note:
+            practice = f"{practice}\n\n_{lesson.provenance_note}_"
         return f"""{fm}
 
 # {lesson.title}
@@ -306,6 +349,9 @@ class KnowledgeBase:
 
 ## Reproduction evidence
 {repro}
+
+## Practice adopted
+{practice}
 
 ## References (reference-set evidence)
 {refs}
@@ -366,10 +412,29 @@ Periodic syntheses of accumulated lessons. Total: **{len(notes)}**.
         path.write_text(content)
         return path
 
+    def _write_practices_moc(self) -> Path:
+        registry = self.registry()
+        path = self.mocs_dir / "Practices MOC.md"
+        path.write_text(
+            practices.render_moc(registry, self.reference_repos, created=_today())
+        )
+        return path
+
+    def _concept_link(self, name: str) -> str:
+        """Link a hand-written concept note only where it exists.
+
+        A generated note must never emit a wikilink into thin air - that is
+        exactly what `hsai kb-check` fails the build for.
+        """
+        note = self.lessons_dir.parent / f"{name}.md"
+        return f"[[{name}]]" if note.is_file() else f"`{name}`"
+
     def _write_root_moc(self) -> Path:
         fm = self._frontmatter(("moc", "index"), {"updated": _today()})
         n_lessons = len(self.lesson_notes())
         n_papers = len(self.whitepaper_notes())
+        n_practices = len(self.registry())
+        hsai = self._concept_link("hsai")
         content = f"""{fm}
 
 # Knowledge Base MOC
@@ -380,11 +445,14 @@ vault and use the graph view to explore how lessons connect.
 ## Maps
 - [[Lessons MOC]] - {n_lessons} lesson(s)
 - [[Whitepapers MOC]] - {n_papers} whitepaper(s)
+- [[Practices MOC]] - {n_practices} adopted practice(s), with per-project coverage
 
 ## How this is maintained
-- Each PR the [[hsai]] loop opens contributes exactly one lesson.
+- Each PR the {hsai} loop opens contributes exactly one lesson.
 - Every {self.whitepaper_every} lessons, a whitepaper synthesizes the themes.
+- `hsai practices` re-derives the adopted-practice registry from the lessons.
 - These MOCs are regenerated by `hsai reindex` after each iteration.
+- `hsai kb-check` gates the vault's link integrity in CI.
 """
         path = self.mocs_dir / "Knowledge Base MOC.md"
         path.write_text(content)

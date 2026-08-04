@@ -5,6 +5,8 @@ Commands:
   hsai run-once [--dry-run]                                    a single iteration
   hsai status                                                  config + backlog snapshot
   hsai reindex                                                 rebuild knowledge MOCs
+  hsai practices                                               rebuild the practice registry
+  hsai kb-check [--strict]                                     knowledge-base integrity gate
   hsai doctor                                                  verify environment + invariants
   hsai traj <iteration> [--json]                               print a stored agent run
   hsai replay <iteration> [--json]                             alias of `hsai traj`
@@ -15,7 +17,7 @@ import argparse
 import os
 import sys
 
-from . import __version__, ai, repro, trajectory
+from . import __version__, ai, kb_check, repro, trajectory
 from .config import CoreConfig, load_config, validate
 from .knowledge import KnowledgeBase
 from .orchestrator import run_loop
@@ -72,10 +74,43 @@ def cmd_reindex(args: argparse.Namespace) -> int:
     if kb.should_write_whitepaper():
         p = kb.write_whitepaper(kb.synthesize_whitepaper())
         print(f"wrote whitepaper {p}")
+    kb.write_practices()
     written = kb.reindex_mocs()
     for p in written:
         print(f"reindexed {p}")
     return 0
+
+
+def cmd_practices(args: argparse.Namespace) -> int:
+    """Re-derive the adopted-practice registry from the lessons on disk.
+
+    One note per (reference repo, practice), a Practices MOC carrying the
+    per-repo coverage table, and the root MOC relinked to both.
+    """
+    cfg = _load(args)
+    kb = KnowledgeBase.from_config(cfg, args.root)
+    written = kb.write_practices()
+    registry = kb.registry()
+    verified = sum(1 for n in registry if n.verified)
+    for path in written:
+        print(f"wrote {path}")
+    for path in kb.reindex_mocs():
+        print(f"reindexed {path}")
+    print(
+        f"registry: {len(registry)} practice(s) across "
+        f"{len({n.repo for n in registry})} repo(s); {verified} verified, "
+        f"{len(registry) - verified} legacy"
+    )
+    return 0
+
+
+def cmd_kb_check(args: argparse.Namespace) -> int:
+    """Fail on a broken knowledge base: dangling wikilinks, orphans, MOC drift."""
+    report = kb_check.check_vault(args.root)
+    print(report.render())
+    if args.strict and report.warnings:
+        return 1
+    return 0 if report.ok else 1
 
 
 def cmd_cycle(args: argparse.Namespace) -> int:
@@ -205,6 +240,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     ri = sub.add_parser("reindex", help="rebuild knowledge-base MOCs")
     ri.set_defaults(func=cmd_reindex)
+
+    pc = sub.add_parser("practices", help="rebuild the adopted-practice registry")
+    pc.add_argument("--root", default=".", help="repo root holding knowledge/")
+    pc.set_defaults(func=cmd_practices)
+
+    kc = sub.add_parser("kb-check", help="knowledge-base integrity gate (CI)")
+    kc.add_argument("--root", default=".", help="repo root holding knowledge/")
+    kc.add_argument(
+        "--strict", action="store_true",
+        help="also fail on orphan lessons and MOC drift (run after `hsai reindex`)",
+    )
+    kc.set_defaults(func=cmd_kb_check)
 
     cy = sub.add_parser("cycle", help="run one half-day governance block")
     cy.add_argument("--index", type=int, default=None, help="cycle index (default: derived)")

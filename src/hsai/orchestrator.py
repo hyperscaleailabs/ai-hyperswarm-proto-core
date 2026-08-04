@@ -15,12 +15,12 @@ import time
 from dataclasses import dataclass, field
 from uuid import uuid4
 
-from . import ai, ci, github, gitops, ledger, repro, trajectory
+from . import ai, ci, github, gitops, ledger, provenance, repro, trajectory
 from .config import CoreConfig
 from .knowledge import KnowledgeBase, Lesson
 from .models import ModelChoice, Task, select
 from .proc import Runner, run
-from .tickets import NEEDS_REFINEMENT, issue_well_formed
+from .tickets import NEEDS_REFINEMENT, is_exempt_kind, issue_well_formed
 
 HEAL = "heal"
 IMPLEMENT = "implement"
@@ -98,6 +98,7 @@ def build_pr_body(
     kind: str = "",
     references: tuple[str, ...] = (),
     trajectory_digest: str = "",
+    provenance_note: str = "",
 ) -> str:
     """Assemble a PR body that satisfies the traceability invariants.
 
@@ -105,7 +106,9 @@ def build_pr_body(
     """
     if not ticket:
         raise ValueError("Every PR must be linked to a ticket (traceability invariant).")
-    refs = ", ".join(f"`{r}`" for r in references) or "_(none)_"
+    # Resolved from the ticket, or explicitly unknown. Never a plausible default:
+    # this section used to list `reference_top10[:3]` on every single PR.
+    refs = ", ".join(f"`{r}`" for r in references) or provenance.UNATTRIBUTED
     artifacts = _phase_artifacts(kind) if kind else ""
     artifacts_section = f"\n## Phase artifacts\n{artifacts}\n" if artifacts else ""
     # What the run cost and how it ended, visible on the PR itself - the full
@@ -113,6 +116,8 @@ def build_pr_body(
     traj_section = (
         f"\n## Trajectory\n{trajectory_digest}\n" if trajectory_digest else ""
     )
+    # The gate's verdict travels with the evidence it judged.
+    verdict = f"\n_{provenance_note}_\n" if provenance_note else ""
     return f"""Closes #{ticket}
 
 ## Model used
@@ -129,7 +134,7 @@ See [[{lesson_note}]] in the knowledge base.
 
 ## Reference-set evidence
 {refs}
-
+{verdict}
 ---
 _Filed automatically by the `hsai` loop. Model usage is on the Claude subscription (no metered API)._
 """
@@ -171,10 +176,15 @@ def _task_prompt(kind: str, cfg: CoreConfig, ticket_title: str, ticket_body: str
         "code style consistent, and ensure `ruff check .` and `pytest` both pass. "
         f"Project goals: {goals}."
     )
+    # Non-exempt work must state its field evidence; the gate below checks it.
+    contract = (
+        "" if is_exempt_kind(ticket_title)
+        else provenance.prompt_contract(cfg.known_repos())
+    )
     if kind == HEAL:
         return (
             f"{common}\nThe build is RED. Diagnose and fix it so CI is green. "
-            f"Ticket: {ticket_title}\n{ticket_body}"
+            f"Ticket: {ticket_title}\n{ticket_body}{contract}"
         )
     if kind == IMPLEMENT:
         return (
@@ -182,11 +192,11 @@ def _task_prompt(kind: str, cfg: CoreConfig, ticket_title: str, ticket_body: str
             "its Acceptance criteria and execute its Verification plan, adding tests "
             "as evidence. A knowledge-only or docs-only diff on a feat/skill/refactor "
             "ticket is an automatic failure - real code must change.\n"
-            f"Ticket: {ticket_title}\n{ticket_body}"
+            f"Ticket: {ticket_title}\n{ticket_body}{contract}"
         )
     return (
         f"{common}\nImplement this self-improvement, learning from the reference set "
-        f"pinned in .ai-swarm/core.yaml.\nTicket: {ticket_title}\n{ticket_body}"
+        f"pinned in .ai-swarm/core.yaml.\nTicket: {ticket_title}\n{ticket_body}{contract}"
     )
 
 
@@ -194,6 +204,40 @@ def _requires_code(ticket_title: str) -> bool:
     """Tickets whose titles promise code must produce code."""
     lowered = ticket_title.strip().lower()
     return lowered.startswith(("feat:", "fix:", "skill:", "refactor:", "perf:", "test:"))
+
+
+def _workflow_edits_authorized(ticket_body: str) -> bool:
+    """May this ticket touch ``.github/workflows/``?
+
+    Workflow edits are reverted by default so local CI can never diverge from
+    remote (a worker once added mypy to remote CI only). But the blanket revert
+    also meant the loop could never land a CI gate it was explicitly asked for -
+    `hsai repro-check` was written as a CI step and silently stripped. A ticket
+    that names the workflow path in its own body has authorized the edit; the
+    change is still reported on the PR and in the lesson either way.
+    """
+    return ".github/workflows/" in (ticket_body or "")
+
+
+def _resolve_references(
+    cfg: CoreConfig,
+    ticket_body: str,
+    pcheck: provenance.ProvenanceCheck | None,
+) -> tuple[str, ...]:
+    """Which reference projects this change may honestly claim to come from.
+
+    In order: the projects the ticket's own '## Synthesis rationale' names, then
+    the ones the worker proved it adopted from. If neither is available the
+    answer is ``()`` and the artifacts say `_(unattributed)_` - the loop used to
+    answer this question with `cfg.reference_top10[:3]` regardless of the work.
+    """
+    known = cfg.known_repos()
+    cited = provenance.parse_rationale(ticket_body, known)
+    if cited:
+        return cited
+    if pcheck is not None and pcheck.ok and pcheck.provenance:
+        return tuple(r for r in pcheck.provenance.repos if r in known)
+    return ()
 
 
 def _improvement_idea(cfg: CoreConfig) -> tuple[str, str]:
@@ -376,6 +420,7 @@ def run_once(
     agent_err = ""
     reverted_workflows: list[str] = []
     repro_result: repro.ReproResult | None = None
+    pcheck: provenance.ProvenanceCheck | None = None
     if not dry_run:
         prompt = _task_prompt(kind, cfg, ticket_title, ticket_body)
         agent_started = time.time()
@@ -400,14 +445,27 @@ def run_once(
         if agent_err:
             agent_err = _format_error_with_context(agent_err, kind, ticket_num)
 
+        # Provenance gate: the change must say which reference project it came
+        # from, and that citation must name a repo in the pinned set. Warn-only
+        # while `governance.provenance_gate` is `warn` (the note still lands on
+        # the lesson and the PR); `block` returns the ticket to the backlog.
+        pcheck = provenance.check(
+            ticket_title=ticket_title, text=ares.text, known_repos=cfg.known_repos()
+        )
+        result.notes.append(pcheck.note())
+
         # Guard: a task must not change the CI checks, or local and remote CI
         # would diverge (as happened once when a worker added mypy). Revert any
-        # workflow edits before they are committed and note it in the lesson.
-        reverted_workflows = [
+        # workflow edits before they are committed, unless the ticket explicitly
+        # authorized them - either way the change is noted in the lesson.
+        changed_workflows = [
             p for p in gitops.changed_paths(cwd=wt, runner=runner)
             if p.startswith(".github/workflows/")
         ]
-        if reverted_workflows:
+        if changed_workflows and _workflow_edits_authorized(ticket_body):
+            result.notes.append(f"workflow edits authorized by ticket: {changed_workflows}")
+        elif changed_workflows:
+            reverted_workflows = changed_workflows
             gitops.restore_pathspec(".github/workflows", cwd=wt, runner=runner)
             result.notes.append(f"reverted workflow edits: {reverted_workflows}")
 
@@ -428,6 +486,17 @@ def run_once(
                 _record_cost("incomplete")
                 gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
                 return result
+
+        if cfg.provenance_gate == "block" and not pcheck.ok:
+            _recover_failed(
+                cfg, repo, 0, kind=kind, ticket_num=ticket_num,
+                claimed_issue=claimed_issue, login=login,
+                remote="UNATTRIBUTED", runner=runner,
+            )
+            result.recovered = True
+            _record_cost("unattributed")
+            gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
+            return result
 
         # Reproduce-before-fix guard: heal/bugfix tickets must add or modify a
         # test that FAILS on the pre-fix (parent) tree and PASSES on the fix
@@ -467,7 +536,9 @@ def run_once(
         # refines it to the merge outcome once that is settled.
         traj.outcome = outcome
     kb = KnowledgeBase.from_config(cfg, wt)
-    references = tuple(r.repo for r in cfg.reference_top10[:3])
+    # The citation is RESOLVED, never assumed: what the ticket's rationale
+    # actually named, else what the worker proved it adopted, else nothing.
+    references = _resolve_references(cfg, ticket_body, pcheck)
     lesson = Lesson(
         title=f"{kind}: {ticket_title}"[:120],
         outcome=outcome,
@@ -501,6 +572,8 @@ def run_once(
         model=choice.model,
         references=references,
         repro_evidence=repro.render_evidence(repro_result) if repro_result else "",
+        provenance=pcheck.provenance if pcheck and pcheck.ok else None,
+        provenance_note=pcheck.note() if pcheck else "",
     )
     # Each PR commits ONLY its own uniquely-named lesson file. The MOC indexes
     # and whitepapers are regenerated by the serialized `hsai reindex`
@@ -529,6 +602,7 @@ def run_once(
         kind=kind,
         references=references,
         trajectory_digest=traj.digest() if traj else "",
+        provenance_note=pcheck.note() if pcheck else "",
     )
     pr_num = github.create_pr(
         repo, branch, f"{kind}: {ticket_title}"[:120], pr_body,

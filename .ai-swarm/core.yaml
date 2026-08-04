@@ -122,6 +122,12 @@ governance:
   adr_dir: docs/adr
   review_label: review
   reviews_per_day: 2
+  # Provenance gate (src/hsai/provenance.py): a non-exempt change must name the
+  # reference project and artifact kind it was learned from, and that project
+  # must be in the pinned set below. `warn` notes an unverified claim on the
+  # lesson and the PR; `block` returns the ticket to the backlog instead.
+  # Shipped warn-only for one block, then flipped to `block`.
+  provenance_gate: warn
 
 cycle:
   block_size: 5                # sequential implementations per half-day block

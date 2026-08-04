@@ -20,10 +20,12 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from pathlib import Path
 
-from . import github
+from . import github, practices
 from .ai import run_agent
 from .config import CoreConfig
+from .knowledge import KnowledgeBase
 from .models import ModelChoice
 from .proc import Runner, run
 from .tickets import TicketSpec
@@ -86,12 +88,23 @@ def build_context_pack(
     return ContextPack(repos=repos, sections=sections)
 
 
-def build_prompt(cfg: CoreConfig, pack: ContextPack) -> str:
+def build_prompt(cfg: CoreConfig, pack: ContextPack, adopted: str = "") -> str:
     goals = "\n".join(f"- {g.get('id')}: {g.get('title')} - {g.get('description', '')}"
                       for g in cfg.goals)
     ideas = int(cfg.synthesis.get("ideas_target", 10))
     top = int(cfg.synthesis.get("file_top", 3))
     combine = int(cfg.synthesis.get("min_projects_combined", 3))
+    # What has already landed, per project, so candidates must go beyond it -
+    # the rotation alone kept re-offering ground that was already mined.
+    already = (
+        f"""
+
+Already adopted from these repos (from the practice registry - see
+`hsai practices`). A candidate that re-proposes one of these is rejected in
+PHASE 2; prefer the projects with little or no coverage:
+{adopted}"""
+        if adopted else ""
+    )
     return f"""You are the SYNTHESIS planner for ai-hyperswarm-proto-core, an
 autonomous self-improving AI-swarm harness. Your job is NOT to copy one idea
 from one project, but to COMBINE practices across projects into substantial,
@@ -102,7 +115,7 @@ Project goals:
 {goals}
 
 Study digest of reference projects for this cycle:
-{pack.render()}
+{pack.render()}{already}
 
 Work in three explicit phases and show them all in your output:
 
@@ -165,10 +178,17 @@ class SynthesisResult:
     error: str = ""
 
 
+def adopted_briefing(cfg: CoreConfig, repo_dir: str | Path = ".") -> str:
+    """Per-repo coverage from the practice registry, for the planner prompt."""
+    kb = KnowledgeBase.from_config(cfg, repo_dir)
+    return practices.adopted_section(kb.registry(), kb.reference_repos)
+
+
 def synthesize(
     cfg: CoreConfig,
     *,
     cycle_index: int = 0,
+    repo_dir: str | Path = ".",
     runner: Runner = run,
     ai_runner: Runner = run,
 ) -> SynthesisResult:
@@ -183,7 +203,7 @@ def synthesize(
         strategy="synthesis-v1",
     )
     ares = run_agent(
-        build_prompt(cfg, pack), choice, cfg,
+        build_prompt(cfg, pack, adopted_briefing(cfg, repo_dir)), choice, cfg,
         timeout=float(cfg.synthesis.get("timeout_seconds", 2400)),
         runner=ai_runner,
     )

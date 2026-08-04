@@ -1,9 +1,12 @@
+from pathlib import Path
+
 from hsai import ai
 from hsai.config import load_config
 from hsai.models import ModelChoice
 from hsai.proc import Proc
 from hsai.synthesis import (
     ContextPack,
+    adopted_briefing,
     build_prompt,
     parse_ticket_specs,
     pick_rotation,
@@ -32,6 +35,32 @@ def test_prompt_demands_combination_and_reflection():
     assert "PHASE 1" in prompt and "PHASE 2" in prompt and "PHASE 3" in prompt
     assert "at least 3 different reference projects" in prompt or "combine" in prompt.lower()
     assert "acceptance_criteria" in prompt
+
+
+def test_prompt_carries_the_already_adopted_registry():
+    """Candidates must go beyond what has already landed (the duplicate-idea hole)."""
+    cfg = _cfg()
+    pack = ContextPack(repos=["a/b"], sections={"a/b": "digest"})
+    adopted = (
+        "- `SWE-agent/SWE-agent`: adopted: link-integrity-in-ci.\n"
+        "- `crewAIInc/crewAI`: nothing adopted yet - unmined ground."
+    )
+
+    prompt = build_prompt(cfg, pack, adopted)
+    assert "Already adopted from these repos" in prompt
+    assert "link-integrity-in-ci" in prompt
+    assert "nothing adopted yet - unmined ground" in prompt
+    assert "re-proposes one of these is rejected" in prompt
+
+    # ...and nothing is claimed when the registry is empty
+    assert "Already adopted" not in build_prompt(cfg, pack)
+
+
+def test_adopted_briefing_reads_the_committed_registry():
+    briefing = adopted_briefing(_cfg(), Path(__file__).resolve().parents[1])
+    # one line per pinned reference repo, mined or not
+    for repo in (r.repo for r in _cfg().reference_top10):
+        assert f"`{repo}`" in briefing
 
 
 def test_parse_ticket_specs_takes_last_json_block():
