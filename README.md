@@ -69,14 +69,17 @@ hsai doctor        # verify subscription-only guard + environment
 hsai loop --dry-run   # a full iteration with no side effects
 hsai loop          # one real iteration (opens & merges a PR on green)
 hsai loop --max-parallel 3 -n 1   # ramp to the swarm (after proving one iteration)
-hsai replay 12-7   # reconstruct what agent run 12-7 did (spends no quota)
+hsai traj 12       # print what agent run (iteration) 12 did (spends no quota)
 ```
 
 Every agent run persists a **trajectory** - prompt, step stream, exit status,
-token usage - to `.hsai/trajectories/<iteration>-<ticket>.json`. Those files
-quote repo content, so they stay local and gitignored; the committed lesson
-carries only a redacted tail. `hsai replay <id> [--json]` reads one back
-without invoking `claude`.
+token usage, session id - to `.hsai/traj/<block>/<iteration>.json`. Those files
+quote repo content, so they stay local and gitignored, and everything written
+is scrubbed first: credentials and absolute home paths never reach disk. The
+committed lesson and the PR body carry only a digest line (tokens, duration,
+exit status) plus a redacted tail. `hsai traj <iteration> [--json]` reads one
+back without invoking `claude`; older blocks are pruned per
+`execution.trajectory_retention_blocks`.
 
 ## Learning targets (top-10, pinned snapshot)
 

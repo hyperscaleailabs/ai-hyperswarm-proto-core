@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import github, gitops, ledger
+from . import github, gitops, ledger, trajectory
 from .ai import run_agent
 from .config import CoreConfig
 from .governance import BlockReport, open_review_issue, write_direction
@@ -137,6 +137,12 @@ def run_cycle(
 
     # Fold the block's ledger records into the summary the review brief surfaces.
     report.cost = ledger.aggregate_block(ledger.read_records(ledger_file), idx)
+
+    # Trajectories are local forensics, not repo content: keep the recent blocks
+    # replayable and drop the rest so the store stays bounded.
+    dropped = trajectory.prune(repo_root, cfg.trajectory_retention_blocks)
+    if dropped:
+        report.notes.append(f"pruned trajectories for block(s) {dropped}")
 
     # 3. Sync main so knowledge produced by merged PRs is present locally.
     gitops.sync_main(cfg.default_branch, cwd=str(repo_root), runner=runner)

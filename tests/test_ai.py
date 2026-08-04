@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 
 from hsai import ai
 from hsai.config import load_config
@@ -39,6 +40,12 @@ def _runner(stdout: str, code: int = 0, stderr: str = ""):
     return runner
 
 
+def _cfg(**overrides):
+    """The real config, with `execution.*` overrides applied."""
+    cfg = load_config()
+    return replace(cfg, **overrides)
+
+
 def test_build_command_requests_json_output():
     cfg = load_config()
     cmd = ai.build_command("do the thing", CHOICE, cfg)
@@ -47,6 +54,27 @@ def test_build_command_requests_json_output():
     assert cmd[cmd.index("--output-format") + 1] == "json"
     assert cmd[:3] == ["claude", "-p", "do the thing"]
     assert cmd[cmd.index("--model") + 1] == "sonnet"
+
+
+def test_output_format_flag_is_config_driven():
+    # The shipped config asks for json...
+    assert load_config().output_format == "json"
+
+    # ...and the flag follows the key rather than a hardcoded literal, so a
+    # `claude` CLI change is a YAML edit, not a code change.
+    cmd = ai.build_command("x", CHOICE, _cfg(output_format="stream-json"))
+    assert cmd[cmd.index("--output-format") + 1] == "stream-json"
+    # `-p` + stream-json is rejected by the CLI unless --verbose is passed.
+    assert "--verbose" in cmd
+    assert "--verbose" not in ai.build_command("x", CHOICE, _cfg(output_format="json"))
+
+
+def test_build_command_drops_the_flag_for_plain_text():
+    # The escape hatch: a broken flag can never brick the loop.
+    for fmt in ("text", ""):
+        cmd = ai.build_command("x", CHOICE, _cfg(output_format=fmt))
+        assert "--output-format" not in cmd
+        assert cmd[:3] == ["claude", "-p", "x"]
 
 
 def test_parse_output_extracts_payload_and_usage():
@@ -71,12 +99,13 @@ def test_parse_output_degrades_on_non_json():
     assert raw == {"result": "hi"} and usage is None
 
 
-def test_run_agent_populates_usage_and_raw():
+def test_run_agent_populates_usage_and_payload():
     cfg = load_config()
     result = ai.run_agent("prompt", CHOICE, cfg, runner=_runner(CLAUDE_JSON_PAYLOAD))
     assert result.ok is True
     assert result.usage is not None and result.usage["output_tokens"] == 345
-    assert result.raw is not None
+    assert result.payload is not None
+    assert result.session_id == "b2f0e1d4"
     assert result.text == "Added the widget and a test for it."
     assert result.output == CLAUDE_JSON_PAYLOAD  # raw stdout is preserved
 
@@ -84,7 +113,8 @@ def test_run_agent_populates_usage_and_raw():
 def test_run_agent_plain_text_fallback():
     cfg = load_config()
     result = ai.run_agent("prompt", CHOICE, cfg, runner=_runner("plain output\n"))
-    assert result.raw is None and result.usage is None
+    assert result.payload is None and result.usage is None
+    assert result.session_id == ""
     assert result.text == "plain output\n"  # falls back to the raw stdout
 
 

@@ -101,20 +101,26 @@ def read_records(path: str | Path) -> list[LedgerRecord]:
     return records
 
 
-def parse_tokens(output: str) -> tuple[int, int] | None:
-    """Best-effort ``(input, output)`` token counts from a ``claude -p`` output.
+def parse_tokens(output: str | dict | None) -> tuple[int, int] | None:
+    """Best-effort ``(input, output)`` token counts from a ``claude -p`` run.
 
-    Subscription-safe: this is a pure parse of whatever text the CLI already
-    printed (its JSON ``--output-format`` carries a ``usage`` object); it never
-    issues a metered call. Returns ``None`` when no counts are exposed.
+    Accepts either the raw stdout or the already-parsed envelope
+    (:attr:`hsai.ai.AIResult.payload`) - callers that have the parsed form pass
+    it directly rather than re-parsing the text. Subscription-safe either way:
+    this only reads what the CLI already printed (its JSON ``--output-format``
+    carries a ``usage`` object) and never issues a metered call. Returns
+    ``None`` when no counts are exposed.
     """
-    text = (output or "").strip()
-    if not text.startswith("{"):
-        return None
-    try:
-        data = json.loads(text)
-    except (ValueError, TypeError):
-        return None
+    if isinstance(output, dict):
+        data: object = output
+    else:
+        text = (output or "").strip()
+        if not text.startswith("{"):
+            return None
+        try:
+            data = json.loads(text)
+        except (ValueError, TypeError):
+            return None
     if not isinstance(data, dict):
         return None
     usage = data.get("usage")
@@ -133,20 +139,37 @@ class BlockAggregate:
     block: int
     iterations: int = 0
     heavy_iterations: int = 0
+    merged_iterations: int = 0
     total_seconds: float = 0.0
     total_attempts: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
     tier_counts: dict[str, int] = field(default_factory=dict)
 
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+    def tokens_per_merged_pr(self) -> float | None:
+        """Quota spent per unit of delivered work - the block's efficiency.
+
+        ``None`` when the block merged nothing (the ratio would be undefined)
+        or when no run reported token counts.
+        """
+        if not self.merged_iterations or not self.total_tokens:
+            return None
+        return self.total_tokens / self.merged_iterations
+
     def summary(self) -> str:
         tiers = ", ".join(f"{t}={self.tier_counts[t]}" for t in sorted(self.tier_counts))
-        toks = self.input_tokens + self.output_tokens
+        toks = self.total_tokens
+        per_pr = self.tokens_per_merged_pr()
         return (
             f"{self.iterations} iterations, heavy-tier={self.heavy_iterations}, "
             f"{self.total_seconds:.0f}s wall-clock, {self.total_attempts} attempts"
             + (f", tiers[{tiers}]" if tiers else "")
             + (f", {toks} tokens" if toks else "")
+            + (f", {per_pr:.0f} tokens/merged PR" if per_pr else "")
         )
 
 
@@ -162,6 +185,8 @@ def aggregate_block(records: list[LedgerRecord], block: int) -> BlockAggregate:
         agg.tier_counts[r.tier] = agg.tier_counts.get(r.tier, 0) + 1
         if r.tier == "heavy":
             agg.heavy_iterations += 1
+        if r.outcome == "merged":
+            agg.merged_iterations += 1
         agg.input_tokens += r.input_tokens or 0
         agg.output_tokens += r.output_tokens or 0
     agg.total_seconds = round(agg.total_seconds, 3)

@@ -71,29 +71,41 @@ renderers - is tested directly.
 
 ## Observability: trajectories
 
-`claude -p` is invoked with `--output-format json`, so every run returns a
-structured envelope (final result, message stream, token usage) instead of an
-opaque blob. `orchestrator.run_once` hands that envelope to
-`trajectory.record` at the single choke point right after `ai.run_agent` -
-*before* the completeness and reproduce-before-fix guards can return early -
-and writes one JSON file per run to `.hsai/trajectories/<iteration>-<ticket>.json`.
-The final outcome (`merged`, `recovered`, `incomplete`, `no_repro`, ...) is
-folded back in when the iteration's cost record is appended.
+`claude -p` is invoked with `--output-format <execution.output_format>`
+(default `json`), so every run returns a structured envelope (final result,
+message stream, token usage, session id) instead of an opaque blob. The flag is
+config-driven rather than hardcoded so a CLI change is a YAML edit, not a code
+change: setting the key to `text` drops the flag and every consumer falls back
+to the plain-text path.
+
+`orchestrator.run_once` hands that envelope to `trajectory.record` at the
+single choke point right after `ai.run_agent` - *before* the completeness and
+reproduce-before-fix guards can return early - and writes one JSON file per run
+to `.hsai/traj/<block>/<iteration>.json`. The final outcome (`merged`,
+`recovered`, `incomplete`, `no_repro`, ...) is folded back in when the
+iteration's cost record is appended. Sharding by block is what makes the store
+bounded: `hsai cycle` prunes block directories beyond
+`execution.trajectory_retention_blocks`.
 
 Two audiences, deliberately split:
 
 - **Local and complete.** Trajectories quote repo content, so they are
-  gitignored and never pushed. `hsai replay <id> [--json]` reconstructs one -
-  prompt, step stream, exit status, usage - purely by reading the file, with no
-  `claude` subprocess and no quota spent.
-- **Committed and redacted.** The lesson embeds only `Trajectory.excerpt()`: a
-  secrets-scrubbed tail of the last few steps. The knowledge base gains signal
-  without mirroring the working tree.
+  gitignored and never pushed. Everything is redacted on the way to disk -
+  credentials *and* absolute home paths - so an artifact can be shared as-is.
+  `hsai traj <iteration> [--json]` reconstructs one - prompt, step stream, exit
+  status, usage - purely by reading the file, with no `claude` subprocess and
+  no quota spent. (`hsai replay` is an alias.)
+- **Committed and redacted.** The lesson and the PR body carry
+  `Trajectory.digest()` - tokens, duration, exit status, first failing step -
+  plus, in the lesson, `Trajectory.excerpt()`: a secrets-scrubbed tail of the
+  last few steps. The audit trail is visible on the PR; the knowledge base
+  gains signal without mirroring the working tree.
 
-The same envelope feeds `ledger.parse_tokens`, so the quota ledger's token
-columns - and the block aggregate in the review brief - report real numbers
-instead of nulls. Output that is not JSON (an older `claude` binary) degrades
-to a single-step trajectory with null usage rather than breaking the loop.
+The same envelope feeds `ledger.parse_tokens` (which accepts the parsed payload
+directly), so the quota ledger's token columns - and the block aggregate in the
+review brief, including **tokens per merged PR** - report real numbers instead
+of nulls. Output that is not JSON (an older `claude` binary) degrades to a
+single-step trajectory with null usage rather than breaking the loop.
 
 ## Headless permission mode
 

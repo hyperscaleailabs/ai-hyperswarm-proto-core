@@ -30,14 +30,21 @@ class AIResult:
     error: str
     cmd: Sequence[str]
     usage: dict[str, Any] | None = None  # token counts, when the CLI exposes them
-    raw: dict[str, Any] | None = None  # the parsed JSON envelope (None = plain text)
+    payload: dict[str, Any] | None = None  # parsed JSON envelope (None = plain text)
 
     @property
     def text(self) -> str:
         """The agent's final message, unwrapped from the JSON envelope."""
-        if isinstance(self.raw, dict) and isinstance(self.raw.get("result"), str):
-            return self.raw["result"]
+        if isinstance(self.payload, dict) and isinstance(self.payload.get("result"), str):
+            return self.payload["result"]
         return self.output
+
+    @property
+    def session_id(self) -> str:
+        """The CLI's per-run session id, when the envelope exposes one."""
+        if isinstance(self.payload, dict):
+            return str(self.payload.get("session_id") or "")
+        return ""
 
 
 def parse_output(stdout: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
@@ -83,12 +90,16 @@ def build_command(
 ) -> list[str]:
     """Construct the ``claude -p`` argument vector (no execution).
 
-    ``--output-format json`` is not optional: the structured envelope is what
-    makes a run auditable afterwards (token usage for the quota ledger, the
-    step stream for the trajectory store). See :mod:`hsai.trajectory`.
+    The structured envelope is what makes a run auditable afterwards (token
+    usage for the quota ledger, the step stream for the trajectory store; see
+    :mod:`hsai.trajectory`), so ``execution.output_format`` defaults to
+    ``json``. It stays config-driven rather than hardcoded because the loop
+    must not be brickable by a CLI flag change: setting it to ``text`` (or
+    empty) drops the flag and falls back to the plain-text path, which every
+    consumer already tolerates.
     """
     mode = permission_mode or cfg.permission_mode
-    return [
+    cmd = [
         "claude",
         "-p",
         prompt,
@@ -96,9 +107,14 @@ def build_command(
         choice.model,
         "--permission-mode",
         mode,
-        "--output-format",
-        "json",
     ]
+    fmt = (cfg.output_format or "").strip()
+    if fmt and fmt != "text":
+        cmd += ["--output-format", fmt]
+        # The CLI refuses `stream-json` under `-p` unless `--verbose` is set.
+        if fmt == "stream-json":
+            cmd.append("--verbose")
+    return cmd
 
 
 def preflight(cfg: CoreConfig) -> None:
@@ -128,7 +144,7 @@ def run_agent(
     preflight(cfg)
     cmd = build_command(prompt, choice, cfg, permission_mode=permission_mode)
     proc: Proc = runner(cmd, cwd=cwd, env=_sanitized_env(cfg), timeout=timeout)
-    raw, usage = parse_output(proc.stdout)
+    payload, usage = parse_output(proc.stdout)
     return AIResult(
         ok=proc.ok,
         model=choice.model,
@@ -136,5 +152,5 @@ def run_agent(
         error=proc.stderr,
         cmd=cmd,
         usage=usage,
-        raw=raw,
+        payload=payload,
     )

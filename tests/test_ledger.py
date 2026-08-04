@@ -1,5 +1,6 @@
 import json
 
+from hsai.ai import run_agent
 from hsai.config import load_config
 from hsai.ledger import (
     HARD,
@@ -15,7 +16,8 @@ from hsai.ledger import (
     parse_tokens,
     read_records,
 )
-from hsai.models import Task, select
+from hsai.models import ModelChoice, Task, select
+from hsai.proc import Proc
 
 
 def _rec(block=1, tier="standard", seconds=10.0, attempts=1, outcome="merged", **kw):
@@ -172,3 +174,86 @@ def test_select_demote_biases_toward_cheaper_tier():
     assert normal.tier == "heavy"
     assert demoted.tier == "standard"
     assert "soft budget breach" in demoted.rationale
+
+
+# --- the previously-dead path: real stdout -> tokens -> LedgerRecord --------
+
+REAL_CLAUDE_STDOUT = json.dumps({
+    "type": "result",
+    "subtype": "success",
+    "is_error": False,
+    "duration_ms": 41230,
+    "num_turns": 14,
+    "result": "Implemented the ticket and added tests.",
+    "session_id": "0f2a9c31-6d4e-4a11-9d0f-7c2b5e8a1d33",
+    "total_cost_usd": 0.0,
+    "usage": {
+        "input_tokens": 1512,
+        "cache_creation_input_tokens": 8241,
+        "cache_read_input_tokens": 130422,
+        "output_tokens": 3987,
+    },
+})
+
+
+def test_parse_tokens_accepts_an_already_parsed_payload():
+    """Callers holding `AIResult.payload` pass it straight in - no re-parsing."""
+    assert parse_tokens(json.loads(REAL_CLAUDE_STDOUT)) == (1512, 3987)
+    assert parse_tokens({"result": "ok"}) is None
+    assert parse_tokens(None) is None
+
+
+def test_run_agent_output_populates_the_ledger_record(tmp_path):
+    """End to end: `claude -p` stdout -> run_agent -> parse_tokens -> ledger.
+
+    Before `--output-format json` was actually passed, `parse_tokens` could
+    never fire and these two columns were dead. This is the regression test for
+    that wiring.
+    """
+    cfg = load_config()
+
+    def runner(cmd, *, cwd=None, env=None, timeout=None, input_text=None):
+        return Proc(cmd, 0, REAL_CLAUDE_STDOUT, "")
+
+    ares = run_agent(
+        "implement the ticket",
+        ModelChoice(tier="standard", model="sonnet", rationale="t"),
+        cfg, runner=runner,
+    )
+
+    tokens = parse_tokens(ares.payload)
+    assert tokens == (1512, 3987)          # non-None: the path fires
+
+    path = tmp_path / "ledger.jsonl"
+    append_record(path, _rec(input_tokens=tokens[0], output_tokens=tokens[1]))
+
+    stored = read_records(path)[0]
+    assert stored.input_tokens == 1512 and stored.output_tokens == 3987
+    # And it survives the JSONL round-trip as real numbers, not strings.
+    assert json.loads(path.read_text())["input_tokens"] == 1512
+
+
+# --- tokens per merged PR (the block's efficiency signal) -------------------
+
+def test_tokens_per_merged_pr():
+    records = [
+        _rec(block=1, outcome="merged", input_tokens=1000, output_tokens=200),
+        _rec(block=1, outcome="merged", input_tokens=600, output_tokens=200),
+        _rec(block=1, outcome="recovered", input_tokens=400, output_tokens=0),
+    ]
+    agg = aggregate_block(records, block=1)
+    assert agg.merged_iterations == 2
+    assert agg.total_tokens == 2400
+    assert agg.tokens_per_merged_pr() == 1200.0
+    assert "1200 tokens/merged PR" in agg.summary()
+
+
+def test_tokens_per_merged_pr_is_undefined_without_merges_or_tokens():
+    nothing_merged = aggregate_block(
+        [_rec(block=1, outcome="recovered", input_tokens=500, output_tokens=100)], block=1
+    )
+    assert nothing_merged.tokens_per_merged_pr() is None
+    assert "tokens/merged PR" not in nothing_merged.summary()
+
+    no_tokens = aggregate_block([_rec(block=1, outcome="merged")], block=1)
+    assert no_tokens.tokens_per_merged_pr() is None

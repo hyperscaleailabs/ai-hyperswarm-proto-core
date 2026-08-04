@@ -10,6 +10,26 @@ def test_core_yaml_loads_and_is_valid():
     assert v.ok, f"config invalid: {v.errors}"
 
 
+def test_execution_telemetry_keys():
+    """The agent-output format and trajectory retention are config, not code."""
+    cfg = load_config()
+    assert cfg.output_format == "json"
+    assert cfg.trajectory_retention_blocks >= 1
+
+
+def test_execution_telemetry_defaults_when_keys_absent(tmp_path):
+    core = tmp_path / ".ai-swarm"
+    core.mkdir()
+    (core / "core.yaml").write_text(
+        "identity:\n  owner: someone\n"
+        "models:\n  tiers:\n    standard:\n      model: sonnet\n"
+        "  default_tier: standard\n"
+    )
+    cfg = load_config(core / "core.yaml")
+    assert cfg.output_format == "json"          # structured envelope by default
+    assert cfg.trajectory_retention_blocks == 8
+
+
 def test_reference_set_meets_criteria():
     cfg = load_config()
     assert len(cfg.reference_top10) == 10

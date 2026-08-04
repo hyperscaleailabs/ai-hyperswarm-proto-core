@@ -1,8 +1,9 @@
 # hsai runtime
 .hsai/
-# Raw worker trajectories quote repo content: they stay local (replay them with
-# `hsai replay <id>`); only a redacted tail is committed, inside the lesson.
-.hsai/trajectories/
+# Raw worker trajectories quote repo content: they stay local (inspect them
+# with `hsai traj <iteration>`); only a digest line and a redacted tail are
+# committed, inside the lesson and the PR body.
+.hsai/traj/
 *.log
 
 # Python

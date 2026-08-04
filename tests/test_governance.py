@@ -79,3 +79,23 @@ def test_brief_cost_note_when_no_ledger_records():
     cfg = load_config()
     body = render_brief(cfg, BlockReport(cycle_index=7))
     assert "_no ledger records for this block_" in body
+
+
+def test_brief_reports_tokens_per_merged_pr():
+    """Quota spent per unit of delivered work - the number G4 steers on."""
+    cfg = load_config()
+    cost = BlockAggregate(
+        block=7, iterations=3, heavy_iterations=1, merged_iterations=2,
+        total_seconds=180.0, total_attempts=3,
+        input_tokens=9000, output_tokens=1000,
+    )
+    body = render_brief(cfg, BlockReport(cycle_index=7, cost=cost))
+    assert "5000 tokens per merged PR" in body
+    assert "10000 tokens / 2 merged" in body
+
+
+def test_brief_says_when_tokens_per_merged_pr_is_unavailable():
+    cfg = load_config()
+    cost = BlockAggregate(block=7, iterations=2, total_seconds=10.0)
+    body = render_brief(cfg, BlockReport(cycle_index=7, cost=cost))
+    assert "tokens per merged PR: _not available_" in body
