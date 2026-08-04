@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import github, gitops, ledger
+from . import github, gitops, ledger, practices
 from .ai import run_agent
 from .config import CoreConfig
 from .governance import BlockReport, open_review_issue, write_direction
@@ -100,7 +100,9 @@ def run_cycle(
     # 1. Synthesize substantial tickets when the well-formed backlog is thin.
     low_water = int(cfg.cycle.get("backlog_low_watermark", 4))
     if _well_formed_backlog(cfg, runner=runner) < low_water:
-        sres = synthesize(cfg, cycle_index=idx, runner=runner, ai_runner=ai_runner)
+        sres = synthesize(
+            cfg, cycle_index=idx, runner=runner, ai_runner=ai_runner, repo_root=repo_root
+        )
         report.synthesized = sres.filed
         if not sres.ok:
             report.notes.append(f"synthesis produced no tickets: {sres.error}")
@@ -142,7 +144,11 @@ def run_cycle(
     gitops.sync_main(cfg.default_branch, cwd=str(repo_root), runner=runner)
     runner(["git", "merge", "--ff-only", f"origin/{cfg.default_branch}"], cwd=str(repo_root))
 
-    # 4. Block whitepaper + persona articles + MOCs + DIRECTION refresh.
+    # 4. Fold the block's practice transitions into the registry, then the
+    # block whitepaper + persona articles + MOCs + DIRECTION refresh. The
+    # registry is rebuilt here (serialized) and never by a parallel worker.
+    for practice in practices.apply_transitions(cfg, repo_root):
+        report.notes.append(f"practice {practice.id} -> {practice.status}")
     kb = KnowledgeBase.from_config(cfg, repo_root)
     if cfg.cycle.get("whitepaper_per_block", True) and kb.lesson_notes():
         paper = kb.synthesize_whitepaper(n=block)

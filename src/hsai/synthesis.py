@@ -6,12 +6,18 @@ copied from one project, a heavy model:
 1. receives a context pack built from a rotating subset of the reference set
    (README, recent commit subjects, CI workflow inventory - fetched via `gh`),
 2. generates ~``ideas_target`` candidate improvements, each required to COMBINE
-   practices from >= ``min_projects_combined`` different reference projects,
+   practices from >= ``min_projects_combined`` different reference projects and
+   to avoid anything the reference-practice registry already records as adopted
+   or rejected (:mod:`hsai.practices`),
 3. runs a reflection pass - critiques its own candidates for feasibility,
    originality, and fit with the goals in core.yaml,
 4. prioritizes by impact x effort and emits the top ``file_top`` as fully
    structured tickets (schema in :mod:`hsai.tickets`), which are filed on
    GitHub for the cheaper implementation agents to pick up.
+
+Each digest is also persisted as a durable reference note under
+``knowledge/reference/`` so the corpus is fetched once and cited forever,
+rather than thrown away when the model answers.
 
 The model call goes through :mod:`hsai.ai`, so it stays subscription-only.
 """
@@ -19,12 +25,16 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
 
-from . import github
+from . import github, practices
 from .ai import run_agent
 from .config import CoreConfig
+from .knowledge import KnowledgeBase
 from .models import ModelChoice
+from .practices import Practice
 from .proc import Runner, run
 from .tickets import TicketSpec
 
@@ -55,9 +65,20 @@ def pick_rotation(cfg: CoreConfig, cycle_index: int) -> list[str]:
 
 
 def build_context_pack(
-    repos: list[str], *, runner: Runner = run, commits: int = 30
+    repos: list[str],
+    *,
+    runner: Runner = run,
+    commits: int = 30,
+    kb: KnowledgeBase | None = None,
+    registry: Sequence[Practice] = (),
 ) -> ContextPack:
-    """Fetch a compact study digest for each repo via the GitHub API."""
+    """Fetch a compact study digest for each repo via the GitHub API.
+
+    When ``kb`` is given, each digest is also persisted as an Obsidian-ready
+    reference note (one deterministic path per repo, so a repeated rotation
+    updates the note rather than duplicating it) - turning throwaway API
+    responses into a citable corpus.
+    """
     sections: dict[str, str] = {}
     for repo in repos:
         parts: list[str] = []
@@ -83,15 +104,26 @@ def build_context_pack(
         if workflows.ok and workflows.stdout.strip():
             parts.append("CI workflows:\n" + workflows.stdout[:500])
         sections[repo] = "\n\n".join(parts) or "(no data fetched)"
+        if kb is not None:
+            kb.write_reference_note(repo, sections[repo], registry)
     return ContextPack(repos=repos, sections=sections)
 
 
-def build_prompt(cfg: CoreConfig, pack: ContextPack) -> str:
+def build_prompt(
+    cfg: CoreConfig, pack: ContextPack, registry: Sequence[Practice] = ()
+) -> str:
     goals = "\n".join(f"- {g.get('id')}: {g.get('title')} - {g.get('description', '')}"
                       for g in cfg.goals)
     ideas = int(cfg.synthesis.get("ideas_target", 10))
     top = int(cfg.synthesis.get("file_top", 3))
     combine = int(cfg.synthesis.get("min_projects_combined", 3))
+    memory = practices.render_for_prompt(registry)
+    memory_section = (
+        f"\nWhat this loop has already done with the reference set - treat it as "
+        f"binding memory:\n{memory}\n"
+        if memory
+        else ""
+    )
     return f"""You are the SYNTHESIS planner for ai-hyperswarm-proto-core, an
 autonomous self-improving AI-swarm harness. Your job is NOT to copy one idea
 from one project, but to COMBINE practices across projects into substantial,
@@ -103,7 +135,7 @@ Project goals:
 
 Study digest of reference projects for this cycle:
 {pack.render()}
-
+{memory_section}
 Work in three explicit phases and show them all in your output:
 
 PHASE 1 - DIVERGE: generate {ideas} candidate improvements. Each MUST combine
@@ -163,6 +195,7 @@ class SynthesisResult:
     studied: list[str]
     filed: list[int]
     error: str = ""
+    proposed: list[str] = field(default_factory=list)  # practice ids
 
 
 def synthesize(
@@ -171,10 +204,20 @@ def synthesize(
     cycle_index: int = 0,
     runner: Runner = run,
     ai_runner: Runner = run,
+    repo_root: str | Path = ".",
 ) -> SynthesisResult:
-    """Run one synthesis pass and file the resulting tickets."""
+    """Run one synthesis pass, file the resulting tickets, and register the
+    practice each one stands for as ``proposed``.
+
+    Synthesis is one of the serialized paths, so it is allowed to write the
+    shared registry directly; parallel workers only ever append to the journal.
+    """
+    root = Path(repo_root)
+    kb = KnowledgeBase.from_config(cfg, root)
+    reg_path = practices.registry_path(cfg, root)
+    registry = practices.load(reg_path)
     repos = pick_rotation(cfg, cycle_index)
-    pack = build_context_pack(repos, runner=runner)
+    pack = build_context_pack(repos, runner=runner, kb=kb, registry=registry)
     tier = cfg.synthesis.get("tier", "heavy")
     model = cfg.tiers[tier].model if tier in cfg.tiers else cfg.tiers[cfg.default_tier].model
     choice = ModelChoice(
@@ -183,7 +226,7 @@ def synthesize(
         strategy="synthesis-v1",
     )
     ares = run_agent(
-        build_prompt(cfg, pack), choice, cfg,
+        build_prompt(cfg, pack, registry), choice, cfg,
         timeout=float(cfg.synthesis.get("timeout_seconds", 2400)),
         runner=ai_runner,
     )
@@ -191,12 +234,31 @@ def synthesize(
         return SynthesisResult(ok=False, studied=repos, filed=[], error=ares.error[:500])
 
     specs = parse_ticket_specs(ares.output)
+    known_repos = [r.repo for r in cfg.reference_top10]
     filed: list[int] = []
+    proposed: list[str] = []
     for spec in specs:
         num = github.create_issue(
             cfg.repo_slug, spec.title, spec.render(), spec.all_labels(), runner=runner
         )
-        if num:
-            filed.append(num)
+        if not num:
+            continue
+        filed.append(num)
+        practice = practices.practice_from_ticket(
+            title=spec.title,
+            rationale=spec.synthesis_rationale,
+            known_repos=known_repos,
+            studied=repos,
+            ticket=num,
+        )
+        registry = practices.upsert(registry, practice)
+        proposed.append(practice.id)
+    if proposed:
+        practices.save(reg_path, registry)
+        # Re-render the notes so each studied project immediately shows what it
+        # just inspired, without waiting for the next rotation.
+        for repo in repos:
+            kb.write_reference_note(repo, pack.sections.get(repo, ""), registry)
     return SynthesisResult(ok=bool(filed), studied=repos, filed=filed,
-                           error="" if specs else "no parseable ticket specs in output")
+                           error="" if specs else "no parseable ticket specs in output",
+                           proposed=proposed)

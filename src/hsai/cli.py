@@ -14,7 +14,7 @@ import argparse
 import os
 import sys
 
-from . import __version__, ai, repro, trajectory
+from . import __version__, ai, practices, repro, trajectory
 from .config import CoreConfig, load_config, validate
 from .knowledge import KnowledgeBase
 from .orchestrator import run_loop
@@ -62,11 +62,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def cmd_reindex(args: argparse.Namespace) -> int:
-    """Serialized knowledge maintenance: whitepaper cadence + MOC rebuild.
+    """Serialized knowledge maintenance: practice registry + whitepaper + MOCs.
 
-    Kept out of the parallel workers so PRs never collide on derived index files.
+    Kept out of the parallel workers so PRs never collide on derived index
+    files. Workers only append practice transitions to the journal; folding
+    them into `knowledge/reference/practices.yaml` happens here.
     """
     cfg = _load(args)
+    for practice in practices.apply_transitions(cfg, "."):
+        print(f"practice {practice.id} -> {practice.status}")
     kb = KnowledgeBase.from_config(cfg, ".")
     if kb.should_write_whitepaper():
         p = kb.write_whitepaper(kb.synthesize_whitepaper())
@@ -95,9 +99,10 @@ def cmd_synthesize(args: argparse.Namespace) -> int:
     from .synthesis import synthesize
 
     cfg = _load(args)
-    res = synthesize(cfg, cycle_index=args.index)
+    res = synthesize(cfg, cycle_index=args.index, repo_root=".")
     print(f"studied: {', '.join(res.studied)}")
     print(f"filed tickets: {res.filed or 'none'}")
+    print(f"proposed practices: {', '.join(res.proposed) or 'none'}")
     if res.error:
         print(f"error: {res.error}")
     return 0 if res.ok else 1

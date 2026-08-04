@@ -170,6 +170,8 @@ knowledge:
   lessons_dir: knowledge/lessons
   whitepapers_dir: knowledge/whitepapers
   mocs_dir: knowledge/MOCs
+  reference_dir: knowledge/reference   # durable digests of the reference set +
+                                       # practices.yaml (adoption provenance)
   templates_dir: knowledge/templates
   whitepaper_every_lessons: 10       # synthesize a whitepaper every N new lessons
   obsidian_ready: true               # wikilinks + committed .obsidian config

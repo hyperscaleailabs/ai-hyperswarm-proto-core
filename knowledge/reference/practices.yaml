@@ -1,0 +1,58 @@
+# Reference-practice registry - which upstream practice became which change.
+# Rebuilt from knowledge/reference/adoptions.jsonl by `hsai reindex`; never
+# written by a parallel worker. See src/hsai/practices.py.
+- id: assafelovic-gpt-researcher--per-iteration-cost-ledger-with-a-block-budget-gate
+  source_repo: assafelovic/gpt-researcher
+  source_artifact: 'costs.py: the research loop accounts for its own spend as it runs'
+  description: per-iteration cost ledger with a block budget gate
+  status: adopted
+  ticket: 44
+  pr: 47
+  lesson: 2026-07-26-implement-feat-quota-cost-telemetry-ledger-with-a-warn-then-halt-per-block-budget-gate
+  reason: ''
+  created: '2026-07-26'
+  updated: '2026-07-26'
+- id: foundationagents-metagpt--explicit-phase-artifacts-in-every-pr-body
+  source_repo: FoundationAgents/MetaGPT
+  source_artifact: 'SOP roles: each stage emits a defined, auditable work product'
+  description: explicit phase artifacts in every PR body
+  status: adopted
+  ticket: null
+  pr: null
+  lesson: 2026-07-26-improve-explicit-phase-artifacts-from-metagpt
+  reason: ''
+  created: '2026-07-26'
+  updated: '2026-07-26'
+- id: openai-swarm--phase-and-ticket-context-on-every-error-message
+  source_repo: openai/swarm
+  source_artifact: 'README + core.py: errors carry which step raised them, not just the message'
+  description: phase and ticket context on every error message
+  status: adopted
+  ticket: null
+  pr: null
+  lesson: 2026-07-26-implement-add-structured-execution-context-to-error-messages
+  reason: ''
+  created: '2026-07-26'
+  updated: '2026-07-26'
+- id: run-llama-llama-index--reproduce-before-fix-guard-on-heal-and-bugfix-tickets
+  source_repo: run-llama/llama_index
+  source_artifact: 'commit stream: a fix lands with the test that failed before it'
+  description: reproduce-before-fix guard on heal and bugfix tickets
+  status: adopted
+  ticket: 43
+  pr: 46
+  lesson: 2026-07-26-implement-feat-reproduce-before-fix-regression-guard-for-heal-and-bugfix-tickets
+  reason: ''
+  created: '2026-07-26'
+  updated: '2026-07-26'
+- id: swe-agent-swe-agent--one-durable-trajectory-record-per-agent-run
+  source_repo: SWE-agent/SWE-agent
+  source_artifact: '.traj files + the trajectory inspector: the run record is a primary artifact'
+  description: one durable trajectory record per agent run
+  status: adopted
+  ticket: 79
+  pr: 84
+  lesson: 2026-08-04-implement-feat-worker-trajectory-store-json-agent-output-and-hsai-replay
+  reason: ''
+  created: '2026-08-04'
+  updated: '2026-08-04'

@@ -52,13 +52,29 @@ Clone the repo and **open the folder as an Obsidian vault** - the committed
 
 ```
 knowledge/
-├── MOCs/          # Maps of Content: Knowledge Base / Lessons / Whitepapers
+├── MOCs/          # Maps of Content: Knowledge Base / Lessons / Whitepapers / Reference
 ├── lessons/       # one article per iteration (pass or fail)
 ├── whitepapers/   # periodic syntheses (every N lessons)
+├── reference/     # one durable digest per studied project + practices.yaml
 └── templates/     # note templates
 ```
 
 `hsai reindex` rebuilds the MOCs from what is on disk.
+
+### Provenance: from an upstream artifact to a merged PR
+
+G1 says every improvement should trace back to something observed in the field,
+so that trace is on disk. `knowledge/reference/practices.yaml` holds one row per
+practice - the source repo, the specific artifact that carried it (a commit
+subject, a workflow file, a README section), and a status: `proposed` when
+synthesis files a ticket for it, `adopted` once that ticket's PR merges (ticket,
+PR and lesson note recorded), `rejected` once the ticket exhausts its attempts.
+Adopted and rejected rows are fed back into the synthesis prompt, so the planner
+stops re-deriving work the loop has already done or already failed at.
+
+Parallel workers never rewrite that file - they append a transition to
+`knowledge/reference/adoptions.jsonl`, and the serialized `hsai reindex` folds
+it in, the same single-writer rule the MOC indexes follow.
 
 ## Quickstart
 
