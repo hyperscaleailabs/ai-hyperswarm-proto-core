@@ -66,6 +66,28 @@ def test_parse_tokens_from_json_usage():
     assert parse_tokens(out) == (120, 45)
 
 
+def test_parse_tokens_from_a_realistic_claude_json_payload():
+    """The envelope `claude -p --output-format json` actually emits."""
+    payload = json.dumps({
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "duration_ms": 41230,
+        "duration_api_ms": 39980,
+        "num_turns": 14,
+        "result": "Implemented the ticket and added tests.",
+        "session_id": "0f2a9c31-6d4e-4a11-9d0f-7c2b5e8a1d33",
+        "total_cost_usd": 0.0,
+        "usage": {
+            "input_tokens": 1512,
+            "cache_creation_input_tokens": 8241,
+            "cache_read_input_tokens": 130422,
+            "output_tokens": 3987,
+        },
+    })
+    assert parse_tokens(payload) == (1512, 3987)
+
+
 def test_parse_tokens_none_when_absent_or_plain_text():
     assert parse_tokens("ok\n") is None
     assert parse_tokens("") is None

@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from hsai import orchestrator
+from hsai import ledger, orchestrator, trajectory
 from hsai.config import load_config
 from hsai.models import ModelChoice
 from hsai.orchestrator import (
@@ -18,6 +18,31 @@ from hsai.orchestrator import (
     run_once,
 )
 from hsai.proc import Proc
+
+# The envelope `claude -p --output-format json` returns: the usage object the
+# quota ledger needs, plus (when the CLI exposes it) the message stream the
+# trajectory store turns into steps.
+AGENT_JSON = json.dumps(
+    {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "num_turns": 2,
+        "result": "Implemented the widget and added a test.",
+        "session_id": "5f1c",
+        "usage": {"input_tokens": 1500, "output_tokens": 320},
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "name": "Read",
+                     "input": {"path": "src/hsai/widget.py"}}
+                ],
+            },
+            {"role": "user", "content": [{"type": "tool_result", "content": "widget source"}]},
+        ],
+    }
+)
 
 
 class FakeRunner:
@@ -39,8 +64,10 @@ class FakeRunner:
         worktree_status: str = "",
         repro_fix_ok: bool = True,
         repro_parent_ok: bool = False,
+        agent_output: str = AGENT_JSON,
     ) -> None:
         self.repo_root = repo_root
+        self.agent_output = agent_output
         self.ci_sequence = ci_sequence
         self.open_issues = open_issues or []
         self.remote_ci = remote_ci
@@ -100,7 +127,7 @@ class FakeRunner:
         if cmd[:3] == ["gh", "issue", "edit"]:
             return Proc(cmd, 0, "", "")
         if cmd[:1] == ["claude"]:
-            return Proc(cmd, 0, "ok\n", "")
+            return Proc(cmd, 0, self.agent_output, "")
         if cmd[:3] == ["gh", "pr", "create"]:
             self._pr_seq += 1
             return Proc(cmd, 0, f"https://github.com/o/r/pull/{self._pr_seq}\n", "")
@@ -539,6 +566,223 @@ def test_completeness_guard_blocks_knowledge_only_diff_on_code_ticket(tmp_path):
     assert any(
         c[:3] == ["gh", "issue", "edit"] and "--remove-assignee" in c for c in runner.calls
     )
+
+
+# --- trajectory store (one durable record per agent run) --------------------
+
+WIDGET_ISSUE = {
+    "number": 7,
+    "title": "add widget",
+    "labels": [{"name": "priority:P2"}],
+    "assignees": [],
+    "body": WELL_FORMED_BODY,
+}
+
+
+def _trajectory_files(root: Path) -> list[Path]:
+    return sorted((root / ".hsai" / "trajectories").glob("*.json"))
+
+
+def test_agent_run_is_persisted_as_a_trajectory(tmp_path):
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[dict(WIDGET_ISSUE)]
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=4,
+    )
+
+    assert result.merged is True
+    # Exactly one trajectory file for the one `claude` invocation.
+    assert len([c for c in runner.calls if c[:1] == ["claude"]]) == 1
+    assert [p.name for p in _trajectory_files(tmp_path)] == ["4-7.json"]
+
+    traj = trajectory.load(tmp_path, "4-7")
+    assert traj.iteration == 4 and traj.ticket == 7 and traj.kind == IMPLEMENT
+    assert traj.model == result.model and traj.tier
+    assert "add widget" in traj.prompt              # the prompt is reconstructable
+    assert [s.kind for s in traj.steps] == ["tool_use", "tool_result", "result"]
+    assert traj.usage == {"input_tokens": 1500, "output_tokens": 320}
+    assert traj.exit_status == "ok" and traj.ok is True
+    assert traj.outcome == "merged"                 # final outcome is folded back in
+    assert any(n == "trajectory=4-7" for n in result.notes)
+
+
+def test_trajectory_is_written_when_the_completeness_guard_aborts(tmp_path):
+    cfg = load_config()
+    issue = dict(WIDGET_ISSUE, number=9, title="feat: add widget")
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[issue],
+        worktree_status="?? knowledge/lessons/2026-07-26-fake.md\n",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=5,
+    )
+
+    # The run the guard aborted is exactly the one worth replaying.
+    assert result.recovered is True and result.pr is None
+    traj = trajectory.load(tmp_path, "5-9")
+    assert traj.outcome == "incomplete"
+    assert traj.steps
+
+
+def test_trajectory_is_written_when_the_repro_guard_aborts(tmp_path):
+    cfg = load_config()
+    runner = FakeRunner(repo_root=str(tmp_path), ci_sequence=[False, True])
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=6,
+    )
+
+    assert result.kind == HEAL and result.recovered is True and result.pr is None
+    traj = trajectory.load(tmp_path, f"6-{result.ticket}")
+    assert traj.outcome == "no_repro"
+    assert traj.kind == HEAL and "auto-heal" in traj.prompt
+
+
+def test_one_trajectory_file_per_agent_invocation(tmp_path):
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True, True, True],
+        open_issues=[dict(WIDGET_ISSUE)],
+    )
+
+    for i in (1, 2):
+        run_once(
+            cfg, repo_dir=str(tmp_path), dry_run=False,
+            runner=runner, ai_runner=runner, iteration=i,
+        )
+
+    claude_calls = [c for c in runner.calls if c[:1] == ["claude"]]
+    assert len(claude_calls) == len(_trajectory_files(tmp_path)) == 2
+    assert [p.name for p in _trajectory_files(tmp_path)] == ["1-7.json", "2-7.json"]
+    # Every invocation asked the CLI for the structured envelope.
+    assert all("--output-format" in c and "json" in c for c in claude_calls)
+
+
+def test_dry_run_writes_no_trajectory(tmp_path):
+    cfg = load_config()
+    run_once(cfg, repo_dir=str(tmp_path), dry_run=True, iteration=1)
+    assert not (tmp_path / ".hsai" / "trajectories").exists()
+
+
+def test_token_counts_reach_the_ledger_and_the_block_aggregate(tmp_path):
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[dict(WIDGET_ISSUE)]
+    )
+
+    run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=3,
+    )
+
+    records = ledger.read_records(ledger.ledger_path(cfg, tmp_path))
+    assert len(records) == 1
+    assert records[0].input_tokens == 1500 and records[0].output_tokens == 320
+
+    agg = ledger.aggregate_block(records, block=0)
+    assert agg.input_tokens == 1500 and agg.output_tokens == 320
+    assert "1820 tokens" in agg.summary()      # no longer reporting zero
+
+
+def test_non_json_agent_output_still_produces_an_iteration_and_trajectory(tmp_path):
+    """An older `claude` binary prints plain text: degrade, never break."""
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[dict(WIDGET_ISSUE)],
+        agent_output="widget added, tests green\n",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=8,
+    )
+
+    assert result.merged is True and result.pr is not None
+    assert Path(result.lesson_path).exists()
+
+    traj = trajectory.load(tmp_path, "8-7")
+    assert traj.usage is None                       # nothing to report, not a crash
+    assert [s.kind for s in traj.steps] == ["output"]
+    assert traj.steps[0].text == "widget added, tests green"
+
+    # The ledger record still exists; its token columns are simply null.
+    records = ledger.read_records(ledger.ledger_path(cfg, tmp_path))
+    assert records[0].input_tokens is None and records[0].output_tokens is None
+
+
+LOUD_AGENT_JSON = json.dumps(
+    {
+        "result": "TAIL-MARKER: finished the widget.",
+        "usage": {"input_tokens": 10, "output_tokens": 2},
+        "messages": [
+            {"role": "assistant", "content": f"EARLY-MARKER-{i}: internal repo detail"}
+            for i in range(8)
+        ],
+    }
+)
+
+
+def test_only_a_redacted_excerpt_of_the_trajectory_reaches_the_knowledge_base(tmp_path):
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[dict(WIDGET_ISSUE)],
+        agent_output=LOUD_AGENT_JSON,
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=2,
+    )
+
+    lesson_text = Path(result.lesson_path).read_text()
+    traj = trajectory.load(tmp_path, "2-7")
+    assert len(traj.steps) == 9
+
+    # The lesson quotes the tail (and points at the replay command)...
+    assert "TAIL-MARKER" in lesson_text
+    assert "hsai replay 2-7" in lesson_text
+    assert "earlier step(s) elided" in lesson_text
+    # ...but never the whole run, nor the prompt, nor the raw payload.
+    assert "EARLY-MARKER-0" not in lesson_text
+    assert traj.prompt not in lesson_text
+    assert traj.to_json() not in lesson_text
+
+    # Nothing anywhere under knowledge/ carries the full payload.
+    knowledge = Path(result.lesson_path).parents[1]
+    for note in knowledge.rglob("*.md"):
+        text = note.read_text()
+        assert "EARLY-MARKER-0" not in text
+        assert traj.to_json() not in text
+
+
+def test_agent_secrets_never_reach_the_knowledge_base(tmp_path):
+    cfg = load_config()
+    payload = json.dumps({"result": "used ANTHROPIC_API_KEY=sk-ant-abcdef0123456789 to run"})
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[dict(WIDGET_ISSUE)],
+        agent_output=payload,
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=9,
+    )
+
+    assert "sk-ant-abcdef0123456789" not in Path(result.lesson_path).read_text()
+    assert "sk-ant-abcdef0123456789" not in trajectory.load(tmp_path, "9-7").steps[0].text
+
+
+def test_trajectories_are_gitignored():
+    gitignore = Path(__file__).resolve().parents[1] / ".gitignore"
+    ignored = [line.strip() for line in gitignore.read_text().splitlines()]
+    assert ".hsai/trajectories/" in ignored
 
 
 def test_malformed_ticket_is_refused_and_labeled(tmp_path):

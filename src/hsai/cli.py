@@ -6,6 +6,7 @@ Commands:
   hsai status                                                  config + backlog snapshot
   hsai reindex                                                 rebuild knowledge MOCs
   hsai doctor                                                  verify environment + invariants
+  hsai replay <id> [--json]                                    reconstruct a stored agent run
 """
 from __future__ import annotations
 
@@ -13,7 +14,7 @@ import argparse
 import os
 import sys
 
-from . import __version__, ai, repro
+from . import __version__, ai, repro, trajectory
 from .config import CoreConfig, load_config, validate
 from .knowledge import KnowledgeBase
 from .orchestrator import run_loop
@@ -122,6 +123,20 @@ def cmd_repro_check(args: argparse.Namespace) -> int:
     return 0 if result.ok else 1
 
 
+def cmd_replay(args: argparse.Namespace) -> int:
+    """Reconstruct a stored agent run from the local trajectory store.
+
+    Pure reading: no ``claude`` subprocess, no network, no quota spent.
+    """
+    try:
+        traj = trajectory.load(args.root, args.trajectory_id)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"replay: {exc}", file=sys.stderr)
+        return 1
+    print(traj.to_json() if args.json else traj.render())
+    return 0
+
+
 def cmd_brief(args: argparse.Namespace) -> int:
     from .governance import write_direction
 
@@ -190,6 +205,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     br = sub.add_parser("brief", help="refresh governance/DIRECTION.md")
     br.set_defaults(func=cmd_brief)
+
+    rp = sub.add_parser("replay", help="reconstruct a stored agent run (spends no quota)")
+    rp.add_argument("trajectory_id", help="trajectory id (<iteration>-<ticket>) or a file path")
+    rp.add_argument("--root", default=".", help="repo root holding .hsai/trajectories")
+    rp.add_argument("--json", action="store_true", help="print the raw trajectory JSON")
+    rp.set_defaults(func=cmd_replay)
 
     rc = sub.add_parser(
         "repro-check", help="reproduce-before-fix guard for heal/bugfix PRs (CI gate)"

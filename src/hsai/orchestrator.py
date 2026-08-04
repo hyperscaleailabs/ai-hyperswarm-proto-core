@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 from uuid import uuid4
 
-from . import ai, ci, github, gitops, ledger, repro
+from . import ai, ci, github, gitops, ledger, repro, trajectory
 from .config import CoreConfig
 from .knowledge import KnowledgeBase, Lesson
 from .models import ModelChoice, Task, select
@@ -339,8 +339,14 @@ def run_once(
     # later commits it so the economics stay auditable.
     attempts = (claimed_issue.attempts() if claimed_issue else 0) + 1
     tokens: tuple[int, int] | None = None
+    traj: trajectory.Trajectory | None = None
 
     def _record_cost(outcome: str) -> None:
+        # Every terminal path passes through here, so it is also where the
+        # trajectory learns how its run ended.
+        if traj is not None:
+            traj.outcome = outcome
+            trajectory.write(traj, repo_dir)
         ledger.append_record(
             ledger.ledger_path(cfg, repo_dir),
             ledger.LedgerRecord(
@@ -365,9 +371,21 @@ def run_once(
     repro_result: repro.ReproResult | None = None
     if not dry_run:
         prompt = _task_prompt(kind, cfg, ticket_title, ticket_body)
+        agent_started = time.time()
         ares = ai.run_agent(
             prompt, choice, cfg, cwd=wt, runner=ai_runner, timeout=cfg.agent_timeout
         )
+        # Persist the trajectory FIRST: a guard below can return early, and the
+        # run that gets aborted is exactly the one worth being able to replay.
+        # It lands in the repo root (not the ephemeral worktree) and stays
+        # local - only a redacted tail is quoted in the committed lesson.
+        traj = trajectory.record(
+            repo_dir,
+            iteration=iteration, ticket=ticket_num, kind=kind,
+            tier=choice.tier, model=choice.model, prompt=prompt, result=ares,
+            duration_seconds=time.time() - agent_started,
+        )
+        result.notes.append(f"trajectory={traj.identifier}")
         agent_ok, agent_err = ares.ok, ares.error
         tokens = ledger.parse_tokens(ares.output)
         if agent_err:
@@ -450,6 +468,15 @@ def run_once(
                 if reverted_workflows else ""
             )
             + (f"\n\nAgent error:\n```\n{agent_err[:800]}\n```" if agent_err else "")
+            # Only a redacted tail of the trajectory is committed; the full
+            # record stays in the (gitignored) local store, replayable with
+            # `hsai replay <id>`.
+            + (
+                f"\n\nTrajectory `{traj.identifier}` (redacted tail, "
+                f"`hsai replay {traj.identifier}` for the full run):\n"
+                f"```\n{traj.excerpt()}\n```"
+                if traj else ""
+            )
         ),
         lesson=(
             "Change merged cleanly under a green build."
