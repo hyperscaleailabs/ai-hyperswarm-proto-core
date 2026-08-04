@@ -15,10 +15,11 @@ import time
 from dataclasses import dataclass, field
 from uuid import uuid4
 
-from . import ai, ci, github, gitops, ledger, repro, trajectory
+from . import ai, ci, github, gitops, handoff, ledger, repro, trajectory
 from .config import CoreConfig
+from .handoff import Handoff
 from .knowledge import KnowledgeBase, Lesson
-from .models import ModelChoice, Task, select
+from .models import ModelChoice, Task, escalate, select
 from .proc import Runner, run
 from .tickets import NEEDS_REFINEMENT, issue_well_formed
 
@@ -157,7 +158,14 @@ class IterationResult:
         return "iteration(" + ", ".join(parts) + ")"
 
 
-def _task_prompt(kind: str, cfg: CoreConfig, ticket_title: str, ticket_body: str) -> str:
+def _task_prompt(
+    kind: str,
+    cfg: CoreConfig,
+    ticket_title: str,
+    ticket_body: str,
+    *,
+    prior_handoff: Handoff | None = None,
+) -> str:
     goals = "; ".join(f"{g.get('id')}:{g.get('title')}" for g in cfg.goals)
     common = (
         "You are a worker in the hsai autonomous loop for ai-hyperswarm-proto-core. "
@@ -166,22 +174,33 @@ def _task_prompt(kind: str, cfg: CoreConfig, ticket_title: str, ticket_body: str
         f"Project goals: {goals}."
     )
     if kind == HEAL:
-        return (
+        prompt = (
             f"{common}\nThe build is RED. Diagnose and fix it so CI is green. "
             f"Ticket: {ticket_title}\n{ticket_body}"
         )
-    if kind == IMPLEMENT:
-        return (
+    elif kind == IMPLEMENT:
+        prompt = (
             f"{common}\nImplement this ticket END TO END. Satisfy EVERY checkbox in "
             "its Acceptance criteria and execute its Verification plan, adding tests "
             "as evidence. A knowledge-only or docs-only diff on a feat/skill/refactor "
             "ticket is an automatic failure - real code must change.\n"
             f"Ticket: {ticket_title}\n{ticket_body}"
         )
-    return (
-        f"{common}\nImplement this self-improvement, learning from the reference set "
-        f"pinned in .ai-swarm/core.yaml.\nTicket: {ticket_title}\n{ticket_body}"
-    )
+    else:
+        prompt = (
+            f"{common}\nImplement this self-improvement, learning from the reference set "
+            f"pinned in .ai-swarm/core.yaml.\nTicket: {ticket_title}\n{ticket_body}"
+        )
+
+    if prior_handoff is not None:
+        # Evidence only, never a verdict (SWE-agent's history-processor
+        # discipline): the previous run's conclusion (pass/fail) is never
+        # trusted at face value, only what it observed.
+        prompt += (
+            "\n\n## Previous attempt (evidence only - diagnose independently; "
+            "do not trust its conclusion)\n" + prior_handoff.render_evidence()
+        )
+    return prompt
 
 
 def _requires_code(ticket_title: str) -> bool:
@@ -217,6 +236,7 @@ def run_once(
     ai_runner: Runner = run,
     iteration: int = 0,
     demote_tier: bool = False,
+    budget_decision: ledger.BudgetDecision | None = None,
 ) -> IterationResult:
     """Execute a single iteration of the loop.
 
@@ -224,6 +244,14 @@ def run_once(
     biases model selection one tier cheaper so a block that is burning quota
     keeps progressing instead of halting. Regardless of it, every iteration that
     runs a model appends a cost record to the quota ledger.
+
+    ``budget_decision`` carries the full gate verdict (soft/hard/ok) through to
+    the failed-retry escalation heuristic (:func:`hsai.models.escalate`), which
+    must never escalate a tier when the gate has flagged a soft or hard breach.
+    When omitted it is derived from ``demote_tier`` so callers that only know
+    the soft-breach bit (the caller's budget gate biases model selection one
+    tier cheaper on a soft breach; the caller itself already refuses to start
+    new work at all on a hard breach) still get correct, subordinate behavior.
     """
     repo = cfg.repo_slug
     login = github.current_login(runner=runner) if not dry_run else "hsai-bot"
@@ -322,16 +350,35 @@ def run_once(
         gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
         return res
 
+    # 3b. read back what a prior failed attempt on this ticket left behind, if
+    # any - right after the ticket is claimed, so both model selection and the
+    # task prompt can use it as evidence.
+    prior_handoff: Handoff | None = None
+    if not dry_run and ticket_num:
+        prior_handoff = handoff.read_latest(repo, ticket_num, runner=runner)
+
     # 4. model selection (recorded for audit); a soft budget breach biases it
-    # one tier cheaper.
+    # one tier cheaper. A prior failed attempt escalates it one tier heavier -
+    # unless the budget gate has flagged a soft or hard breach, which always
+    # wins over the retry heuristic.
     task = Task(kind=kind, title=ticket_title, body=ticket_body, labels=(
         tuple(claimed_issue.labels) if claimed_issue else ()
     ))
     choice = select(task, cfg, demote=demote_tier)
+    gate = budget_decision
+    if gate is None:
+        gate = ledger.BudgetDecision(
+            ledger.SOFT if demote_tier else ledger.OK,
+            "soft budget breach (demoted)" if demote_tier else "within budget",
+        )
+    pre_escalation_tier = choice.tier
+    choice = escalate(choice, prior_handoff, cfg, gate)
 
     result = IterationResult(
         kind=kind, ticket=ticket_num, model=choice.model, ci_before=ci_before.ok
     )
+    if choice.tier != pre_escalation_tier:
+        result.notes.append(f"escalated tier: {pre_escalation_tier}->{choice.tier}")
 
     # Quota ledger: every iteration that runs a model appends one cost record.
     # Written to the repo root (not the ephemeral worktree) so the block-level
@@ -370,7 +417,9 @@ def run_once(
     reverted_workflows: list[str] = []
     repro_result: repro.ReproResult | None = None
     if not dry_run:
-        prompt = _task_prompt(kind, cfg, ticket_title, ticket_body)
+        prompt = _task_prompt(
+            kind, cfg, ticket_title, ticket_body, prior_handoff=prior_handoff
+        )
         agent_started = time.time()
         ares = ai.run_agent(
             prompt, choice, cfg, cwd=wt, runner=ai_runner, timeout=cfg.agent_timeout
@@ -414,6 +463,8 @@ def run_once(
                     cfg, repo, 0, kind=kind, ticket_num=ticket_num,
                     claimed_issue=claimed_issue, login=login,
                     remote="INCOMPLETE", runner=runner,
+                    choice=choice, agent_err=agent_err, changed_paths=tuple(touched),
+                    trajectory_id=traj.identifier if traj else None,
                 )
                 result.recovered = True
                 _record_cost("incomplete")
@@ -428,9 +479,8 @@ def run_once(
             base_ref = gitops.merge_base(
                 "HEAD", f"origin/{cfg.default_branch}", cwd=wt, runner=runner,
             ) or f"origin/{cfg.default_branch}"
-            test_files = repro.changed_test_files(
-                gitops.changed_paths(cwd=wt, runner=runner)
-            )
+            changed = gitops.changed_paths(cwd=wt, runner=runner)
+            test_files = repro.changed_test_files(changed)
             repro_result = repro.check_repro(
                 repo_root=repo_dir, wt=wt, base_ref=base_ref,
                 test_files=test_files, worktrees_dir=cfg.worktrees_dir, runner=runner,
@@ -441,6 +491,8 @@ def run_once(
                     cfg, repo, 0, kind=kind, ticket_num=ticket_num,
                     claimed_issue=claimed_issue, login=login,
                     remote="NO_REPRO", runner=runner,
+                    choice=choice, agent_err=agent_err, changed_paths=tuple(changed),
+                    trajectory_id=traj.identifier if traj else None,
                 )
                 result.recovered = True
                 _record_cost("no_repro")
@@ -552,6 +604,9 @@ def run_once(
         _recover_failed(
             cfg, repo, pr_num, kind=kind, ticket_num=ticket_num,
             claimed_issue=claimed_issue, login=login, remote=remote, runner=runner,
+            choice=choice, ci_after=ci_after, agent_err=agent_err,
+            changed_paths=tuple(gitops.changed_paths(cwd=wt, runner=runner)),
+            trajectory_id=traj.identifier if traj else None,
         )
         result.recovered = True
         result.notes.append("recovered: closed PR, returned ticket to backlog")
@@ -574,9 +629,20 @@ def _recover_failed(
     login: str,
     remote: str,
     runner: Runner,
+    choice: ModelChoice | None = None,
+    ci_after: ci.CIResult | None = None,
+    agent_err: str = "",
+    changed_paths: tuple[str, ...] = (),
+    trajectory_id: str | None = None,
 ) -> None:
     """A PR did not go green (or never got one): close it, and either return the
-    ticket to the backlog for another attempt or mark it ``blocked``."""
+    ticket to the backlog for another attempt or mark it ``blocked``.
+
+    Also posts a :class:`hsai.handoff.Handoff` comment on the ticket - the
+    memory the next attempt reads back via :func:`hsai.handoff.read_latest`, so
+    a retry escalates tier and carries this failure's evidence instead of
+    re-running the exact configuration that just lost.
+    """
     if pr_num:
         github.close_pr(
             repo, pr_num,
@@ -590,6 +656,25 @@ def _recover_failed(
     issue = claimed_issue or github.get_issue(repo, ticket_num, runner=runner)
     prior = issue.attempts() if issue else 0
     nxt = prior + 1
+
+    if choice is not None:
+        failing_steps = tuple(
+            name for name, ok in (ci_after.steps if ci_after else {}).items() if not ok
+        )
+        handoff.post(
+            repo, ticket_num,
+            Handoff(
+                attempt=nxt,
+                tier=choice.tier,
+                model=choice.model,
+                remote_ci=remote,
+                failing_steps=failing_steps,
+                agent_error=handoff.clip_error(agent_err),
+                changed_paths=tuple(changed_paths),
+                trajectory_id=trajectory_id,
+            ),
+            runner=runner,
+        )
 
     if nxt >= cfg.max_ticket_attempts:
         github.edit_labels(

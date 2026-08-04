@@ -1,9 +1,15 @@
+from hsai import ledger
 from hsai.config import load_config
-from hsai.models import Task, select
+from hsai.handoff import Handoff
+from hsai.models import ModelChoice, Task, escalate, select
 
 
 def _cfg():
     return load_config()
+
+
+def _handoff(attempt: int = 1, remote_ci: str = "FAILURE") -> Handoff:
+    return Handoff(attempt=attempt, tier="standard", model="sonnet", remote_ci=remote_ci)
 
 
 class TestLightTier:
@@ -204,3 +210,67 @@ class TestEdgeCases:
         )
         choice = select(task, cfg)
         assert choice.tier == "standard"
+
+
+class TestEscalate:
+    """Failure-aware retry: bump the tier one step on a retry, unless the
+    budget gate is in a soft or hard breach - the quota guardrail always
+    wins over the retry heuristic."""
+
+    def test_no_handoff_is_a_noop(self):
+        cfg = _cfg()
+        choice = ModelChoice(tier="light", model=cfg.tiers["light"].model, rationale="x")
+        assert escalate(choice, None, cfg) == choice
+
+    def test_light_escalates_to_standard(self):
+        cfg = _cfg()
+        choice = ModelChoice(tier="light", model=cfg.tiers["light"].model, rationale="x")
+        out = escalate(choice, _handoff(), cfg)
+        assert out.tier == "standard"
+        assert out.model == cfg.tiers["standard"].model
+
+    def test_standard_escalates_to_heavy(self):
+        cfg = _cfg()
+        choice = ModelChoice(tier="standard", model=cfg.tiers["standard"].model, rationale="x")
+        out = escalate(choice, _handoff(), cfg)
+        assert out.tier == "heavy"
+        assert out.model == cfg.tiers["heavy"].model
+
+    def test_heavy_is_already_the_ceiling(self):
+        cfg = _cfg()
+        choice = ModelChoice(tier="heavy", model=cfg.tiers["heavy"].model, rationale="x")
+        out = escalate(choice, _handoff(), cfg)
+        assert out.tier == "heavy"
+        assert out == choice  # nothing heavier to escalate to - a true no-op
+
+    def test_rationale_records_the_escalation_and_carries_the_original_reason(self):
+        cfg = _cfg()
+        choice = ModelChoice(
+            tier="light", model=cfg.tiers["light"].model, rationale="score=-4 -> light",
+        )
+        out = escalate(choice, _handoff(attempt=2, remote_ci="TIMEOUT"), cfg)
+        assert "score=-4 -> light" in out.rationale
+        assert "escalated light->standard" in out.rationale
+        assert "attempt 2" in out.rationale
+        assert "TIMEOUT" in out.rationale
+
+    def test_soft_breach_blocks_escalation(self):
+        cfg = _cfg()
+        choice = ModelChoice(tier="light", model=cfg.tiers["light"].model, rationale="x")
+        decision = ledger.BudgetDecision(ledger.SOFT, "near ceiling")
+        out = escalate(choice, _handoff(), cfg, decision)
+        assert out == choice
+
+    def test_hard_breach_blocks_escalation(self):
+        cfg = _cfg()
+        choice = ModelChoice(tier="standard", model=cfg.tiers["standard"].model, rationale="x")
+        decision = ledger.BudgetDecision(ledger.HARD, "over ceiling")
+        out = escalate(choice, _handoff(), cfg, decision)
+        assert out == choice
+
+    def test_ok_decision_does_not_block_escalation(self):
+        cfg = _cfg()
+        choice = ModelChoice(tier="light", model=cfg.tiers["light"].model, rationale="x")
+        decision = ledger.BudgetDecision(ledger.OK, "within budget")
+        out = escalate(choice, _handoff(), cfg, decision)
+        assert out.tier == "standard"

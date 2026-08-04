@@ -167,6 +167,28 @@ def edit_labels(
     return _gh(args, runner=runner)
 
 
+def add_issue_comment(repo: str, number: int, body: str, *, runner: Runner = run) -> Proc:
+    return _gh(
+        ["issue", "comment", str(number), "--repo", repo, "--body", body], runner=runner,
+    )
+
+
+def list_issue_comments(repo: str, number: int, *, runner: Runner = run) -> list[str]:
+    """All comment bodies on an issue, oldest first (GitHub's natural order)."""
+    p = _gh(
+        ["issue", "view", str(number), "--repo", repo, "--json", "comments"],
+        runner=runner,
+    )
+    try:
+        data = json.loads(p.stdout or "{}")
+    except json.JSONDecodeError:
+        return []
+    comments = data.get("comments") if isinstance(data, dict) else None
+    if not isinstance(comments, list):
+        return []
+    return [c.get("body", "") for c in comments if isinstance(c, dict)]
+
+
 def get_issue(repo: str, number: int, *, runner: Runner = run) -> Issue | None:
     p = _gh(
         [
