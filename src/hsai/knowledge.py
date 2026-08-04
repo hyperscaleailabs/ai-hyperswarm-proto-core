@@ -1,19 +1,32 @@
-"""The knowledge base: lessons, whitepapers, and Maps of Content (MOCs).
+"""The knowledge base: lessons, whitepapers, reference notes, and MOCs.
 
 Everything written here is Obsidian-ready:
 - YAML frontmatter with tags,
-- ``[[wikilinks]]`` between notes and up to their MOCs,
+- ``[[wikilinks]]`` between notes and up to their Maps of Content (MOCs),
 so that cloning the repo and opening it as a vault yields a connected graph.
+
+Reference notes are the durable form of what synthesis studies upstream: one
+note per reference project, carrying the fetched digest and the practices this
+loop has taken from it (see :mod:`hsai.practices`).
 """
 from __future__ import annotations
 
 import re
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 
 from .config import CoreConfig
+from .practices import (
+    ADOPTED,
+    DEFAULT_REFERENCE_DIR,
+    REGISTRY_FILE,
+    Practice,
+    render_for_note,
+)
+from .practices import load as load_practices
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _TAG_RE = re.compile(r"^\s*-\s+(\S.*)$", re.MULTILINE)
@@ -100,14 +113,16 @@ class KnowledgeBase:
         lessons_dir: str = "knowledge/lessons",
         whitepapers_dir: str = "knowledge/whitepapers",
         mocs_dir: str = "knowledge/MOCs",
+        reference_dir: str = DEFAULT_REFERENCE_DIR,
         whitepaper_every: int = 10,
     ) -> None:
         self.root = Path(root)
         self.lessons_dir = self.root / lessons_dir
         self.whitepapers_dir = self.root / whitepapers_dir
         self.mocs_dir = self.root / mocs_dir
+        self.reference_dir = self.root / reference_dir
         self.whitepaper_every = whitepaper_every
-        for d in (self.lessons_dir, self.whitepapers_dir, self.mocs_dir):
+        for d in (self.lessons_dir, self.whitepapers_dir, self.mocs_dir, self.reference_dir):
             d.mkdir(parents=True, exist_ok=True)
 
     @classmethod
@@ -118,8 +133,50 @@ class KnowledgeBase:
             lessons_dir=k.get("lessons_dir", "knowledge/lessons"),
             whitepapers_dir=k.get("whitepapers_dir", "knowledge/whitepapers"),
             mocs_dir=k.get("mocs_dir", "knowledge/MOCs"),
+            reference_dir=k.get("reference_dir", DEFAULT_REFERENCE_DIR),
             whitepaper_every=int(k.get("whitepaper_every_lessons", 10)),
         )
+
+    # --- reference notes ------------------------------------------------------
+    @staticmethod
+    def reference_note_name(repo: str) -> str:
+        """``owner/repo`` -> ``owner-repo``, the note's stable file stem."""
+        return repo.replace("/", "-")
+
+    def known_practices(self) -> list[Practice]:
+        """The reference-practice registry that sits beside the reference notes."""
+        return load_practices(self.reference_dir / REGISTRY_FILE)
+
+    def write_reference_note(
+        self, repo: str, digest: str, practices: Sequence[Practice] = ()
+    ) -> Path:
+        """Persist one studied reference project as a durable, citable note.
+
+        Deterministic path per repo, so re-running a rotation *updates* the note
+        instead of accumulating copies of the same study.
+        """
+        name = self.reference_note_name(repo)
+        path = self.reference_dir / f"{name}.md"
+        fm = self._frontmatter(
+            ("reference", f"reference/{name}"), {"repo": repo, "updated": _today()}
+        )
+        path.write_text(f"""{fm}
+
+# {repo}
+
+> Part of [[Reference MOC]] - [[Knowledge Base MOC]]
+
+Study digest fetched from the GitHub API by `hsai synthesize`. Kept on disk so
+improvements can cite the specific upstream artifact that inspired them (G1)
+instead of re-fetching the same sources every rotation.
+
+## Practices adopted from this project
+{render_for_note(practices, repo)}
+
+## Study digest
+{digest.strip() or "_(no data fetched)_"}
+""")
+        return path
 
     # --- writing --------------------------------------------------------------
     def write_lesson(self, lesson: Lesson) -> Path:
@@ -138,6 +195,9 @@ class KnowledgeBase:
 
     def whitepaper_notes(self) -> list[str]:
         return sorted(p.stem for p in self.whitepapers_dir.glob("*.md"))
+
+    def reference_notes(self) -> list[str]:
+        return sorted(p.stem for p in self.reference_dir.glob("*.md"))
 
     def should_write_whitepaper(self) -> bool:
         n = len(self.lesson_notes())
@@ -254,6 +314,7 @@ class KnowledgeBase:
         written = [
             self._write_lessons_moc(),
             self._write_whitepapers_moc(),
+            self._write_reference_moc(),
             self._write_root_moc(),
         ]
         return written
@@ -366,10 +427,47 @@ Periodic syntheses of accumulated lessons. Total: **{len(notes)}**.
         path.write_text(content)
         return path
 
+    def _write_reference_moc(self) -> Path:
+        """Index the studied projects and, through them, the practices adopted.
+
+        This is the map that makes G1 walkable in the graph view: MOC ->
+        reference note -> the lesson of every practice taken from that project.
+        """
+        notes = self.reference_notes()
+        registry = self.known_practices()
+        fm = self._frontmatter(("moc", "reference"), {"updated": _today()})
+        links = "\n".join(f"- [[{n}]]" for n in notes) or "- _No reference notes yet._"
+        adopted = [p for p in registry if p.status == ADOPTED]
+        adopted_lines = "\n".join(f"- {p.render_line()}" for p in adopted) or (
+            "- _No practice has been carried through to a merged PR yet._"
+        )
+        content = f"""{fm}
+
+# Reference MOC
+
+Up: [[Knowledge Base MOC]]
+
+The corpus behind goal G1. Each note below is a durable digest of one reference
+project, written by `hsai synthesize` instead of being re-fetched every
+rotation, and the registry beside them (`{REGISTRY_FILE}`) records which of
+their practices this loop proposed, adopted, or rejected. Total: **{len(notes)}**
+project(s), **{len(registry)}** tracked practice(s).
+
+## Reference projects
+{links}
+
+## Adopted practices
+{adopted_lines}
+"""
+        path = self.mocs_dir / "Reference MOC.md"
+        path.write_text(content)
+        return path
+
     def _write_root_moc(self) -> Path:
         fm = self._frontmatter(("moc", "index"), {"updated": _today()})
         n_lessons = len(self.lesson_notes())
         n_papers = len(self.whitepaper_notes())
+        n_refs = len(self.reference_notes())
         content = f"""{fm}
 
 # Knowledge Base MOC
@@ -380,10 +478,12 @@ vault and use the graph view to explore how lessons connect.
 ## Maps
 - [[Lessons MOC]] - {n_lessons} lesson(s)
 - [[Whitepapers MOC]] - {n_papers} whitepaper(s)
+- [[Reference MOC]] - {n_refs} studied project(s)
 
 ## How this is maintained
 - Each PR the [[hsai]] loop opens contributes exactly one lesson.
 - Every {self.whitepaper_every} lessons, a whitepaper synthesizes the themes.
+- Each synthesis rotation refreshes the reference notes it studied.
 - These MOCs are regenerated by `hsai reindex` after each iteration.
 """
         path = self.mocs_dir / "Knowledge Base MOC.md"

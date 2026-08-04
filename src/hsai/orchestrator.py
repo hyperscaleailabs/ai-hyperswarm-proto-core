@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 from uuid import uuid4
 
-from . import ai, ci, github, gitops, ledger, repro, trajectory
+from . import ai, ci, github, gitops, ledger, practices, repro, trajectory
 from .config import CoreConfig
 from .knowledge import KnowledgeBase, Lesson
 from .models import ModelChoice, Task, select
@@ -79,6 +79,38 @@ def _phase_artifacts(kind: str) -> str:
         )
 
 
+def _journal_practice(
+    cfg: CoreConfig,
+    repo_dir: str,
+    *,
+    ticket_num: int | None,
+    status: str,
+    pr: int | None = None,
+    lesson: str = "",
+    reason: str = "",
+) -> str:
+    """Journal what became of the reference practice this ticket stands for.
+
+    A worker READS the registry to resolve the ticket to its practice, then
+    APPENDS one transition line - it never rewrites ``practices.yaml``. The
+    registry is a shared derived file, so it is rebuilt only by the serialized
+    ``hsai reindex`` / cycle step and concurrent PRs can never conflict on it
+    (the same rule the MOC indexes follow). Returns the practice id, or "".
+    """
+    registry = practices.load(practices.registry_path(cfg, repo_dir))
+    practice = practices.find_by_ticket(registry, ticket_num)
+    if practice is None:
+        return ""
+    practices.record_transition(
+        practices.journal_path(cfg, repo_dir),
+        practices.Transition(
+            practice_id=practice.id, status=status, ticket=ticket_num,
+            pr=pr, lesson=lesson, reason=reason,
+        ),
+    )
+    return practice.id
+
+
 def decide_path(ci_green: bool, has_tickets: bool) -> str:
     """Map current state to the branch of the loop to execute."""
     if not ci_green:
@@ -97,14 +129,28 @@ def build_pr_body(
     ci_summary: str,
     kind: str = "",
     references: tuple[str, ...] = (),
+    practice: practices.Practice | None = None,
 ) -> str:
     """Assemble a PR body that satisfies the traceability invariants.
 
     Raises if there is no ticket - every PR MUST be linked to one.
+
+    When the ticket carries a registered reference practice, the body cites the
+    specific upstream artifact behind it rather than only a flat list of repo
+    names, so the G1 claim ("every improvement traces back to something
+    observed in the field") is legible straight from the PR.
     """
     if not ticket:
         raise ValueError("Every PR must be linked to a ticket (traceability invariant).")
     refs = ", ".join(f"`{r}`" for r in references) or "_(none)_"
+    if practice is not None:
+        refs = (
+            f"Adopted practice `{practice.id}`\n"
+            f"- **source**: `{practice.source_repo}`\n"
+            f"- **artifact**: {practice.source_artifact}\n"
+            f"- **practice**: {practice.description}\n\n"
+            f"Studied this rotation: {refs}"
+        )
     artifacts = _phase_artifacts(kind) if kind else ""
     artifacts_section = f"\n## Phase artifacts\n{artifacts}\n" if artifacts else ""
     return f"""Closes #{ticket}
@@ -413,7 +459,7 @@ def run_once(
                 _recover_failed(
                     cfg, repo, 0, kind=kind, ticket_num=ticket_num,
                     claimed_issue=claimed_issue, login=login,
-                    remote="INCOMPLETE", runner=runner,
+                    remote="INCOMPLETE", runner=runner, repo_dir=repo_dir,
                 )
                 result.recovered = True
                 _record_cost("incomplete")
@@ -440,7 +486,7 @@ def run_once(
                 _recover_failed(
                     cfg, repo, 0, kind=kind, ticket_num=ticket_num,
                     claimed_issue=claimed_issue, login=login,
-                    remote="NO_REPRO", runner=runner,
+                    remote="NO_REPRO", runner=runner, repo_dir=repo_dir,
                 )
                 result.recovered = True
                 _record_cost("no_repro")
@@ -508,6 +554,10 @@ def run_once(
     gitops.commit_all(commit_msg, cwd=wt, runner=runner)
     gitops.push_branch(branch, cwd=wt, runner=runner)
 
+    # Read-only lookup: which reference practice does this ticket carry?
+    practice = practices.find_by_ticket(
+        practices.load(practices.registry_path(cfg, repo_dir)), ticket_num
+    )
     pr_body = build_pr_body(
         ticket=ticket_num or 0,
         choice=choice,
@@ -516,6 +566,7 @@ def run_once(
         ci_summary=ci_after.summary(),
         kind=kind,
         references=references,
+        practice=practice,
     )
     pr_num = github.create_pr(
         repo, branch, f"{kind}: {ticket_title}"[:120], pr_body,
@@ -547,11 +598,19 @@ def run_once(
     if remote == ci.SUCCESS:
         github.merge_pr(repo, pr_num, auto=True, runner=runner)
         result.merged = True
+        # The practice this ticket stood for is now proven in production.
+        adopted = _journal_practice(
+            cfg, repo_dir, ticket_num=ticket_num, status=practices.ADOPTED,
+            pr=pr_num, lesson=lesson.note_name(),
+        )
+        if adopted:
+            result.notes.append(f"practice adopted={adopted}")
     else:
         result.merged = False
         _recover_failed(
             cfg, repo, pr_num, kind=kind, ticket_num=ticket_num,
             claimed_issue=claimed_issue, login=login, remote=remote, runner=runner,
+            repo_dir=repo_dir,
         )
         result.recovered = True
         result.notes.append("recovered: closed PR, returned ticket to backlog")
@@ -574,9 +633,14 @@ def _recover_failed(
     login: str,
     remote: str,
     runner: Runner,
+    repo_dir: str = ".",
 ) -> None:
     """A PR did not go green (or never got one): close it, and either return the
-    ticket to the backlog for another attempt or mark it ``blocked``."""
+    ticket to the backlog for another attempt or mark it ``blocked``.
+
+    A ticket that exhausts its attempts also settles its reference practice as
+    ``rejected``, so the synthesizer stops re-deriving work the loop has already
+    failed at."""
     if pr_num:
         github.close_pr(
             repo, pr_num,
@@ -598,6 +662,10 @@ def _recover_failed(
         )
         # Leave it unassigned but blocked so no worker retries it.
         github.unassign(repo, ticket_num, login, runner=runner)
+        _journal_practice(
+            cfg, repo_dir, ticket_num=ticket_num, status=practices.REJECTED,
+            reason=f"blocked after {nxt} attempt(s); last remote CI {remote}",
+        )
     else:
         github.edit_labels(
             repo, ticket_num,
