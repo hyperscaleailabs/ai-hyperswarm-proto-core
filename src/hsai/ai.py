@@ -7,9 +7,11 @@ subscription-only constraint: the metered API is never used, which means any
 """
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 from .config import CoreConfig
 from .models import ModelChoice
@@ -27,6 +29,36 @@ class AIResult:
     output: str
     error: str
     cmd: Sequence[str]
+    usage: dict[str, Any] | None = None  # token counts, when the CLI exposes them
+    raw: dict[str, Any] | None = None  # the parsed JSON envelope (None = plain text)
+
+    @property
+    def text(self) -> str:
+        """The agent's final message, unwrapped from the JSON envelope."""
+        if isinstance(self.raw, dict) and isinstance(self.raw.get("result"), str):
+            return self.raw["result"]
+        return self.output
+
+
+def parse_output(stdout: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Split a ``claude -p --output-format json`` stdout into ``(payload, usage)``.
+
+    A pure parse of text the CLI already printed - never a metered call. Any
+    output that is not a JSON object (an older ``claude`` binary, or a crash
+    that printed plain text) degrades to ``(None, None)`` so the loop keeps
+    running on the plain-text path instead of breaking.
+    """
+    text = (stdout or "").strip()
+    if not text.startswith("{"):
+        return None, None
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    usage = data.get("usage")
+    return data, usage if isinstance(usage, dict) else None
 
 
 def _sanitized_env(cfg: CoreConfig) -> dict[str, str]:
@@ -49,7 +81,12 @@ def build_command(
     *,
     permission_mode: str | None = None,
 ) -> list[str]:
-    """Construct the ``claude -p`` argument vector (no execution)."""
+    """Construct the ``claude -p`` argument vector (no execution).
+
+    ``--output-format json`` is not optional: the structured envelope is what
+    makes a run auditable afterwards (token usage for the quota ledger, the
+    step stream for the trajectory store). See :mod:`hsai.trajectory`.
+    """
     mode = permission_mode or cfg.permission_mode
     return [
         "claude",
@@ -59,6 +96,8 @@ def build_command(
         choice.model,
         "--permission-mode",
         mode,
+        "--output-format",
+        "json",
     ]
 
 
@@ -89,10 +128,13 @@ def run_agent(
     preflight(cfg)
     cmd = build_command(prompt, choice, cfg, permission_mode=permission_mode)
     proc: Proc = runner(cmd, cwd=cwd, env=_sanitized_env(cfg), timeout=timeout)
+    raw, usage = parse_output(proc.stdout)
     return AIResult(
         ok=proc.ok,
         model=choice.model,
         output=proc.stdout,
         error=proc.stderr,
         cmd=cmd,
+        usage=usage,
+        raw=raw,
     )

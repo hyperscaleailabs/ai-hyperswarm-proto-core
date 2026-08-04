@@ -14,6 +14,7 @@ so the decision logic stays pure and unit-tested.
 | `hsai.gitops` | worktrees, sync, branch, commit, push | git |
 | `hsai.github` | tickets, labels, PRs, merge | gh |
 | `hsai.ci` | local CI gate (ruff+pytest) + remote status | subprocess |
+| `hsai.trajectory` | one durable record per agent run; redaction, replay | write files |
 | `hsai.knowledge` | lessons, whitepapers, MOC reindex (Obsidian) | write files |
 | `hsai.orchestrator` | one iteration; `decide_path`, `build_pr_body` (pure) | composes above |
 | `hsai.swarm` | run N iterations concurrently | threads |
@@ -28,13 +29,15 @@ sequenceDiagram
     participant C as ci
     participant H as github
     participant A as ai (agent)
+    participant T as trajectory
     participant K as knowledge
 
     O->>G: sync_main + create_worktree
     O->>C: run_local (CI before)
     O->>H: claim ticket (heal / implement / improve)
     O->>A: run_agent(prompt, model choice)
-    A-->>O: ok / error
+    A-->>O: ok / error + steps + usage (JSON envelope)
+    O->>T: record (before any guard can abort)
     O->>C: run_local (CI after)
     O->>K: write_lesson (always, pass or fail)
     O->>G: commit_all + push_branch
@@ -65,6 +68,32 @@ renderers - is tested directly.
 - **Green-gated merges:** merges use `gh pr merge --auto`; with branch
   protection requiring the `ci` check, broken changes simply never merge.
 - **Traceability:** no PR without a ticket, a recorded model, and a lesson.
+
+## Observability: trajectories
+
+`claude -p` is invoked with `--output-format json`, so every run returns a
+structured envelope (final result, message stream, token usage) instead of an
+opaque blob. `orchestrator.run_once` hands that envelope to
+`trajectory.record` at the single choke point right after `ai.run_agent` -
+*before* the completeness and reproduce-before-fix guards can return early -
+and writes one JSON file per run to `.hsai/trajectories/<iteration>-<ticket>.json`.
+The final outcome (`merged`, `recovered`, `incomplete`, `no_repro`, ...) is
+folded back in when the iteration's cost record is appended.
+
+Two audiences, deliberately split:
+
+- **Local and complete.** Trajectories quote repo content, so they are
+  gitignored and never pushed. `hsai replay <id> [--json]` reconstructs one -
+  prompt, step stream, exit status, usage - purely by reading the file, with no
+  `claude` subprocess and no quota spent.
+- **Committed and redacted.** The lesson embeds only `Trajectory.excerpt()`: a
+  secrets-scrubbed tail of the last few steps. The knowledge base gains signal
+  without mirroring the working tree.
+
+The same envelope feeds `ledger.parse_tokens`, so the quota ledger's token
+columns - and the block aggregate in the review brief - report real numbers
+instead of nulls. Output that is not JSON (an older `claude` binary) degrades
+to a single-step trajectory with null usage rather than breaking the loop.
 
 ## Headless permission mode
 

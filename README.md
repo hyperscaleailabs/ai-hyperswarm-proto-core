@@ -69,7 +69,14 @@ hsai doctor        # verify subscription-only guard + environment
 hsai loop --dry-run   # a full iteration with no side effects
 hsai loop          # one real iteration (opens & merges a PR on green)
 hsai loop --max-parallel 3 -n 1   # ramp to the swarm (after proving one iteration)
+hsai replay 12-7   # reconstruct what agent run 12-7 did (spends no quota)
 ```
+
+Every agent run persists a **trajectory** - prompt, step stream, exit status,
+token usage - to `.hsai/trajectories/<iteration>-<ticket>.json`. Those files
+quote repo content, so they stay local and gitignored; the committed lesson
+carries only a redacted tail. `hsai replay <id> [--json]` reads one back
+without invoking `claude`.
 
 ## Learning targets (top-10, pinned snapshot)
 
