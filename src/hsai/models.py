@@ -22,6 +22,11 @@ import re
 from dataclasses import dataclass
 
 from .config import CoreConfig
+from .handoff import Handoff
+
+# Tiers ordered cheap -> expensive; used by both the demote (soft budget
+# breach) and escalate (failed-retry) paths.
+_TIER_STEPS = ("light", "standard", "heavy")
 
 # Signal words weighted by complexity impact.
 _HEAVY_SIGNALS = (
@@ -178,3 +183,52 @@ def select(task: Task, cfg: CoreConfig, *, demote: bool = False) -> ModelChoice:
     model = cfg.tiers[tier].model
     rationale = f"score={score} -> {tier} ({why})"
     return ModelChoice(tier=tier, model=model, rationale=rationale, strategy="heuristic-v1")
+
+
+def escalate(
+    choice: ModelChoice,
+    handoff: Handoff | None,
+    cfg: CoreConfig,
+    budget_decision: object | None = None,
+) -> ModelChoice:
+    """Bump ``choice`` one tier heavier when a prior attempt already failed.
+
+    Retrying a known-failing ticket at the same tier/model spends a scarce
+    retry re-running a configuration that already lost - microsoft/JARVIS's
+    capability-based routing sends an under-delivering task to a more capable
+    model instead. A no-op when ``handoff`` is ``None`` (first attempt, or no
+    parseable handoff was found).
+
+    Subordinated to the budget gate (OpenBMB/ChatDev's cheaper-agent cost
+    discipline): ``budget_decision`` is duck-typed to
+    :class:`hsai.ledger.BudgetDecision` so this module never has to import
+    ``ledger`` at runtime. Either ``.demote`` (soft breach) or ``.halt`` (hard
+    breach) set forces a no-op - the quota guardrail always wins over the
+    retry heuristic.
+    """
+    if handoff is None:
+        return choice
+    if budget_decision is not None and (
+        getattr(budget_decision, "demote", False) or getattr(budget_decision, "halt", False)
+    ):
+        return choice
+
+    try:
+        idx = _TIER_STEPS.index(choice.tier)
+    except ValueError:
+        return choice
+    if idx >= len(_TIER_STEPS) - 1:
+        return choice  # already at the heaviest tier - nothing to escalate to
+
+    next_tier = _TIER_STEPS[idx + 1]
+    if next_tier not in cfg.tiers:
+        return choice
+
+    rationale = (
+        f"{choice.rationale}; escalated {choice.tier}->{next_tier} after attempt "
+        f"{handoff.attempt} failed (remote CI: {handoff.remote_ci})"
+    )
+    return ModelChoice(
+        tier=next_tier, model=cfg.tiers[next_tier].model,
+        rationale=rationale, strategy=choice.strategy,
+    )

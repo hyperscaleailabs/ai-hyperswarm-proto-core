@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from hsai import ledger, orchestrator, trajectory
+from hsai import handoff, ledger, orchestrator, trajectory
 from hsai.config import load_config
 from hsai.models import ModelChoice
 from hsai.orchestrator import (
@@ -81,6 +81,9 @@ class FakeRunner:
         self._ci_round = 0
         self._issue_seq = 100
         self._pr_seq = 200
+        # Issue-comment store (handoff comments live here): number -> bodies,
+        # oldest first, mirroring GitHub's own comment ordering.
+        self.comments: dict[int, list[str]] = {}
 
     def __call__(
         self, cmd, *, cwd=None, env=None, timeout=None, input_text=None
@@ -126,6 +129,11 @@ class FakeRunner:
             return Proc(cmd, 0, f"https://github.com/o/r/issues/{self._issue_seq}\n", "")
         if cmd[:3] == ["gh", "issue", "edit"]:
             return Proc(cmd, 0, "", "")
+        if cmd[:3] == ["gh", "issue", "comment"]:
+            num = int(cmd[3])
+            body = cmd[cmd.index("--body") + 1]
+            self.comments.setdefault(num, []).append(body)
+            return Proc(cmd, 0, "", "")
         if cmd[:1] == ["claude"]:
             return Proc(cmd, 0, self.agent_output, "")
         if cmd[:3] == ["gh", "pr", "create"]:
@@ -145,6 +153,10 @@ class FakeRunner:
             return Proc(cmd, 0, "", "")
         if cmd[:3] == ["gh", "issue", "view"]:
             num = int(cmd[3])
+            fields = cmd[cmd.index("--json") + 1]
+            if fields == "comments":
+                data = {"comments": [{"body": b} for b in self.comments.get(num, [])]}
+                return Proc(cmd, 0, json.dumps(data), "")
             match = next((i for i in self.open_issues if i.get("number") == num), None)
             data = match or {
                 "number": num, "title": "", "labels": [], "assignees": [], "body": ""
@@ -812,3 +824,141 @@ def test_malformed_ticket_is_refused_and_labeled(tmp_path):
         if c[:3] == ["gh", "issue", "edit"] and "needs-refinement" in c and "11" in c
     ]
     assert labeled, "vague ticket should be labeled needs-refinement"
+
+
+# --- failure-aware retry handoff (escalate tier, carry prior-attempt evidence) ----
+
+TIER_BY_MODEL = {
+    "haiku": "light",
+    "sonnet": "standard",
+    "opus": "heavy",
+}
+
+
+def test_second_attempt_escalates_tier_and_carries_failure_evidence(tmp_path):
+    """Attempt 1 fails remote CI; attempt 2 on the same ticket should read back
+    that failure as a handoff, escalate one tier heavier, and put the evidence
+    in front of the worker instead of re-running the identical configuration."""
+    cfg = load_config()
+    open_issues = [
+        {
+            "number": 7,
+            "title": "add widget",
+            "labels": [{"name": "priority:P2"}],
+            "assignees": [],
+            "body": WELL_FORMED_BODY,
+        }
+    ]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True, True, True],
+        open_issues=open_issues, remote_ci="FAILURE",
+    )
+
+    result1 = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+    assert result1.recovered is True and result1.merged is False
+    assert TIER_BY_MODEL[result1.model] == "standard"
+
+    prompt1 = next(c for c in runner.calls if c[:1] == ["claude"])[2]
+    assert "Previous attempt" not in prompt1
+
+    # A handoff comment landed on the ticket, and `_recover_failed`'s usual
+    # bookkeeping (attempts:1, unassigned) is what a real second worker reads.
+    assert runner.comments.get(7), "attempt 1's failure should post a handoff comment"
+    open_issues[0]["labels"] = [{"name": "priority:P2"}, {"name": "attempts:1"}]
+    open_issues[0]["assignees"] = []
+    runner.remote_ci = "SUCCESS"
+
+    result2 = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=2,
+    )
+    assert result2.merged is True
+
+    claude_calls = [c for c in runner.calls if c[:1] == ["claude"]]
+    prompt2 = claude_calls[-1][2]
+    assert prompt1 != prompt2
+    assert "Previous attempt" in prompt2
+    assert "FAILURE" in prompt2
+    assert "attempt 1" in prompt2
+
+    # Escalated exactly one tier heavier than attempt 1's.
+    assert TIER_BY_MODEL[result2.model] == "heavy"
+    assert any(n == "escalated tier: standard->heavy" for n in result2.notes)
+
+    # The escalation reason lands verbatim in the PR's '## Model used' section.
+    pr_create = [c for c in runner.calls if c[:3] == ["gh", "pr", "create"]][-1]
+    body = pr_create[pr_create.index("--body") + 1]
+    assert "## Model used" in body
+    assert "`opus`" in body
+    assert "escalated standard->heavy after attempt 1 failed" in body
+
+
+def test_hard_budget_breach_blocks_escalation_on_retry(tmp_path):
+    """A hard budget breach subordinates the retry heuristic: even with a
+    parseable prior-failure handoff in hand, the tier must not escalate."""
+    cfg = load_config()
+    open_issues = [
+        {
+            "number": 7,
+            "title": "add widget",
+            "labels": [{"name": "priority:P2"}, {"name": "attempts:1"}],
+            "assignees": [],
+            "body": WELL_FORMED_BODY,
+        }
+    ]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=open_issues, remote_ci="SUCCESS",
+    )
+    # Seed the handoff a first (failed) attempt would have left behind.
+    runner.comments[7] = [
+        handoff.Handoff(
+            attempt=1, tier="standard", model="sonnet", remote_ci="FAILURE",
+        ).render_comment()
+    ]
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=2,
+        budget_decision=ledger.BudgetDecision(ledger.HARD, "over ceiling"),
+    )
+
+    assert TIER_BY_MODEL[result.model] == "standard"  # no escalation
+    assert not any(n.startswith("escalated tier:") for n in result.notes)
+    assert result.merged is True  # in-flight work still completes normally
+
+
+def test_soft_budget_breach_blocks_escalation_on_retry(tmp_path):
+    cfg = load_config()
+    open_issues = [
+        {
+            "number": 7,
+            "title": "add widget",
+            "labels": [{"name": "priority:P2"}, {"name": "attempts:1"}],
+            "assignees": [],
+            "body": WELL_FORMED_BODY,
+        }
+    ]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=open_issues, remote_ci="SUCCESS",
+    )
+    runner.comments[7] = [
+        handoff.Handoff(
+            attempt=1, tier="standard", model="sonnet", remote_ci="FAILURE",
+        ).render_comment()
+    ]
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=2,
+        demote_tier=True,
+    )
+
+    # demote_tier=True both biases select() cheaper AND gates escalate() off;
+    # net effect for a standard-tier task is it stays on the demoted tier.
+    assert TIER_BY_MODEL[result.model] == "light"
+    assert not any(n.startswith("escalated tier:") for n in result.notes)
