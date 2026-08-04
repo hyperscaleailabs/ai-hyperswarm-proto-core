@@ -132,6 +132,34 @@ def list_open_issues(repo: str, *, runner: Runner = run) -> list[Issue]:
     return issues
 
 
+def list_closed_issues(repo: str, *, limit: int = 100, runner: Runner = run) -> list[Issue]:
+    """List recently closed issues (newest first) - the replay corpus miner's input."""
+    p = _gh(
+        [
+            "issue", "list", "--repo", repo, "--state", "closed",
+            "--limit", str(limit),
+            "--json", "number,title,labels,assignees,body",
+        ],
+        runner=runner,
+    )
+    try:
+        data = json.loads(p.stdout or "[]")
+    except json.JSONDecodeError:
+        return []
+    issues = [
+        Issue(
+            number=item["number"],
+            title=item.get("title", ""),
+            labels=tuple(lb["name"] for lb in item.get("labels", [])),
+            assignees=tuple(a["login"] for a in item.get("assignees", [])),
+            body=item.get("body", "") or "",
+        )
+        for item in data
+    ]
+    issues.sort(key=lambda i: -i.number)
+    return issues
+
+
 def next_ticket(repo: str, *, runner: Runner = run) -> Issue | None:
     issues = list_open_issues(repo, runner=runner)
     return issues[0] if issues else None

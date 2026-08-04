@@ -110,7 +110,18 @@ models:
       model: opus
       use_for: [architecture, hard-bug, large-refactor, design]
   default_tier: standard
-  selection_strategy: heuristic-v1   # improved over time; tracked as a backlog skill
+  # Which registered strategy in src/hsai/models.py routes tasks to tiers.
+  # `hsai replay` grades any of them offline against the committed corpus at
+  # knowledge/eval/selection-corpus.jsonl - no model calls, no network.
+  # heuristic-v2 is registered and measurably better in-sample (0.9559 vs
+  # 0.7206); promoting it raises heavy-tier routing by half, so it is a
+  # steering decision. See knowledge/eval/2026-08-04-selection-strategy-v1-vs-v2.md.
+  selection_strategy: heuristic-v1
+  # Hard CI gate: `hsai replay` exits non-zero below this benchmark score, so an
+  # edit to the scorer that regresses routing is a red build, not later drift.
+  # Sits just under heuristic-v1's measured 0.7206; ratchet to 0.90 when v2 is
+  # promoted.
+  replay_min_score: 0.70
 
 # Governance: the architect steering loop (three streams).
 # Stream 1: steering  - DIRECTION.md + review briefs + /review-next sessions -> ADRs
