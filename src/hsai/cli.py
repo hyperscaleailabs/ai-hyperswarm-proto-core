@@ -6,7 +6,8 @@ Commands:
   hsai status                                                  config + backlog snapshot
   hsai reindex                                                 rebuild knowledge MOCs
   hsai doctor                                                  verify environment + invariants
-  hsai replay <id> [--json]                                    reconstruct a stored agent run
+  hsai traj <iteration> [--json]                               print a stored agent run
+  hsai replay <iteration> [--json]                             alias of `hsai traj`
 """
 from __future__ import annotations
 
@@ -123,7 +124,7 @@ def cmd_repro_check(args: argparse.Namespace) -> int:
     return 0 if result.ok else 1
 
 
-def cmd_replay(args: argparse.Namespace) -> int:
+def _print_trajectory(args: argparse.Namespace, label: str) -> int:
     """Reconstruct a stored agent run from the local trajectory store.
 
     Pure reading: no ``claude`` subprocess, no network, no quota spent.
@@ -131,10 +132,20 @@ def cmd_replay(args: argparse.Namespace) -> int:
     try:
         traj = trajectory.load(args.root, args.trajectory_id)
     except (FileNotFoundError, ValueError) as exc:
-        print(f"replay: {exc}", file=sys.stderr)
+        print(f"{label}: {exc}", file=sys.stderr)
         return 1
     print(traj.to_json() if args.json else traj.render())
     return 0
+
+
+def cmd_replay(args: argparse.Namespace) -> int:
+    """Reconstruct a stored agent run (alias of ``hsai traj``)."""
+    return _print_trajectory(args, "replay")
+
+
+def cmd_traj(args: argparse.Namespace) -> int:
+    """Print one iteration's stored trajectory for a post-mortem."""
+    return _print_trajectory(args, "traj")
 
 
 def cmd_brief(args: argparse.Namespace) -> int:
@@ -206,11 +217,16 @@ def build_parser() -> argparse.ArgumentParser:
     br = sub.add_parser("brief", help="refresh governance/DIRECTION.md")
     br.set_defaults(func=cmd_brief)
 
-    rp = sub.add_parser("replay", help="reconstruct a stored agent run (spends no quota)")
-    rp.add_argument("trajectory_id", help="trajectory id (<iteration>-<ticket>) or a file path")
-    rp.add_argument("--root", default=".", help="repo root holding .hsai/trajectories")
-    rp.add_argument("--json", action="store_true", help="print the raw trajectory JSON")
-    rp.set_defaults(func=cmd_replay)
+    for name, help_text, func in (
+        ("traj", "print a stored trajectory for a post-mortem", cmd_traj),
+        ("replay", "reconstruct a stored agent run (alias of `traj`)", cmd_replay),
+    ):
+        tp = sub.add_parser(name, help=f"{help_text} (spends no quota)")
+        tp.add_argument("trajectory_id", metavar="iteration",
+                        help="iteration number, or a path to a trajectory file")
+        tp.add_argument("--root", default=".", help="repo root holding .hsai/traj")
+        tp.add_argument("--json", action="store_true", help="print the raw trajectory JSON")
+        tp.set_defaults(func=func)
 
     rc = sub.add_parser(
         "repro-check", help="reproduce-before-fix guard for heal/bugfix PRs (CI gate)"

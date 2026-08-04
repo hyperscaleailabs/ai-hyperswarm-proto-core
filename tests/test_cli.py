@@ -97,15 +97,37 @@ def _no_subprocess(monkeypatch) -> _RunnerSpy:
     return spy
 
 
+def test_traj_prints_a_stored_run_for_post_mortem(tmp_path, monkeypatch, capsys):
+    """`hsai traj <iteration>` is the post-mortem entrance."""
+    _seed_trajectory(tmp_path)
+    spy = _no_subprocess(monkeypatch)
+
+    rc = main(["traj", "12", "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "trajectory 12" in out
+    assert "ticket #7" in out
+    assert "input_tokens=1500" in out
+    assert spy.calls == []                       # reading disk spends no quota
+
+
+def test_traj_unknown_iteration_exits_nonzero(tmp_path, monkeypatch, capsys):
+    _no_subprocess(monkeypatch)
+    rc = main(["traj", "999", "--root", str(tmp_path)])
+    assert rc == 1
+    assert "no trajectory" in capsys.readouterr().err
+
+
 def test_replay_prints_a_human_reconstruction(tmp_path, monkeypatch, capsys):
     _seed_trajectory(tmp_path)
     spy = _no_subprocess(monkeypatch)
 
-    rc = main(["replay", "12-7", "--root", str(tmp_path)])
+    rc = main(["replay", "12", "--root", str(tmp_path)])
     out = capsys.readouterr().out
 
     assert rc == 0
-    assert "trajectory 12-7" in out
+    assert "trajectory 12" in out
     assert "Implement the widget END TO END." in out      # prompt
     assert "tool_use(Read)" in out and "Widget implemented." in out  # step stream
     assert "input_tokens=1500" in out and "output_tokens=320" in out  # usage
@@ -117,7 +139,7 @@ def test_replay_json_flag_round_trips(tmp_path, monkeypatch, capsys):
     traj = _seed_trajectory(tmp_path)
     spy = _no_subprocess(monkeypatch)
 
-    rc = main(["replay", "12-7", "--root", str(tmp_path), "--json"])
+    rc = main(["replay", "12", "--root", str(tmp_path), "--json"])
     out = capsys.readouterr().out
 
     assert rc == 0
@@ -132,14 +154,14 @@ def test_replay_json_flag_round_trips(tmp_path, monkeypatch, capsys):
 def test_replay_accepts_a_file_path(tmp_path, monkeypatch, capsys):
     _seed_trajectory(tmp_path)
     _no_subprocess(monkeypatch)
-    path = trajectory.path_for(tmp_path, "12-7")
+    path = trajectory.path_for(tmp_path, "12", 0)
 
     assert main(["replay", str(path)]) == 0
-    assert "trajectory 12-7" in capsys.readouterr().out
+    assert "trajectory 12" in capsys.readouterr().out
 
 
 def test_replay_unknown_id_exits_nonzero(tmp_path, monkeypatch, capsys):
     _no_subprocess(monkeypatch)
-    rc = main(["replay", "999-1", "--root", str(tmp_path)])
+    rc = main(["replay", "999", "--root", str(tmp_path)])
     assert rc == 1
     assert "no trajectory" in capsys.readouterr().err

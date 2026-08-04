@@ -131,10 +131,23 @@ def write_direction(cfg: CoreConfig, *, repo_root: str | Path, runner: Runner = 
 
 
 def _cost_summary(cost: BlockAggregate | None) -> str:
-    """One-line block economics for the review brief (empty ledger -> note)."""
+    """Block economics for the review brief (empty ledger -> note).
+
+    Tokens-per-merged-PR is called out on its own line: it is the number the
+    architect steers on (quota spent per unit of delivered work), so it should
+    not be buried at the end of the summary string.
+    """
     if cost is None or cost.iterations == 0:
         return "_no ledger records for this block_"
-    return cost.summary()
+    per_pr = cost.tokens_per_merged_pr()
+    efficiency = (
+        f"{per_pr:.0f} tokens per merged PR "
+        f"({cost.total_tokens} tokens / {cost.merged_iterations} merged)"
+        if per_pr
+        else "tokens per merged PR: _not available_ "
+        "(nothing merged, or the CLI reported no token counts)"
+    )
+    return f"{cost.summary()}\n\n**Efficiency:** {efficiency}"
 
 
 def render_brief(cfg: CoreConfig, report: BlockReport) -> str:

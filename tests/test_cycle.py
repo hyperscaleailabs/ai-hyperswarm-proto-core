@@ -10,9 +10,11 @@ gate.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
-from hsai import cycle, ledger
+from hsai import cycle, ledger, trajectory
 from hsai.config import load_config
+from hsai.knowledge import KnowledgeBase
 from hsai.orchestrator import IterationResult
 from hsai.proc import Proc
 
@@ -120,3 +122,54 @@ def test_block_soft_biases_then_hard_halts_but_inflight_merges(tmp_path, monkeyp
     assert len(lines) == 3
     for line in lines:
         json.loads(line)
+
+
+# --- plain-text agent output must not break article generation --------------
+
+def test_persona_articles_survive_output_without_a_json_envelope(tmp_path):
+    """`payload is None` degrades to the raw text, it never skips the article."""
+    cfg = load_config()
+    kb = KnowledgeBase.from_config(cfg, tmp_path)
+    kb.whitepapers_dir.mkdir(parents=True, exist_ok=True)
+    (kb.whitepapers_dir / "2026-08-04-block-1.md").write_text("# Block paper\n\nBody.\n")
+
+    article = "# What this block changed\n\nPlain text, no JSON envelope.\n"
+
+    def ai_runner(cmd, *, cwd=None, env=None, timeout=None, input_text=None):
+        return Proc(cmd, 0, article, "")
+
+    written = cycle._persona_articles(
+        cfg, kb, "2026-08-04-block-1", repo_root=tmp_path, ai_runner=ai_runner
+    )
+
+    assert len(written) == len(cfg.personas)
+    for rel in written:
+        text = (tmp_path / rel).read_text()
+        assert "Plain text, no JSON envelope." in text
+
+
+# --- trajectory retention ---------------------------------------------------
+
+def test_cycle_prunes_trajectory_blocks_beyond_retention(tmp_path, monkeypatch):
+    cfg = load_config()
+    cfg.cycle["block_size"] = 0            # no iterations; isolate the pruning step
+    cfg = replace(cfg, trajectory_retention_blocks=2)
+
+    for block in range(5):
+        trajectory.write(
+            trajectory.Trajectory(
+                iteration=block * 100 + 1, ticket=1, kind="implement", tier="standard",
+                model="sonnet", prompt="p", block=block,
+            ),
+            tmp_path,
+        )
+
+    runner = _Runner()
+    monkeypatch.setattr(cycle, "_well_formed_backlog", lambda cfg, *, runner: 999)
+    monkeypatch.setattr(cycle, "_governance_pr", lambda *a, **k: 0)
+
+    res = cycle.run_cycle(cfg, repo_dir=str(tmp_path), cycle_index=4, runner=runner)
+
+    kept = sorted(p.name for p in trajectory.trajectory_dir(tmp_path).iterdir())
+    assert kept == ["3", "4"]              # only the newest `retention_blocks`
+    assert any("pruned trajectories" in n for n in res.report.notes)

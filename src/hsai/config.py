@@ -41,6 +41,8 @@ class CoreConfig:
     default_branch: str
     worktrees_dir: str
     permission_mode: str
+    output_format: str
+    trajectory_retention_blocks: int
     agent_timeout: float | None
     ci_remote_timeout: float
     ci_poll_interval: float
@@ -128,6 +130,10 @@ def load_config(path: str | Path | None = None) -> CoreConfig:
         default_branch=execution.get("default_branch", "main"),
         worktrees_dir=execution.get("worktrees_dir", ".hsai/worktrees"),
         permission_mode=execution.get("permission_mode", "acceptEdits"),
+        # Config-driven so a `claude` CLI change can be worked around by editing
+        # YAML instead of shipping code: "text" (or empty) drops the flag entirely.
+        output_format=str(execution.get("output_format", "json") or ""),
+        trajectory_retention_blocks=int(execution.get("trajectory_retention_blocks", 8)),
         agent_timeout=execution.get("agent_timeout_seconds"),
         ci_remote_timeout=float(execution.get("ci_remote_timeout_seconds", 300)),
         ci_poll_interval=float(execution.get("ci_poll_interval_seconds", 10)),

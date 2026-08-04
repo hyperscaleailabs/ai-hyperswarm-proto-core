@@ -1,5 +1,14 @@
+from hsai import ai
 from hsai.config import load_config
-from hsai.synthesis import ContextPack, build_prompt, parse_ticket_specs, pick_rotation
+from hsai.models import ModelChoice
+from hsai.proc import Proc
+from hsai.synthesis import (
+    ContextPack,
+    build_prompt,
+    parse_ticket_specs,
+    pick_rotation,
+    synthesize,
+)
 
 
 def _cfg():
@@ -48,3 +57,50 @@ PHASE 3:
 def test_parse_handles_garbage():
     assert parse_ticket_specs("no json here") == []
     assert parse_ticket_specs("```json\nnot json\n```") == []
+
+
+# --- plain-text (non-JSON) CLI output must never break synthesis -------------
+
+PLAIN_TEXT_OUTPUT = """PHASE 1 - DIVERGE: ten candidates considered.
+PHASE 2 - REFLECT: three survived critique.
+PHASE 3 - PRIORITIZE:
+```json
+[{"title": "feat: adaptive budget", "problem": "p", "proposal": "pp",
+  "acceptance_criteria": ["a", "b", "c"], "verification_plan": ["v1", "v2"],
+  "size": "L", "goal_ids": ["G4"], "synthesis_rationale": "combines x+y+z"}]
+```"""
+
+
+def _plain_text_runner():
+    """A `claude` that prints plain text - an older binary, or a crash."""
+    calls: list[list[str]] = []
+
+    def runner(cmd, *, cwd=None, env=None, timeout=None, input_text=None):
+        calls.append(list(cmd))
+        if cmd[:1] == ["claude"]:
+            return Proc(cmd, 0, PLAIN_TEXT_OUTPUT, "")
+        if cmd[:3] == ["gh", "issue", "create"]:
+            return Proc(cmd, 0, "https://github.com/o/r/issues/321\n", "")
+        return Proc(cmd, 0, "", "")
+
+    runner.calls = calls  # type: ignore[attr-defined]
+    return runner
+
+
+def test_synthesize_survives_output_without_a_json_envelope():
+    """`payload is None` is a supported state, not a failure mode."""
+    cfg = _cfg()
+    runner = _plain_text_runner()
+
+    # The CLI exposed no structured envelope at all...
+    result = ai.run_agent(
+        "p", ModelChoice(tier="heavy", model="opus", rationale="t"), cfg, runner=runner
+    )
+    assert result.payload is None and result.usage is None
+    assert result.text == PLAIN_TEXT_OUTPUT      # falls back to raw stdout
+
+    # ...and synthesis still parses its ticket specs off the raw text and files them.
+    res = synthesize(cfg, cycle_index=0, runner=runner, ai_runner=runner)
+    assert res.ok is True
+    assert res.filed == [321]
+    assert res.error == ""

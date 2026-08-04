@@ -580,7 +580,7 @@ WIDGET_ISSUE = {
 
 
 def _trajectory_files(root: Path) -> list[Path]:
-    return sorted((root / ".hsai" / "trajectories").glob("*.json"))
+    return sorted((root / ".hsai" / "traj").glob("*/*.json"))
 
 
 def test_agent_run_is_persisted_as_a_trajectory(tmp_path):
@@ -595,19 +595,39 @@ def test_agent_run_is_persisted_as_a_trajectory(tmp_path):
     )
 
     assert result.merged is True
-    # Exactly one trajectory file for the one `claude` invocation.
+    # Exactly one trajectory file for the one `claude` invocation, sharded by block.
     assert len([c for c in runner.calls if c[:1] == ["claude"]]) == 1
-    assert [p.name for p in _trajectory_files(tmp_path)] == ["4-7.json"]
+    assert [p.name for p in _trajectory_files(tmp_path)] == ["4.json"]
+    assert _trajectory_files(tmp_path)[0].parent.name == "0"   # block 4 // 100
 
-    traj = trajectory.load(tmp_path, "4-7")
+    traj = trajectory.load(tmp_path, "4")
     assert traj.iteration == 4 and traj.ticket == 7 and traj.kind == IMPLEMENT
+    assert traj.block == 0
     assert traj.model == result.model and traj.tier
     assert "add widget" in traj.prompt              # the prompt is reconstructable
+    assert traj.prompt_digest                       # and fingerprinted
+    assert traj.session_id == "5f1c"                # per-run id, when exposed
     assert [s.kind for s in traj.steps] == ["tool_use", "tool_result", "result"]
     assert traj.usage == {"input_tokens": 1500, "output_tokens": 320}
     assert traj.exit_status == "ok" and traj.ok is True
     assert traj.outcome == "merged"                 # final outcome is folded back in
-    assert any(n == "trajectory=4-7" for n in result.notes)
+    assert any(n == "trajectory=4" for n in result.notes)
+
+
+def test_trajectories_are_sharded_by_block(tmp_path):
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[dict(WIDGET_ISSUE)]
+    )
+
+    # `hsai cycle` numbers a block's runs block*100 + n.
+    run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=703,
+    )
+
+    assert (tmp_path / ".hsai" / "traj" / "7" / "703.json").is_file()
+    assert trajectory.load(tmp_path, "703").block == 7
 
 
 def test_trajectory_is_written_when_the_completeness_guard_aborts(tmp_path):
@@ -625,9 +645,15 @@ def test_trajectory_is_written_when_the_completeness_guard_aborts(tmp_path):
 
     # The run the guard aborted is exactly the one worth replaying.
     assert result.recovered is True and result.pr is None
-    traj = trajectory.load(tmp_path, "5-9")
+    assert [p.name for p in _trajectory_files(tmp_path)] == ["5.json"]
+    traj = trajectory.load(tmp_path, "5")
     assert traj.outcome == "incomplete"
     assert traj.steps
+    # The ledger record for the aborted run carries its token cost too: an
+    # abort still spent quota.
+    records = ledger.read_records(ledger.ledger_path(cfg, tmp_path))
+    assert [r.outcome for r in records] == ["incomplete"]
+    assert records[0].input_tokens == 1500 and records[0].output_tokens == 320
 
 
 def test_trajectory_is_written_when_the_repro_guard_aborts(tmp_path):
@@ -640,9 +666,15 @@ def test_trajectory_is_written_when_the_repro_guard_aborts(tmp_path):
     )
 
     assert result.kind == HEAL and result.recovered is True and result.pr is None
-    traj = trajectory.load(tmp_path, f"6-{result.ticket}")
+    assert [p.name for p in _trajectory_files(tmp_path)] == ["6.json"]
+    traj = trajectory.load(tmp_path, "6")
     assert traj.outcome == "no_repro"
     assert traj.kind == HEAL and "auto-heal" in traj.prompt
+    assert traj.ticket == result.ticket
+
+    records = ledger.read_records(ledger.ledger_path(cfg, tmp_path))
+    assert [r.outcome for r in records] == ["no_repro"]
+    assert records[0].input_tokens == 1500
 
 
 def test_one_trajectory_file_per_agent_invocation(tmp_path):
@@ -660,15 +692,17 @@ def test_one_trajectory_file_per_agent_invocation(tmp_path):
 
     claude_calls = [c for c in runner.calls if c[:1] == ["claude"]]
     assert len(claude_calls) == len(_trajectory_files(tmp_path)) == 2
-    assert [p.name for p in _trajectory_files(tmp_path)] == ["1-7.json", "2-7.json"]
+    assert [p.name for p in _trajectory_files(tmp_path)] == ["1.json", "2.json"]
     # Every invocation asked the CLI for the structured envelope.
     assert all("--output-format" in c and "json" in c for c in claude_calls)
 
 
 def test_dry_run_writes_no_trajectory(tmp_path):
     cfg = load_config()
+    # A dry run makes no model call, so it must leave no artifact behind.
     run_once(cfg, repo_dir=str(tmp_path), dry_run=True, iteration=1)
-    assert not (tmp_path / ".hsai" / "trajectories").exists()
+    assert not (tmp_path / ".hsai" / "traj").exists()
+    assert _trajectory_files(tmp_path) == []
 
 
 def test_token_counts_reach_the_ledger_and_the_block_aggregate(tmp_path):
@@ -689,6 +723,34 @@ def test_token_counts_reach_the_ledger_and_the_block_aggregate(tmp_path):
     agg = ledger.aggregate_block(records, block=0)
     assert agg.input_tokens == 1500 and agg.output_tokens == 320
     assert "1820 tokens" in agg.summary()      # no longer reporting zero
+    # Tokens per merged PR is the block's efficiency signal (G4).
+    assert agg.merged_iterations == 1
+    assert agg.tokens_per_merged_pr() == 1820
+    assert "1820 tokens/merged PR" in agg.summary()
+
+
+def test_trajectory_digest_reaches_the_lesson_and_the_pr_body(tmp_path):
+    """The audit trail is visible on the PR, not only on local disk."""
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[dict(WIDGET_ISSUE)]
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=14,
+    )
+
+    pr_create = next(c for c in runner.calls if c[:3] == ["gh", "pr", "create"])
+    pr_body = pr_create[pr_create.index("--body") + 1]
+    lesson_text = Path(result.lesson_path).read_text()
+
+    for text in (pr_body, lesson_text):
+        assert "tokens=1500in/320out" in text     # what the run cost
+        assert "duration=" in text                # how long it took
+        assert "exit=ok" in text                  # how it ended
+        assert "hsai traj 14" in text             # where the full record is
+    assert "## Trajectory" in pr_body
 
 
 def test_non_json_agent_output_still_produces_an_iteration_and_trajectory(tmp_path):
@@ -707,7 +769,7 @@ def test_non_json_agent_output_still_produces_an_iteration_and_trajectory(tmp_pa
     assert result.merged is True and result.pr is not None
     assert Path(result.lesson_path).exists()
 
-    traj = trajectory.load(tmp_path, "8-7")
+    traj = trajectory.load(tmp_path, "8")
     assert traj.usage is None                       # nothing to report, not a crash
     assert [s.kind for s in traj.steps] == ["output"]
     assert traj.steps[0].text == "widget added, tests green"
@@ -742,12 +804,12 @@ def test_only_a_redacted_excerpt_of_the_trajectory_reaches_the_knowledge_base(tm
     )
 
     lesson_text = Path(result.lesson_path).read_text()
-    traj = trajectory.load(tmp_path, "2-7")
+    traj = trajectory.load(tmp_path, "2")
     assert len(traj.steps) == 9
 
-    # The lesson quotes the tail (and points at the replay command)...
+    # The lesson quotes the tail (and points at the post-mortem command)...
     assert "TAIL-MARKER" in lesson_text
-    assert "hsai replay 2-7" in lesson_text
+    assert "hsai traj 2" in lesson_text
     assert "earlier step(s) elided" in lesson_text
     # ...but never the whole run, nor the prompt, nor the raw payload.
     assert "EARLY-MARKER-0" not in lesson_text
@@ -776,13 +838,39 @@ def test_agent_secrets_never_reach_the_knowledge_base(tmp_path):
     )
 
     assert "sk-ant-abcdef0123456789" not in Path(result.lesson_path).read_text()
-    assert "sk-ant-abcdef0123456789" not in trajectory.load(tmp_path, "9-7").steps[0].text
+    assert "sk-ant-abcdef0123456789" not in trajectory.load(tmp_path, "9").steps[0].text
 
 
 def test_trajectories_are_gitignored():
     gitignore = Path(__file__).resolve().parents[1] / ".gitignore"
     ignored = [line.strip() for line in gitignore.read_text().splitlines()]
-    assert ".hsai/trajectories/" in ignored
+    assert ".hsai/traj/" in ignored
+
+
+def test_home_paths_never_reach_the_written_trajectory(tmp_path):
+    """The worker prompt names an absolute worktree path; the artifact must not."""
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[dict(WIDGET_ISSUE)],
+        agent_output=json.dumps({
+            "result": "done",
+            "usage": {"input_tokens": 5, "output_tokens": 1},
+            "messages": [{
+                "role": "assistant",
+                "content": "ran in /Users/someuser/repo with token=ghp_0123456789abcdefghij",
+            }],
+        }),
+    )
+
+    run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=13,
+    )
+
+    written = (tmp_path / ".hsai" / "traj" / "0" / "13.json").read_text()
+    assert "/Users/someuser" not in written
+    assert "ghp_0123456789abcdefghij" not in written
+    assert "~/repo" in written                       # still readable, just anonymised
 
 
 def test_malformed_ticket_is_refused_and_labeled(tmp_path):

@@ -97,6 +97,7 @@ def build_pr_body(
     ci_summary: str,
     kind: str = "",
     references: tuple[str, ...] = (),
+    trajectory_digest: str = "",
 ) -> str:
     """Assemble a PR body that satisfies the traceability invariants.
 
@@ -107,11 +108,16 @@ def build_pr_body(
     refs = ", ".join(f"`{r}`" for r in references) or "_(none)_"
     artifacts = _phase_artifacts(kind) if kind else ""
     artifacts_section = f"\n## Phase artifacts\n{artifacts}\n" if artifacts else ""
+    # What the run cost and how it ended, visible on the PR itself - the full
+    # record stays in the local (gitignored) trajectory store.
+    traj_section = (
+        f"\n## Trajectory\n{trajectory_digest}\n" if trajectory_digest else ""
+    )
     return f"""Closes #{ticket}
 
 ## Model used
 - **model**: `{choice.model}` (tier: `{choice.tier}`)
-- **selection**: {choice.rationale} [strategy: `{choice.strategy}`]{artifacts_section}
+- **selection**: {choice.rationale} [strategy: `{choice.strategy}`]{artifacts_section}{traj_section}
 
 ## CI
 {ci_summary}
@@ -338,6 +344,7 @@ def run_once(
     # aggregate and budget gate can read across iterations; the governance PR
     # later commits it so the economics stay auditable.
     attempts = (claimed_issue.attempts() if claimed_issue else 0) + 1
+    block = iteration // 100
     tokens: tuple[int, int] | None = None
     traj: trajectory.Trajectory | None = None
 
@@ -351,7 +358,7 @@ def run_once(
             ledger.ledger_path(cfg, repo_dir),
             ledger.LedgerRecord(
                 iteration=iteration,
-                block=iteration // 100,
+                block=block,
                 ticket=ticket_num,
                 kind=kind,
                 tier=choice.tier,
@@ -383,11 +390,13 @@ def run_once(
             repo_dir,
             iteration=iteration, ticket=ticket_num, kind=kind,
             tier=choice.tier, model=choice.model, prompt=prompt, result=ares,
-            duration_seconds=time.time() - agent_started,
+            block=block, duration_seconds=time.time() - agent_started,
         )
         result.notes.append(f"trajectory={traj.identifier}")
         agent_ok, agent_err = ares.ok, ares.error
-        tokens = ledger.parse_tokens(ares.output)
+        # Fed from the parsed envelope, not re-parsed from stdout: this is the
+        # path that finally populates the ledger's token columns.
+        tokens = ledger.parse_tokens(ares.payload)
         if agent_err:
             agent_err = _format_error_with_context(agent_err, kind, ticket_num)
 
@@ -453,6 +462,10 @@ def run_once(
 
     # 7. lesson (ALWAYS, pass or fail)
     outcome = "pass" if (agent_ok and ci_after.ok) else "fail"
+    if traj is not None:
+        # The digest quoted below should state what is known now; `_record_cost`
+        # refines it to the merge outcome once that is settled.
+        traj.outcome = outcome
     kb = KnowledgeBase.from_config(cfg, wt)
     references = tuple(r.repo for r in cfg.reference_top10[:3])
     lesson = Lesson(
@@ -468,13 +481,12 @@ def run_once(
                 if reverted_workflows else ""
             )
             + (f"\n\nAgent error:\n```\n{agent_err[:800]}\n```" if agent_err else "")
-            # Only a redacted tail of the trajectory is committed; the full
-            # record stays in the (gitignored) local store, replayable with
-            # `hsai replay <id>`.
+            # Only a digest line plus a redacted tail of the trajectory is
+            # committed; the full record stays in the (gitignored) local store,
+            # replayable with `hsai traj <iteration>`.
             + (
-                f"\n\nTrajectory `{traj.identifier}` (redacted tail, "
-                f"`hsai replay {traj.identifier}` for the full run):\n"
-                f"```\n{traj.excerpt()}\n```"
+                f"\n\nTrajectory `{traj.identifier}` digest: {traj.digest()}"
+                f"\n\nRedacted tail:\n```\n{traj.excerpt()}\n```"
                 if traj else ""
             )
         ),
@@ -516,6 +528,7 @@ def run_once(
         ci_summary=ci_after.summary(),
         kind=kind,
         references=references,
+        trajectory_digest=traj.digest() if traj else "",
     )
     pr_num = github.create_pr(
         repo, branch, f"{kind}: {ticket_title}"[:120], pr_body,
