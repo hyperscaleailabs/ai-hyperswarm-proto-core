@@ -1,7 +1,7 @@
 ---
 tags:
   - whitepaper
-created: 2026-08-02
+created: 2026-08-04
 ---
 
 # Synthesis after 15 lessons
