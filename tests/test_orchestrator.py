@@ -873,6 +873,191 @@ def test_home_paths_never_reach_the_written_trajectory(tmp_path):
     assert "~/repo" in written                       # still readable, just anonymised
 
 
+# --- provenance: the citation is resolved, never fabricated -----------------
+
+FABRICATED = ("langchain-ai/langchain", "FoundationAgents/MetaGPT", "crewAIInc/crewAI")
+
+RATIONALE_BODY = WELL_FORMED_BODY + """
+## Synthesis rationale
+SWE-agent supplies the issue-to-PR provenance chain; openai/swarm contributes
+the ergonomics of a handoff that carries its own context.
+"""
+
+PRACTICE_AGENT_JSON = json.dumps(
+    {
+        "result": (
+            "Implemented the widget.\n\n"
+            "## Practice adopted\n"
+            "- repos: `SWE-agent/SWE-agent`\n"
+            "- artifact: ci_cd\n"
+            "- practice: link-integrity-in-ci\n"
+            "- claim: gate link integrity in CI\n"
+        ),
+        "usage": {"input_tokens": 10, "output_tokens": 2},
+    }
+)
+
+
+def _issue(**kwargs) -> dict:
+    base = {
+        "number": 7,
+        "title": "add widget",
+        "labels": [{"name": "priority:P2"}],
+        "assignees": [],
+        "body": WELL_FORMED_BODY,
+    }
+    base.update(kwargs)
+    return base
+
+
+def _pr_body(runner: FakeRunner) -> str:
+    create = next(c for c in runner.calls if c[:3] == ["gh", "pr", "create"])
+    return create[create.index("--body") + 1]
+
+
+def test_pr_cites_the_projects_the_ticket_named_not_the_default_three(tmp_path):
+    """The headline defect: every PR used to claim langchain + MetaGPT + crewAI."""
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[_issue(body=RATIONALE_BODY)],
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    body = _pr_body(runner)
+    evidence = body.split("## Reference-set evidence", 1)[1]
+    assert "`SWE-agent/SWE-agent`" in evidence
+    assert "`openai/swarm`" in evidence
+    for repo in FABRICATED:
+        assert repo not in body, f"{repo} was never studied for this ticket"
+
+    lesson_text = Path(result.lesson_path).read_text()
+    assert "- `SWE-agent/SWE-agent`" in lesson_text
+    assert "- `openai/swarm`" in lesson_text
+    for repo in FABRICATED:
+        assert repo not in lesson_text
+
+
+def test_a_ticket_that_cites_nothing_is_marked_unattributed(tmp_path):
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[_issue()],
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    body = _pr_body(runner)
+    assert "## Reference-set evidence\n_(unattributed)_" in body
+    assert "_(unattributed)_" in Path(result.lesson_path).read_text()
+    for repo in FABRICATED:
+        assert repo not in body
+
+
+def test_provenance_gate_warns_without_blocking_by_default(tmp_path):
+    cfg = load_config()
+    assert cfg.provenance_gate == "warn"
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[_issue()],
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    # the agent cited nothing: noted on the run, the lesson and the PR - but merged
+    assert result.merged is True
+    assert any("provenance UNVERIFIED" in n for n in result.notes)
+    assert "provenance UNVERIFIED" in _pr_body(runner)
+    assert "provenance UNVERIFIED" in Path(result.lesson_path).read_text()
+
+
+def test_provenance_gate_in_block_mode_returns_the_ticket_to_the_backlog(tmp_path):
+    cfg = load_config()
+    cfg.governance["provenance_gate"] = "block"
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[_issue()],
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=2,
+    )
+
+    assert result.recovered is True
+    assert result.pr is None and result.merged is False
+    assert not any(c[:3] == ["gh", "pr", "create"] for c in runner.calls)
+    assert any(
+        c[:3] == ["gh", "issue", "edit"] and "--remove-assignee" in c for c in runner.calls
+    )
+    records = ledger.read_records(ledger.ledger_path(cfg, tmp_path))
+    assert [r.outcome for r in records] == ["unattributed"]
+    assert trajectory.load(tmp_path, "2").outcome == "unattributed"
+
+
+def test_a_verified_practice_block_satisfies_the_gate_and_supplies_the_citation(tmp_path):
+    """With no rationale on the ticket, the worker's own proven claim is the trace."""
+    cfg = load_config()
+    cfg.governance["provenance_gate"] = "block"
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[_issue()],
+        agent_output=PRACTICE_AGENT_JSON,
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.merged is True and result.recovered is False
+    assert any("provenance verified" in n for n in result.notes)
+
+    lesson_text = Path(result.lesson_path).read_text()
+    assert "## Practice adopted" in lesson_text
+    assert "- practice: link-integrity-in-ci" in lesson_text
+    assert "- artifact: ci_cd" in lesson_text
+    assert "`SWE-agent/SWE-agent`" in _pr_body(runner)
+
+
+def test_worker_prompt_requires_a_practice_block_except_on_exempt_kinds():
+    cfg = load_config()
+    prompt = orchestrator._task_prompt(IMPLEMENT, cfg, "feat: widget", "body")
+    assert "## Practice adopted" in prompt
+    assert "- artifact: one of source_code" in prompt
+    assert "Never invent a citation" in prompt
+
+    for exempt in ("chore: refresh the snapshot", "docs: fix a typo"):
+        assert "## Practice adopted" not in orchestrator._task_prompt(
+            IMPROVE, cfg, exempt, "body"
+        )
+
+
+def test_workflow_edits_are_kept_when_the_ticket_authorizes_them(tmp_path):
+    """A blanket revert meant the loop could never land a CI gate it was asked for."""
+    cfg = load_config()
+    body = WELL_FORMED_BODY + "\nRun the new gate as a step in `.github/workflows/ci.yml`.\n"
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[_issue(body=body)],
+        worktree_status=" M .github/workflows/ci.yml\n?? src/hsai/new.py\n",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert not any(c[:3] == ["git", "checkout", "HEAD"] for c in runner.calls)
+    assert any("workflow edits authorized by ticket" in n for n in result.notes)
+    assert not any("reverted workflow edits" in n for n in result.notes)
+
+
 def test_malformed_ticket_is_refused_and_labeled(tmp_path):
     cfg = load_config()
     open_issues = [

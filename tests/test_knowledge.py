@@ -1,4 +1,5 @@
 from hsai.knowledge import KnowledgeBase, Lesson, LessonRecord, Whitepaper, slugify
+from hsai.provenance import UNATTRIBUTED, Provenance
 
 
 def test_slugify():
@@ -51,9 +52,60 @@ def test_write_lesson_and_reindex(tmp_path):
 
     written = kb.reindex_mocs()
     names = {p.name for p in written}
-    assert names == {"Lessons MOC.md", "Whitepapers MOC.md", "Knowledge Base MOC.md"}
+    assert names == {
+        "Lessons MOC.md",
+        "Whitepapers MOC.md",
+        "Practices MOC.md",
+        "Knowledge Base MOC.md",
+    }
     lessons_moc = (kb.mocs_dir / "Lessons MOC.md").read_text()
     assert f"[[{lesson.note_name()}]]" in lessons_moc
+
+
+def test_lesson_without_a_citation_says_so_instead_of_inventing_one(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    path = kb.write_lesson(
+        Lesson(
+            title="implement: add widget",
+            outcome="pass",
+            kind="implement",
+            context="ctx",
+            what_happened="did the thing",
+            lesson="small steps win",
+        )
+    )
+    text = path.read_text()
+    assert "## Practice adopted" in text
+    assert text.count(UNATTRIBUTED) == 2      # the practice block and the references
+    assert "langchain" not in text            # no fabricated reference-set evidence
+
+
+def test_lesson_records_the_practice_it_adopted(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    path = kb.write_lesson(
+        Lesson(
+            title="implement: kb integrity gate",
+            outcome="pass",
+            kind="implement",
+            context="ctx",
+            what_happened="did the thing",
+            lesson="link rot is a broken audit trail",
+            references=("SWE-agent/SWE-agent",),
+            provenance=Provenance(
+                repos=("SWE-agent/SWE-agent",),
+                practice="link-integrity-in-ci",
+                claim="gate link integrity in CI",
+                artifact_kind="ci_cd",
+            ),
+            provenance_note="provenance verified: link-integrity-in-ci adopted",
+        )
+    )
+    text = path.read_text()
+    assert "## Practice adopted" in text
+    assert "- practice: link-integrity-in-ci" in text
+    assert "- artifact: ci_cd" in text
+    assert "provenance verified" in text
+    assert UNATTRIBUTED not in text
 
 
 def test_whitepaper_cadence(tmp_path):

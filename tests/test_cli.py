@@ -31,6 +31,38 @@ def test_status_command_returns_zero(capsys):
     assert "hyperscaleailabs/ai-hyperswarm-proto-core" in out
 
 
+def test_practices_command_builds_the_registry_from_lessons(tmp_path, capsys):
+    lessons = tmp_path / "knowledge" / "lessons"
+    lessons.mkdir(parents=True)
+    (lessons / "2026-08-04-gate.md").write_text(
+        "# implement: feat: kb gate\n\n"
+        "## Lesson learned\nLink rot is a broken audit trail.\n\n"
+        "## Practice adopted\n"
+        "- repos: `SWE-agent/SWE-agent`\n"
+        "- artifact: ci_cd\n"
+        "- practice: link-integrity-in-ci\n"
+        "- claim: gate link integrity in CI\n"
+    )
+
+    rc = main(["practices", "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "1 practice(s)" in out and "1 verified" in out
+    note = tmp_path / "knowledge/practices/swe-agent-swe-agent/link-integrity-in-ci.md"
+    assert note.exists()
+    assert "[[2026-08-04-gate]]" in note.read_text()
+
+    moc = (tmp_path / "knowledge/MOCs/Practices MOC.md").read_text()
+    assert "[[link-integrity-in-ci]]" in moc
+    assert "| `SWE-agent/SWE-agent` | 1 | 1 | 1 |" in moc      # coverage table
+    root_moc = (tmp_path / "knowledge/MOCs/Knowledge Base MOC.md").read_text()
+    assert "[[Practices MOC]]" in root_moc
+
+    # and the vault it just wrote passes its own integrity gate
+    assert main(["kb-check", "--root", str(tmp_path)]) == 0
+
+
 def test_parser_repro_check_defaults():
     parser = build_parser()
     args = parser.parse_args(["repro-check"])

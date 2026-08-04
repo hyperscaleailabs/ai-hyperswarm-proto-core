@@ -78,10 +78,18 @@ class WellFormedness:
     reasons: list[str] = field(default_factory=list)
 
 
+def is_exempt_kind(title: str) -> bool:
+    """Is this ticket one of the kinds the substantial-schema gates exempt?
+
+    Shared with the provenance gate (:mod:`hsai.provenance`) so both gates
+    exempt exactly the same set: docs, chores, and the loop's own heal tickets.
+    """
+    return title.strip().lower().startswith(_EXEMPT_PREFIXES)
+
+
 def check_well_formed(title: str, body: str) -> WellFormedness:
     """Is this ticket substantial enough to hand to an implementation agent?"""
-    lowered = title.strip().lower()
-    if any(lowered.startswith(p) for p in _EXEMPT_PREFIXES):
+    if is_exempt_kind(title):
         return WellFormedness(ok=True, reasons=["exempt kind (docs/chore/heal)"])
 
     reasons: list[str] = []

@@ -100,7 +100,9 @@ def run_cycle(
     # 1. Synthesize substantial tickets when the well-formed backlog is thin.
     low_water = int(cfg.cycle.get("backlog_low_watermark", 4))
     if _well_formed_backlog(cfg, runner=runner) < low_water:
-        sres = synthesize(cfg, cycle_index=idx, runner=runner, ai_runner=ai_runner)
+        sres = synthesize(
+            cfg, cycle_index=idx, repo_dir=repo_root, runner=runner, ai_runner=ai_runner
+        )
         report.synthesized = sres.filed
         if not sres.ok:
             report.notes.append(f"synthesis produced no tickets: {sres.error}")
@@ -157,6 +159,9 @@ def run_cycle(
         report.articles = _persona_articles(
             cfg, kb, report.whitepaper, repo_root=repo_root, ai_runner=ai_runner
         )
+    # Re-derive the adopted-practice registry from the block's lessons before
+    # the MOCs are rebuilt, so the coverage table and the index agree.
+    kb.write_practices()
     kb.reindex_mocs()
     write_direction(cfg, repo_root=repo_root, runner=runner)
 
