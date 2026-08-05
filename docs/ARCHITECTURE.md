@@ -15,6 +15,7 @@ so the decision logic stays pure and unit-tested.
 | `hsai.github` | tickets, labels, PRs, merge | gh |
 | `hsai.ci` | local CI gate (ruff+pytest) + remote status | subprocess |
 | `hsai.trajectory` | one durable record per agent run; redaction, replay | write files |
+| `hsai.journal` | append-only per-block step journal; `once()` replay | write files |
 | `hsai.knowledge` | lessons, whitepapers, MOC reindex (Obsidian) | write files |
 | `hsai.orchestrator` | one iteration; `decide_path`, `build_pr_body` (pure) | composes above |
 | `hsai.swarm` | run N iterations concurrently | threads |
@@ -106,6 +107,40 @@ directly), so the quota ledger's token columns - and the block aggregate in the
 review brief, including **tokens per merged PR** - report real numbers instead
 of nulls. Output that is not JSON (an older `claude` binary) degrades to a
 single-step trajectory with null usage rather than breaking the loop.
+
+## Durability: the cycle journal
+
+A block is a long chain of expensive, side-effecting steps - synthesis, N
+implementations, a whitepaper, persona articles, a governance PR, a review
+issue. `hsai.journal` makes that chain restartable: every step appends one JSON
+line to `.hsai/cycles/<cycle_index>/journal.jsonl` *after* it completes, and
+`run_cycle` wraps each one in
+
+```python
+payload = journal.once(jr, "whitepaper", "block", write_the_whitepaper)
+```
+
+On a first run the callable executes and its payload is journaled; on a resumed
+run the recorded payload is returned and the callable never runs. Effects are
+therefore at-least-once (a step killed mid-flight leaves no record and is
+retried) and *completed* steps are at-most-once - so `hsai cycle --resume` files
+no duplicate ticket, opens no second review issue, and spends no quota twice.
+Because the report is rebuilt from the replayed payloads, a resumed block
+produces the same brief an uninterrupted one would have, plus one `resume:
+replayed N recorded step(s)` line in its Notes.
+
+Two statuses close a journal: `halted` (the budget gate hard-breached and
+stopped new work) and `complete`. `hsai cycle --resume` with no index picks the
+most recent block whose journal has neither - so a finished block is never
+re-run, and a halted one is never restarted under a breached ceiling. The
+pre-iteration budget verdict is journaled alongside the iteration itself:
+re-grading it from the ledger on a replay would see the whole block's spend
+before iteration 0 and halt immediately.
+
+The store lives under `.hsai/` (gitignored) for the same reason trajectories do
+- local operational forensics, not repo content. `--dry-run` journals into
+`journal.dry-run.jsonl` so a rehearsal can neither satisfy nor poison a later
+live run of the same block.
 
 ## Headless permission mode
 

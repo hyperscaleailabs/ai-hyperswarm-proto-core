@@ -4,6 +4,7 @@ Commands:
   hsai loop [--iterations N] [--max-parallel M] [--dry-run]   run the auto loop
   hsai run-once [--dry-run]                                    a single iteration
   hsai status                                                  config + backlog snapshot
+  hsai cycle [--cycle-index N] [--resume] [--dry-run]          one governance block
   hsai reindex                                                 rebuild knowledge MOCs
   hsai doctor                                                  verify environment + invariants
   hsai traj <iteration> [--json]                               print a stored agent run
@@ -82,7 +83,12 @@ def cmd_cycle(args: argparse.Namespace) -> int:
     from .cycle import run_cycle
 
     cfg = _load(args)
-    res = run_cycle(cfg, repo_dir=".", cycle_index=args.index)
+    res = run_cycle(
+        cfg, repo_dir=".", cycle_index=args.index,
+        resume=args.resume, dry_run=args.dry_run,
+    )
+    print(f"cycle: block {res.report.cycle_index}"
+          f"{' (resumed)' if res.resumed else ''}  journal: {res.journal_path}")
     print(f"cycle: synthesized={res.report.synthesized} merged={res.report.merged_prs} "
           f"recovered={res.report.recovered_prs}")
     print(f"whitepaper={res.report.whitepaper or '-'} articles={len(res.report.articles)}")
@@ -207,7 +213,13 @@ def build_parser() -> argparse.ArgumentParser:
     ri.set_defaults(func=cmd_reindex)
 
     cy = sub.add_parser("cycle", help="run one half-day governance block")
-    cy.add_argument("--index", type=int, default=None, help="cycle index (default: derived)")
+    cy.add_argument("--index", "--cycle-index", dest="index", type=int, default=None,
+                    help="cycle index (default: derived, or the resume target)")
+    cy.add_argument("--resume", action="store_true",
+                    help="replay an interrupted block's journal instead of re-running its "
+                         "completed steps (no index: the most recent unfinished block)")
+    cy.add_argument("--dry-run", action="store_true",
+                    help="no GitHub writes and no agent quota spend; journals separately")
     cy.set_defaults(func=cmd_cycle)
 
     sy = sub.add_parser("synthesize", help="heavy-model synthesis: file substantial tickets")
