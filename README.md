@@ -70,6 +70,7 @@ hsai loop --dry-run   # a full iteration with no side effects
 hsai loop          # one real iteration (opens & merges a PR on green)
 hsai loop --max-parallel 3 -n 1   # ramp to the swarm (after proving one iteration)
 hsai traj 12       # print what agent run (iteration) 12 did (spends no quota)
+hsai cycle --resume   # finish an interrupted governance block, replaying what completed
 ```
 
 Every agent run persists a **trajectory** - prompt, step stream, exit status,
@@ -107,6 +108,10 @@ The loop is governed, not just autonomous - see [docs/SDLC.md](docs/SDLC.md) and
    them in a sequential block; the block ships a whitepaper + persona articles
    (CTO / architect / DevOps) + a refreshed DIRECTION.md. Install the
    twice-daily schedule with `scripts/install_cycles_launchd.sh`.
+   Every block step is journaled to `.hsai/cycles/<index>/journal.jsonl` as it
+   completes, so a crash or a machine sleep is recoverable: `hsai cycle --resume`
+   replays what already finished (no re-filed tickets, no second review issue,
+   no quota spent twice) and only re-runs what did not.
 
 Whitepapers are ingested by [agentic-atlas](https://github.com/hyperscaleailabs/agentic-atlas)
 via its own pipeline (pull-based publishing).

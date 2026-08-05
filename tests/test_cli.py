@@ -31,6 +31,39 @@ def test_status_command_returns_zero(capsys):
     assert "hyperscaleailabs/ai-hyperswarm-proto-core" in out
 
 
+def test_parser_cycle_resume_args():
+    parser = build_parser()
+    plain = parser.parse_args(["cycle"])
+    assert plain.index is None and not plain.resume and not plain.dry_run
+
+    resumed = parser.parse_args(["cycle", "--resume", "--cycle-index", "42"])
+    assert resumed.resume and resumed.index == 42      # --cycle-index aliases --index
+    assert parser.parse_args(["cycle", "--index", "42"]).index == 42
+
+
+def test_cycle_command_passes_resume_through(monkeypatch, capsys):
+    from hsai.cycle import CycleResult
+    from hsai.governance import BlockReport
+
+    seen = {}
+
+    def fake_run_cycle(cfg, **kwargs):
+        seen.update(kwargs)
+        return CycleResult(
+            report=BlockReport(cycle_index=42), review_issue=0, governance_pr=0,
+            journal_path="/tmp/j.jsonl", resumed=True,
+        )
+
+    monkeypatch.setattr("hsai.cycle.run_cycle", fake_run_cycle)
+
+    rc = main(["cycle", "--resume", "--cycle-index", "42"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert seen["resume"] is True and seen["cycle_index"] == 42 and seen["dry_run"] is False
+    assert "block 42 (resumed)" in out and "/tmp/j.jsonl" in out
+
+
 def test_parser_repro_check_defaults():
     parser = build_parser()
     args = parser.parse_args(["repro-check"])

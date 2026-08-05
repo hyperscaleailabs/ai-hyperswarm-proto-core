@@ -1,4 +1,4 @@
-"""Budget-gate behavior of a simulated half-day block.
+"""Budget-gate and durability behavior of a simulated half-day block.
 
 Drives ``run_cycle`` with a fake ``run_once`` that appends escalating cost to
 the quota ledger, and asserts the warn-then-halt transitions: cheaper-tier
@@ -6,17 +6,26 @@ biasing on a soft breach, then a new-work halt on a hard breach that still lets
 the already-started (in-flight) iteration finish and merge. The heavy tail of a
 cycle (synthesis, whitepaper, governance PR) is stubbed so the test isolates the
 gate.
+
+The second half drives the same block through a crash and a resume, with a fake
+GitHub runner that records every write, so "a resumed block files nothing twice"
+is an assertion rather than a hope.
 """
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import replace
+from pathlib import Path
 
-from hsai import cycle, ledger, trajectory
+import pytest
+
+from hsai import cycle, github, journal, ledger, trajectory
 from hsai.config import load_config
-from hsai.knowledge import KnowledgeBase
+from hsai.knowledge import KnowledgeBase, Lesson
 from hsai.orchestrator import IterationResult
 from hsai.proc import Proc
+from hsai.synthesis import SynthesisResult
 
 
 class _Runner:
@@ -45,7 +54,7 @@ def _make_fake_run_once(ledger_file, *, tier: str, seconds: float):
     """
     state = {"demotes": [], "started_prs": [], "merged_prs": []}
 
-    def fake(cfg, *, repo_dir, runner, ai_runner, iteration, demote_tier=False):
+    def fake(cfg, *, repo_dir, runner, ai_runner, iteration, demote_tier=False, dry_run=False):
         state["demotes"].append(demote_tier)
         pr = 500 + len(state["demotes"])
         state["started_prs"].append(pr)
@@ -173,3 +182,279 @@ def test_cycle_prunes_trajectory_blocks_beyond_retention(tmp_path, monkeypatch):
     kept = sorted(p.name for p in trajectory.trajectory_dir(tmp_path).iterdir())
     assert kept == ["3", "4"]              # only the newest `retention_blocks`
     assert any("pruned trajectories" in n for n in res.report.notes)
+
+
+# --- crash + resume: the cycle journal --------------------------------------
+#
+# A block is a long chain of expensive, side-effecting steps. These tests kill
+# it mid-chain and resume it, asserting the two properties that make the
+# journal worth having: no GitHub write happens twice, and the resumed block
+# produces the brief an uninterrupted one would have.
+
+BLOCK = 7          # the cycle index every resume test drives
+ARTICLE = "# Block article\n\nWhat this block changed.\n"
+
+
+class _GhRunner:
+    """Records every git/gh call so duplicate GitHub writes are provable.
+
+    Reports a dirty tree so the governance PR path (ticket -> branch -> PR)
+    actually runs instead of short-circuiting on "nothing to commit".
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+        self.issue_titles: list[str] = []
+        self.pr_heads: list[str] = []
+        self.review_bodies: list[str] = []
+        self._issue = 900
+        self._pr = 700
+
+    def __call__(self, cmd, *, cwd=None, env=None, timeout=None, input_text=None) -> Proc:
+        cmd = list(cmd)
+        self.calls.append(cmd)
+        if cmd[:3] == ["gh", "issue", "list"]:
+            return Proc(cmd, 0, "[]", "")
+        if cmd[:3] == ["gh", "issue", "create"]:
+            self._issue += 1
+            title = cmd[cmd.index("--title") + 1]
+            self.issue_titles.append(title)
+            if title.startswith("review:"):
+                self.review_bodies.append(cmd[cmd.index("--body") + 1])
+            return Proc(cmd, 0, f"https://github.com/o/r/issues/{self._issue}\n", "")
+        if cmd[:3] == ["gh", "pr", "create"]:
+            self._pr += 1
+            self.pr_heads.append(cmd[cmd.index("--head") + 1])
+            return Proc(cmd, 0, f"https://github.com/o/r/pull/{self._pr}\n", "")
+        if cmd[:3] == ["git", "status", "--porcelain"]:
+            return Proc(cmd, 0, " M knowledge/whitepapers/block.md\n", "")
+        return Proc(cmd, 0, "", "")
+
+    def count(self, *prefix: str) -> int:
+        return sum(1 for c in self.calls if c[: len(prefix)] == list(prefix))
+
+    def titles_like(self, prefix: str) -> list[str]:
+        return [t for t in self.issue_titles if t.startswith(prefix)]
+
+
+def _article_runner(cmd, *, cwd=None, env=None, timeout=None, input_text=None) -> Proc:
+    return Proc(list(cmd), 0, ARTICLE, "")
+
+
+def _fake_synthesize(cfg, *, cycle_index, runner, ai_runner) -> SynthesisResult:
+    """Files two tickets through the real `gh issue create` path, once."""
+    filed = [
+        github.create_issue(
+            cfg.repo_slug, f"feat: synthesized {n} for block {cycle_index}",
+            "problem/proposal", ["hsai"], runner=runner,
+        )
+        for n in (1, 2)
+    ]
+    return SynthesisResult(ok=True, studied=["a/b"], filed=filed)
+
+
+def _make_run_once(ledger_file, *, crash_at: int | None = None):
+    """A ``run_once`` stand-in whose PR number depends only on the iteration.
+
+    Determinism is the point: the control run and the resumed run must produce
+    identical reports, so nothing may depend on how many times it was called.
+    ``crash_at`` is a 1-based position within the block; the crash happens
+    before any ledger record is written, exactly like a worker dying mid-run.
+    """
+    state: dict[str, list[int]] = {"iterations": []}
+
+    def fake(cfg, *, repo_dir, runner, ai_runner, iteration, demote_tier=False, dry_run=False):
+        position = iteration % 100
+        if crash_at is not None and position == crash_at:
+            raise RuntimeError(f"worker died during iteration {iteration}")
+        state["iterations"].append(iteration)
+        ledger.append_record(
+            ledger_file,
+            ledger.LedgerRecord(
+                iteration=iteration, block=iteration // 100, ticket=iteration,
+                kind="implement", tier="standard", model="sonnet",
+                wall_clock_seconds=5.0, attempts=1, outcome="merged",
+            ),
+        )
+        return IterationResult(
+            kind="implement", ticket=iteration, pr=500 + position,
+            model="sonnet", merged=True,
+        )
+
+    return fake, state
+
+
+def _block_cfg(*, block_size: int = 3):
+    cfg = load_config()
+    cfg.budget.clear()                      # budget gate is exercised separately
+    cfg.cycle["block_size"] = block_size
+    return cfg
+
+
+def _seed_lesson(root) -> None:
+    """One lesson, so the whitepaper + persona-article steps actually run."""
+    KnowledgeBase.from_config(load_config(), root).write_lesson(
+        Lesson(
+            title="Green gate held", outcome="pass", kind="implement",
+            context="c", what_happened="w", lesson="Remote CI is the truth.",
+            created="2026-08-05",
+        )
+    )
+
+
+def _drive(root, cfg, monkeypatch, *, crash_at=None, resume=False,
+           cycle_index=BLOCK, dry_run=False):
+    """Run one block against fresh fakes; returns (result, gh runner, state)."""
+    runner = _GhRunner()
+    fake, state = _make_run_once(ledger.ledger_path(cfg, root), crash_at=crash_at)
+    monkeypatch.setattr(cycle, "run_once", fake)
+    monkeypatch.setattr(cycle, "synthesize", _fake_synthesize)
+    res = cycle.run_cycle(
+        cfg, repo_dir=str(root), cycle_index=cycle_index, resume=resume,
+        dry_run=dry_run, runner=runner, ai_runner=_article_runner,
+    )
+    return res, runner, state
+
+
+def _brief_fields(report) -> tuple:
+    return (
+        report.synthesized, report.iterations, report.merged_prs,
+        report.whitepaper, report.articles,
+    )
+
+
+def test_resume_after_a_crash_replays_and_writes_nothing_to_github_twice(
+    tmp_path, monkeypatch
+):
+    """Crash inside the third implementation, resume, compare against a control."""
+    crashed, control = tmp_path / "crashed", tmp_path / "control"
+    for root in (crashed, control):
+        root.mkdir()
+        _seed_lesson(root)
+
+    # --- the uninterrupted run this block should end up equal to --------------
+    expected, control_gh, control_state = _drive(control, _block_cfg(), monkeypatch)
+    assert control_state["iterations"] == [701, 702, 703]
+
+    # --- run 1: dies inside the third implementation --------------------------
+    cfg = _block_cfg()
+    with pytest.raises(RuntimeError):
+        _drive(crashed, cfg, monkeypatch, crash_at=3)
+
+    jpath = journal.journal_path(crashed, BLOCK)
+    steps_before = [(r.step, r.key) for r in journal.read_records(jpath)]
+    assert ("synthesis", "block") in steps_before
+    assert ("iteration", "0") in steps_before and ("iteration", "1") in steps_before
+    assert ("iteration", "2") not in steps_before        # the crashed one left no record
+    assert ("review_issue", "block") not in steps_before
+    assert journal.latest_resumable(crashed) == BLOCK    # journal never closed
+
+    # --- run 2: `hsai cycle --resume` with no index finds the block ------------
+    res, gh, state = _drive(crashed, cfg, monkeypatch, resume=True, cycle_index=None)
+
+    assert res.report.cycle_index == BLOCK and res.resumed
+    assert state["iterations"] == [703]                  # only the crashed one re-ran
+
+    # Zero duplicate GitHub writes: synthesis tickets are not re-filed, and the
+    # review issue / governance ticket / governance PR each happen exactly once.
+    assert gh.titles_like("feat: synthesized") == []
+    assert len(gh.titles_like("review:")) == 1
+    assert len(gh.titles_like("chore: governance artifacts")) == 1
+    assert gh.count("gh", "pr", "create") == 1
+    assert len(control_gh.titles_like("feat: synthesized")) == 2
+
+    # The resumed brief is the brief an uninterrupted run would have produced.
+    assert _brief_fields(res.report) == _brief_fields(expected.report)
+    assert res.report.merged_prs == [501, 502, 503]
+    assert res.report.whitepaper and len(res.report.articles) == len(cfg.personas)
+
+    # ...plus one line telling the architect the block was resumed.
+    resume_notes = [n for n in res.report.notes if n.startswith("resume: replayed")]
+    assert len(resume_notes) == 1
+    assert resume_notes[0] in gh.review_bodies[0]
+
+    # The journal is closed, so a later `--resume` will not pick it up again.
+    assert journal.latest_resumable(crashed) is None
+    assert journal.open_journal(crashed, BLOCK).terminal().status == journal.COMPLETE
+
+
+def test_resume_after_a_hard_halt_starts_no_new_work(tmp_path, monkeypatch):
+    """The budget halt is terminal: resuming replays it, it never restarts work."""
+    _seed_lesson(tmp_path)
+    cfg = _block_cfg(block_size=10)
+    # Two iterations (5s each) then a ceiling of 8s: the third grade hard-breaches.
+    cfg.budget.update({"max_seconds_per_block": 8, "soft_ratio": 0.5})
+
+    first, gh1, state1 = _drive(tmp_path, cfg, monkeypatch)
+    assert state1["iterations"] == [701, 702]            # halted before the 3rd of 10
+    assert any("hard breach" in n and "halting new work" in n for n in first.report.notes)
+
+    halt = journal.open_journal(tmp_path, BLOCK).find("budget_halt", "block")
+    assert halt is not None and halt.status == journal.HALTED and halt.terminal
+    assert journal.latest_resumable(tmp_path) is None   # a halted block is not "unfinished"
+
+    # The ceiling is still breached when we come back to the block...
+    spent = ledger.aggregate_block(
+        ledger.read_records(ledger.ledger_path(cfg, tmp_path)), BLOCK
+    )
+    assert ledger.evaluate_budget(spent, cfg.budget).halt
+
+    # ...so an explicit resume replays the halt and starts nothing new.
+    second, gh2, state2 = _drive(tmp_path, cfg, monkeypatch, resume=True)
+
+    assert state2["iterations"] == []                   # zero new implementations
+    assert _brief_fields(second.report) == _brief_fields(first.report)
+    assert any("hard breach" in n for n in second.report.notes)
+    assert gh2.count("gh", "issue", "create") == 0      # no second review issue
+    assert gh2.count("gh", "pr", "create") == 0
+    assert gh1.count("gh", "pr", "create") == 1
+    # The green-merge invariant is untouched: resume merged nothing at all.
+    assert gh2.count("gh", "pr", "merge") == 0
+
+
+def test_resume_with_no_journal_behaves_exactly_like_a_fresh_run(tmp_path, monkeypatch):
+    plain, resumed = tmp_path / "plain", tmp_path / "resumed"
+    for root in (plain, resumed):
+        root.mkdir()
+        _seed_lesson(root)
+
+    fresh, gh_fresh, state_fresh = _drive(plain, _block_cfg(), monkeypatch)
+    blind, gh_blind, state_blind = _drive(resumed, _block_cfg(), monkeypatch, resume=True)
+
+    assert not blind.resumed
+    assert _brief_fields(blind.report) == _brief_fields(fresh.report)
+    assert state_blind["iterations"] == state_fresh["iterations"] == [701, 702, 703]
+    for prefix in (("gh", "issue", "create"), ("gh", "pr", "create"), ("gh", "pr", "merge")):
+        assert gh_blind.count(*prefix) == gh_fresh.count(*prefix)
+    assert len(gh_blind.titles_like("feat: synthesized")) == 2
+
+    # With nothing journaled anywhere, `--resume` falls back to the derived index.
+    before = int(time.time()) // 43200
+    assert cycle.resolve_cycle_index(tmp_path / "empty", None, resume=True) in (
+        before, before + 1
+    )
+
+
+def test_a_second_dry_run_replays_the_journal_instead_of_re_executing(tmp_path, monkeypatch):
+    """`hsai cycle --dry-run` twice: the journal is unchanged the second time."""
+    _seed_lesson(tmp_path)
+    cfg = _block_cfg()
+
+    first, gh1, state1 = _drive(tmp_path, cfg, monkeypatch, dry_run=True)
+    jpath = Path(first.journal_path)
+    assert jpath.name == journal.DRY_RUN_JOURNAL_FILE
+    assert state1["iterations"] == [701, 702, 703]
+    assert gh1.count("gh", "issue", "create") == 0      # a rehearsal writes nothing
+    assert gh1.count("gh", "pr", "create") == 0
+
+    recorded = jpath.read_text()
+
+    second, gh2, state2 = _drive(tmp_path, cfg, monkeypatch, dry_run=True)
+
+    assert jpath.read_text() == recorded                # pure replay: nothing appended
+    assert second.resumed and state2["iterations"] == []
+    assert gh2.count("gh", "issue", "create") == 0
+    assert _brief_fields(second.report) == _brief_fields(first.report)
+    # The rehearsal never touched - nor satisfied - the live journal.
+    assert not (jpath.parent / journal.JOURNAL_FILE).exists()
+    assert journal.latest_resumable(tmp_path) is None
