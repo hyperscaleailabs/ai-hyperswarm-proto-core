@@ -122,14 +122,34 @@ def _iteration_payload(res: IterationResult) -> dict:
 
 
 def _synthesis_step(
-    cfg: CoreConfig, *, idx: int, runner: Runner, ai_runner: Runner, dry_run: bool
+    cfg: CoreConfig,
+    *,
+    idx: int,
+    repo_root: Path,
+    runner: Runner,
+    ai_runner: Runner,
+    dry_run: bool,
 ) -> dict:
-    """Synthesize tickets when the well-formed backlog is thin (journaled once)."""
+    """Synthesize tickets when the well-formed backlog is thin (journaled once).
+
+    The payload carries the dedupe outcome, not just the filed numbers: whether
+    synthesis is still finding new ground is exactly what the review brief needs
+    to show, and a resumed block must reconstruct it from the journal.
+    """
     low_water = int(cfg.cycle.get("backlog_low_watermark", 4))
     if dry_run or _well_formed_backlog(cfg, runner=runner) >= low_water:
         return {"ran": False, "filed": [], "error": ""}
-    sres = synthesize(cfg, cycle_index=idx, runner=runner, ai_runner=ai_runner)
-    return {"ran": True, "filed": list(sres.filed), "error": sres.error}
+    sres = synthesize(
+        cfg, cycle_index=idx, repo_root=repo_root, runner=runner, ai_runner=ai_runner
+    )
+    return {
+        "ran": True,
+        "filed": list(sres.filed),
+        "flagged": list(sres.flagged),
+        "skipped": [s.describe() for s in sres.skipped],
+        "candidates": sres.candidates,
+        "error": sres.error,
+    }
 
 
 def _grade_budget(ledger_file: Path, idx: int, budget: dict) -> dict:
@@ -229,10 +249,16 @@ def run_cycle(
     synth = journal.once(
         jr, "synthesis", "block",
         lambda: _synthesis_step(
-            cfg, idx=idx, runner=runner, ai_runner=ai_runner, dry_run=dry_run
+            cfg, idx=idx, repo_root=repo_root, runner=runner,
+            ai_runner=ai_runner, dry_run=dry_run,
         ),
     )
+    # `.get` throughout: a journal written before these keys existed must still
+    # replay into a brief rather than raise.
     report.synthesized = list(synth["filed"])
+    report.synthesis_flagged = list(synth.get("flagged", []))
+    report.synthesis_skipped = list(synth.get("skipped", []))
+    report.synthesis_candidates = int(synth.get("candidates", 0))
     if synth["ran"] and not report.synthesized:
         report.notes.append(f"synthesis produced no tickets: {synth['error']}")
 
