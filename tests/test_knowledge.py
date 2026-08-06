@@ -56,6 +56,39 @@ def test_write_lesson_and_reindex(tmp_path):
     assert f"[[{lesson.note_name()}]]" in lessons_moc
 
 
+def test_lesson_renders_an_agent_trajectory_section(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    lesson = Lesson(
+        title="implement: add status command",
+        outcome="pass",
+        kind="implement",
+        context="ctx",
+        what_happened="did the thing",
+        lesson="small steps win",
+        ticket=7,
+        trajectory_digest=(
+            "Trajectory `14` digest: tokens=1500in/320out, duration=42.5s, exit=ok, "
+            "outcome=merged, replay=`hsai traj 14`"
+        ),
+    )
+    text = kb.write_lesson(lesson).read_text()
+    assert "## Agent trajectory" in text
+    assert "tokens=1500in/320out" in text
+    # The digest section immediately follows "## Lesson learned" in source order.
+    assert text.index("## Agent trajectory") > text.index("## Lesson learned")
+
+
+def test_lesson_without_a_trajectory_says_so(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    lesson = Lesson(
+        title="chore: dry run", outcome="pass", kind="improve",
+        context="ctx", what_happened="did the thing", lesson="ok",
+    )
+    text = kb.write_lesson(lesson).read_text()
+    assert "## Agent trajectory" in text
+    assert "not applicable" in text
+
+
 def test_whitepaper_cadence(tmp_path):
     kb = KnowledgeBase(tmp_path, whitepaper_every=3)
     assert kb.should_write_whitepaper() is False

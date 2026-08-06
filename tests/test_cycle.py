@@ -157,6 +157,41 @@ def test_persona_articles_survive_output_without_a_json_envelope(tmp_path):
         assert "Plain text, no JSON envelope." in text
 
 
+def test_persona_articles_unwrap_the_json_envelope(tmp_path):
+    """`--output-format json` means every `claude -p` reply is an envelope now -
+    the article must contain the assistant's text only, never the envelope
+    itself (regression test for writing `.output` straight into the KB)."""
+    cfg = load_config()
+    kb = KnowledgeBase.from_config(cfg, tmp_path)
+    kb.whitepapers_dir.mkdir(parents=True, exist_ok=True)
+    (kb.whitepapers_dir / "2026-08-04-block-1.md").write_text("# Block paper\n\nBody.\n")
+
+    article_text = "# What this block changed\n\nWritten from the JSON envelope.\n"
+    envelope = json.dumps({
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": article_text,
+        "usage": {"input_tokens": 10, "output_tokens": 4},
+    })
+
+    def ai_runner(cmd, *, cwd=None, env=None, timeout=None, input_text=None):
+        return Proc(cmd, 0, envelope, "")
+
+    written = cycle._persona_articles(
+        cfg, kb, "2026-08-04-block-1", repo_root=tmp_path, ai_runner=ai_runner
+    )
+
+    assert len(written) == len(cfg.personas)
+    for rel in written:
+        text = (tmp_path / rel).read_text()
+        assert "Written from the JSON envelope." in text
+        # No trace of the envelope's own keys reaching the knowledge base.
+        assert '"subtype"' not in text
+        assert '"usage"' not in text
+        assert '"is_error"' not in text
+
+
 # --- trajectory retention ---------------------------------------------------
 
 def test_cycle_prunes_trajectory_blocks_beyond_retention(tmp_path, monkeypatch):

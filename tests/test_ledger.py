@@ -157,6 +157,39 @@ def test_empty_budget_never_gates():
     assert evaluate_budget(agg, {}).status == OK
 
 
+# --- token ceiling (max_tokens_per_block) ------------------------------------
+
+TOKEN_BUDGET = {"max_tokens_per_block": 1000, "soft_ratio": 0.8}
+
+
+def test_budget_tokens_ok_below_soft_threshold():
+    agg = BlockAggregate(block=1, input_tokens=400, output_tokens=100)  # 500 < 0.8*1000
+    decision = evaluate_budget(agg, TOKEN_BUDGET)
+    assert decision.status == OK
+
+
+def test_budget_tokens_soft_breach_biases_cheaper():
+    agg = BlockAggregate(block=1, input_tokens=700, output_tokens=100)  # 800 >= 0.8*1000
+    decision = evaluate_budget(agg, TOKEN_BUDGET)
+    assert decision.status == SOFT
+    assert decision.demote and not decision.halt
+    assert "tokens" in decision.reason
+
+
+def test_budget_tokens_hard_breach_halts():
+    agg = BlockAggregate(block=1, input_tokens=900, output_tokens=200)  # 1100 >= 1000
+    decision = evaluate_budget(agg, TOKEN_BUDGET)
+    assert decision.status == HARD
+    assert decision.halt and not decision.demote
+    assert "tokens" in decision.reason
+
+
+def test_budget_tokens_unset_ceiling_disables_dimension():
+    agg = BlockAggregate(block=1, input_tokens=10**9, output_tokens=10**9)
+    decision = evaluate_budget(agg, {"max_heavy_iterations_per_block": 99})
+    assert decision.status == OK
+
+
 # --- tier demotion drives selection cheaper ---------------------------------
 
 def test_demote_tier_steps_down_and_floors():

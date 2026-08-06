@@ -220,6 +220,7 @@ def evaluate_budget(agg: BlockAggregate, budget: dict) -> BudgetDecision:
     """
     max_heavy = budget.get("max_heavy_iterations_per_block")
     max_seconds = budget.get("max_seconds_per_block")
+    max_tokens = budget.get("max_tokens_per_block")
     soft_ratio = float(budget.get("soft_ratio", 0.8))
 
     hard: list[str] = []
@@ -236,6 +237,11 @@ def evaluate_budget(agg: BlockAggregate, budget: dict) -> BudgetDecision:
             soft.append(
                 f"wall-clock {agg.total_seconds:.0f}s >= {soft_ratio:g}x{max_seconds}s"
             )
+    if max_tokens is not None:
+        if agg.total_tokens >= max_tokens:
+            hard.append(f"tokens {agg.total_tokens} >= {max_tokens}")
+        elif agg.total_tokens >= soft_ratio * max_tokens:
+            soft.append(f"tokens {agg.total_tokens} >= {soft_ratio:g}x{max_tokens}")
 
     if hard:
         return BudgetDecision(HARD, "; ".join(hard))

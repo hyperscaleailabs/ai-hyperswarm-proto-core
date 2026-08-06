@@ -190,7 +190,9 @@ def synthesize(
     if not ares.ok:
         return SynthesisResult(ok=False, studied=repos, filed=[], error=ares.error[:500])
 
-    specs = parse_ticket_specs(ares.output)
+    # `.text` unwraps the JSON envelope to the assistant's final message; the
+    # ticket-spec fences live there, not in the raw envelope (`.output`).
+    specs = parse_ticket_specs(ares.text)
     filed: list[int] = []
     for spec in specs:
         num = github.create_issue(

@@ -83,11 +83,14 @@ def _persona_articles(
             f"article markdown, starting with a # title.\n\n{paper[:6000]}"
         )
         ares = run_agent(prompt, choice, cfg, runner=ai_runner, timeout=600)
-        if ares.ok and ares.output.strip():
+        # `.text` unwraps the JSON envelope to the assistant's final message;
+        # `.output` is the raw CLI stdout and would dump the whole envelope
+        # (subtype, usage, messages, ...) straight into the knowledge base.
+        if ares.ok and ares.text.strip():
             out = articles_dir / f"{whitepaper_note}-{pid}.md"
             out.write_text(
                 f"---\ntags:\n  - article\n  - persona/{pid}\n---\n\n"
-                + ares.output.strip() + "\n"
+                + ares.text.strip() + "\n"
             )
             written.append(str(out.relative_to(repo_root)))
     return written

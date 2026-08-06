@@ -1,3 +1,5 @@
+import json
+
 from hsai import ai
 from hsai.config import load_config
 from hsai.models import ModelChoice
@@ -103,4 +105,43 @@ def test_synthesize_survives_output_without_a_json_envelope():
     res = synthesize(cfg, cycle_index=0, runner=runner, ai_runner=runner)
     assert res.ok is True
     assert res.filed == [321]
+    assert res.error == ""
+
+
+# --- JSON envelope: the ticket-spec fences live in `.text`, not `.output` ----
+
+def _json_envelope_runner():
+    """A `claude -p --output-format json` reply: the ticket specs are wrapped
+    inside the envelope's `result` field, not printed raw."""
+    calls: list[list[str]] = []
+    envelope = json.dumps({
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": PLAIN_TEXT_OUTPUT,
+        "usage": {"input_tokens": 50, "output_tokens": 20},
+    })
+
+    def runner(cmd, *, cwd=None, env=None, timeout=None, input_text=None):
+        calls.append(list(cmd))
+        if cmd[:1] == ["claude"]:
+            return Proc(cmd, 0, envelope, "")
+        if cmd[:3] == ["gh", "issue", "create"]:
+            return Proc(cmd, 0, "https://github.com/o/r/issues/402\n", "")
+        return Proc(cmd, 0, "", "")
+
+    runner.calls = calls  # type: ignore[attr-defined]
+    return runner
+
+
+def test_synthesize_unwraps_the_json_envelope_before_parsing_specs():
+    """Regression test: `ares.output` is the raw envelope (would fail to parse
+    ticket-spec fences buried inside JSON string escaping); `ares.text` is the
+    assistant's unwrapped result, which is what must be parsed."""
+    cfg = _cfg()
+    runner = _json_envelope_runner()
+
+    res = synthesize(cfg, cycle_index=0, runner=runner, ai_runner=runner)
+    assert res.ok is True
+    assert res.filed == [402]
     assert res.error == ""

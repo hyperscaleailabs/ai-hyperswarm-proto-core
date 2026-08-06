@@ -59,6 +59,7 @@ class Lesson:
     created: str = field(default_factory=_today)
     remote_ci: str = ""  # SUCCESS | FAILURE | TIMEOUT, filled in once gh checks conclude
     repro_evidence: str = ""  # heal/bugfix only: failing-then-passing reproduction proof
+    trajectory_digest: str = ""  # bounded, redacted digest of the agent run (see trajectory.py)
 
     def note_name(self) -> str:
         return f"{self.created}-{slugify(self.title)}"
@@ -303,6 +304,9 @@ class KnowledgeBase:
 
 ## Lesson learned
 {lesson.lesson}
+
+## Agent trajectory
+{lesson.trajectory_digest or "_(not applicable: dry-run or no agent invocation)_"}
 
 ## Reproduction evidence
 {repro}

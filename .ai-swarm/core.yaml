@@ -145,6 +145,7 @@ synthesis:
 budget:
   max_heavy_iterations_per_block: 3   # heavy-tier (opus) runs before halting new work
   max_seconds_per_block: 5400         # cumulative wall-clock across the block (90 min)
+  max_tokens_per_block: 3000000       # cumulative input+output tokens across the block
   soft_ratio: 0.8                     # fraction of a ceiling that triggers a soft breach
 
 personas:                      # article targets generated from each whitepaper
