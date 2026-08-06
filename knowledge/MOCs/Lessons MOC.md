@@ -2,14 +2,14 @@
 tags:
   - moc
   - lessons
-updated: 2026-08-04
+updated: 2026-08-06
 ---
 
 # Lessons MOC
 
 Up: [[Knowledge Base MOC]]
 
-Every hsai iteration leaves a lesson here - pass or fail. Total: **17**.
+Every hsai iteration leaves a lesson here - pass or fail. Total: **20**.
 
 - [[2026-07-25-bootstrap-the-hsai-loop]]
 - [[2026-07-26-architect-steering-quality-over-throughput]]
@@ -28,3 +28,6 @@ Every hsai iteration leaves a lesson here - pass or fail. Total: **17**.
 - [[2026-07-26-loop-reliability-retry-and-ci-parity]]
 - [[2026-08-04-implement-feat-worker-trajectory-capture-and-working-token-cost-telemetry]]
 - [[2026-08-04-implement-feat-worker-trajectory-store-json-agent-output-and-hsai-replay]]
+- [[2026-08-05-implement-chore-governance-artifacts-for-block-41339]]
+- [[2026-08-05-implement-feat-durable-cycle-journal-with-idempotent-resume-for-interrupted-blocks]]
+- [[2026-08-06-implement-chore-governance-artifacts-for-block-41341]]
