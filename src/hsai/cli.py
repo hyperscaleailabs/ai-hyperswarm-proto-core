@@ -5,6 +5,7 @@ Commands:
   hsai run-once [--dry-run]                                    a single iteration
   hsai status                                                  config + backlog snapshot
   hsai cycle [--cycle-index N] [--resume] [--dry-run]          one governance block
+  hsai synthesize [--index N] [--dry-run]                      heavy-model ticket synthesis
   hsai reindex                                                 rebuild knowledge MOCs
   hsai doctor                                                  verify environment + invariants
   hsai traj <iteration> [--json]                               print a stored agent run
@@ -102,11 +103,22 @@ def cmd_synthesize(args: argparse.Namespace) -> int:
     from .synthesis import synthesize
 
     cfg = _load(args)
-    res = synthesize(cfg, cycle_index=args.index)
+    res = synthesize(cfg, cycle_index=args.index, repo_root=".", dry_run=args.dry_run)
     print(f"studied: {', '.join(res.studied)}")
-    print(f"filed tickets: {res.filed or 'none'}")
+    if args.dry_run:
+        # The prompt IS the artifact under review in a rehearsal: print it whole
+        # so the repo-memory pack can be eyeballed before quota is spent on it.
+        print(f"--- prompt ({len(res.prompt)} chars) ---")
+        print(res.prompt)
+        print("--- end prompt (dry run: no agent call, no tickets filed) ---")
+        return 0
+    print(f"candidates parsed: {res.candidates}")
+    print(f"filed tickets: {res.filed or 'none'}"
+          f"{f' (possible-duplicate: {res.flagged})' if res.flagged else ''}")
+    for skipped in res.skipped:
+        print(f"skipped as duplicate: {skipped.describe()}")
     if res.error:
-        print(f"error: {res.error}")
+        print(f"note: {res.error}")
     return 0 if res.ok else 1
 
 
@@ -224,6 +236,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sy = sub.add_parser("synthesize", help="heavy-model synthesis: file substantial tickets")
     sy.add_argument("--index", type=int, default=0, help="rotation index for reference subset")
+    sy.add_argument("--dry-run", action="store_true",
+                    help="render and print the prompt only: no agent call, no tickets filed")
     sy.set_defaults(func=cmd_synthesize)
 
     br = sub.add_parser("brief", help="refresh governance/DIRECTION.md")

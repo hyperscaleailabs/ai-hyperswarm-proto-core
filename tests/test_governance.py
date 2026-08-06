@@ -58,6 +58,26 @@ def test_brief_links_everything(tmp_path):
     assert "/review-next" in body
 
 
+def test_brief_shows_whether_synthesis_still_finds_new_ground():
+    cfg = load_config()
+    report = BlockReport(
+        cycle_index=8, synthesized=[31, 32], synthesis_candidates=5,
+        synthesis_flagged=[32],
+        synthesis_skipped=["feat: restated - 0.88 match with #12 (closed) feat: original"],
+    )
+    body = render_brief(cfg, report)
+    assert "5 candidate(s) parsed - 2 filed, 1 skipped as near-duplicates" in body
+    assert "- skipped: feat: restated - 0.88 match with #12 (closed) feat: original" in body
+    assert "#32 (synthesized this block) **possible-duplicate**" in body
+    assert "#31 (synthesized this block)\n" in body  # the clean one is not flagged
+
+
+def test_brief_says_plainly_when_synthesis_did_not_run():
+    cfg = load_config()
+    body = render_brief(cfg, BlockReport(cycle_index=9))
+    assert "synthesis did not run this block" in body
+
+
 def test_preserved_notes_default_when_missing(tmp_path):
     assert "never overwritten" in preserved_notes(tmp_path / "nope.md")
 

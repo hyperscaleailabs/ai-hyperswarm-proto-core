@@ -25,7 +25,7 @@ from hsai.config import load_config
 from hsai.knowledge import KnowledgeBase, Lesson
 from hsai.orchestrator import IterationResult
 from hsai.proc import Proc
-from hsai.synthesis import SynthesisResult
+from hsai.synthesis import SkippedCandidate, SynthesisResult
 
 
 class _Runner:
@@ -241,8 +241,13 @@ def _article_runner(cmd, *, cwd=None, env=None, timeout=None, input_text=None) -
     return Proc(list(cmd), 0, ARTICLE, "")
 
 
-def _fake_synthesize(cfg, *, cycle_index, runner, ai_runner) -> SynthesisResult:
-    """Files two tickets through the real `gh issue create` path, once."""
+def _fake_synthesize(cfg, *, cycle_index, repo_root, runner, ai_runner) -> SynthesisResult:
+    """Files two tickets through the real `gh issue create` path, once.
+
+    It also reports a third candidate withheld as a near-duplicate, so the
+    resume test proves the dedupe counts survive the journal round-trip and
+    reach the brief - not just the filed ticket numbers.
+    """
     filed = [
         github.create_issue(
             cfg.repo_slug, f"feat: synthesized {n} for block {cycle_index}",
@@ -250,7 +255,13 @@ def _fake_synthesize(cfg, *, cycle_index, runner, ai_runner) -> SynthesisResult:
         )
         for n in (1, 2)
     ]
-    return SynthesisResult(ok=True, studied=["a/b"], filed=filed)
+    return SynthesisResult(
+        ok=True, studied=["a/b"], filed=filed, candidates=3,
+        skipped=[SkippedCandidate(
+            title="feat: synthesized 1 restated", score=0.91,
+            matched_issue=filed[0], matched_title="feat: synthesized 1", matched_state="open",
+        )],
+    )
 
 
 def _make_run_once(ledger_file, *, crash_at: int | None = None):
@@ -318,7 +329,8 @@ def _drive(root, cfg, monkeypatch, *, crash_at=None, resume=False,
 
 def _brief_fields(report) -> tuple:
     return (
-        report.synthesized, report.iterations, report.merged_prs,
+        report.synthesized, report.synthesis_candidates, report.synthesis_flagged,
+        report.synthesis_skipped, report.iterations, report.merged_prs,
         report.whitepaper, report.articles,
     )
 
@@ -372,6 +384,13 @@ def test_resume_after_a_crash_replays_and_writes_nothing_to_github_twice(
     resume_notes = [n for n in res.report.notes if n.startswith("resume: replayed")]
     assert len(resume_notes) == 1
     assert resume_notes[0] in gh.review_bodies[0]
+
+    # The dedupe counts are journaled with the block, so a resumed brief still
+    # answers "is synthesis finding new ground?".
+    assert res.report.synthesis_candidates == 3
+    assert res.report.synthesis_skipped == ["feat: synthesized 1 restated - 0.91 match with "
+                                            "#901 (open) feat: synthesized 1"]
+    assert "3 candidate(s) parsed - 2 filed, 1 skipped" in gh.review_bodies[0]
 
     # The journal is closed, so a later `--resume` will not pick it up again.
     assert journal.latest_resumable(crashed) is None

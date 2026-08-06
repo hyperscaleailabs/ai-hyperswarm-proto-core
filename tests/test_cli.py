@@ -64,6 +64,61 @@ def test_cycle_command_passes_resume_through(monkeypatch, capsys):
     assert "block 42 (resumed)" in out and "/tmp/j.jsonl" in out
 
 
+def test_parser_synthesize_dry_run_defaults():
+    parser = build_parser()
+    plain = parser.parse_args(["synthesize"])
+    assert plain.index == 0 and plain.dry_run is False
+    rehearsal = parser.parse_args(["synthesize", "--dry-run", "--index", "4"])
+    assert rehearsal.dry_run is True and rehearsal.index == 4
+
+
+def test_synthesize_dry_run_prints_the_prompt_and_files_nothing(monkeypatch, capsys):
+    """The rehearsal's whole output is the prompt: the memory pack is reviewable."""
+    from hsai.synthesis import MEMORY_HEADING, SynthesisResult
+
+    seen = {}
+
+    def fake_synthesize(cfg, **kwargs):
+        seen.update(kwargs)
+        return SynthesisResult(
+            ok=True, studied=["a/b"], filed=[],
+            prompt=f"## {MEMORY_HEADING}\n#7 feat: already open",
+        )
+
+    monkeypatch.setattr("hsai.synthesis.synthesize", fake_synthesize)
+
+    rc = main(["synthesize", "--dry-run", "--index", "4"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert seen["dry_run"] is True and seen["cycle_index"] == 4
+    assert MEMORY_HEADING in out and "#7 feat: already open" in out
+    assert "no agent call, no tickets filed" in out
+
+
+def test_synthesize_reports_duplicates_it_withheld(monkeypatch, capsys):
+    from hsai.synthesis import SkippedCandidate, SynthesisResult
+
+    def fake_synthesize(cfg, **kwargs):
+        return SynthesisResult(
+            ok=True, studied=["a/b"], filed=[12], flagged=[12], candidates=2,
+            skipped=[SkippedCandidate(
+                title="feat: restated", score=0.88, matched_issue=7,
+                matched_title="feat: original", matched_state="closed",
+            )],
+        )
+
+    monkeypatch.setattr("hsai.synthesis.synthesize", fake_synthesize)
+
+    rc = main(["synthesize"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "candidates parsed: 2" in out
+    assert "possible-duplicate: [12]" in out
+    assert "skipped as duplicate: feat: restated - 0.88 match with #7 (closed)" in out
+
+
 def test_parser_repro_check_defaults():
     parser = build_parser()
     args = parser.parse_args(["repro-check"])

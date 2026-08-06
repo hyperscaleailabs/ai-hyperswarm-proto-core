@@ -39,6 +39,11 @@ class BlockReport:
 
     cycle_index: int
     synthesized: list[int] = field(default_factory=list)  # ticket numbers filed
+    # Whether synthesis is still finding new ground: how many candidates the
+    # heavy model produced, and which ones repo memory already covered.
+    synthesis_candidates: int = 0
+    synthesis_flagged: list[int] = field(default_factory=list)  # filed as possible-duplicate
+    synthesis_skipped: list[str] = field(default_factory=list)  # "title - 0.81 match with #12"
     iterations: list[str] = field(default_factory=list)   # IterationResult.describe() lines
     merged_prs: list[int] = field(default_factory=list)
     recovered_prs: list[int] = field(default_factory=list)
@@ -150,11 +155,35 @@ def _cost_summary(cost: BlockAggregate | None) -> str:
     return f"{cost.summary()}\n\n**Efficiency:** {efficiency}"
 
 
+def _synthesis_novelty(report: BlockReport) -> str:
+    """Is synthesis still finding new ground, or restating what already shipped?
+
+    A block where most candidates were withheld as duplicates is the signal that
+    the planner has exhausted its current context - the architect should widen
+    the reference rotation or re-aim the goals rather than keep paying for the
+    heavy tier.
+    """
+    if not report.synthesis_candidates and not report.synthesis_skipped:
+        return "**Synthesis novelty:** _synthesis did not run this block._"
+    filed = len(report.synthesized)
+    skipped = report.synthesis_skipped
+    lines = [
+        f"**Synthesis novelty:** {report.synthesis_candidates} candidate(s) parsed - "
+        f"{filed} filed, {len(skipped)} skipped as near-duplicates of known tickets."
+    ]
+    lines += [f"- skipped: {s}" for s in skipped]
+    return "\n".join(lines)
+
+
 def render_brief(cfg: CoreConfig, report: BlockReport) -> str:
     """The review-issue body for one block: everything clickable in one place."""
     repo = cfg.repo_slug
     synth = (
-        "\n".join(f"- #{n} (synthesized this block)" for n in report.synthesized)
+        "\n".join(
+            f"- #{n} (synthesized this block)"
+            + (" **possible-duplicate**" if n in report.synthesis_flagged else "")
+            for n in report.synthesized
+        )
         or "_none - backlog was sufficient_"
     )
     iters = "\n".join(f"- `{line}`" for line in report.iterations) or "_none_"
@@ -168,6 +197,7 @@ def render_brief(cfg: CoreConfig, report: BlockReport) -> str:
     paper = f"`knowledge/whitepapers/{report.whitepaper}.md`" if report.whitepaper else "_none_"
     articles = "\n".join(f"- `{a}`" for a in report.articles) or "_none_"
     cost = _cost_summary(report.cost)
+    novelty = _synthesis_novelty(report)
     extra = "\n".join(f"- {n}" for n in report.notes)
     return f"""# Block review - cycle {report.cycle_index}
 
@@ -177,6 +207,8 @@ sequentially, records your feedback as ADRs, and ends with a merged PR.
 
 ## Tickets synthesized (heavy model)
 {synth}
+
+{novelty}
 
 ## Iterations
 {iters}

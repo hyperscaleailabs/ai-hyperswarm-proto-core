@@ -20,6 +20,8 @@ _TAG_RE = re.compile(r"^\s*-\s+(\S.*)$", re.MULTILINE)
 _FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
 _TITLE_RE = re.compile(r"^# (.+)$", re.MULTILINE)
 _SECTION_RE = re.compile(r"^## (.+)$", re.MULTILINE)
+# Reference-set citations are rendered as "- `owner/repo`" list items.
+_REFERENCE_RE = re.compile(r"^\s*-\s+`([^`]+)`\s*$", re.MULTILINE)
 _WORD_RE = re.compile(r"[a-zA-Z][a-zA-Z-]{3,}")
 _STOPWORDS = {
     "this", "that", "with", "from", "have", "been", "were", "will", "which",
@@ -75,6 +77,14 @@ class LessonRecord:
     tags: tuple[str, ...]
     lesson_text: str
     what_happened: str = ""
+    references: tuple[str, ...] = ()  # reference-set repos this lesson cited
+
+    def headline(self) -> str:
+        """The first line of the lesson - what a reader gets in one glance."""
+        for line in self.lesson_text.splitlines():
+            if line.strip():
+                return line.strip()
+        return ""
 
 
 @dataclass
@@ -158,6 +168,9 @@ class KnowledgeBase:
         title_match = _TITLE_RE.search(text)
         title = title_match.group(1).strip() if title_match else note_name
         sections = self._split_sections(text)
+        refs_body = next(
+            (body for head, body in sections.items() if head.startswith("references")), ""
+        )
         return LessonRecord(
             note_name=note_name,
             title=title,
@@ -166,6 +179,7 @@ class KnowledgeBase:
             tags=tags,
             lesson_text=sections.get("lesson learned", ""),
             what_happened=sections.get("what happened", ""),
+            references=tuple(m.group(1) for m in _REFERENCE_RE.finditer(refs_body)),
         )
 
     @staticmethod

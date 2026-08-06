@@ -136,6 +136,16 @@ synthesis:
   ideas_target: 10             # candidate ideas generated before reflection
   file_top: 3                  # tickets actually filed after critique + prioritization
   min_projects_combined: 3     # an idea must combine practices from >= N reference projects
+  # Repo memory: what this codebase has already tried is packed into the prompt so
+  # the planner differentiates instead of re-proposing shipped work.
+  prompt_char_budget: 48000    # hard ceiling on the whole rendered prompt
+  memory_char_budget: 6000     # of that, what the "already tried" pack may use
+  memory_closed_tickets: 60    # recently-closed tickets pulled into memory + dedupe
+  # Near-duplicate bands (see src/hsai/dedupe.py). >= skip is withheld and reported;
+  # >= flag is filed with a `possible-duplicate` label and a backlink. Nothing is
+  # ever auto-closed: the architect keeps the final call.
+  dedupe_skip_threshold: 0.70
+  dedupe_flag_threshold: 0.45
 
 # Quota/cost budget for one half-day block (subscription-only: purely local
 # measurement, never a metered API call). The ledger aggregates each block's

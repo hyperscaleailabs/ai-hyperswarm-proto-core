@@ -22,6 +22,7 @@ STANDARD_LABELS = {
     "blocked": ("000000", "Exhausted auto-retries; needs a human"),
     "review": ("e99695", "Block review brief for the architect"),
     "needs-refinement": ("f9d0c4", "Ticket lacks acceptance criteria / verification plan"),
+    "possible-duplicate": ("fef2c0", "Overlaps an existing ticket; the architect decides"),
     "size:S": ("c5def5", "Small, mechanical change"),
     "size:M": ("76c7f0", "Substantial feature or refactor"),
     "size:L": ("1f77b4", "Large, multi-step change"),
@@ -104,12 +105,14 @@ def create_issue(
     return _parse_issue_number(p.stdout)
 
 
-def list_open_issues(repo: str, *, runner: Runner = run) -> list[Issue]:
-    """List open issues, highest priority first."""
+def list_issues(
+    repo: str, *, state: str = "open", limit: int = 100, runner: Runner = run
+) -> list[Issue]:
+    """List issues in ``state``, newest first (as `gh` returns them)."""
     p = _gh(
         [
-            "issue", "list", "--repo", repo, "--state", "open",
-            "--limit", "100",
+            "issue", "list", "--repo", repo, "--state", state,
+            "--limit", str(limit),
             "--json", "number,title,labels,assignees,body",
         ],
         runner=runner,
@@ -118,7 +121,7 @@ def list_open_issues(repo: str, *, runner: Runner = run) -> list[Issue]:
         data = json.loads(p.stdout or "[]")
     except json.JSONDecodeError:
         return []
-    issues = [
+    return [
         Issue(
             number=item["number"],
             title=item.get("title", ""),
@@ -128,8 +131,18 @@ def list_open_issues(repo: str, *, runner: Runner = run) -> list[Issue]:
         )
         for item in data
     ]
+
+
+def list_open_issues(repo: str, *, runner: Runner = run) -> list[Issue]:
+    """List open issues, highest priority first."""
+    issues = list_issues(repo, state="open", runner=runner)
     issues.sort(key=lambda i: (i.priority_rank(), i.number))
     return issues
+
+
+def list_closed_issues(repo: str, *, limit: int = 60, runner: Runner = run) -> list[Issue]:
+    """List recently closed issues, most recently closed first."""
+    return list_issues(repo, state="closed", limit=limit, runner=runner)
 
 
 def next_ticket(repo: str, *, runner: Runner = run) -> Issue | None:
