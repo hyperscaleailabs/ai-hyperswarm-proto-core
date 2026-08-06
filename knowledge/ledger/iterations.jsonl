@@ -1,0 +1,2 @@
+{"attempts": 2, "block": 41341, "created": "2026-08-05T23:58:22.332416+00:00", "input_tokens": null, "iteration": 4134101, "kind": "implement", "model": "sonnet", "outcome": "incomplete", "output_tokens": null, "ticket": 101, "tier": "standard", "wall_clock_seconds": 3805.701}
+{"attempts": 1, "block": 41341, "created": "2026-08-06T00:59:48.114542+00:00", "input_tokens": null, "iteration": 4134102, "kind": "implement", "model": "opus", "outcome": "merged", "output_tokens": null, "ticket": 102, "tier": "heavy", "wall_clock_seconds": 3685.223}
