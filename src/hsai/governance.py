@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import github
+from . import github, workflows
 from .config import CoreConfig
 from .knowledge import KnowledgeBase
 from .ledger import BlockAggregate
@@ -169,6 +169,7 @@ def render_brief(cfg: CoreConfig, report: BlockReport) -> str:
     articles = "\n".join(f"- `{a}`" for a in report.articles) or "_none_"
     cost = _cost_summary(report.cost)
     extra = "\n".join(f"- {n}" for n in report.notes)
+    proposed_workflows = workflows.render_proposed_workflows_section(".")
     return f"""# Block review - cycle {report.cycle_index}
 
 One block of the twice-daily governance rhythm. Review here, then run
@@ -186,6 +187,9 @@ sequentially, records your feedback as ADRs, and ends with a merged PR.
 
 ## PRs recovered (failed the gate)
 {recovered}
+
+## Proposed CI changes (workflow proposals)
+{proposed_workflows}
 
 ## Cost this block (quota ledger)
 {cost}

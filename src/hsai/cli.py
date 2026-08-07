@@ -44,6 +44,9 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
+    from . import workflows
+    from pathlib import Path
+
     cfg = _load(args)
     ok = True
     print(f"hsai {__version__}")
@@ -60,6 +63,29 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         ok = False
     print(f"  constraints: subscription_only={cfg.subscription_only}, "
           f"require_ticket_per_pr={cfg.constraints.get('require_ticket_per_pr')}")
+
+    # Check documented vs enforced status checks (if --strict)
+    if getattr(args, "strict", False):
+        sdlc_path = Path(".") / "docs" / "SDLC.md"
+        workflow_path = Path(".") / ".github" / "workflows" / "ci.yml"
+
+        if sdlc_path.exists() and workflow_path.exists():
+            missing = workflows.check_documented_gates(
+                sdlc_path.read_text(),
+                workflow_path.read_text(),
+            )
+            if missing:
+                for check in missing:
+                    print(f"  workflow MISSING: `{check}` documented but not enforced")
+                ok = False
+            else:
+                print("  workflow gates: OK (all documented checks enforced)")
+        else:
+            if not sdlc_path.exists():
+                print(f"  workflow check: SKIP (no {sdlc_path})")
+            if not workflow_path.exists():
+                print(f"  workflow check: SKIP (no {workflow_path})")
+
     return 0 if ok else 1
 
 
@@ -207,6 +233,8 @@ def build_parser() -> argparse.ArgumentParser:
     st.set_defaults(func=cmd_status)
 
     dr = sub.add_parser("doctor", help="verify environment and safety invariants")
+    dr.add_argument("--strict", action="store_true",
+                    help="check that documented CI gates match the workflow")
     dr.set_defaults(func=cmd_doctor)
 
     ri = sub.add_parser("reindex", help="rebuild knowledge-base MOCs")

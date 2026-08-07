@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 from uuid import uuid4
 
-from . import ai, ci, github, gitops, ledger, repro, trajectory
+from . import ai, ci, github, gitops, ledger, repro, trajectory, workflows
 from .config import CoreConfig
 from .knowledge import KnowledgeBase, Lesson
 from .models import ModelChoice, Task, select
@@ -402,14 +402,34 @@ def run_once(
 
         # Guard: a task must not change the CI checks, or local and remote CI
         # would diverge (as happened once when a worker added mypy). Revert any
-        # workflow edits before they are committed and note it in the lesson.
+        # workflow edits before they are committed, capture them as a proposal,
+        # and note it in the lesson.
         reverted_workflows = [
             p for p in gitops.changed_paths(cwd=wt, runner=runner)
             if p.startswith(".github/workflows/")
         ]
+        proposal_paths: list[str] = []
         if reverted_workflows:
+            # Capture the patch before reverting it, so the intent survives
+            # as a proposal file rather than being lost silently.
+            diff_result = runner(
+                ["git", "diff", "HEAD", "--", ".github/workflows"],
+                cwd=wt,
+            )
+            if diff_result.ok and diff_result.stdout.strip():
+                reason = (
+                    f"Worker proposed changes to CI workflow. Ticket: #{ticket_num}. "
+                    f"Changes: {', '.join(reverted_workflows)}. "
+                    f"See the lesson for context. (Iteration {iteration})"
+                )
+                proposal_path = workflows.propose_workflow_change(
+                    diff_result.stdout, reason, repo_root=repo_dir,
+                )
+                proposal_paths.append(str(proposal_path.relative_to(repo_dir)))
             gitops.restore_pathspec(".github/workflows", cwd=wt, runner=runner)
             result.notes.append(f"reverted workflow edits: {reverted_workflows}")
+            if proposal_paths:
+                result.notes.append(f"proposals: {proposal_paths}")
 
         # Completeness guard: a code ticket (feat/skill/refactor/fix) cannot be
         # satisfied by a knowledge-only diff. PR #17 once "closed" a feature
@@ -478,6 +498,7 @@ def run_once(
             f"Agent ok={agent_ok}. CI after: {ci_after.summary()}."
             + (
                 f"\n\nReverted off-spec workflow edits: {reverted_workflows}."
+                + (f"\n\nProposals (review in /review-next):\n" + "\n".join(f"- {p}" for p in proposal_paths))
                 if reverted_workflows else ""
             )
             + (f"\n\nAgent error:\n```\n{agent_err[:800]}\n```" if agent_err else "")
