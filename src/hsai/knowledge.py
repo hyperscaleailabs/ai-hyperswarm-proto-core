@@ -20,6 +20,7 @@ _TAG_RE = re.compile(r"^\s*-\s+(\S.*)$", re.MULTILINE)
 _FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
 _TITLE_RE = re.compile(r"^# (.+)$", re.MULTILINE)
 _SECTION_RE = re.compile(r"^## (.+)$", re.MULTILINE)
+_TICKET_RE = re.compile(r"^\|\s*ticket\s*\|\s*#(\d+)\s*\|", re.MULTILINE)
 _WORD_RE = re.compile(r"[a-zA-Z][a-zA-Z-]{3,}")
 _STOPWORDS = {
     "this", "that", "with", "from", "have", "been", "were", "will", "which",
@@ -36,6 +37,15 @@ _STOPWORDS = {
 
 def slugify(text: str) -> str:
     return _SLUG_RE.sub("-", text.lower()).strip("-") or "untitled"
+
+
+def tokenize(text: str) -> set[str]:
+    """The content words of ``text``, lowercased and de-duplicated.
+
+    One shared vocabulary for both readers of the corpus: whitepaper theme
+    detection below, and :mod:`hsai.memory`'s retrieval scoring.
+    """
+    return {w.lower() for w in _WORD_RE.findall(text or "")} - _STOPWORDS
 
 
 def _today() -> str:
@@ -55,6 +65,7 @@ class Lesson:
     pr: int | None = None
     model: str = ""
     references: tuple[str, ...] = ()  # reference-set repos that informed the work
+    recalled: tuple[str, ...] = ()  # note names episodic memory injected into the prompt
     tags: tuple[str, ...] = ()
     created: str = field(default_factory=_today)
     remote_ci: str = ""  # SUCCESS | FAILURE | TIMEOUT, filled in once gh checks conclude
@@ -75,6 +86,7 @@ class LessonRecord:
     tags: tuple[str, ...]
     lesson_text: str
     what_happened: str = ""
+    ticket: int | None = None  # which ticket this iteration worked on
 
 
 @dataclass
@@ -158,6 +170,7 @@ class KnowledgeBase:
         title_match = _TITLE_RE.search(text)
         title = title_match.group(1).strip() if title_match else note_name
         sections = self._split_sections(text)
+        ticket_match = _TICKET_RE.search(text)
         return LessonRecord(
             note_name=note_name,
             title=title,
@@ -166,6 +179,7 @@ class KnowledgeBase:
             tags=tags,
             lesson_text=sections.get("lesson learned", ""),
             what_happened=sections.get("what happened", ""),
+            ticket=int(ticket_match.group(1)) if ticket_match else None,
         )
 
     @staticmethod
@@ -193,8 +207,7 @@ class KnowledgeBase:
 
         word_sources: dict[str, set[str]] = {}
         for r in covered:
-            words = {w.lower() for w in _WORD_RE.findall(r.lesson_text)} - _STOPWORDS
-            for w in words:
+            for w in tokenize(r.lesson_text):
                 word_sources.setdefault(w, set()).add(r.note_name)
         recurring_themes = sorted(
             (w for w, notes in word_sources.items() if len(notes) >= 2),
@@ -276,6 +289,10 @@ class KnowledgeBase:
             {"created": lesson.created, "iteration": str(lesson.iteration)},
         )
         refs = "\n".join(f"- `{r}`" for r in lesson.references) or "- _(none cited)_"
+        recalled = (
+            "\n".join(f"- [[{n}]]" for n in lesson.recalled)
+            or "- _(none: no prior lesson matched this task)_"
+        )
         ticket = f"#{lesson.ticket}" if lesson.ticket else "_(none)_"
         pr = f"#{lesson.pr}" if lesson.pr else "_(none)_"
         repro = lesson.repro_evidence or "_(not applicable: not a heal/bugfix ticket)_"
@@ -306,6 +323,11 @@ class KnowledgeBase:
 
 ## Reproduction evidence
 {repro}
+
+## Recalled
+Prior lessons episodic memory injected into this iteration's prompt:
+
+{recalled}
 
 ## References (reference-set evidence)
 {refs}

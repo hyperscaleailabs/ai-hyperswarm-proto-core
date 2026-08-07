@@ -310,6 +310,35 @@ def find(repo_root: str | Path, identifier: str) -> Path | None:
     return matches[0] if matches else None
 
 
+def recent_for_ticket(
+    repo_root: str | Path, ticket: int | None, *, scan_limit: int = 50
+) -> list[Trajectory]:
+    """The stored runs that worked on ``ticket``, newest first.
+
+    This is how a retry learns about its predecessor: a failed attempt's PR is
+    closed and its branch deleted, so its *lesson* usually never reaches
+    ``main`` - but its trajectory is local and survives. Only the newest
+    ``scan_limit`` files are opened, so the cost stays bounded no matter how
+    many blocks of history are retained.
+    """
+    if not ticket:
+        return []
+    paths = sorted(
+        trajectory_dir(repo_root).glob("*/*.json"),
+        key=lambda p: int(p.stem) if p.stem.isdigit() else -1,
+        reverse=True,
+    )
+    found: list[Trajectory] = []
+    for path in paths[:scan_limit]:
+        try:
+            traj = read(path)
+        except (OSError, ValueError, TypeError):
+            continue  # a half-written or foreign file is not worth failing over
+        if traj.ticket == ticket:
+            found.append(traj)
+    return found
+
+
 def write(traj: Trajectory, repo_root: str | Path) -> Path:
     """Persist (or refresh) one trajectory as a single redacted JSON file."""
     path = path_for(repo_root, traj.identifier, traj.block)
