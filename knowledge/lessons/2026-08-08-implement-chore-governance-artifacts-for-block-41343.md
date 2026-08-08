@@ -4,7 +4,7 @@ tags:
   - outcome/fail
   - kind/implement
 created: 2026-08-08
-iteration: 4134701
+iteration: 4134702
 ---
 
 # implement: chore: governance artifacts for block 41343
@@ -15,14 +15,14 @@ iteration: 4134701
 | --- | --- |
 | outcome | **fail** |
 | kind | implement |
-| iteration | 4134701 |
-| ticket | #120 |
+| iteration | 4134702 |
+| ticket | #124 |
 | pull request | _(none)_ |
 | model | `haiku` |
-| remote CI | SUCCESS |
+| remote CI | _(pending)_ |
 
 ## Context
-Iteration 4134701. Ticket #120. CI before: CI green (ruff=pass, pytest=pass).
+Iteration 4134702. Ticket #124. CI before: CI green (ruff=pass, pytest=pass).
 
 ## What happened
 Model `haiku` (light) ran the task. Agent ok=False. CI after: CI green (ruff=pass, pytest=pass).
