@@ -99,3 +99,74 @@ def test_brief_says_when_tokens_per_merged_pr_is_unavailable():
     cost = BlockAggregate(block=7, iterations=2, total_seconds=10.0)
     body = render_brief(cfg, BlockReport(cycle_index=7, cost=cost))
     assert "tokens per merged PR: _not available_" in body
+
+
+def test_block_41345_governance_artifacts_exist():
+    """Verify that governance artifacts for block 41345 have been created."""
+    import pathlib
+
+    # Verify lesson files exist
+    lesson_41344 = pathlib.Path("knowledge/lessons/2026-08-08-implement-skill-learned-model-selection-heuristic-v2-calibrated-from-lessons.md")
+    lesson_41345 = pathlib.Path("knowledge/lessons/2026-08-08-implement-feat-adversarial-acceptance-criteria-review-gate.md")
+    lesson_governance = pathlib.Path("knowledge/lessons/2026-08-08-implement-chore-governance-artifacts-for-block-41345.md")
+    assert lesson_41344.exists(), f"Lesson file for block 41344 not found: {lesson_41344}"
+    assert lesson_41345.exists(), f"Lesson file for block 41345 not found: {lesson_41345}"
+    assert lesson_governance.exists(), f"Lesson file for governance artifacts not found: {lesson_governance}"
+
+    # Verify whitepaper exists
+    whitepaper = pathlib.Path("knowledge/whitepapers/2026-08-08-synthesis-after-22-lessons.md")
+    assert whitepaper.exists(), f"Whitepaper not found: {whitepaper}"
+
+    # Verify persona articles exist
+    architect_article = pathlib.Path("knowledge/articles/2026-08-08-synthesis-after-22-lessons-architect.md")
+    devops_article = pathlib.Path("knowledge/articles/2026-08-08-synthesis-after-22-lessons-devops.md")
+    assert architect_article.exists(), f"Architect article not found: {architect_article}"
+    assert devops_article.exists(), f"DevOps article not found: {devops_article}"
+
+
+def test_block_41345_lesson_files_have_correct_metadata():
+    """Verify that lesson files have correct metadata and format."""
+    import pathlib
+    import yaml
+
+    lesson_41344 = pathlib.Path("knowledge/lessons/2026-08-08-implement-skill-learned-model-selection-heuristic-v2-calibrated-from-lessons.md")
+    content_41344 = lesson_41344.read_text()
+
+    # Extract YAML front matter
+    parts = content_41344.split("---")
+    assert len(parts) >= 3, "Lesson file missing YAML front matter"
+
+    metadata = yaml.safe_load(parts[1])
+    assert "lesson" in metadata.get("tags", []), "Lesson missing 'lesson' tag"
+    assert "outcome/pass" in metadata.get("tags", []), "Lesson should have outcome/pass"
+    assert metadata.get("created") == "2026-08-08", "Lesson should be dated 2026-08-08"
+    assert metadata.get("iteration") == 4134701, "Lesson should reference iteration 4134701"
+
+
+def test_block_41345_moc_counts_updated():
+    """Verify that MOCs have been updated with correct lesson and whitepaper counts."""
+    import pathlib
+
+    lessons_moc = pathlib.Path("knowledge/MOCs/Lessons MOC.md")
+    content = lessons_moc.read_text()
+    assert "Total: **23**" in content, "Lessons MOC should show 23 lessons"
+    assert "[[2026-08-08-implement-skill-learned-model-selection-heuristic-v2-calibrated-from-lessons]]" in content
+    assert "[[2026-08-08-implement-feat-adversarial-acceptance-criteria-review-gate]]" in content
+    assert "[[2026-08-08-implement-chore-governance-artifacts-for-block-41345]]" in content
+
+    whitepapers_moc = pathlib.Path("knowledge/MOCs/Whitepapers MOC.md")
+    content = whitepapers_moc.read_text()
+    assert "Total: **6**" in content, "Whitepapers MOC should show 6 whitepapers"
+    assert "[[2026-08-08-synthesis-after-22-lessons]]" in content
+
+
+def test_block_41345_direction_updated():
+    """Verify that DIRECTION.md reflects the new state."""
+    import pathlib
+
+    direction = pathlib.Path("governance/DIRECTION.md")
+    content = direction.read_text()
+    assert "23 lessons" in content, "DIRECTION should mention 23 lessons"
+    assert "6 whitepapers" in content, "DIRECTION should mention 6 whitepapers"
+    assert "Learned model selection" in content, "DIRECTION should reference learned model selection"
+    assert "adversarial acceptance-criteria" in content, "DIRECTION should reference adversarial gate"
