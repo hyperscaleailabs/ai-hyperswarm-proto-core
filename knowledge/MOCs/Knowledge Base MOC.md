@@ -12,7 +12,7 @@ vault and use the graph view to explore how lessons connect.
 
 ## Maps
 - [[Lessons MOC]] - 20 lesson(s)
-- [[Whitepapers MOC]] - 4 whitepaper(s)
+- [[Whitepapers MOC]] - 5 whitepaper(s)
 
 ## How this is maintained
 - Each PR the [[hsai]] loop opens contributes exactly one lesson.
