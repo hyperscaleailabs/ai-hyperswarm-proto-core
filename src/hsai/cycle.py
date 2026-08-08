@@ -58,7 +58,10 @@ def _persona_articles(
     repo_root: Path,
     ai_runner: Runner,
 ) -> list[str]:
-    """Generate one targeted article per persona from the block whitepaper."""
+    """Generate one targeted article per persona from the block whitepaper.
+
+    Idempotent: skips personas that already have articles and only generates missing ones.
+    """
     if not whitepaper_note:
         return []
     paper_path = kb.whitepapers_dir / f"{whitepaper_note}.md"
@@ -67,6 +70,10 @@ def _persona_articles(
     paper = paper_path.read_text()
     articles_dir = repo_root / "knowledge" / "articles"
     articles_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check which personas already have articles
+    existing = kb.persona_articles(whitepaper_note)
+
     tier = "standard" if "standard" in cfg.tiers else cfg.default_tier
     choice = ModelChoice(
         tier=tier, model=cfg.tiers[tier].model,
@@ -75,6 +82,10 @@ def _persona_articles(
     written: list[str] = []
     for persona in cfg.personas:
         pid = persona.get("id", "reader")
+        # Skip if already exists
+        if pid in existing:
+            written.append(str(existing[pid].relative_to(repo_root)))
+            continue
         audience = persona.get("audience", "")
         prompt = (
             f"Rewrite the following engineering whitepaper as a short article "

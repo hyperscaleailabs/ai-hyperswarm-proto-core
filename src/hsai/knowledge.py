@@ -139,6 +139,21 @@ class KnowledgeBase:
     def whitepaper_notes(self) -> list[str]:
         return sorted(p.stem for p in self.whitepapers_dir.glob("*.md"))
 
+    def persona_articles(self, whitepaper_note: str) -> dict[str, Path]:
+        """Find all persona articles for a given whitepaper.
+
+        Returns a dict mapping persona ID to file path, e.g.
+        {"cto": Path("knowledge/articles/2026-08-08-...-cto.md"), ...}
+        """
+        articles: dict[str, Path] = {}
+        for path in self.root.glob(f"knowledge/articles/{whitepaper_note}-*.md"):
+            # Extract persona ID from filename: 2026-08-08-...-{persona_id}.md
+            parts = path.stem.rsplit("-", 1)
+            if len(parts) == 2:
+                persona_id = parts[1]
+                articles[persona_id] = path
+        return articles
+
     def should_write_whitepaper(self) -> bool:
         n = len(self.lesson_notes())
         return n > 0 and n % self.whitepaper_every == 0

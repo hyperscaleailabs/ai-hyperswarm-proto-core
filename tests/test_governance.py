@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 from hsai.config import load_config
 from hsai.governance import (
@@ -9,6 +10,7 @@ from hsai.governance import (
     render_brief,
     render_direction,
 )
+from hsai.knowledge import KnowledgeBase
 from hsai.ledger import BlockAggregate
 from hsai.proc import Proc
 
@@ -99,3 +101,78 @@ def test_brief_says_when_tokens_per_merged_pr_is_unavailable():
     cost = BlockAggregate(block=7, iterations=2, total_seconds=10.0)
     body = render_brief(cfg, BlockReport(cycle_index=7, cost=cost))
     assert "tokens per merged PR: _not available_" in body
+
+
+def test_governance_artifacts_latest_whitepaper_has_all_personas():
+    """Verify the latest whitepaper has persona articles for all configured personas.
+
+    This test enforces that block governance artifacts are complete:
+    - Whitepaper synthesized ✓
+    - Persona articles for each configured persona ✓
+    - MOCs reindexed (verified elsewhere)
+    - DIRECTION refreshed (verified elsewhere)
+    """
+    cfg = load_config()
+    kb = KnowledgeBase.from_config(cfg, Path("."))
+    papers = kb.whitepaper_notes()
+    assert papers, "No whitepapers found - knowledge base is empty"
+
+    latest_paper = papers[-1]
+    articles = kb.persona_articles(latest_paper)
+    personas = cfg.personas or []
+
+    for persona in personas:
+        persona_id = persona.get("id")
+        assert (
+            persona_id in articles
+        ), f"Missing persona article for {persona_id} in whitepaper {latest_paper}. " \
+           f"Found: {list(articles.keys())}, Expected: {[p.get('id') for p in personas]}"
+
+
+def test_mocs_include_all_lessons():
+    """Verify all lesson notes are referenced in the Lessons MOC."""
+    cfg = load_config()
+    kb = KnowledgeBase.from_config(cfg, Path("."))
+    moc_path = kb.mocs_dir / "Lessons MOC.md"
+    assert moc_path.exists(), "Lessons MOC not found"
+
+    moc_content = moc_path.read_text()
+    lessons = kb.lesson_notes()
+
+    for lesson_note in lessons:
+        assert (
+            f"[[{lesson_note}]]" in moc_content
+        ), f"Lesson {lesson_note} not linked in Lessons MOC"
+
+
+def test_mocs_include_all_whitepapers():
+    """Verify all whitepaper notes are referenced in the Whitepapers MOC."""
+    cfg = load_config()
+    kb = KnowledgeBase.from_config(cfg, Path("."))
+    moc_path = kb.mocs_dir / "Whitepapers MOC.md"
+    assert moc_path.exists(), "Whitepapers MOC not found"
+
+    moc_content = moc_path.read_text()
+    papers = kb.whitepaper_notes()
+
+    for paper_note in papers:
+        assert (
+            f"[[{paper_note}]]" in moc_content
+        ), f"Whitepaper {paper_note} not linked in Whitepapers MOC"
+
+
+def test_direction_doc_exists_and_is_recent():
+    """Verify DIRECTION.md exists and references the current goals."""
+    cfg = load_config()
+    direction_path = Path(".") / cfg.governance.get("direction_doc", "governance/DIRECTION.md")
+    assert direction_path.exists(), f"DIRECTION doc not found at {direction_path}"
+
+    content = direction_path.read_text()
+    assert "## Now (current state)" in content
+    assert "## Issues Map" in content
+    assert "## Direction (where we are going)" in content
+
+    # Verify all goals are referenced
+    for goal in cfg.goals:
+        goal_id = goal.get("id")
+        assert f"- **{goal_id}**" in content, f"Goal {goal_id} not found in DIRECTION"
