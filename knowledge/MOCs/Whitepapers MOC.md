@@ -2,7 +2,7 @@
 tags:
   - moc
   - whitepapers
-updated: 2026-08-04
+updated: 2026-08-08
 ---
 
 # Whitepapers MOC
