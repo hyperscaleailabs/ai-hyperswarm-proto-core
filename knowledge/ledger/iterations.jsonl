@@ -1,0 +1,2 @@
+{"attempts": 1, "block": 41345, "created": "2026-08-07T23:19:43.746928+00:00", "input_tokens": null, "iteration": 4134501, "kind": "implement", "model": "haiku", "outcome": "merged", "output_tokens": null, "ticket": 120, "tier": "light", "wall_clock_seconds": 1662.082}
+{"attempts": 1, "block": 41345, "created": "2026-08-08T01:37:31.686703+00:00", "input_tokens": null, "iteration": 4134502, "kind": "implement", "model": "haiku", "outcome": "recovered", "output_tokens": null, "ticket": 120, "tier": "light", "wall_clock_seconds": 8267.422}
