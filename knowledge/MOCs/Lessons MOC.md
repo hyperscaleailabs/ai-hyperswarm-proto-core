@@ -9,7 +9,7 @@ updated: 2026-08-08
 
 Up: [[Knowledge Base MOC]]
 
-Every hsai iteration leaves a lesson here - pass or fail. Total: **20**.
+Every hsai iteration leaves a lesson here - pass or fail. Total: **23**.
 
 - [[2026-07-25-bootstrap-the-hsai-loop]]
 - [[2026-07-26-architect-steering-quality-over-throughput]]
@@ -31,3 +31,6 @@ Every hsai iteration leaves a lesson here - pass or fail. Total: **20**.
 - [[2026-08-05-implement-chore-governance-artifacts-for-block-41339]]
 - [[2026-08-05-implement-feat-durable-cycle-journal-with-idempotent-resume-for-interrupted-blocks]]
 - [[2026-08-08-implement-chore-governance-artifacts-for-block-41343]]
+- [[2026-08-08-implement-skill-learned-model-selection-heuristic-v2-calibrated-from-lessons]]
+- [[2026-08-08-implement-feat-adversarial-acceptance-criteria-review-gate]]
+- [[2026-08-08-implement-chore-governance-artifacts-for-block-41345]]
