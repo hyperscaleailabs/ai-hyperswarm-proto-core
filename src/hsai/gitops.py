@@ -104,6 +104,12 @@ def changed_paths(*, cwd: str, runner: Runner = run) -> list[str]:
     return paths
 
 
+def show_file(ref: str, path: str, *, cwd: str, runner: Runner = run) -> str:
+    """Contents of ``path`` at ``ref`` ("" if it does not exist there)."""
+    p = _git(["show", f"{ref}:{path}"], cwd=cwd, runner=runner)
+    return p.stdout if p.ok else ""
+
+
 def restore_pathspec(pathspec: str, *, cwd: str, runner: Runner = run) -> None:
     """Discard both tracked edits and new files under ``pathspec``."""
     _git(["checkout", "HEAD", "--", pathspec], cwd=cwd, runner=runner)

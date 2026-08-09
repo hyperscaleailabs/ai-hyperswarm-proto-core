@@ -183,10 +183,17 @@ and `main`; green-gated auto-merge serializes the actual integration.
   written back into the lesson (and pushed as a follow-up commit) so the
   knowledge base records the true CI outcome for every PR, not just the
   local approximation.
-- **Local == remote by construction.** A task must not change the CI checks, or
-  local and remote would diverge. The orchestrator reverts any edits under
-  `.github/workflows/**` before committing (and notes it in the lesson), so a
-  worker cannot (accidentally or otherwise) move the goalposts it is judged by.
+- **Local == remote by construction.** A worker must not be able to move the
+  goalposts it is judged by - but CI still has to be improvable. `ciguard`
+  (see [ADR-0002](adr/0002-governed-ci-change-channel.md)) admits an edit under
+  `.github/workflows/**` only on a `ci-change`-labelled ticket, only in the lane
+  named by `ci_policy.workflow_path`, only while every `ci_policy.required_steps`
+  command survives, and only while each declared gate mirrors
+  `ci.local_commands()` (the same list `run_local` executes) in both directions.
+  Anything else - including a missing ticket or an unparseable workflow - is
+  reverted, exactly as the old blanket guard did. Either way the verdict lands in
+  the iteration notes, the lesson, and a `## CI change` section of the PR body.
+  `hsai ci-parity` runs the same comparison standalone.
 - **No ticket is stranded on failure.** If remote CI does not go green,
   `_recover_failed` closes the PR (deleting the branch) and returns the ticket
   to the backlog with an incremented `attempts:N` label. After
