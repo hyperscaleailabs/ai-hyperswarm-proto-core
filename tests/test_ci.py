@@ -72,3 +72,27 @@ def test_run_local_matches_workflow_steps():
     assert result.ok
     assert ["ruff", "check", "."] in calls
     assert ["pytest"] in calls
+
+
+def test_local_commands_describe_exactly_what_run_local_runs():
+    """`ci.local_commands` is what the parity check compares the workflow to,
+    so it must be derived from the same list `run_local` executes."""
+    calls = []
+
+    def fake(cmd, **kwargs):
+        calls.append(list(cmd))
+        return Proc(cmd, 0, "", "")
+
+    ci.run_local(runner=fake)
+    assert ci.local_commands() == tuple(" ".join(c) for c in calls)
+    assert ci.local_commands() == ("ruff check .", "pytest")
+
+
+def test_run_local_reports_the_failing_step():
+    def fake(cmd, **kwargs):
+        return Proc(cmd, 0 if cmd[0] == "ruff" else 1, "", "boom")
+
+    result = ci.run_local(runner=fake)
+    assert not result.ok
+    assert result.steps == {"ruff": True, "pytest": False}
+    assert "$ pytest" in result.log

@@ -65,9 +65,16 @@ class FakeRunner:
         repro_fix_ok: bool = True,
         repro_parent_ok: bool = False,
         agent_output: str = AGENT_JSON,
+        head_workflow: str = "",
+        worktree_files: dict[str, str] | None = None,
     ) -> None:
         self.repo_root = repo_root
         self.agent_output = agent_output
+        # `head_workflow` answers `git show HEAD:<path>` (the committed CI
+        # workflow); `worktree_files` is what the "agent" leaves on disk in the
+        # fresh worktree, which is how a workflow edit is simulated.
+        self.head_workflow = head_workflow
+        self.worktree_files = worktree_files or {}
         self.ci_sequence = ci_sequence
         self.open_issues = open_issues or []
         self.remote_ci = remote_ci
@@ -98,8 +105,17 @@ class FakeRunner:
             return Proc(cmd, 0, f"{self.repo_root}\n", "")
         if cmd[:2] == ["git", "merge-base"]:
             return Proc(cmd, 0, "parentsha\n", "")
+        if cmd[:3] == ["git", "worktree", "add"] and "-b" in cmd:
+            wt_path = Path(cmd[cmd.index("-b") + 2])
+            for rel, text in self.worktree_files.items():
+                target = wt_path / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text)
+            return Proc(cmd, 0, "", "")
         if cmd[:3] in (["git", "worktree", "add"], ["git", "worktree", "remove"]):
             return Proc(cmd, 0, "", "")
+        if cmd[:2] == ["git", "show"]:
+            return Proc(cmd, 0, self.head_workflow, "")
         if cmd[:2] == ["git", "status"]:
             return Proc(cmd, 0, self.worktree_status, "")
         if cmd[:2] in (["git", "add"], ["git", "commit"], ["git", "push"]):
@@ -212,6 +228,20 @@ def test_build_pr_body_contains_traceability():
     assert "kept it small" in body       # lesson present
     assert "[[2026-07-25-do-thing]]" in body
     assert "openai/swarm" in body
+
+
+def test_build_pr_body_ci_change_section_is_opt_in():
+    choice = ModelChoice(tier="standard", model="sonnet", rationale="x")
+    kwargs = dict(
+        ticket=42, choice=choice, lesson_note="n", lesson_summary="s", ci_summary="green",
+    )
+    assert "## CI change" not in build_pr_body(**kwargs)
+
+    body = build_pr_body(**kwargs, ci_change="**Verdict**: `allow` - parity holds")
+    assert "## CI change" in body
+    assert "`allow`" in body
+    # the invariant sections are untouched by the new one
+    assert "Closes #42" in body and "## Lesson learned" in body and "## CI" in body
 
 
 def test_build_pr_body_includes_phase_artifacts():
@@ -532,7 +562,125 @@ def test_workflow_edits_are_reverted(tmp_path):
     # #12: workflow edits are restored so local CI can't diverge from remote
     assert any(c[:3] == ["git", "checkout", "HEAD"] for c in runner.calls)
     assert any(c[:2] == ["git", "clean"] for c in runner.calls)
-    assert any("reverted workflow edits" in n for n in result.notes)
+    # the reverted path AND the reason are on the iteration record (#152)
+    note = next(n for n in result.notes if "reverted workflow edits" in n)
+    assert ".github/workflows/ci.yml" in note
+    assert "ci-change" in note
+
+
+# --- governed CI-change channel ---------------------------------------------
+
+HEAD_WORKFLOW = """\
+name: CI
+on:
+  pull_request:
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install
+        run: pip install -e ".[dev]"
+      - name: Lint (ruff)
+        run: ruff check .
+      - name: Test (pytest)
+        run: pytest
+"""
+
+# Legal edit: caps the job's runtime; every gate stays mirrored locally.
+TIMEOUT_WORKFLOW = HEAD_WORKFLOW.replace(
+    "    runs-on: ubuntu-latest",
+    "    runs-on: ubuntu-latest\n    timeout-minutes: 20",
+)
+# Illegal edit: drops the pytest gate.
+NO_PYTEST_WORKFLOW = HEAD_WORKFLOW.replace(
+    "      - name: Test (pytest)\n        run: pytest\n", ""
+)
+# Illegal edit: adds a remote-only gate `ci.run_local` never runs.
+MYPY_WORKFLOW = HEAD_WORKFLOW + "      - name: Types (mypy)\n        run: mypy src\n"
+
+CI_TICKET = {
+    "number": 7,
+    "title": "feat: cap CI job runtime",
+    "labels": [{"name": "priority:P2"}, {"name": "ci-change"}],
+    "assignees": [],
+    "body": WELL_FORMED_BODY,
+}
+
+
+def _ci_change_run(tmp_path, after_workflow, *, labels=None):
+    issue = dict(CI_TICKET)
+    if labels is not None:
+        issue["labels"] = [{"name": name} for name in labels]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[issue],
+        worktree_status=" M .github/workflows/ci.yml\n M src/hsai/ci.py\n",
+        head_workflow=HEAD_WORKFLOW,
+        worktree_files={".github/workflows/ci.yml": after_workflow},
+    )
+    result = run_once(
+        load_config(), repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+    return runner, result
+
+
+def _pr_body(runner):
+    call = next(c for c in runner.calls if c[:3] == ["gh", "pr", "create"])
+    return call[call.index("--body") + 1]
+
+
+def test_valid_workflow_edit_on_a_ci_change_ticket_is_committed(tmp_path):
+    runner, result = _ci_change_run(tmp_path, TIMEOUT_WORKFLOW)
+
+    # not reverted: the edit reaches the commit
+    assert not any(c[:3] == ["git", "checkout", "HEAD"] for c in runner.calls)
+    assert any("allowed workflow edits" in n for n in result.notes)
+
+    body = _pr_body(runner)
+    assert "## CI change" in body
+    assert ".github/workflows/ci.yml" in body
+    assert "`allow`" in body and "parity" in body
+    assert "CI change (allow)" in Path(result.lesson_path).read_text()
+    assert result.merged is True
+
+
+def test_workflow_edit_dropping_a_required_step_is_reverted(tmp_path):
+    runner, result = _ci_change_run(tmp_path, NO_PYTEST_WORKFLOW)
+
+    assert any(c[:3] == ["git", "checkout", "HEAD"] for c in runner.calls)
+    note = next(n for n in result.notes if "reverted workflow edits" in n)
+    assert "drops required step(s)" in note and "`pytest`" in note
+
+    # traceability survives a rejection: lesson + linked PR still exist
+    assert result.pr is not None
+    assert "Closes #7" in _pr_body(runner)
+    assert "## CI change" in _pr_body(runner)
+    assert "CI change (revert)" in Path(result.lesson_path).read_text()
+
+
+def test_workflow_edit_adding_a_remote_only_gate_is_reverted(tmp_path):
+    runner, result = _ci_change_run(tmp_path, MYPY_WORKFLOW)
+
+    assert any(c[:3] == ["git", "checkout", "HEAD"] for c in runner.calls)
+    note = next(n for n in result.notes if "reverted workflow edits" in n)
+    assert "local/remote CI would diverge" in note and "`mypy src`" in note
+    assert result.pr is not None  # still a lesson-carrying, ticket-linked PR
+
+
+def test_same_workflow_edit_differs_only_by_the_ci_change_label(tmp_path):
+    """The policy's whole surface: identical diff, opposite outcome."""
+    allowed_runner, allowed = _ci_change_run(tmp_path, TIMEOUT_WORKFLOW)
+    denied_runner, denied = _ci_change_run(
+        tmp_path, TIMEOUT_WORKFLOW, labels=["priority:P2"]
+    )
+
+    assert any("allowed workflow edits" in n for n in allowed.notes)
+    assert any("reverted workflow edits" in n for n in denied.notes)
+    assert not any(c[:3] == ["git", "checkout", "HEAD"] for c in allowed_runner.calls)
+    assert any(c[:3] == ["git", "checkout", "HEAD"] for c in denied_runner.calls)
+    assert "`allow`" in _pr_body(allowed_runner)
+    assert "`revert`" in _pr_body(denied_runner)
 
 
 def test_completeness_guard_blocks_knowledge_only_diff_on_code_ticket(tmp_path):

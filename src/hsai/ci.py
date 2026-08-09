@@ -21,6 +21,20 @@ TIMEOUT = "TIMEOUT"
 
 _PASS_CONCLUSIONS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 
+# The single definition of "a green build", as (step name, argv) pairs.
+# ``run_local`` executes exactly these, and :mod:`hsai.ciguard` compares them
+# against what the GitHub workflow declares - so the two can never silently
+# drift apart. Adding a gate here is what makes it legal to add it remotely.
+LOCAL_STEPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("ruff", ("ruff", "check", ".")),
+    ("pytest", ("pytest",)),
+)
+
+
+def local_commands() -> tuple[str, ...]:
+    """The shell form of every gate ``run_local`` executes, in order."""
+    return tuple(" ".join(argv) for _, argv in LOCAL_STEPS)
+
 
 @dataclass
 class CIResult:
@@ -40,13 +54,10 @@ def run_local(*, cwd: str | None = None, runner: Runner = run) -> CIResult:
     steps: dict[str, bool] = {}
     logs: list[str] = []
 
-    lint = runner(["ruff", "check", "."], cwd=cwd)
-    steps["ruff"] = lint.ok
-    logs.append(f"$ ruff check .\n{lint.stdout}\n{lint.stderr}")
-
-    tests = runner(["pytest"], cwd=cwd)
-    steps["pytest"] = tests.ok
-    logs.append(f"$ pytest\n{tests.stdout}\n{tests.stderr}")
+    for name, argv in LOCAL_STEPS:
+        p = runner(list(argv), cwd=cwd)
+        steps[name] = p.ok
+        logs.append(f"$ {' '.join(argv)}\n{p.stdout}\n{p.stderr}")
 
     return CIResult(ok=all(steps.values()), steps=steps, log="\n\n".join(logs))
 

@@ -17,6 +17,7 @@ STANDARD_LABELS = {
     "priority:P3": ("0e8a16", "Low priority / nice to have"),
     "hsai": ("5319e7", "Filed or handled by the hsai loop"),
     "ci": ("1d76db", "Continuous integration / build health"),
+    "ci-change": ("0b5394", "Authorizes an audited, parity-checked workflow edit"),
     "self-improve": ("0052cc", "Improvement toward core.yaml goals"),
     "skill": ("bfd4f2", "A learnable orchestrator capability"),
     "blocked": ("000000", "Exhausted auto-retries; needs a human"),

@@ -13,9 +13,10 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from uuid import uuid4
 
-from . import ai, ci, github, gitops, ledger, repro, trajectory
+from . import ai, ci, ciguard, github, gitops, ledger, repro, trajectory
 from .config import CoreConfig
 from .knowledge import KnowledgeBase, Lesson
 from .models import ModelChoice, Task, select
@@ -98,6 +99,7 @@ def build_pr_body(
     kind: str = "",
     references: tuple[str, ...] = (),
     trajectory_digest: str = "",
+    ci_change: str = "",
 ) -> str:
     """Assemble a PR body that satisfies the traceability invariants.
 
@@ -113,11 +115,15 @@ def build_pr_body(
     traj_section = (
         f"\n## Trajectory\n{trajectory_digest}\n" if trajectory_digest else ""
     )
+    # Only present when the run touched `.github/workflows/`: names every
+    # workflow file involved and states the parity verdict, so a CI change is
+    # never invisible on the PR that carries it.
+    ci_change_section = f"\n## CI change\n{ci_change}\n" if ci_change else ""
     return f"""Closes #{ticket}
 
 ## Model used
 - **model**: `{choice.model}` (tier: `{choice.tier}`)
-- **selection**: {choice.rationale} [strategy: `{choice.strategy}`]{artifacts_section}{traj_section}
+- **selection**: {choice.rationale} [strategy: `{choice.strategy}`]{artifacts_section}{traj_section}{ci_change_section}
 
 ## CI
 {ci_summary}
@@ -260,6 +266,9 @@ def run_once(
     ticket_title = ""
     ticket_body = ""
     claimed_issue: github.Issue | None = None
+    # Labels of the ticket this run is executing. Stays None when no ticket was
+    # identified, which the CI-change guard treats as "fail closed".
+    ticket_labels: tuple[str, ...] | None = None
 
     if dry_run:
         kind = decide_path(ci_before.ok, has_tickets=False)
@@ -291,14 +300,17 @@ def run_once(
                 ticket_body = (
                     f"CI failing on {cfg.default_branch}.\n\n```\n{ci_before.summary()}\n```"
                 )
+                heal_labels = ["priority:P0", "ci", "hsai"]
+                ticket_labels = tuple(heal_labels)
                 ticket_num = github.create_issue(
-                    repo, ticket_title, ticket_body, ["priority:P0", "ci", "hsai"],
+                    repo, ticket_title, ticket_body, heal_labels,
                     assignee=login, runner=runner,
                 )
             elif kind == IMPLEMENT:
                 top = open_unassigned[0]
                 ticket_num, ticket_title, ticket_body = top.number, top.title, top.body
                 claimed_issue = top
+                ticket_labels = tuple(top.labels)
                 github.assign(repo, top.number, login, runner=runner)
             else:  # IMPROVE - file a ticket FIRST so the PR has one
                 ticket_title, ticket_body = _improvement_idea(cfg)
@@ -314,11 +326,13 @@ def run_once(
                         ticket_num = existing.number
                         ticket_body = existing.body
                         claimed_issue = existing
+                        ticket_labels = tuple(existing.labels)
                         github.assign(repo, existing.number, login, runner=runner)
                 else:
+                    improve_labels = ["priority:P3", "self-improve", "hsai"]
+                    ticket_labels = tuple(improve_labels)
                     ticket_num = github.create_issue(
-                        repo, ticket_title, ticket_body,
-                        ["priority:P3", "self-improve", "hsai"],
+                        repo, ticket_title, ticket_body, improve_labels,
                         assignee=login, runner=runner,
                     )
 
@@ -374,7 +388,7 @@ def run_once(
     # 5. run the agent (subscription-only)
     agent_ok = True
     agent_err = ""
-    reverted_workflows: list[str] = []
+    ci_verdict: ciguard.WorkflowVerdict | None = None
     repro_result: repro.ReproResult | None = None
     if not dry_run:
         prompt = _task_prompt(kind, cfg, ticket_title, ticket_body)
@@ -400,16 +414,35 @@ def run_once(
         if agent_err:
             agent_err = _format_error_with_context(agent_err, kind, ticket_num)
 
-        # Guard: a task must not change the CI checks, or local and remote CI
-        # would diverge (as happened once when a worker added mypy). Revert any
-        # workflow edits before they are committed and note it in the lesson.
-        reverted_workflows = [
-            p for p in gitops.changed_paths(cwd=wt, runner=runner)
-            if p.startswith(".github/workflows/")
-        ]
-        if reverted_workflows:
-            gitops.restore_pathspec(".github/workflows", cwd=wt, runner=runner)
-            result.notes.append(f"reverted workflow edits: {reverted_workflows}")
+        # Guard: CI may evolve, but only through the governed channel. A
+        # workflow edit is committed when the ticket carries the `ci-change`
+        # label, the required steps survive, and local/remote parity holds -
+        # otherwise it is reverted exactly as the old blanket guard did (a
+        # worker once added mypy remotely and diverged the two CIs). See
+        # docs/adr/0002 and src/hsai/ciguard.py.
+        touched_workflows = ciguard.workflow_paths(
+            gitops.changed_paths(cwd=wt, runner=runner)
+        )
+        if touched_workflows:
+            policy = ciguard.policy_from_config(cfg)
+            before_text = gitops.show_file(
+                "HEAD", policy.workflow_path, cwd=wt, runner=runner
+            )
+            after_path = Path(wt) / policy.workflow_path
+            after_text = after_path.read_text() if after_path.is_file() else ""
+            ci_verdict = ciguard.classify_workflow_diff(
+                touched_workflows, ticket_labels, before_text, after_text,
+                policy=policy,
+            )
+            if ci_verdict.allowed:
+                result.notes.append(
+                    f"allowed workflow edits: {touched_workflows} - {ci_verdict.reason}"
+                )
+            else:
+                gitops.restore_pathspec(".github/workflows", cwd=wt, runner=runner)
+                result.notes.append(
+                    f"reverted workflow edits: {touched_workflows} - {ci_verdict.reason}"
+                )
 
         # Completeness guard: a code ticket (feat/skill/refactor/fix) cannot be
         # satisfied by a knowledge-only diff. PR #17 once "closed" a feature
@@ -476,9 +509,11 @@ def run_once(
         what_happened=(
             f"Model `{choice.model}` ({choice.tier}) ran the task. "
             f"Agent ok={agent_ok}. CI after: {ci_after.summary()}."
+            # Whichever way the CI-change guard ruled, the ruling is recorded:
+            # a reverted edit must never look like it simply never happened.
             + (
-                f"\n\nReverted off-spec workflow edits: {reverted_workflows}."
-                if reverted_workflows else ""
+                f"\n\nCI change ({ci_verdict.action}):\n\n{ci_verdict.render()}"
+                if ci_verdict else ""
             )
             + (f"\n\nAgent error:\n```\n{agent_err[:800]}\n```" if agent_err else "")
             # Only a digest line plus a redacted tail of the trajectory is
@@ -529,6 +564,7 @@ def run_once(
         kind=kind,
         references=references,
         trajectory_digest=traj.digest() if traj else "",
+        ci_change=ci_verdict.render() if ci_verdict else "",
     )
     pr_num = github.create_pr(
         repo, branch, f"{kind}: {ticket_title}"[:120], pr_body,

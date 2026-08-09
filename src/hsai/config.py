@@ -57,6 +57,7 @@ class CoreConfig:
     synthesis: dict[str, Any]
     budget: dict[str, Any]
     personas: tuple[dict[str, Any], ...]
+    ci_policy: dict[str, Any]
 
     # --- convenience accessors -------------------------------------------------
     @property
@@ -148,6 +149,7 @@ def load_config(path: str | Path | None = None) -> CoreConfig:
         synthesis=data.get("synthesis", {}),
         budget=data.get("budget", {}),
         personas=tuple(data.get("personas", [])),
+        ci_policy=data.get("ci_policy", {}) or {},
     )
 
 

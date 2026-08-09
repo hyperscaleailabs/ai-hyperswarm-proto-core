@@ -70,6 +70,7 @@ hsai loop --dry-run   # a full iteration with no side effects
 hsai loop          # one real iteration (opens & merges a PR on green)
 hsai loop --max-parallel 3 -n 1   # ramp to the swarm (after proving one iteration)
 hsai traj 12       # print what agent run (iteration) 12 did (spends no quota)
+hsai ci-parity     # assert .github/workflows/ci.yml and `ci.run_local` run the same gates
 hsai cycle --resume   # finish an interrupted governance block, replaying what completed
 ```
 

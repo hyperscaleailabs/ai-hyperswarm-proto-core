@@ -7,6 +7,7 @@ Commands:
   hsai cycle [--cycle-index N] [--resume] [--dry-run]          one governance block
   hsai reindex                                                 rebuild knowledge MOCs
   hsai doctor                                                  verify environment + invariants
+  hsai ci-parity [--workflow PATH]                             local vs remote CI gates
   hsai traj <iteration> [--json]                               print a stored agent run
   hsai replay <iteration> [--json]                             alias of `hsai traj`
 """
@@ -15,8 +16,9 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from pathlib import Path
 
-from . import __version__, ai, repro, trajectory
+from . import __version__, ai, ci, ciguard, repro, trajectory
 from .config import CoreConfig, load_config, validate
 from .knowledge import KnowledgeBase
 from .orchestrator import run_loop
@@ -128,6 +130,27 @@ def cmd_repro_check(args: argparse.Namespace) -> int:
     if result.log:
         print(result.log)
     return 0 if result.ok else 1
+
+
+def cmd_ci_parity(args: argparse.Namespace) -> int:
+    """Assert local and remote CI run the same gates.
+
+    Standalone counterpart of the orchestrator's CI-change guard: compares the
+    workflow's declared gates with what :func:`hsai.ci.run_local` executes and
+    exits non-zero (with a readable report) when they disagree. Pure file
+    reading - no network, no ``gh``.
+    """
+    cfg = _load(args)
+    policy = ciguard.policy_from_config(cfg)
+    path = Path(args.workflow or policy.workflow_path)
+    try:
+        text = path.read_text()
+    except OSError as exc:
+        print(f"ci-parity: cannot read {path}: {exc}", file=sys.stderr)
+        return 1
+    diff = ciguard.check_parity(text, ci.local_commands(), policy=policy)
+    print(ciguard.render_parity(diff, workflow_path=str(path)))
+    return 0 if diff.ok else 1
 
 
 def _print_trajectory(args: argparse.Namespace, label: str) -> int:
@@ -248,6 +271,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--base-ref", default="origin/main", help="pre-fix ref to diff/checkout against"
     )
     rc.set_defaults(func=cmd_repro_check)
+
+    cp = sub.add_parser(
+        "ci-parity", help="assert the workflow and `ci.run_local` run the same gates"
+    )
+    cp.add_argument(
+        "--workflow", default=None,
+        help="workflow to check (default: ci_policy.workflow_path)",
+    )
+    cp.set_defaults(func=cmd_ci_parity)
 
     return p
 

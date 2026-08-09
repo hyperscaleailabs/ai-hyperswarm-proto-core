@@ -147,6 +147,24 @@ budget:
   max_seconds_per_block: 5400         # cumulative wall-clock across the block (90 min)
   soft_ratio: 0.8                     # fraction of a ceiling that triggers a soft breach
 
+# Governed change channel for CI itself (see docs/adr/0002 and src/hsai/ciguard.py).
+# The loop may edit the workflow ONLY on a ticket labelled `change_label`, only
+# in the `workflow_path` lane, only while every `required_steps` command is still
+# declared, and only while local (`ci.run_local`) and remote CI still run the same
+# gates. Anything else - including an unreadable workflow or a missing ticket - is
+# reverted. Steps listed under parity_exempt_steps cannot have a local counterpart
+# (environment setup, or checks reading GitHub-only context); every OTHER step with
+# a `run:` is treated as a gate and must be mirrored locally.
+ci_policy:
+  change_label: ci-change
+  workflow_path: .github/workflows/ci.yml
+  required_steps:
+    - ruff check .
+    - pytest
+  parity_exempt_steps:
+    - Install
+    - SDLC evidence (PR body)
+
 personas:                      # article targets generated from each whitepaper
   - id: cto
     audience: CTO level - business impact, risk posture, strategic direction

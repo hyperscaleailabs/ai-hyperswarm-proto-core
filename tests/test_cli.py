@@ -95,6 +95,51 @@ def test_repro_check_command_passes_and_exits_zero(monkeypatch, capsys):
     assert "PASS" in out
 
 
+# --- ci-parity (local vs remote CI gates; no network, no gh) ----------------
+
+def test_parser_ci_parity_defaults():
+    args = build_parser().parse_args(["ci-parity"])
+    assert args.command == "ci-parity"
+    assert args.workflow is None
+
+
+def test_ci_parity_agrees_on_this_repo(capsys):
+    """The shipped workflow and `ci.run_local` run the same gates."""
+    rc = main(["ci-parity"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "AGREE" in out
+    assert "mirrored     ruff check ." in out
+    assert "mirrored     pytest" in out
+
+
+def test_ci_parity_exits_nonzero_when_the_workflow_diverges(tmp_path, capsys):
+    workflow = tmp_path / "ci.yml"
+    workflow.write_text(
+        "name: CI\n"
+        "jobs:\n"
+        "  ci:\n"
+        "    steps:\n"
+        "      - name: Lint (ruff)\n"
+        "        run: ruff check .\n"
+        "      - name: Types (mypy)\n"
+        "        run: mypy src\n"
+    )
+    rc = main(["ci-parity", "--workflow", str(workflow)])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "DIVERGED" in out
+    assert "REMOTE ONLY  mypy src" in out          # gate with no local counterpart
+    assert "LOCAL ONLY   pytest" in out            # local gate no longer declared
+
+
+def test_ci_parity_reports_a_missing_workflow(tmp_path, capsys):
+    rc = main(["ci-parity", "--workflow", str(tmp_path / "nope.yml")])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "cannot read" in err
+
+
 # --- replay (reads the local trajectory store, spends no quota) -------------
 
 class _RunnerSpy:
