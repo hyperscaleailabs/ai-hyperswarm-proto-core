@@ -31,6 +31,7 @@ Every PR is held to three **traceability invariants**:
 | linked to a ticket | `build_pr_body` refuses to build a body without one |
 | records the model used | model + tier + selection rationale in the PR body |
 | carries a lesson learned (pass **or** fail) | written to `knowledge/lessons/` every iteration |
+| cites only provenance it can prove | the PR's reference-set evidence is derived from the practices the *ticket* declared, validated against the pinned set - never a default list |
 
 ## Subscription-only, no metered API
 
@@ -52,13 +53,31 @@ Clone the repo and **open the folder as an Obsidian vault** - the committed
 
 ```
 knowledge/
-├── MOCs/          # Maps of Content: Knowledge Base / Lessons / Whitepapers
+├── MOCs/          # Maps of Content: Knowledge Base / Lessons / Whitepapers / Practices
 ├── lessons/       # one article per iteration (pass or fail)
+├── practices/     # one note per reference-set practice: source, artifact, status
 ├── whitepapers/   # periodic syntheses (every N lessons)
 └── templates/     # note templates
 ```
 
 `hsai reindex` rebuilds the MOCs from what is on disk.
+
+### Provenance, not assertion
+
+Every improvement is supposed to trace back to something observed in a reference
+project (goal G1). That trace is a record, not a claim: synthesis names the
+practices a ticket adopts in a `## Practices adopted` section and queues one
+note per practice; the orchestrator reads those declarations back off the
+claimed ticket to build the PR's evidence section, and flips the notes to
+`adopted` - with the PR and the lesson - once the change merges green. A slug
+that is not pinned in `reference_set` never reaches a PR body, and a ticket that
+declares nothing renders `_(none declared)_`.
+
+```bash
+hsai practices                              # coverage across the pinned set
+hsai practices --repo crewAIInc/crewAI      # one project
+hsai practices --status adopted             # only what actually shipped
+```
 
 ## Quickstart
 

@@ -11,6 +11,7 @@ import re
 from dataclasses import dataclass, field
 
 from .github import Issue
+from .practices import PracticeRef, render_practices_section
 
 # Sections a substantial ticket must carry.
 ACCEPTANCE_HEADING = re.compile(r"^#{2,3}\s*acceptance criteria\s*$", re.IGNORECASE | re.MULTILINE)
@@ -39,6 +40,10 @@ class TicketSpec:
     size: str = "M"  # S | M | L
     goal_ids: tuple[str, ...] = ()
     synthesis_rationale: str = ""  # which reference projects were combined, and how
+    # Provenance: the reference-set practices this ticket claims to adopt. The
+    # PR's evidence section is derived from these, so an empty tuple means the
+    # PR declares nothing rather than inheriting a default list.
+    practices: tuple[PracticeRef, ...] = ()
     labels: tuple[str, ...] = ()
 
     def render(self) -> str:
@@ -50,6 +55,7 @@ class TicketSpec:
             if self.synthesis_rationale
             else ""
         )
+        adopted = f"\n{render_practices_section(self.practices)}" if self.practices else ""
         return f"""## Problem
 {self.problem}
 
@@ -61,7 +67,7 @@ class TicketSpec:
 
 ## Verification plan
 {vp}
-{synth}
+{synth}{adopted}
 ## Meta
 - goals: {goals}
 - size: {self.size}

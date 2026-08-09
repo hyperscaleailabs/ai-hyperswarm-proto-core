@@ -1,3 +1,4 @@
+from hsai.practices import PracticeRef, parse_practices_section
 from hsai.tickets import TicketSpec, check_well_formed
 
 
@@ -21,6 +22,41 @@ def test_spec_renders_all_required_sections():
     assert "size:M" in spec.all_labels()
     wf = check_well_formed(spec.title, body)
     assert wf.ok, wf.reasons
+
+
+def test_spec_without_practices_declares_nothing():
+    """No declared practices -> no section at all, never a default list."""
+    spec = TicketSpec(
+        title="feat: thing", problem="p", proposal="pp",
+        acceptance_criteria=("a", "b"), verification_plan=("v",),
+    )
+    body = spec.render()
+    assert "## Practices adopted" not in body
+    assert parse_practices_section(body) == ()
+
+
+def test_spec_renders_declared_practices_and_round_trips_them():
+    """Provenance survives the trip through a GitHub issue body verbatim."""
+    refs = (
+        PracticeRef("crewAIInc/crewAI", "commits a durable provenance artifact per change",
+                    artifact="[docs-freeze] docs: snapshot"),
+        PracticeRef("run-llama/llama_index", "scopes commit titles to the affected component"),
+    )
+    spec = TicketSpec(
+        title="feat: provenance registry", problem="p", proposal="pp",
+        acceptance_criteria=("a", "b"), verification_plan=("v",),
+        synthesis_rationale="combines the two above",
+        practices=refs,
+    )
+    body = spec.render()
+
+    assert "## Practices adopted" in body
+    assert "- crewAIInc/crewAI -> commits a durable provenance artifact per change" in body
+    assert "(artifact: `[docs-freeze] docs: snapshot`)" in body
+    # ...and the ticket is still well-formed with the extra section present
+    assert check_well_formed(spec.title, body).ok
+
+    assert parse_practices_section(body) == refs
 
 
 def test_vague_feature_ticket_is_malformed():

@@ -241,7 +241,7 @@ def _article_runner(cmd, *, cwd=None, env=None, timeout=None, input_text=None) -
     return Proc(list(cmd), 0, ARTICLE, "")
 
 
-def _fake_synthesize(cfg, *, cycle_index, runner, ai_runner) -> SynthesisResult:
+def _fake_synthesize(cfg, *, cycle_index, repo_root, runner, ai_runner) -> SynthesisResult:
     """Files two tickets through the real `gh issue create` path, once."""
     filed = [
         github.create_issue(

@@ -52,6 +52,7 @@ class CoreConfig:
     constraints: dict[str, Any]
     knowledge: dict[str, Any]
     reference_top10: tuple[ReferenceRepo, ...]
+    reference_watchlist: tuple[ReferenceRepo, ...]
     governance: dict[str, Any]
     cycle: dict[str, Any]
     synthesis: dict[str, Any]
@@ -73,6 +74,19 @@ class CoreConfig:
 
     def goal_ids(self) -> list[str]:
         return [str(g.get("id")) for g in self.goals if g.get("id")]
+
+    def reference_repos(self) -> tuple[str, ...]:
+        """Every repo slug the loop may cite as evidence: top-10 + watchlist.
+
+        This is the closed set that provenance is validated against - a citation
+        outside it is fabricated by definition (goal G1).
+        """
+        return tuple(
+            dict.fromkeys(
+                [r.repo for r in self.reference_top10]
+                + [r.repo for r in self.reference_watchlist]
+            )
+        )
 
 
 def _find_core(start: str | Path | None = None) -> Path:
@@ -105,16 +119,21 @@ def load_config(path: str | Path | None = None) -> CoreConfig:
     }
 
     ref = data.get("reference_set", {})
-    top10 = tuple(
-        ReferenceRepo(
-            rank=r.get("rank", 0),
-            repo=r["repo"],
-            stars=r.get("stars", 0),
-            license=r.get("license", ""),
-            note=r.get("note", ""),
+
+    def _refs(key: str) -> tuple[ReferenceRepo, ...]:
+        return tuple(
+            ReferenceRepo(
+                rank=r.get("rank", 0),
+                repo=r["repo"],
+                stars=r.get("stars", 0),
+                license=r.get("license", ""),
+                note=r.get("note", ""),
+            )
+            for r in ref.get(key, []) or []
         )
-        for r in ref.get("top10", [])
-    )
+
+    top10 = _refs("top10")
+    watchlist = _refs("watchlist")
 
     return CoreConfig(
         raw=data,
@@ -143,6 +162,7 @@ def load_config(path: str | Path | None = None) -> CoreConfig:
         constraints=data.get("constraints", {}),
         knowledge=data.get("knowledge", {}),
         reference_top10=top10,
+        reference_watchlist=watchlist,
         governance=data.get("governance", {}),
         cycle=data.get("cycle", {}),
         synthesis=data.get("synthesis", {}),

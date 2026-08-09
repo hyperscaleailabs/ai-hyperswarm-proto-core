@@ -100,14 +100,17 @@ class KnowledgeBase:
         lessons_dir: str = "knowledge/lessons",
         whitepapers_dir: str = "knowledge/whitepapers",
         mocs_dir: str = "knowledge/MOCs",
+        practices_dir: str = "knowledge/practices",
         whitepaper_every: int = 10,
     ) -> None:
         self.root = Path(root)
         self.lessons_dir = self.root / lessons_dir
         self.whitepapers_dir = self.root / whitepapers_dir
         self.mocs_dir = self.root / mocs_dir
+        self.practices_dir = self.root / practices_dir
+        self._practices_dir = practices_dir  # kept relative for the practice registry
         self.whitepaper_every = whitepaper_every
-        for d in (self.lessons_dir, self.whitepapers_dir, self.mocs_dir):
+        for d in (self.lessons_dir, self.whitepapers_dir, self.mocs_dir, self.practices_dir):
             d.mkdir(parents=True, exist_ok=True)
 
     @classmethod
@@ -118,6 +121,7 @@ class KnowledgeBase:
             lessons_dir=k.get("lessons_dir", "knowledge/lessons"),
             whitepapers_dir=k.get("whitepapers_dir", "knowledge/whitepapers"),
             mocs_dir=k.get("mocs_dir", "knowledge/MOCs"),
+            practices_dir=k.get("practices_dir", "knowledge/practices"),
             whitepaper_every=int(k.get("whitepaper_every_lessons", 10)),
         )
 
@@ -254,6 +258,7 @@ class KnowledgeBase:
         written = [
             self._write_lessons_moc(),
             self._write_whitepapers_moc(),
+            self._write_practices_moc(),
             self._write_root_moc(),
         ]
         return written
@@ -366,10 +371,53 @@ Periodic syntheses of accumulated lessons. Total: **{len(notes)}**.
         path.write_text(content)
         return path
 
+    def _write_practices_moc(self) -> Path:
+        """Index the practice registry, grouped by the project it came from.
+
+        The per-project counts are the coverage signal for goal G1: which
+        reference projects have actually taught this repo something, and which
+        are still unmined.
+        """
+        # Imported here: the registry reads this module's note conventions, so a
+        # module-level import would be circular.
+        from .practices import PracticeRegistry
+
+        registry = PracticeRegistry(self.root, practices_dir=self._practices_dir)
+        practices = registry.read_all()
+        by_repo: dict[str, list] = {}
+        for p in practices:
+            by_repo.setdefault(p.source_repo or "_(unattributed)_", []).append(p)
+
+        blocks = []
+        for repo in sorted(by_repo):
+            group = sorted(by_repo[repo], key=lambda p: p.id)
+            counts = Counter(p.status for p in group)
+            tally = ", ".join(f"{k}={counts[k]}" for k in sorted(counts))
+            links = "\n".join(f"- [[{p.id}]] - {p.status}" for p in group)
+            blocks.append(f"### `{repo}` - {len(group)} practice(s) ({tally})\n{links}")
+        body = "\n\n".join(blocks) or "_No practices extracted yet._"
+
+        fm = self._frontmatter(("moc", "practices"), {"updated": _today()})
+        content = f"""{fm}
+
+# Practices MOC
+
+Up: [[Knowledge Base MOC]]
+
+Every practice this repo adopted from the reference set, and the PR that shipped
+it. Total: **{len(practices)}** across **{len(by_repo)}** project(s).
+
+{body}
+"""
+        path = self.mocs_dir / "Practices MOC.md"
+        path.write_text(content)
+        return path
+
     def _write_root_moc(self) -> Path:
         fm = self._frontmatter(("moc", "index"), {"updated": _today()})
         n_lessons = len(self.lesson_notes())
         n_papers = len(self.whitepaper_notes())
+        n_practices = len(list(self.practices_dir.glob("*.md")))
         content = f"""{fm}
 
 # Knowledge Base MOC
@@ -380,6 +428,7 @@ vault and use the graph view to explore how lessons connect.
 ## Maps
 - [[Lessons MOC]] - {n_lessons} lesson(s)
 - [[Whitepapers MOC]] - {n_papers} whitepaper(s)
+- [[Practices MOC]] - {n_practices} reference-set practice(s)
 
 ## How this is maintained
 - Each PR the [[hsai]] loop opens contributes exactly one lesson.

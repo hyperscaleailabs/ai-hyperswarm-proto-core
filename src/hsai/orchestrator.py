@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 from uuid import uuid4
 
-from . import ai, ci, github, gitops, ledger, repro, trajectory
+from . import ai, ci, github, gitops, ledger, practices, repro, trajectory
 from .config import CoreConfig
 from .knowledge import KnowledgeBase, Lesson
 from .models import ModelChoice, Task, select
@@ -95,6 +95,7 @@ def build_pr_body(
     lesson_note: str,
     lesson_summary: str,
     ci_summary: str,
+    cfg: CoreConfig,
     kind: str = "",
     references: tuple[str, ...] = (),
     trajectory_digest: str = "",
@@ -102,10 +103,15 @@ def build_pr_body(
     """Assemble a PR body that satisfies the traceability invariants.
 
     Raises if there is no ticket - every PR MUST be linked to one.
+
+    ``references`` is provenance, not decoration: every slug is validated
+    against the pinned reference set, and anything else is dropped. A PR that
+    declares nothing says so - it never borrows a default list (goal G1).
     """
     if not ticket:
         raise ValueError("Every PR must be linked to a ticket (traceability invariant).")
-    refs = ", ".join(f"`{r}`" for r in references) or "_(none)_"
+    validated = practices.validate_references(cfg, references)
+    refs = ", ".join(f"`{r}`" for r in validated) or "_(none declared)_"
     artifacts = _phase_artifacts(kind) if kind else ""
     artifacts_section = f"\n## Phase artifacts\n{artifacts}\n" if artifacts else ""
     # What the run cost and how it ended, visible on the PR itself - the full
@@ -467,7 +473,15 @@ def run_once(
         # refines it to the merge outcome once that is settled.
         traj.outcome = outcome
     kb = KnowledgeBase.from_config(cfg, wt)
-    references = tuple(r.repo for r in cfg.reference_top10[:3])
+    # Provenance comes from the ticket itself - the practices it declared - and
+    # from nowhere else. A ticket that declares none cites none.
+    declared = practices.validated_practices(
+        cfg, practices.parse_practices_section(ticket_body)
+    )
+    references = practices.validate_references(
+        cfg, tuple(p.source_repo for p in declared)
+    )
+    result.notes.append(f"declared practices={len(declared)}")
     lesson = Lesson(
         title=f"{kind}: {ticket_title}"[:120],
         outcome=outcome,
@@ -526,6 +540,7 @@ def run_once(
         lesson_note=lesson.note_name(),
         lesson_summary=lesson.lesson,
         ci_summary=ci_after.summary(),
+        cfg=cfg,
         kind=kind,
         references=references,
         trajectory_digest=traj.digest() if traj else "",
@@ -551,8 +566,19 @@ def run_once(
     # update so it lands in the knowledge base once the PR merges.
     lesson.remote_ci = remote
     kb.write_lesson(lesson)
+    # A practice counts as adopted only once its change is about to merge under
+    # a green remote build - and the flip is committed on THIS branch, so the
+    # registry and the code it describes land together.
+    adopted: list[practices.Practice] = []
+    if remote == ci.SUCCESS and declared:
+        adopted = practices.PracticeRegistry.from_config(cfg, wt).mark_adopted(
+            declared, pr=pr_num, ticket=ticket_num, lesson_note=lesson.note_name(),
+        )
+        result.notes.append(f"adopted practices={[p.id for p in adopted]}")
     gitops.commit_all(
-        f"docs: record remote CI outcome ({remote}) in lesson\n\nRefs #{ticket_num}",
+        f"docs: record remote CI outcome ({remote}) in lesson"
+        + (f"; adopt {len(adopted)} reference practice(s)" if adopted else "")
+        + f"\n\nRefs #{ticket_num}",
         cwd=wt, runner=runner,
     )
     gitops.push_branch(branch, cwd=wt, runner=runner)

@@ -1,6 +1,7 @@
 from hsai import ai
 from hsai.config import load_config
 from hsai.models import ModelChoice
+from hsai.practices import ADOPTED, Practice, PracticeRef, PracticeRegistry, practice_id
 from hsai.proc import Proc
 from hsai.synthesis import (
     ContextPack,
@@ -32,6 +33,43 @@ def test_prompt_demands_combination_and_reflection():
     assert "PHASE 1" in prompt and "PHASE 2" in prompt and "PHASE 3" in prompt
     assert "at least 3 different reference projects" in prompt or "combine" in prompt.lower()
     assert "acceptance_criteria" in prompt
+
+
+def test_prompt_tells_the_planner_what_not_to_re_propose():
+    cfg = _cfg()
+    pack = ContextPack(repos=["a/b"], sections={"a/b": "digest"})
+    adopted = [
+        Practice(
+            id="crewaiinc-crewai-docs-freeze", source_repo="crewAIInc/crewAI",
+            artifact="docs-freeze", summary="snapshots docs alongside each change",
+            status=ADOPTED, adopted_by_pr=13,
+        )
+    ]
+    prompt = build_prompt(cfg, pack, adopted)
+    assert "do NOT re-propose" in prompt
+    assert "snapshots docs alongside each change" in prompt
+    assert "crewAIInc/crewAI" in prompt
+
+    # an empty registry still says so explicitly, rather than saying nothing
+    assert "nothing adopted yet" in build_prompt(cfg, pack)
+
+
+def test_parse_ticket_specs_declares_the_practices_its_rationale_credits():
+    cfg = _cfg()
+    output = """```json
+[{"title": "feat: x", "problem": "p", "proposal": "pp",
+  "acceptance_criteria": ["a", "b"], "verification_plan": ["v"],
+  "size": "L", "goal_ids": ["G1"],
+  "synthesis_rationale": "Combines crewAIInc/crewAI's `[docs-freeze]` provenance commits with openai/swarm ergonomics and notmyrepo/invented tricks."}]
+```"""
+    spec = parse_ticket_specs(output, cfg)[0]
+
+    assert {p.source_repo for p in spec.practices} == {"crewAIInc/crewAI", "openai/swarm"}
+    assert "notmyrepo/invented" not in {p.source_repo for p in spec.practices}
+    assert "## Practices adopted" in spec.render()
+
+    # without a cfg there is no pinned set to match against, so nothing is claimed
+    assert parse_ticket_specs(output)[0].practices == ()
 
 
 def test_parse_ticket_specs_takes_last_json_block():
@@ -71,14 +109,14 @@ PHASE 3 - PRIORITIZE:
 ```"""
 
 
-def _plain_text_runner():
+def _plain_text_runner(output: str = PLAIN_TEXT_OUTPUT):
     """A `claude` that prints plain text - an older binary, or a crash."""
     calls: list[list[str]] = []
 
     def runner(cmd, *, cwd=None, env=None, timeout=None, input_text=None):
         calls.append(list(cmd))
         if cmd[:1] == ["claude"]:
-            return Proc(cmd, 0, PLAIN_TEXT_OUTPUT, "")
+            return Proc(cmd, 0, output, "")
         if cmd[:3] == ["gh", "issue", "create"]:
             return Proc(cmd, 0, "https://github.com/o/r/issues/321\n", "")
         return Proc(cmd, 0, "", "")
@@ -87,7 +125,7 @@ def _plain_text_runner():
     return runner
 
 
-def test_synthesize_survives_output_without_a_json_envelope():
+def test_synthesize_survives_output_without_a_json_envelope(tmp_path):
     """`payload is None` is a supported state, not a failure mode."""
     cfg = _cfg()
     runner = _plain_text_runner()
@@ -100,7 +138,58 @@ def test_synthesize_survives_output_without_a_json_envelope():
     assert result.text == PLAIN_TEXT_OUTPUT      # falls back to raw stdout
 
     # ...and synthesis still parses its ticket specs off the raw text and files them.
-    res = synthesize(cfg, cycle_index=0, runner=runner, ai_runner=runner)
+    res = synthesize(
+        cfg, cycle_index=0, repo_root=tmp_path, runner=runner, ai_runner=runner
+    )
     assert res.ok is True
     assert res.filed == [321]
     assert res.error == ""
+
+
+CITING_OUTPUT = """PHASE 3:
+```json
+[{"title": "feat: provenance registry", "problem": "p", "proposal": "pp",
+  "acceptance_criteria": ["a", "b"], "verification_plan": ["v"],
+  "size": "L", "goal_ids": ["G1"],
+  "synthesis_rationale": "Combines crewAIInc/crewAI's `[docs-freeze]` provenance commits with openai/swarm ergonomics."}]
+```"""
+
+
+def test_synthesize_queues_a_practice_note_per_cited_practice(tmp_path):
+    """Filing a ticket also files the provenance it will later be judged on."""
+    cfg = _cfg()
+    runner = _plain_text_runner(CITING_OUTPUT)
+
+    res = synthesize(
+        cfg, cycle_index=0, repo_root=tmp_path, runner=runner, ai_runner=runner
+    )
+    assert res.filed == [321]
+
+    registry = PracticeRegistry.from_config(cfg, tmp_path)
+    stored = {p.source_repo: p for p in registry.read_all()}
+    assert set(stored) == {"crewAIInc/crewAI", "openai/swarm"}
+    assert all(p.status == "queued" for p in stored.values())
+    assert all(p.adopted_by_ticket == 321 for p in stored.values())
+    assert stored["crewAIInc/crewAI"].artifact == "[docs-freeze]"
+
+    # the filed issue body carries the same declarations the registry queued
+    issue_create = next(c for c in runner.calls if c[:3] == ["gh", "issue", "create"])
+    body = issue_create[issue_create.index("--body") + 1]
+    assert "## Practices adopted" in body
+    assert "- crewAIInc/crewAI ->" in body
+
+
+def test_synthesize_feeds_adopted_practices_back_into_the_prompt(tmp_path):
+    cfg = _cfg()
+    registry = PracticeRegistry.from_config(cfg, tmp_path)
+    ref = PracticeRef("openai/swarm", "keeps handoffs explicit between agents")
+    registry.mark_adopted([ref], pr=13)
+
+    runner = _plain_text_runner(CITING_OUTPUT)
+    synthesize(cfg, cycle_index=0, repo_root=tmp_path, runner=runner, ai_runner=runner)
+
+    claude_call = next(c for c in runner.calls if c[:1] == ["claude"])
+    prompt = " ".join(claude_call)
+    assert "do NOT re-propose" in prompt
+    assert "keeps handoffs explicit between agents" in prompt
+    assert practice_id(ref.source_repo, ref.practice) in {p.id for p in registry.adopted()}

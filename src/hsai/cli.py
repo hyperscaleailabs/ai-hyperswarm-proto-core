@@ -6,6 +6,7 @@ Commands:
   hsai status                                                  config + backlog snapshot
   hsai cycle [--cycle-index N] [--resume] [--dry-run]          one governance block
   hsai reindex                                                 rebuild knowledge MOCs
+  hsai practices [--repo SLUG] [--status STATUS]               reference-practice coverage
   hsai doctor                                                  verify environment + invariants
   hsai traj <iteration> [--json]                               print a stored agent run
   hsai replay <iteration> [--json]                             alias of `hsai traj`
@@ -19,6 +20,7 @@ import sys
 from . import __version__, ai, repro, trajectory
 from .config import CoreConfig, load_config, validate
 from .knowledge import KnowledgeBase
+from .practices import STATUSES, PracticeRegistry
 from .orchestrator import run_loop
 from .swarm import run_parallel
 
@@ -76,6 +78,38 @@ def cmd_reindex(args: argparse.Namespace) -> int:
     written = kb.reindex_mocs()
     for p in written:
         print(f"reindexed {p}")
+    return 0
+
+
+def cmd_practices(args: argparse.Namespace) -> int:
+    """Print reference-practice coverage: what each pinned project has taught us.
+
+    Reads the registry only - no network, no quota. Exits 0 on an empty
+    registry: "nothing extracted yet" is a legitimate answer, not an error.
+    """
+    cfg = _load(args)
+    registry = PracticeRegistry.from_config(cfg, args.root)
+    repos = [args.repo] if args.repo else list(cfg.reference_repos())
+    rows = [c for c in registry.coverage(repos) if not args.repo or c.repo == args.repo]
+
+    print(f"practices: {registry.practices_dir}")
+    print("| reference project | queued | adopted | rejected | total |")
+    print("| --- | --- | --- | --- | --- |")
+    for c in rows:
+        print(f"| {c.repo} | {c.queued} | {c.adopted} | {c.rejected} | {c.total} |")
+    covered = sum(1 for c in rows if c.total)
+    print(f"coverage: {covered}/{len(rows)} project(s) with at least one practice extracted")
+
+    listed = [
+        p for p in registry.read_all()
+        if (not args.repo or p.source_repo == args.repo)
+        and (not args.status or p.status == args.status)
+    ]
+    for p in listed:
+        pr = f" (PR #{p.adopted_by_pr})" if p.adopted_by_pr else ""
+        print(f"  [{p.status}] {p.source_repo}: {p.summary[:80]}{pr}")
+    if not listed:
+        print("  _(no practices recorded for this filter)_")
     return 0
 
 
@@ -211,6 +245,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     ri = sub.add_parser("reindex", help="rebuild knowledge-base MOCs")
     ri.set_defaults(func=cmd_reindex)
+
+    pr = sub.add_parser("practices", help="reference-practice registry coverage")
+    pr.add_argument("--repo", default=None, help="only this reference project (owner/name)")
+    pr.add_argument("--status", default=None, choices=list(STATUSES),
+                    help="only practices in this state")
+    pr.add_argument("--root", default=".", help="repo root holding knowledge/practices")
+    pr.set_defaults(func=cmd_practices)
 
     cy = sub.add_parser("cycle", help="run one half-day governance block")
     cy.add_argument("--index", "--cycle-index", dest="index", type=int, default=None,

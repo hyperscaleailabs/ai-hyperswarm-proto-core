@@ -3,6 +3,8 @@ import json
 from hsai import cli as cli_module
 from hsai import trajectory
 from hsai.cli import build_parser, main
+from hsai.config import load_config
+from hsai.practices import PracticeRef, PracticeRegistry
 from hsai.repro import ReproResult
 from hsai.trajectory import Step, Trajectory
 
@@ -62,6 +64,48 @@ def test_cycle_command_passes_resume_through(monkeypatch, capsys):
     assert rc == 0
     assert seen["resume"] is True and seen["cycle_index"] == 42 and seen["dry_run"] is False
     assert "block 42 (resumed)" in out and "/tmp/j.jsonl" in out
+
+
+def test_practices_command_on_an_empty_registry_exits_zero(tmp_path, capsys):
+    rc = main(["practices", "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "| reference project | queued | adopted | rejected | total |" in out
+    assert "| crewAIInc/crewAI | 0 | 0 | 0 | 0 |" in out       # unmined projects listed
+    assert "coverage: 0/12 project(s)" in out                  # top-10 + 2 watchlist
+    assert "no practices recorded" in out
+
+
+def test_practices_command_reports_coverage_and_filters_by_repo(tmp_path, capsys):
+    cfg = load_config()
+    registry = PracticeRegistry.from_config(cfg, tmp_path)
+    registry.record_queued(
+        [PracticeRef("crewAIInc/crewAI", "snapshots docs alongside each change")], ticket=7
+    )
+    registry.mark_adopted(
+        [PracticeRef("openai/swarm", "keeps handoffs explicit")], pr=13, ticket=8
+    )
+
+    assert main(["practices", "--root", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert "| crewAIInc/crewAI | 1 | 0 | 0 | 1 |" in out
+    assert "| openai/swarm | 0 | 1 | 0 | 1 |" in out
+    assert "coverage: 2/12 project(s)" in out
+    assert "[adopted] openai/swarm: keeps handoffs explicit (PR #13)" in out
+
+    # --repo narrows the report to that project alone
+    assert main(["practices", "--root", str(tmp_path), "--repo", "crewAIInc/crewAI"]) == 0
+    out = capsys.readouterr().out
+    assert "| crewAIInc/crewAI | 1 | 0 | 0 | 1 |" in out
+    assert "openai/swarm" not in out
+    assert "coverage: 1/1 project(s)" in out
+
+    # --status narrows to a lifecycle state
+    assert main(["practices", "--root", str(tmp_path), "--status", "adopted"]) == 0
+    out = capsys.readouterr().out
+    assert "[adopted] openai/swarm" in out
+    assert "[queued]" not in out
 
 
 def test_parser_repro_check_defaults():

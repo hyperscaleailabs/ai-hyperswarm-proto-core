@@ -38,6 +38,29 @@ def test_reference_set_meets_criteria():
         assert repo.license in {"MIT", "Apache-2.0"}, f"{repo.repo} not permissive"
 
 
+def test_reference_repos_is_the_closed_set_provenance_is_checked_against():
+    cfg = load_config()
+    repos = cfg.reference_repos()
+
+    assert len(repos) == len(set(repos))                       # deduped
+    assert repos[:1] == ("langchain-ai/langchain",)            # top-10 order preserved
+    assert "camel-ai/camel" in repos                           # watchlist counts too
+    assert len(repos) == len(cfg.reference_top10) + len(cfg.reference_watchlist)
+
+
+def test_reference_watchlist_is_optional(tmp_path):
+    core = tmp_path / ".ai-swarm"
+    core.mkdir()
+    (core / "core.yaml").write_text(
+        "identity:\n  owner: someone\n"
+        "models:\n  tiers:\n    standard:\n      model: sonnet\n"
+        "  default_tier: standard\n"
+    )
+    cfg = load_config(core / "core.yaml")
+    assert cfg.reference_watchlist == ()
+    assert cfg.reference_repos() == ()
+
+
 def test_subscription_only_constraint_present():
     cfg = load_config()
     assert cfg.subscription_only is True

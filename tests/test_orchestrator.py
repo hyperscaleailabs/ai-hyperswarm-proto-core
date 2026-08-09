@@ -17,6 +17,7 @@ from hsai.orchestrator import (
     decide_path,
     run_once,
 )
+from hsai.practices import practice_id
 from hsai.proc import Proc
 
 # The envelope `claude -p --output-format json` returns: the usage object the
@@ -196,7 +197,7 @@ def test_build_pr_body_requires_ticket():
     with pytest.raises(ValueError):
         build_pr_body(
             ticket=0, choice=choice, lesson_note="n",
-            lesson_summary="s", ci_summary="CI green",
+            lesson_summary="s", ci_summary="CI green", cfg=load_config(),
         )
 
 
@@ -205,6 +206,7 @@ def test_build_pr_body_contains_traceability():
     body = build_pr_body(
         ticket=42, choice=choice, lesson_note="2026-07-25-do-thing",
         lesson_summary="kept it small", ci_summary="CI green (ruff=pass, pytest=pass)",
+        cfg=load_config(),
         references=("openai/swarm", "SWE-agent/SWE-agent"),
     )
     assert "Closes #42" in body          # ticket linkage
@@ -214,11 +216,36 @@ def test_build_pr_body_contains_traceability():
     assert "openai/swarm" in body
 
 
+def test_build_pr_body_drops_invented_reference_slugs():
+    """An invented citation must never reach a PR body (G1/G2)."""
+    cfg = load_config()
+    body = build_pr_body(
+        ticket=42, choice=ModelChoice(tier="standard", model="sonnet", rationale="x"),
+        lesson_note="n", lesson_summary="s", ci_summary="green", cfg=cfg,
+        references=("openai/swarm", "evil-corp/fabricated", "camel-ai/camel"),
+    )
+    evidence = body.split("## Reference-set evidence\n", 1)[1]
+    assert "evil-corp/fabricated" not in body
+    assert "`openai/swarm`" in evidence and "`camel-ai/camel`" in evidence  # watchlist counts
+
+
+def test_build_pr_body_declares_nothing_rather_than_inventing():
+    body = build_pr_body(
+        ticket=42, choice=ModelChoice(tier="standard", model="sonnet", rationale="x"),
+        lesson_note="n", lesson_summary="s", ci_summary="green", cfg=load_config(),
+    )
+    evidence = body.split("## Reference-set evidence\n", 1)[1]
+    assert evidence.startswith("_(none declared)_")
+    # never falls back to the head of the pinned reference set
+    assert "langchain-ai/langchain" not in body
+
+
 def test_build_pr_body_includes_phase_artifacts():
     choice = ModelChoice(tier="standard", model="sonnet", rationale="x")
+    cfg = load_config()
     body = build_pr_body(
         ticket=10, choice=choice, lesson_note="2026-07-26-test",
-        lesson_summary="test", ci_summary="green",
+        lesson_summary="test", ci_summary="green", cfg=cfg,
         kind=HEAL,
     )
     assert "## Phase artifacts" in body
@@ -228,7 +255,7 @@ def test_build_pr_body_includes_phase_artifacts():
     # Test with IMPLEMENT phase
     body = build_pr_body(
         ticket=11, choice=choice, lesson_note="2026-07-26-test",
-        lesson_summary="test", ci_summary="green",
+        lesson_summary="test", ci_summary="green", cfg=cfg,
         kind=IMPLEMENT,
     )
     assert "## Phase artifacts" in body
@@ -238,7 +265,7 @@ def test_build_pr_body_includes_phase_artifacts():
     # Without kind, artifacts should not appear
     body = build_pr_body(
         ticket=12, choice=choice, lesson_note="2026-07-26-test",
-        lesson_summary="test", ci_summary="green",
+        lesson_summary="test", ci_summary="green", cfg=cfg,
     )
     assert "## Phase artifacts" not in body
 
@@ -431,6 +458,78 @@ def test_run_once_implement_path_with_fake_runner(tmp_path):
     claude_calls = [c for c in runner.calls if c[:1] == ["claude"]]
     assert len(claude_calls) == 1
     assert all(c[0] in {"git", "gh", "ruff", "pytest", "claude"} for c in runner.calls)
+
+
+BODY_WITH_PRACTICES = WELL_FORMED_BODY + """
+## Practices adopted
+- crewAIInc/crewAI -> snapshots docs alongside each change (artifact: `docs-freeze`)
+- evil-corp/fabricated -> invented provenance that must never be believed
+"""
+
+
+def test_run_once_derives_pr_evidence_from_the_tickets_declared_practices(
+    tmp_path, monkeypatch
+):
+    """The PR's evidence section is the ticket's provenance - nothing else."""
+    cfg = load_config()
+    wt = _pin_worktree_path(monkeypatch, tmp_path, cfg)
+    open_issues = [{
+        "number": 7, "title": "add widget", "labels": [{"name": "priority:P2"}],
+        "assignees": [], "body": BODY_WITH_PRACTICES,
+    }]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+    assert result.merged is True
+
+    pr_create = next(c for c in runner.calls if c[:3] == ["gh", "pr", "create"])
+    body = pr_create[pr_create.index("--body") + 1]
+    evidence = body.split("## Reference-set evidence\n", 1)[1]
+
+    assert "`crewAIInc/crewAI`" in evidence          # what the ticket actually declared
+    assert "evil-corp/fabricated" not in body        # invented slugs never survive
+    assert "langchain-ai/langchain" not in body      # no hardcoded head-of-set fallback
+    assert "FoundationAgents/MetaGPT" not in body
+
+    # ...and the lesson cites exactly the same provenance
+    lesson_text = Path(result.lesson_path).read_text()
+    assert "- `crewAIInc/crewAI`" in lesson_text
+    assert "langchain-ai/langchain" not in lesson_text
+
+    # on green remote CI, the declared practice is flipped to `adopted` on this
+    # branch, stamped with the PR and the lesson that shipped it
+    pid = practice_id("crewAIInc/crewAI", "snapshots docs alongside each change")
+    stored = (wt / "knowledge" / "practices" / f"{pid}.md").read_text()
+    assert "status: adopted" in stored
+    assert f"pr: {result.pr}" in stored
+    assert f"[[{Path(result.lesson_path).stem}]]" in stored
+    assert "docs-freeze" in stored                   # the artifact it was observed in
+
+
+def test_run_once_declares_nothing_when_the_ticket_cites_nothing(tmp_path):
+    cfg = load_config()
+    open_issues = [{
+        "number": 7, "title": "add widget", "labels": [{"name": "priority:P2"}],
+        "assignees": [], "body": WELL_FORMED_BODY,
+    }]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    pr_create = next(c for c in runner.calls if c[:3] == ["gh", "pr", "create"])
+    body = pr_create[pr_create.index("--body") + 1]
+    assert "## Reference-set evidence\n_(none declared)_" in body
+    assert result.merged is True
 
 
 def test_run_once_records_remote_ci_in_lesson_before_merging(tmp_path):

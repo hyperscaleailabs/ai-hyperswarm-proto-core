@@ -19,12 +19,15 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 from . import github
 from .ai import run_agent
 from .config import CoreConfig
 from .models import ModelChoice
+from .practices import Practice, PracticeRegistry, extract_practices
 from .proc import Runner, run
 from .tickets import TicketSpec
 
@@ -86,7 +89,23 @@ def build_context_pack(
     return ContextPack(repos=repos, sections=sections)
 
 
-def build_prompt(cfg: CoreConfig, pack: ContextPack) -> str:
+def _adopted_block(adopted: Sequence[Practice]) -> str:
+    """The 'do not re-propose this' block: ground the loop has already covered."""
+    if not adopted:
+        return (
+            "Already adopted from the reference set (do NOT re-propose):\n"
+            "- _(nothing adopted yet - the registry is empty)_"
+        )
+    lines = "\n".join(f"- `{p.source_repo}` -> {p.summary}" for p in adopted)
+    return (
+        "Already adopted from the reference set (do NOT re-propose these; "
+        "propose something the registry does not already cover):\n" + lines
+    )
+
+
+def build_prompt(
+    cfg: CoreConfig, pack: ContextPack, adopted: Sequence[Practice] = ()
+) -> str:
     goals = "\n".join(f"- {g.get('id')}: {g.get('title')} - {g.get('description', '')}"
                       for g in cfg.goals)
     ideas = int(cfg.synthesis.get("ideas_target", 10))
@@ -103,6 +122,8 @@ Project goals:
 
 Study digest of reference projects for this cycle:
 {pack.render()}
+
+{_adopted_block(adopted)}
 
 Work in three explicit phases and show them all in your output:
 
@@ -124,11 +145,23 @@ block: a JSON array where each element has exactly these keys:
   "goal_ids" (array like ["G1","G4"]),
   "synthesis_rationale" (string naming the >= {combine} projects combined and how).
 
+In "synthesis_rationale", name each project by its FULL `owner/name` slug exactly
+as pinned above, and put the practice you are taking from it in the same sentence
+as that slug, citing the concrete artifact in backticks. That text is parsed into
+the ticket's declared provenance and becomes the PR's reference-set evidence - a
+project you do not name there is a project the PR cannot claim.
+
 The JSON block must be the LAST fenced block in your reply."""
 
 
-def parse_ticket_specs(output: str) -> list[TicketSpec]:
-    """Extract the final JSON block and convert it into TicketSpecs."""
+def parse_ticket_specs(output: str, cfg: CoreConfig | None = None) -> list[TicketSpec]:
+    """Extract the final JSON block and convert it into TicketSpecs.
+
+    With a ``cfg``, each spec's declared provenance is mined out of its own
+    ``synthesis_rationale`` by matching pinned reference slugs, so the ticket
+    carries the practices it actually credits - the PR's evidence section is
+    then derived from that instead of asserted.
+    """
     blocks = _JSON_BLOCK.findall(output)
     if not blocks:
         return []
@@ -136,9 +169,11 @@ def parse_ticket_specs(output: str) -> list[TicketSpec]:
         raw = json.loads(blocks[-1])
     except json.JSONDecodeError:
         return []
+    known = cfg.reference_repos() if cfg else ()
     specs: list[TicketSpec] = []
     for item in raw:
         try:
+            rationale = str(item.get("synthesis_rationale", ""))
             specs.append(
                 TicketSpec(
                     title=str(item["title"])[:150],
@@ -148,7 +183,8 @@ def parse_ticket_specs(output: str) -> list[TicketSpec]:
                     verification_plan=tuple(str(v) for v in item["verification_plan"]),
                     size=str(item.get("size", "M")),
                     goal_ids=tuple(str(g) for g in item.get("goal_ids", [])),
-                    synthesis_rationale=str(item.get("synthesis_rationale", "")),
+                    synthesis_rationale=rationale,
+                    practices=extract_practices(rationale, known),
                     labels=("self-improve", "hsai", "priority:P2"),
                 )
             )
@@ -169,12 +205,19 @@ def synthesize(
     cfg: CoreConfig,
     *,
     cycle_index: int = 0,
+    repo_root: str | Path = ".",
     runner: Runner = run,
     ai_runner: Runner = run,
 ) -> SynthesisResult:
-    """Run one synthesis pass and file the resulting tickets."""
+    """Run one synthesis pass and file the resulting tickets.
+
+    Each filed ticket also queues one practice note per practice it credits, so
+    the registry knows what has been proposed before the work starts and the
+    planner can be told what not to propose again.
+    """
     repos = pick_rotation(cfg, cycle_index)
     pack = build_context_pack(repos, runner=runner)
+    registry = PracticeRegistry.from_config(cfg, repo_root)
     tier = cfg.synthesis.get("tier", "heavy")
     model = cfg.tiers[tier].model if tier in cfg.tiers else cfg.tiers[cfg.default_tier].model
     choice = ModelChoice(
@@ -183,14 +226,14 @@ def synthesize(
         strategy="synthesis-v1",
     )
     ares = run_agent(
-        build_prompt(cfg, pack), choice, cfg,
+        build_prompt(cfg, pack, registry.adopted()), choice, cfg,
         timeout=float(cfg.synthesis.get("timeout_seconds", 2400)),
         runner=ai_runner,
     )
     if not ares.ok:
         return SynthesisResult(ok=False, studied=repos, filed=[], error=ares.error[:500])
 
-    specs = parse_ticket_specs(ares.output)
+    specs = parse_ticket_specs(ares.output, cfg)
     filed: list[int] = []
     for spec in specs:
         num = github.create_issue(
@@ -198,5 +241,6 @@ def synthesize(
         )
         if num:
             filed.append(num)
+            registry.record_queued(spec.practices, ticket=num)
     return SynthesisResult(ok=bool(filed), studied=repos, filed=filed,
                            error="" if specs else "no parseable ticket specs in output")
