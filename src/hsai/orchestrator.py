@@ -19,6 +19,7 @@ from . import ai, ci, github, gitops, ledger, repro, trajectory
 from .config import CoreConfig
 from .knowledge import KnowledgeBase, Lesson
 from .models import ModelChoice, Task, select
+from .practices import PracticeRegistry, parse_practices
 from .proc import Runner, run
 from .tickets import NEEDS_REFINEMENT, issue_well_formed
 
@@ -97,15 +98,24 @@ def build_pr_body(
     ci_summary: str,
     kind: str = "",
     references: tuple[str, ...] = (),
+    known_references: tuple[str, ...] = (),
     trajectory_digest: str = "",
 ) -> str:
     """Assemble a PR body that satisfies the traceability invariants.
 
     Raises if there is no ticket - every PR MUST be linked to one.
+
+    ``references`` is the provenance the ticket declared; ``known_references`` is
+    the allowlist it is checked against (the pinned reference set plus the
+    watchlist). Anything else is dropped rather than presented as evidence - an
+    unverifiable citation is worse than no citation, and this section used to be
+    a hardcoded fiction.
     """
     if not ticket:
         raise ValueError("Every PR must be linked to a ticket (traceability invariant).")
-    refs = ", ".join(f"`{r}`" for r in references) or "_(none)_"
+    allowed = set(known_references)
+    verified = tuple(r for r in references if r in allowed)
+    refs = ", ".join(f"`{r}`" for r in verified) or "_(none declared)_"
     artifacts = _phase_artifacts(kind) if kind else ""
     artifacts_section = f"\n## Phase artifacts\n{artifacts}\n" if artifacts else ""
     # What the run cost and how it ended, visible on the PR itself - the full
@@ -467,7 +477,14 @@ def run_once(
         # refines it to the merge outcome once that is settled.
         traj.outcome = outcome
     kb = KnowledgeBase.from_config(cfg, wt)
-    references = tuple(r.repo for r in cfg.reference_top10[:3])
+    # Provenance, not decoration: whatever the ticket declared under
+    # '## Practices adopted', deduped and filtered to the pinned set. A ticket
+    # that declares nothing cites nothing.
+    declared = parse_practices(ticket_body)
+    known = set(cfg.known_reference_slugs())
+    references = tuple(
+        dict.fromkeys(p.source_repo for p in declared if p.source_repo in known)
+    )
     lesson = Lesson(
         title=f"{kind}: {ticket_title}"[:120],
         outcome=outcome,
@@ -528,6 +545,7 @@ def run_once(
         ci_summary=ci_after.summary(),
         kind=kind,
         references=references,
+        known_references=cfg.known_reference_slugs(),
         trajectory_digest=traj.digest() if traj else "",
     )
     pr_num = github.create_pr(
@@ -560,6 +578,16 @@ def run_once(
     if remote == ci.SUCCESS:
         github.merge_pr(repo, pr_num, auto=True, runner=runner)
         result.merged = True
+        # The merge is the receipt: promote every practice this ticket declared
+        # from 'queued' to 'adopted'. Written to the repo root (like the ledger)
+        # rather than the doomed worktree, so the next `hsai cycle` ships it in
+        # the governance PR and synthesis stops re-proposing covered ground.
+        verified = tuple(p for p in declared if p.source_repo in known)
+        adopted_notes = PracticeRegistry.from_config(cfg, repo_dir).mark_adopted(
+            verified, ticket=ticket_num, pr=pr_num, lesson_note=lesson.note_name(),
+        )
+        if adopted_notes:
+            result.notes.append(f"practices adopted: {len(adopted_notes)}")
     else:
         result.merged = False
         _recover_failed(

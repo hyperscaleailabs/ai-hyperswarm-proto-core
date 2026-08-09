@@ -1,4 +1,5 @@
 from hsai.knowledge import KnowledgeBase, Lesson, LessonRecord, Whitepaper, slugify
+from hsai.practices import Practice, PracticeRef, PracticeRegistry
 
 
 def test_slugify():
@@ -51,9 +52,43 @@ def test_write_lesson_and_reindex(tmp_path):
 
     written = kb.reindex_mocs()
     names = {p.name for p in written}
-    assert names == {"Lessons MOC.md", "Whitepapers MOC.md", "Knowledge Base MOC.md"}
+    assert names == {
+        "Lessons MOC.md", "Whitepapers MOC.md", "Practices MOC.md", "Knowledge Base MOC.md",
+    }
     lessons_moc = (kb.mocs_dir / "Lessons MOC.md").read_text()
     assert f"[[{lesson.note_name()}]]" in lessons_moc
+
+
+def test_practices_moc_indexes_every_note_and_is_idempotent(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    registry = PracticeRegistry(tmp_path)
+    registry.queue(Practice(
+        id="crewaiinc-crewai-docs-freeze", source_repo="crewAIInc/crewAI",
+        artifact="commit [docs-freeze]", summary="durable provenance artifact per change",
+    ))
+    registry.mark_adopted(
+        (PracticeRef("openai/swarm", "tiny inspectable control loop"),), ticket=3, pr=4
+    )
+
+    kb.reindex_mocs()
+    moc = kb.mocs_dir / "Practices MOC.md"
+    text = moc.read_text()
+    for practice in registry.read_all():
+        assert f"[[{practice.note_name()}]]" in text
+    assert "### crewAIInc/crewAI - 1 practice(s)" in text
+    assert "| openai/swarm | 0 | 1 | 0 | 1 |" in text        # per-project coverage
+    assert "PR #4" in text
+    assert "[[Practices MOC]]" in (kb.mocs_dir / "Knowledge Base MOC.md").read_text()
+
+    # derived index: rebuilding it must not churn the vault
+    kb.reindex_mocs()
+    assert moc.read_text() == text
+
+
+def test_practices_moc_is_written_for_an_empty_registry(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    kb.reindex_mocs()
+    assert "No practices extracted yet" in (kb.mocs_dir / "Practices MOC.md").read_text()
 
 
 def test_whitepaper_cadence(tmp_path):

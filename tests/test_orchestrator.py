@@ -17,6 +17,7 @@ from hsai.orchestrator import (
     decide_path,
     run_once,
 )
+from hsai.practices import ADOPTED, PracticeRegistry
 from hsai.proc import Proc
 
 # The envelope `claude -p --output-format json` returns: the usage object the
@@ -206,12 +207,41 @@ def test_build_pr_body_contains_traceability():
         ticket=42, choice=choice, lesson_note="2026-07-25-do-thing",
         lesson_summary="kept it small", ci_summary="CI green (ruff=pass, pytest=pass)",
         references=("openai/swarm", "SWE-agent/SWE-agent"),
+        known_references=load_config().known_reference_slugs(),
     )
     assert "Closes #42" in body          # ticket linkage
     assert "`opus`" in body              # model recorded
     assert "kept it small" in body       # lesson present
     assert "[[2026-07-25-do-thing]]" in body
     assert "openai/swarm" in body
+
+
+def test_build_pr_body_drops_references_outside_the_pinned_set():
+    """An invented slug must never reach the PR's evidence section."""
+    cfg = load_config()
+    choice = ModelChoice(tier="standard", model="sonnet", rationale="x")
+    body = build_pr_body(
+        ticket=42, choice=choice, lesson_note="n", lesson_summary="s",
+        ci_summary="green",
+        references=("evil/invented", "openai/swarm"),
+        known_references=cfg.known_reference_slugs(),
+    )
+    assert "evil/invented" not in body
+    assert "`openai/swarm`" in body
+
+
+def test_build_pr_body_declares_nothing_rather_than_inventing():
+    cfg = load_config()
+    choice = ModelChoice(tier="standard", model="sonnet", rationale="x")
+    body = build_pr_body(
+        ticket=42, choice=choice, lesson_note="n", lesson_summary="s",
+        ci_summary="green", references=(),
+        known_references=cfg.known_reference_slugs(),
+    )
+    assert "_(none declared)_" in body
+    # the old fabrication was "the first three entries of the reference set"
+    for repo in (r.repo for r in cfg.reference_top10[:3]):
+        assert repo not in body
 
 
 def test_build_pr_body_includes_phase_artifacts():
@@ -900,3 +930,102 @@ def test_malformed_ticket_is_refused_and_labeled(tmp_path):
         if c[:3] == ["gh", "issue", "edit"] and "needs-refinement" in c and "11" in c
     ]
     assert labeled, "vague ticket should be labeled needs-refinement"
+
+
+# --- provenance: the PR's evidence section is derived, never asserted --------
+
+PROVENANCE_BODY = WELL_FORMED_BODY + """
+## Practices adopted
+- openai/swarm -> keep the control loop small enough to read in one sitting
+- SWE-agent/SWE-agent -> turn one issue into one PR, end to end
+"""
+
+PROVENANCE_ISSUE = {
+    "number": 21,
+    "title": "add widget",
+    "labels": [{"name": "priority:P2"}],
+    "assignees": [],
+    "body": PROVENANCE_BODY,
+}
+
+
+def test_pr_evidence_comes_from_the_ticket_not_the_reference_set(tmp_path):
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[dict(PROVENANCE_ISSUE)],
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.merged is True
+    pr_create = next(c for c in runner.calls if c[:3] == ["gh", "pr", "create"])
+    body = pr_create[pr_create.index("--body") + 1]
+
+    assert "`openai/swarm`" in body
+    assert "`SWE-agent/SWE-agent`" in body
+    # what the ticket did NOT declare must not appear as evidence
+    for repo in (r.repo for r in cfg.reference_top10[:3]):
+        assert repo not in body
+    # and the lesson cites the same provenance the PR does
+    assert "openai/swarm" in Path(result.lesson_path).read_text()
+
+
+def test_ticket_declaring_nothing_yields_no_evidence(tmp_path):
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[dict(WIDGET_ISSUE)],
+    )
+
+    run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    pr_create = next(c for c in runner.calls if c[:3] == ["gh", "pr", "create"])
+    body = pr_create[pr_create.index("--body") + 1]
+    assert "_(none declared)_" in body
+    assert not list((tmp_path / "knowledge" / "practices").glob("*.md"))
+
+
+def test_merge_flips_declared_practices_to_adopted(tmp_path):
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[dict(PROVENANCE_ISSUE)],
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    registry = PracticeRegistry.from_config(cfg, tmp_path)
+    adopted = registry.read_all()
+    assert {p.source_repo for p in adopted} == {"openai/swarm", "SWE-agent/SWE-agent"}
+    assert all(p.status == ADOPTED for p in adopted)
+    assert all(p.adopted_by_pr == result.pr for p in adopted)
+    assert all(p.adopted_by_ticket == 21 for p in adopted)
+    lesson_note = Path(result.lesson_path).stem
+    assert all(
+        f"[[{lesson_note}]]" in (registry.dir / f"{p.id}.md").read_text() for p in adopted
+    )
+
+
+def test_a_failed_remote_ci_never_marks_a_practice_adopted(tmp_path):
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[dict(PROVENANCE_ISSUE)], remote_ci="FAILURE",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.merged is False
+    assert PracticeRegistry.from_config(cfg, tmp_path).read_all() == []

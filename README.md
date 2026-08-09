@@ -52,13 +52,24 @@ Clone the repo and **open the folder as an Obsidian vault** - the committed
 
 ```
 knowledge/
-├── MOCs/          # Maps of Content: Knowledge Base / Lessons / Whitepapers
+├── MOCs/          # Maps of Content: Knowledge Base / Lessons / Whitepapers / Practices
 ├── lessons/       # one article per iteration (pass or fail)
+├── practices/     # one note per practice adopted from a reference project
 ├── whitepapers/   # periodic syntheses (every N lessons)
 └── templates/     # note templates
 ```
 
 `hsai reindex` rebuilds the MOCs from what is on disk.
+
+### Provenance is recorded, not asserted
+
+A PR's "Reference-set evidence" section is derived from the `## Practices
+adopted` block of the ticket it closes, filtered to the pinned reference set -
+a ticket that declares nothing cites nothing (`_(none declared)_`). Synthesis
+files a `queued` practice note for every project it cites; the merge flips that
+note to `adopted` with its PR and lesson, and the next synthesis run is told not
+to re-propose it. `hsai practices [--repo SLUG] [--status STATUS]` prints the
+per-project coverage table.
 
 ## Quickstart
 
@@ -70,6 +81,7 @@ hsai loop --dry-run   # a full iteration with no side effects
 hsai loop          # one real iteration (opens & merges a PR on green)
 hsai loop --max-parallel 3 -n 1   # ramp to the swarm (after proving one iteration)
 hsai traj 12       # print what agent run (iteration) 12 did (spends no quota)
+hsai practices     # which reference projects we have actually learned from
 hsai cycle --resume   # finish an interrupted governance block, replaying what completed
 ```
 

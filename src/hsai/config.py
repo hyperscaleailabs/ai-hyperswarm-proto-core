@@ -52,6 +52,7 @@ class CoreConfig:
     constraints: dict[str, Any]
     knowledge: dict[str, Any]
     reference_top10: tuple[ReferenceRepo, ...]
+    watchlist: tuple[ReferenceRepo, ...]
     governance: dict[str, Any]
     cycle: dict[str, Any]
     synthesis: dict[str, Any]
@@ -73,6 +74,14 @@ class CoreConfig:
 
     def goal_ids(self) -> list[str]:
         return [str(g.get("id")) for g in self.goals if g.get("id")]
+
+    def known_reference_slugs(self) -> tuple[str, ...]:
+        """Every repo the loop is allowed to cite as provenance.
+
+        This is the allowlist behind the PR body's reference section: a slug the
+        harness did not actually pin cannot be presented as evidence.
+        """
+        return tuple(r.repo for r in (*self.reference_top10, *self.watchlist))
 
 
 def _find_core(start: str | Path | None = None) -> Path:
@@ -105,16 +114,21 @@ def load_config(path: str | Path | None = None) -> CoreConfig:
     }
 
     ref = data.get("reference_set", {})
-    top10 = tuple(
-        ReferenceRepo(
-            rank=r.get("rank", 0),
-            repo=r["repo"],
-            stars=r.get("stars", 0),
-            license=r.get("license", ""),
-            note=r.get("note", ""),
+
+    def _refs(key: str) -> tuple[ReferenceRepo, ...]:
+        return tuple(
+            ReferenceRepo(
+                rank=r.get("rank", 0),
+                repo=r["repo"],
+                stars=r.get("stars", 0),
+                license=r.get("license", ""),
+                note=r.get("note", ""),
+            )
+            for r in ref.get(key, []) or []
         )
-        for r in ref.get("top10", [])
-    )
+
+    top10 = _refs("top10")
+    watchlist = _refs("watchlist")
 
     return CoreConfig(
         raw=data,
@@ -143,6 +157,7 @@ def load_config(path: str | Path | None = None) -> CoreConfig:
         constraints=data.get("constraints", {}),
         knowledge=data.get("knowledge", {}),
         reference_top10=top10,
+        watchlist=watchlist,
         governance=data.get("governance", {}),
         cycle=data.get("cycle", {}),
         synthesis=data.get("synthesis", {}),

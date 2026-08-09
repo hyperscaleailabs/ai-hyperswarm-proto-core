@@ -38,7 +38,7 @@ def slugify(text: str) -> str:
     return _SLUG_RE.sub("-", text.lower()).strip("-") or "untitled"
 
 
-def _today() -> str:
+def today_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
@@ -56,7 +56,7 @@ class Lesson:
     model: str = ""
     references: tuple[str, ...] = ()  # reference-set repos that informed the work
     tags: tuple[str, ...] = ()
-    created: str = field(default_factory=_today)
+    created: str = field(default_factory=today_stamp)
     remote_ci: str = ""  # SUCCESS | FAILURE | TIMEOUT, filled in once gh checks conclude
     repro_evidence: str = ""  # heal/bugfix only: failing-then-passing reproduction proof
 
@@ -84,7 +84,7 @@ class Whitepaper:
     body: str
     covers_lessons: tuple[str, ...] = ()  # note names
     tags: tuple[str, ...] = ()
-    created: str = field(default_factory=_today)
+    created: str = field(default_factory=today_stamp)
 
     def note_name(self) -> str:
         return f"{self.created}-{slugify(self.title)}"
@@ -100,14 +100,16 @@ class KnowledgeBase:
         lessons_dir: str = "knowledge/lessons",
         whitepapers_dir: str = "knowledge/whitepapers",
         mocs_dir: str = "knowledge/MOCs",
+        practices_dir: str = "knowledge/practices",
         whitepaper_every: int = 10,
     ) -> None:
         self.root = Path(root)
         self.lessons_dir = self.root / lessons_dir
         self.whitepapers_dir = self.root / whitepapers_dir
         self.mocs_dir = self.root / mocs_dir
+        self.practices_dir = self.root / practices_dir
         self.whitepaper_every = whitepaper_every
-        for d in (self.lessons_dir, self.whitepapers_dir, self.mocs_dir):
+        for d in (self.lessons_dir, self.whitepapers_dir, self.mocs_dir, self.practices_dir):
             d.mkdir(parents=True, exist_ok=True)
 
     @classmethod
@@ -118,6 +120,7 @@ class KnowledgeBase:
             lessons_dir=k.get("lessons_dir", "knowledge/lessons"),
             whitepapers_dir=k.get("whitepapers_dir", "knowledge/whitepapers"),
             mocs_dir=k.get("mocs_dir", "knowledge/MOCs"),
+            practices_dir=k.get("practices_dir", "knowledge/practices"),
             whitepaper_every=int(k.get("whitepaper_every_lessons", 10)),
         )
 
@@ -254,6 +257,7 @@ class KnowledgeBase:
         written = [
             self._write_lessons_moc(),
             self._write_whitepapers_moc(),
+            self._write_practices_moc(),
             self._write_root_moc(),
         ]
         return written
@@ -332,7 +336,7 @@ class KnowledgeBase:
 
     def _write_lessons_moc(self) -> Path:
         notes = self.lesson_notes()
-        fm = self._frontmatter(("moc", "lessons"), {"updated": _today()})
+        fm = self._frontmatter(("moc", "lessons"), {"updated": today_stamp()})
         links = "\n".join(f"- [[{n}]]" for n in notes) or "- _No lessons recorded yet._"
         content = f"""{fm}
 
@@ -350,7 +354,7 @@ Every hsai iteration leaves a lesson here - pass or fail. Total: **{len(notes)}*
 
     def _write_whitepapers_moc(self) -> Path:
         notes = self.whitepaper_notes()
-        fm = self._frontmatter(("moc", "whitepapers"), {"updated": _today()})
+        fm = self._frontmatter(("moc", "whitepapers"), {"updated": today_stamp()})
         links = "\n".join(f"- [[{n}]]" for n in notes) or "- _No whitepapers yet._"
         content = f"""{fm}
 
@@ -366,10 +370,58 @@ Periodic syntheses of accumulated lessons. Total: **{len(notes)}**.
         path.write_text(content)
         return path
 
+    def _write_practices_moc(self) -> Path:
+        """Index the reference-practice registry, grouped by source project.
+
+        This is the G1 coverage view: which of the pinned projects the loop has
+        actually extracted something from, and how far each extraction got.
+        """
+        # Deferred: `practices` builds on this module's slug/date helpers, so the
+        # dependency only points the other way at call time.
+        from .practices import PracticeRegistry, render_coverage_table
+
+        registry = PracticeRegistry(self.root, practices_dir=self.practices_dir)
+        practices = registry.read_all()
+        fm = self._frontmatter(("moc", "practices"), {"updated": today_stamp()})
+
+        groups: dict[str, list[str]] = {}
+        for p in practices:
+            groups.setdefault(p.source_repo or "(unattributed)", []).append(
+                f"- [[{p.note_name()}]] - **{p.status}**"
+                + (f" (PR #{p.adopted_by_pr})" if p.adopted_by_pr else "")
+            )
+        if groups:
+            sections = "\n\n".join(
+                f"### {repo} - {len(links)} practice(s)\n" + "\n".join(sorted(links))
+                for repo, links in sorted(groups.items())
+            )
+        else:
+            sections = "_No practices extracted yet._"
+
+        content = f"""{fm}
+
+# Practices MOC
+
+Up: [[Knowledge Base MOC]]
+
+Every practice this loop adopted from the pinned reference set, with the ticket,
+PR, and lesson that prove it shipped. Total: **{len(practices)}**.
+
+## Coverage
+{render_coverage_table(registry.coverage())}
+
+## By source project
+{sections}
+"""
+        path = self.mocs_dir / "Practices MOC.md"
+        path.write_text(content)
+        return path
+
     def _write_root_moc(self) -> Path:
-        fm = self._frontmatter(("moc", "index"), {"updated": _today()})
+        fm = self._frontmatter(("moc", "index"), {"updated": today_stamp()})
         n_lessons = len(self.lesson_notes())
         n_papers = len(self.whitepaper_notes())
+        n_practices = len(list(self.practices_dir.glob("*.md")))
         content = f"""{fm}
 
 # Knowledge Base MOC
@@ -380,9 +432,11 @@ vault and use the graph view to explore how lessons connect.
 ## Maps
 - [[Lessons MOC]] - {n_lessons} lesson(s)
 - [[Whitepapers MOC]] - {n_papers} whitepaper(s)
+- [[Practices MOC]] - {n_practices} reference practice(s)
 
 ## How this is maintained
 - Each PR the [[hsai]] loop opens contributes exactly one lesson.
+- Each practice a ticket adopts from the reference set leaves a practice note.
 - Every {self.whitepaper_every} lessons, a whitepaper synthesizes the themes.
 - These MOCs are regenerated by `hsai reindex` after each iteration.
 """

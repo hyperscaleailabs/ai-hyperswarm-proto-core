@@ -25,6 +25,7 @@ from . import github
 from .ai import run_agent
 from .config import CoreConfig
 from .models import ModelChoice
+from .practices import ADOPTED, Practice, PracticeRegistry, extract_practice_refs
 from .proc import Runner, run
 from .tickets import TicketSpec
 
@@ -86,12 +87,19 @@ def build_context_pack(
     return ContextPack(repos=repos, sections=sections)
 
 
-def build_prompt(cfg: CoreConfig, pack: ContextPack) -> str:
+def build_prompt(
+    cfg: CoreConfig, pack: ContextPack, adopted: tuple[Practice, ...] = ()
+) -> str:
     goals = "\n".join(f"- {g.get('id')}: {g.get('title')} - {g.get('description', '')}"
                       for g in cfg.goals)
     ideas = int(cfg.synthesis.get("ideas_target", 10))
     top = int(cfg.synthesis.get("file_top", 3))
     combine = int(cfg.synthesis.get("min_projects_combined", 3))
+    # Ground already covered: without this the planner keeps re-proposing
+    # practices the loop has shipped, and burns a heavy-tier run doing it.
+    adopted_block = "\n".join(
+        f"- {p.source_repo}: {' '.join(p.summary.split())[:200]}" for p in adopted
+    ) or "- (nothing adopted yet - the whole reference set is open ground)"
     return f"""You are the SYNTHESIS planner for ai-hyperswarm-proto-core, an
 autonomous self-improving AI-swarm harness. Your job is NOT to copy one idea
 from one project, but to COMBINE practices across projects into substantial,
@@ -103,6 +111,9 @@ Project goals:
 
 Study digest of reference projects for this cycle:
 {pack.render()}
+
+ALREADY ADOPTED - do not re-propose these practices; build past them:
+{adopted_block}
 
 Work in three explicit phases and show them all in your output:
 
@@ -122,13 +133,21 @@ block: a JSON array where each element has exactly these keys:
   "verification_plan" (array of 2-4 concrete check strings),
   "size" ("M" or "L" - substantial work, never "S"),
   "goal_ids" (array like ["G1","G4"]),
-  "synthesis_rationale" (string naming the >= {combine} projects combined and how).
+  "synthesis_rationale" (string naming the >= {combine} projects combined and how;
+    name each one by its FULL owner/name slug exactly as it appears above - the
+    ticket's provenance section is derived from these slugs, and one that is not
+    in the pinned set is silently dropped rather than cited).
 
 The JSON block must be the LAST fenced block in your reply."""
 
 
-def parse_ticket_specs(output: str) -> list[TicketSpec]:
-    """Extract the final JSON block and convert it into TicketSpecs."""
+def parse_ticket_specs(output: str, cfg: CoreConfig | None = None) -> list[TicketSpec]:
+    """Extract the final JSON block and convert it into TicketSpecs.
+
+    With a ``cfg``, each spec also carries the practices its rationale cites -
+    matched against the pinned reference set and watchlist, so a project the
+    model invented cannot become provenance downstream.
+    """
     blocks = _JSON_BLOCK.findall(output)
     if not blocks:
         return []
@@ -136,9 +155,11 @@ def parse_ticket_specs(output: str) -> list[TicketSpec]:
         raw = json.loads(blocks[-1])
     except json.JSONDecodeError:
         return []
+    known = cfg.known_reference_slugs() if cfg else ()
     specs: list[TicketSpec] = []
     for item in raw:
         try:
+            rationale = str(item.get("synthesis_rationale", ""))
             specs.append(
                 TicketSpec(
                     title=str(item["title"])[:150],
@@ -148,13 +169,32 @@ def parse_ticket_specs(output: str) -> list[TicketSpec]:
                     verification_plan=tuple(str(v) for v in item["verification_plan"]),
                     size=str(item.get("size", "M")),
                     goal_ids=tuple(str(g) for g in item.get("goal_ids", [])),
-                    synthesis_rationale=str(item.get("synthesis_rationale", "")),
+                    synthesis_rationale=rationale,
+                    practices=extract_practice_refs(rationale, known),
                     labels=("self-improve", "hsai", "priority:P2"),
                 )
             )
         except (KeyError, TypeError):
             continue
     return specs
+
+
+def _queue_practices(
+    registry: PracticeRegistry, spec: TicketSpec, *, ticket: int
+) -> list[str]:
+    """File one queued practice note per practice the freshly-filed ticket cites."""
+    queued: list[str] = []
+    for ref in spec.practices:
+        pid = ref.practice_id()
+        registry.queue(Practice(
+            id=pid,
+            source_repo=ref.source_repo,
+            artifact=f"{ref.source_repo} (cited by ticket #{ticket})",
+            summary=ref.practice,
+            adopted_by_ticket=ticket,
+        ))
+        queued.append(pid)
+    return queued
 
 
 @dataclass
@@ -169,12 +209,15 @@ def synthesize(
     cfg: CoreConfig,
     *,
     cycle_index: int = 0,
+    repo_dir: str = ".",
     runner: Runner = run,
     ai_runner: Runner = run,
 ) -> SynthesisResult:
     """Run one synthesis pass and file the resulting tickets."""
     repos = pick_rotation(cfg, cycle_index)
     pack = build_context_pack(repos, runner=runner)
+    registry = PracticeRegistry.from_config(cfg, repo_dir)
+    adopted = tuple(p for p in registry.read_all() if p.status == ADOPTED)
     tier = cfg.synthesis.get("tier", "heavy")
     model = cfg.tiers[tier].model if tier in cfg.tiers else cfg.tiers[cfg.default_tier].model
     choice = ModelChoice(
@@ -183,14 +226,14 @@ def synthesize(
         strategy="synthesis-v1",
     )
     ares = run_agent(
-        build_prompt(cfg, pack), choice, cfg,
+        build_prompt(cfg, pack, adopted), choice, cfg,
         timeout=float(cfg.synthesis.get("timeout_seconds", 2400)),
         runner=ai_runner,
     )
     if not ares.ok:
         return SynthesisResult(ok=False, studied=repos, filed=[], error=ares.error[:500])
 
-    specs = parse_ticket_specs(ares.output)
+    specs = parse_ticket_specs(ares.output, cfg)
     filed: list[int] = []
     for spec in specs:
         num = github.create_issue(
@@ -198,5 +241,6 @@ def synthesize(
         )
         if num:
             filed.append(num)
+            _queue_practices(registry, spec, ticket=num)
     return SynthesisResult(ok=bool(filed), studied=repos, filed=filed,
                            error="" if specs else "no parseable ticket specs in output")

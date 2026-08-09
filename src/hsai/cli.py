@@ -6,6 +6,7 @@ Commands:
   hsai status                                                  config + backlog snapshot
   hsai cycle [--cycle-index N] [--resume] [--dry-run]          one governance block
   hsai reindex                                                 rebuild knowledge MOCs
+  hsai practices [--repo SLUG] [--status STATUS]               reference-practice coverage
   hsai doctor                                                  verify environment + invariants
   hsai traj <iteration> [--json]                               print a stored agent run
   hsai replay <iteration> [--json]                             alias of `hsai traj`
@@ -20,6 +21,7 @@ from . import __version__, ai, repro, trajectory
 from .config import CoreConfig, load_config, validate
 from .knowledge import KnowledgeBase
 from .orchestrator import run_loop
+from .practices import STATUSES, PracticeRegistry, render_coverage_table
 from .swarm import run_parallel
 
 
@@ -76,6 +78,32 @@ def cmd_reindex(args: argparse.Namespace) -> int:
     written = kb.reindex_mocs()
     for p in written:
         print(f"reindexed {p}")
+    return 0
+
+
+def cmd_practices(args: argparse.Namespace) -> int:
+    """Print reference-practice coverage: what was learned, from where, and whether it shipped.
+
+    An empty registry is a legitimate state (nothing extracted yet), so this
+    reports zero coverage and exits 0 rather than erroring.
+    """
+    cfg = _load(args)
+    registry = PracticeRegistry.from_config(cfg, ".")
+    rows = registry.coverage(repo=args.repo, status=args.status)
+    matching = [
+        p for p in registry.read_all()
+        if (not args.repo or p.source_repo == args.repo)
+        and (not args.status or p.status == args.status)
+    ]
+    filters = [f"repo={args.repo}" if args.repo else "",
+               f"status={args.status}" if args.status else ""]
+    scope = " ".join(f for f in filters if f)
+    header = f"practices: {len(matching)} note(s) in {registry.dir}"
+    print(f"{header}  [{scope}]" if scope else header)
+    print(render_coverage_table(rows))
+    for p in matching:
+        pr = f" PR #{p.adopted_by_pr}" if p.adopted_by_pr else ""
+        print(f"  - {p.id} [{p.status}]{pr}: {' '.join(p.summary.split())[:80]}")
     return 0
 
 
@@ -211,6 +239,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     ri = sub.add_parser("reindex", help="rebuild knowledge-base MOCs")
     ri.set_defaults(func=cmd_reindex)
+
+    pr_ = sub.add_parser("practices", help="reference-practice registry coverage")
+    pr_.add_argument("--repo", default=None, help="only this reference project (owner/name)")
+    pr_.add_argument("--status", default=None, choices=list(STATUSES),
+                     help="only practices in this status")
+    pr_.set_defaults(func=cmd_practices)
 
     cy = sub.add_parser("cycle", help="run one half-day governance block")
     cy.add_argument("--index", "--cycle-index", dest="index", type=int, default=None,

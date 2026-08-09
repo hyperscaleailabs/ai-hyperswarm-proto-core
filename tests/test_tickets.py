@@ -17,6 +17,7 @@ def test_spec_renders_all_required_sections():
     assert body.count("- [ ]") == 5
     assert "## Verification plan" in body
     assert "## Synthesis rationale" in body
+    assert "## Practices adopted" in body    # provenance section, always rendered
     assert "size: M" in body
     assert "size:M" in spec.all_labels()
     wf = check_well_formed(spec.title, body)

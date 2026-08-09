@@ -1,8 +1,12 @@
 import json
+from pathlib import Path
+
+import pytest
 
 from hsai import cli as cli_module
 from hsai import trajectory
 from hsai.cli import build_parser, main
+from hsai.practices import Practice, PracticeRef, PracticeRegistry
 from hsai.repro import ReproResult
 from hsai.trajectory import Step, Trajectory
 
@@ -198,3 +202,73 @@ def test_replay_unknown_id_exits_nonzero(tmp_path, monkeypatch, capsys):
     rc = main(["replay", "999", "--root", str(tmp_path)])
     assert rc == 1
     assert "no trajectory" in capsys.readouterr().err
+
+
+# --- hsai practices: reference-set coverage ---------------------------------
+
+
+CORE_YAML = Path(__file__).resolve().parents[1] / ".ai-swarm" / "core.yaml"
+
+
+def _seed_practices(root: Path) -> PracticeRegistry:
+    registry = PracticeRegistry(root)
+    registry.queue(Practice(
+        id="crewaiinc-crewai-freeze", source_repo="crewAIInc/crewAI",
+        artifact="commit [docs-freeze]", summary="durable provenance artifact per change",
+    ))
+    registry.mark_adopted(
+        (PracticeRef("openai/swarm", "tiny inspectable control loop"),), ticket=3, pr=4
+    )
+    return registry
+
+
+def test_practices_on_an_empty_registry_exits_zero(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+
+    rc = main(["--config", str(CORE_YAML), "practices"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "practices: 0 note(s)" in out
+    assert "no practices recorded yet" in out
+
+
+def test_practices_prints_per_project_coverage(tmp_path, monkeypatch, capsys):
+    _seed_practices(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    rc = main(["--config", str(CORE_YAML), "practices"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "| crewAIInc/crewAI | 1 | 0 | 0 | 1 |" in out
+    assert "| openai/swarm | 0 | 1 | 0 | 1 |" in out
+    assert "PR #4" in out
+
+
+def test_practices_repo_filter_reports_only_that_project(tmp_path, monkeypatch, capsys):
+    _seed_practices(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    rc = main(["--config", str(CORE_YAML), "practices", "--repo", "crewAIInc/crewAI"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "crewAIInc/crewAI" in out
+    assert "openai/swarm" not in out
+    assert "practices: 1 note(s)" in out
+
+
+def test_practices_status_filter(tmp_path, monkeypatch, capsys):
+    _seed_practices(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["--config", str(CORE_YAML), "practices", "--status", "adopted"]) == 0
+    out = capsys.readouterr().out
+    assert "openai/swarm" in out
+    assert "crewAIInc/crewAI" not in out
+
+
+def test_practices_rejects_an_unknown_status():
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["practices", "--status", "invented"])

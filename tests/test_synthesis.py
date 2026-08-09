@@ -1,6 +1,7 @@
 from hsai import ai
 from hsai.config import load_config
 from hsai.models import ModelChoice
+from hsai.practices import ADOPTED, Practice, PracticeRegistry
 from hsai.proc import Proc
 from hsai.synthesis import (
     ContextPack,
@@ -34,6 +35,24 @@ def test_prompt_demands_combination_and_reflection():
     assert "acceptance_criteria" in prompt
 
 
+def test_prompt_tells_the_planner_what_not_to_re_propose():
+    cfg = _cfg()
+    pack = ContextPack(repos=["a/b"], sections={"a/b": "digest"})
+    adopted = (
+        Practice(
+            id="openai-swarm-tiny-loop", source_repo="openai/swarm", artifact="README",
+            summary="Keep the control loop small enough to read in one sitting.",
+            status=ADOPTED,
+        ),
+    )
+    prompt = build_prompt(cfg, pack, adopted)
+    assert "ALREADY ADOPTED" in prompt
+    assert "openai/swarm: Keep the control loop small enough to read in one sitting." in prompt
+
+    # with an empty registry the planner is told the field is wide open
+    assert "nothing adopted yet" in build_prompt(cfg, pack)
+
+
 def test_parse_ticket_specs_takes_last_json_block():
     output = """PHASE 1 ... PHASE 2 ...
 ```json
@@ -57,6 +76,53 @@ PHASE 3:
 def test_parse_handles_garbage():
     assert parse_ticket_specs("no json here") == []
     assert parse_ticket_specs("```json\nnot json\n```") == []
+
+
+PROVENANCE_OUTPUT = """PHASE 3:
+```json
+[{"title": "feat: provenance registry", "problem": "p", "proposal": "pp",
+  "acceptance_criteria": ["a", "b", "c"], "verification_plan": ["v1", "v2"],
+  "size": "L", "goal_ids": ["G1"],
+  "synthesis_rationale": "Combines crewAIInc/crewAI's durable provenance commits; \
+run-llama/llama_index's scoped attribution titles; and evil/invented's fake trick."}]
+```"""
+
+
+def test_parse_ticket_specs_derives_practices_from_the_rationale():
+    cfg = _cfg()
+    spec = parse_ticket_specs(PROVENANCE_OUTPUT, cfg)[0]
+    repos = [p.source_repo for p in spec.practices]
+
+    assert repos == ["crewAIInc/crewAI", "run-llama/llama_index"]
+    assert "evil/invented" not in spec.render()   # unpinned slugs never become provenance
+    assert "## Practices adopted" in spec.render()
+    assert "- crewAIInc/crewAI -> " in spec.render()
+
+    # without a config there is nothing to validate against, so nothing is claimed
+    assert parse_ticket_specs(PROVENANCE_OUTPUT)[0].practices == ()
+
+
+def test_synthesize_queues_a_practice_note_per_citation(tmp_path):
+    cfg = _cfg()
+
+    def runner(cmd, *, cwd=None, env=None, timeout=None, input_text=None):
+        if cmd[:1] == ["claude"]:
+            return Proc(cmd, 0, PROVENANCE_OUTPUT, "")
+        if cmd[:3] == ["gh", "issue", "create"]:
+            return Proc(cmd, 0, "https://github.com/o/r/issues/321\n", "")
+        return Proc(cmd, 0, "", "")
+
+    res = synthesize(
+        cfg, cycle_index=0, repo_dir=str(tmp_path), runner=runner, ai_runner=runner
+    )
+    assert res.filed == [321]
+
+    practices = PracticeRegistry.from_config(cfg, tmp_path).read_all()
+    assert {p.source_repo for p in practices} == {"crewAIInc/crewAI", "run-llama/llama_index"}
+    assert all(p.status == "queued" for p in practices)
+    assert all(p.adopted_by_ticket == 321 for p in practices)
+    assert all("[[ticket-321]]" in (tmp_path / "knowledge" / "practices" /
+                                    f"{p.id}.md").read_text() for p in practices)
 
 
 # --- plain-text (non-JSON) CLI output must never break synthesis -------------
