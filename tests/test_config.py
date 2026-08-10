@@ -44,6 +44,27 @@ def test_subscription_only_constraint_present():
     assert "ANTHROPIC_API_KEY" in cfg.forbidden_env
 
 
+def test_ci_backoff_and_gc_defaults():
+    cfg = load_config()
+    assert cfg.ci_remote_max_interval > 0
+    assert cfg.ci_backoff_multiplier > 1.0
+    assert cfg.worktree_gc_stale_hours > 0
+
+
+def test_ci_backoff_defaults_when_keys_absent(tmp_path):
+    core = tmp_path / ".ai-swarm"
+    core.mkdir()
+    (core / "core.yaml").write_text(
+        "identity:\n  owner: someone\n"
+        "models:\n  tiers:\n    standard:\n      model: sonnet\n"
+        "  default_tier: standard\n"
+    )
+    cfg = load_config(core / "core.yaml")
+    assert cfg.ci_remote_max_interval == 60
+    assert cfg.ci_backoff_multiplier == 2.0
+    assert cfg.worktree_gc_stale_hours == 12
+
+
 def test_ramp_config():
     cfg = load_config()
     assert cfg.proven_at == 1

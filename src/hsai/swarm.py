@@ -7,6 +7,7 @@ single iteration has been proven.
 """
 from __future__ import annotations
 
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .config import CoreConfig
@@ -24,12 +25,19 @@ def run_parallel(
     runner: Runner = run,
     ai_runner: Runner = run,
 ) -> list[IterationResult]:
-    """Run ``workers`` iterations concurrently for ``rounds`` rounds."""
+    """Run ``workers`` iterations concurrently for ``rounds`` rounds.
+
+    A worker that raises (a bug, a transient network error the wrapper
+    modules didn't already turn into a result) is caught per-future: it never
+    propagates out of this call and abandons its still-running siblings. The
+    failure becomes an ``IterationResult`` note instead of a lost round, so
+    one bad worker costs one iteration, not the whole round's results.
+    """
     workers = max(1, min(workers, cfg.max_parallel))
     results: list[IterationResult] = []
     for r in range(rounds):
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [
+            futures = {
                 pool.submit(
                     run_once,
                     cfg,
@@ -38,9 +46,19 @@ def run_parallel(
                     runner=runner,
                     ai_runner=ai_runner,
                     iteration=r * workers + w + 1,
-                )
+                ): r * workers + w + 1
                 for w in range(workers)
-            ]
+            }
             for fut in as_completed(futures):
-                results.append(fut.result())
+                iteration = futures[fut]
+                try:
+                    results.append(fut.result())
+                except Exception as exc:  # isolate one worker's crash from its siblings
+                    result = IterationResult(kind="error")
+                    result.notes.append(
+                        f"worker for iteration {iteration} raised: "
+                        f"{type(exc).__name__}: {exc}\n"
+                        + traceback.format_exc(limit=5)
+                    )
+                    results.append(result)
     return results

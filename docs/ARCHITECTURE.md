@@ -19,6 +19,7 @@ so the decision logic stays pure and unit-tested.
 | `hsai.knowledge` | lessons, whitepapers, MOC reindex (Obsidian) | write files |
 | `hsai.orchestrator` | one iteration; `decide_path`, `build_pr_body` (pure) | composes above |
 | `hsai.swarm` | run N iterations concurrently | threads |
+| `hsai.gc` | reclaim stale worktrees + safe-to-drop branches | git, gh |
 | `hsai.cli` | `hsai` entry point | - |
 
 ## One iteration, sequence
@@ -44,13 +45,16 @@ sequenceDiagram
     O->>G: commit_all + push_branch
     O->>H: create_pr (linked to ticket, model, lesson)
     O->>C: wait_remote (poll real GitHub checks)
-    C-->>O: success / failure
-    alt remote CI success
+    C-->>O: SUCCESS / FAILURE / TIMEOUT
+    O->>C: disposition(remote)
+    alt MERGE (SUCCESS)
         O->>H: merge_pr (auto)
-    else remote CI failure
-        O->>H: close_pr + return ticket to backlog
+    else RECOVER (FAILURE)
+        O->>H: close_pr + return ticket to backlog (+1 attempt)
+    else REQUEUE (TIMEOUT/PENDING)
+        O->>H: unassign ticket (PR + branch left intact, no attempt spent)
     end
-    O->>G: remove_worktree
+    O->>G: remove_worktree (always, in a `finally` - even on a raised exception)
 ```
 
 ## Testability
@@ -187,8 +191,26 @@ and `main`; green-gated auto-merge serializes the actual integration.
   local and remote would diverge. The orchestrator reverts any edits under
   `.github/workflows/**` before committing (and notes it in the lesson), so a
   worker cannot (accidentally or otherwise) move the goalposts it is judged by.
-- **No ticket is stranded on failure.** If remote CI does not go green,
-  `_recover_failed` closes the PR (deleting the branch) and returns the ticket
-  to the backlog with an incremented `attempts:N` label. After
-  `execution.max_ticket_attempts`, the ticket is labelled `blocked` and left for
-  a human; blocked/assigned tickets are skipped by future workers.
+- **TIMEOUT is not FAILURE.** `ci.disposition(remote)` is the one place that
+  turns a rollup outcome into an action: only `SUCCESS` ever merges. `FAILURE`
+  is a real, conclusive red build - `_recover_failed` closes the PR (deleting
+  the branch) and returns the ticket to the backlog with an incremented
+  `attempts:N` label; after `execution.max_ticket_attempts` the ticket is
+  labelled `blocked` and left for a human. `TIMEOUT` (the wait window elapsed
+  while checks were still unresolved) is infrastructure latency, not a
+  verdict: `_requeue_pr` leaves the PR open and the branch intact and only
+  unassigns the ticket - no attempt is ever consumed, so a merely-slow build
+  can never permanently block a healthy ticket. `wait_remote` itself polls
+  with bounded exponential backoff (`execution.ci_remote_max_timeout_seconds`,
+  `execution.ci_backoff_multiplier`) rather than hammering `gh` every
+  `ci_poll_interval_seconds` for the whole wait window.
+- **No worktree is ever leaked.** Everything from worktree creation to the end
+  of `run_once` runs inside a `try/finally`; the worktree is removed on every
+  exit path, including a raised exception mid-iteration. `swarm.run_parallel`
+  similarly isolates a worker that raises so it costs one iteration, not the
+  whole round's results. `hsai gc [--dry-run] [--older-than HOURS]` is the
+  safety net for anything that still leaks (a killed process, or state left
+  behind before this contract existed): it finds registered worktrees under
+  `execution.worktrees_dir` older than the threshold and removes them, then
+  deletes the local `hsai/iter-*` branch only when it is merged or has no open
+  PR - a branch backing a still-open (e.g. requeued) PR is never torn out.

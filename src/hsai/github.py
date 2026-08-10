@@ -190,6 +190,13 @@ def get_issue(repo: str, number: int, *, runner: Runner = run) -> Issue | None:
     )
 
 
+def comment_pr(repo: str, number: int, body: str, *, runner: Runner = run) -> Proc:
+    """Post a comment on a PR without closing it (used by the TIMEOUT requeue path)."""
+    return _gh(
+        ["pr", "comment", str(number), "--repo", repo, "--body", body], runner=runner
+    )
+
+
 def close_pr(
     repo: str,
     number: int,

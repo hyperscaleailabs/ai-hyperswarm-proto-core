@@ -20,6 +20,12 @@ without evidence does not merge.
 - **Review**: twice daily the architect reviews the brief and runs
   `/review-next` - feedback is encoded as ADRs in `docs/adr/`, tickets are
   refined or filed, and the session ends with a merged PR.
-- **Retry policy**: a PR that fails the gate is closed and its ticket returns
-  to the backlog (`attempts:N`); after `max_ticket_attempts` it is `blocked`
-  for a human.
+- **Retry policy**: a PR whose remote CI concludes `FAILURE` is closed and its
+  ticket returns to the backlog (`attempts:N`); after `max_ticket_attempts` it
+  is `blocked` for a human. A `TIMEOUT` (the wait window elapsed while checks
+  were still unresolved) is infrastructure latency, not a verdict: the PR
+  stays open, the branch stays intact, and the ticket is unassigned without
+  consuming an attempt - see `ci.disposition()` in `docs/ARCHITECTURE.md`.
+- **Worktree hygiene**: `run_once` reclaims its worktree in a `finally` on
+  every exit path; `hsai gc [--dry-run] [--older-than HOURS]` is the safety
+  net for anything a killed process still leaks.

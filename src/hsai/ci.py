@@ -3,7 +3,10 @@
 ``run_local`` mirrors what the GitHub Actions workflow does (ruff + pytest) so
 the loop can pre-flight a change before it ever opens a PR. ``wait_remote``
 blocks until a PR's real GitHub checks conclude - that remote result is the
-source of truth for whether a change may merge.
+source of truth for whether a change may merge. ``disposition`` maps a
+concluded (or timed-out) rollup to what the caller should DO about it - the
+single place that answers "is TIMEOUT a FAILURE?" (no: a merely-slow build is
+infrastructure latency, not a verdict on the change).
 """
 from __future__ import annotations
 
@@ -19,7 +22,39 @@ FAILURE = "FAILURE"
 PENDING = "PENDING"
 TIMEOUT = "TIMEOUT"
 
+# Dispositions returned by `disposition()` - what run_once should DO with a
+# rollup outcome, as distinct from the outcome itself.
+MERGE = "merge"      # SUCCESS: the only outcome that may ever merge a PR
+RECOVER = "recover"  # FAILURE: a real red build - close the PR, consume an attempt
+REQUEUE = "requeue"  # TIMEOUT/PENDING: unresolved - leave PR+branch alone, no attempt spent
+
 _PASS_CONCLUSIONS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+
+
+@dataclass(frozen=True)
+class Disposition:
+    """What to do about a concluded (or timed-out) rollup, and why."""
+
+    action: str  # MERGE | RECOVER | REQUEUE
+    remote: str  # the rollup outcome (SUCCESS/FAILURE/PENDING/TIMEOUT) that produced it
+
+
+def disposition(remote: str) -> Disposition:
+    """Pure map from a rollup outcome to the caller's next move.
+
+    SUCCESS is the ONLY outcome that may merge. FAILURE is a real, conclusive
+    red build: close the PR and consume a retry attempt exactly as before.
+    TIMEOUT (the deadline passed while checks were still unresolved) and a
+    bare PENDING (should not normally reach here after `wait_remote`, but is
+    handled the same way defensively) both REQUEUE: this is infrastructure
+    latency, not a verdict on the change, so the PR stays open, the branch
+    stays intact, and no attempt is consumed.
+    """
+    if remote == SUCCESS:
+        return Disposition(MERGE, remote)
+    if remote == FAILURE:
+        return Disposition(RECOVER, remote)
+    return Disposition(REQUEUE, remote)
 
 
 @dataclass
@@ -71,16 +106,19 @@ def _rollup_result(rollup: list[dict]) -> str:
     return SUCCESS
 
 
-def poll_remote(pr_number: int, repo: str, *, runner: Runner = run) -> str:
-    """One-shot: reduce a PR's current check rollup to SUCCESS/FAILURE/PENDING."""
+def _fetch_rollup(pr_number: int, repo: str, *, runner: Runner = run) -> list[dict]:
     p = runner(
         ["gh", "pr", "view", str(pr_number), "--repo", repo, "--json", "statusCheckRollup"]
     )
     try:
-        rollup = json.loads(p.stdout or "{}").get("statusCheckRollup", []) or []
+        return json.loads(p.stdout or "{}").get("statusCheckRollup", []) or []
     except json.JSONDecodeError:
-        rollup = []
-    return _rollup_result(rollup)
+        return []
+
+
+def poll_remote(pr_number: int, repo: str, *, runner: Runner = run) -> str:
+    """One-shot: reduce a PR's current check rollup to SUCCESS/FAILURE/PENDING."""
+    return _rollup_result(_fetch_rollup(pr_number, repo, runner=runner))
 
 
 def wait_remote(
@@ -89,15 +127,33 @@ def wait_remote(
     *,
     timeout: float = 300,
     interval: float = 10,
+    max_interval: float = 60,
+    backoff_multiplier: float = 2.0,
     runner: Runner = run,
     sleep=time.sleep,
 ) -> str:
-    """Block until a PR's remote checks conclude. Returns SUCCESS/FAILURE/TIMEOUT."""
+    """Block until a PR's remote checks conclude. Returns SUCCESS/FAILURE/TIMEOUT.
+
+    Polls with bounded exponential backoff: the wait between polls doubles
+    (``backoff_multiplier``) each round, capped at ``max_interval``, so a slow
+    build is not hammered with `gh` calls every ``interval`` seconds for the
+    full ``timeout`` window. Backoff only grows once GitHub has actually
+    reported checks (a non-empty rollup) - an empty rollup means "nothing
+    reported yet" (Actions hasn't started the run), which resolves fast once
+    it does and should not be starved by an already-large interval. TIMEOUT is
+    returned only once the deadline passes AND the rollup is still genuinely
+    unresolved (PENDING) - never in place of an actual FAILURE/SUCCESS.
+    """
     deadline = time.monotonic() + timeout
+    cur_interval = interval
     while True:
-        result = poll_remote(pr_number, repo, runner=runner)
+        rollup = _fetch_rollup(pr_number, repo, runner=runner)
+        result = _rollup_result(rollup)
         if result != PENDING:
             return result
-        if time.monotonic() >= deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             return TIMEOUT
-        sleep(interval)
+        sleep(min(cur_interval, remaining))
+        if rollup:  # checks have started reporting - back off further
+            cur_interval = min(cur_interval * backoff_multiplier, max_interval)

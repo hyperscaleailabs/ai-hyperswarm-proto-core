@@ -9,6 +9,7 @@ Commands:
   hsai doctor                                                  verify environment + invariants
   hsai traj <iteration> [--json]                               print a stored agent run
   hsai replay <iteration> [--json]                             alias of `hsai traj`
+  hsai gc [--dry-run] [--older-than HOURS]                     reclaim stale worktrees/branches
 """
 from __future__ import annotations
 
@@ -18,6 +19,7 @@ import sys
 
 from . import __version__, ai, repro, trajectory
 from .config import CoreConfig, load_config, validate
+from .gc import run_gc
 from .knowledge import KnowledgeBase
 from .orchestrator import run_loop
 from .swarm import run_parallel
@@ -63,6 +65,21 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def cmd_gc(args: argparse.Namespace) -> int:
+    """Reclaim registered-but-stale worktrees (and safe-to-drop branches).
+
+    ``run_gc()`` itself defaults to ``dry_run=True`` for any programmatic
+    caller; the CLI makes the choice explicit via ``--dry-run``.
+    """
+    cfg = _load(args)
+    res = run_gc(
+        cfg, repo_root=".", stale_hours=args.older_than,
+        dry_run=args.dry_run,
+    )
+    print(res.summary())
+    return 0
+
+
 def cmd_reindex(args: argparse.Namespace) -> int:
     """Serialized knowledge maintenance: whitepaper cadence + MOC rebuild.
 
@@ -90,7 +107,7 @@ def cmd_cycle(args: argparse.Namespace) -> int:
     print(f"cycle: block {res.report.cycle_index}"
           f"{' (resumed)' if res.resumed else ''}  journal: {res.journal_path}")
     print(f"cycle: synthesized={res.report.synthesized} merged={res.report.merged_prs} "
-          f"recovered={res.report.recovered_prs}")
+          f"recovered={res.report.recovered_prs} requeued={res.report.requeued_prs}")
     print(f"whitepaper={res.report.whitepaper or '-'} articles={len(res.report.articles)}")
     print(f"review issue: #{res.review_issue}  governance PR: #{res.governance_pr}")
     for line in res.report.iterations:
@@ -248,6 +265,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--base-ref", default="origin/main", help="pre-fix ref to diff/checkout against"
     )
     rc.set_defaults(func=cmd_repro_check)
+
+    gc = sub.add_parser(
+        "gc", help="reclaim registered-but-stale worktrees and their local branches"
+    )
+    gc.add_argument(
+        "--dry-run", action="store_true",
+        help="report what would be removed without changing anything",
+    )
+    gc.add_argument(
+        "--older-than", type=float, default=None, metavar="HOURS",
+        help="staleness threshold in hours (default: execution.worktree_gc_stale_hours)",
+    )
+    gc.set_defaults(func=cmd_gc)
 
     return p
 

@@ -77,6 +77,37 @@ def _make_fake_run_once(ledger_file, *, tier: str, seconds: float):
     return fake, state
 
 
+def test_requeued_iterations_are_reported_separately_from_merged_and_recovered(
+    tmp_path, monkeypatch
+):
+    """A TIMEOUT-requeued iteration lands in `report.requeued_prs`, not
+    `merged_prs` or `recovered_prs`, and never consumes a retry attempt."""
+    cfg = load_config()
+    cfg.cycle["block_size"] = 1
+
+    def fake_run_once(cfg, *, repo_dir, runner, ai_runner, iteration, demote_tier=False,
+                       dry_run=False):
+        return IterationResult(
+            kind="implement", ticket=iteration, pr=61, model="sonnet",
+            merged=False, recovered=False, requeued=True, remote="TIMEOUT",
+        )
+
+    runner = _Runner()
+    monkeypatch.setattr(cycle, "run_once", fake_run_once)
+    monkeypatch.setattr(cycle, "_well_formed_backlog", lambda cfg, *, runner: 999)
+    monkeypatch.setattr(cycle, "_governance_pr", lambda *a, **k: 0)
+
+    res = cycle.run_cycle(cfg, repo_dir=str(tmp_path), cycle_index=1, runner=runner)
+
+    assert res.report.requeued_prs == [61]
+    assert res.report.merged_prs == []
+    assert res.report.recovered_prs == []
+
+    brief = runner.review_bodies[-1]
+    assert "## PRs requeued" in brief
+    assert "pull/61" in brief.split("## PRs requeued")[1].split("## Cost")[0]
+
+
 def test_block_soft_biases_then_hard_halts_but_inflight_merges(tmp_path, monkeypatch):
     cfg = load_config()
     # Budget calibrated so the seconds ceiling drives the transitions:

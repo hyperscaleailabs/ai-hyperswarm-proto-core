@@ -143,6 +143,8 @@ class FakeRunner:
             return Proc(cmd, 0, json.dumps(rollup), "")
         if cmd[:3] == ["gh", "pr", "close"]:
             return Proc(cmd, 0, "", "")
+        if cmd[:3] == ["gh", "pr", "comment"]:
+            return Proc(cmd, 0, "", "")
         if cmd[:3] == ["gh", "issue", "view"]:
             num = int(cmd[3])
             match = next((i for i in self.open_issues if i.get("number") == num), None)
@@ -506,6 +508,161 @@ def test_run_once_recovers_when_remote_ci_fails(tmp_path):
     )
     # retry counter bumped (attempts:1, below max_ticket_attempts=2)
     assert any("attempts:1" in c for c in runner.calls)
+
+
+def test_run_once_requeues_on_remote_ci_timeout(tmp_path, monkeypatch):
+    """A TIMEOUT is infrastructure latency, not a verdict: the PR stays open,
+    the branch stays intact, and the ticket's attempts label is untouched."""
+    cfg = load_config()
+    open_issues = [
+        {
+            "number": 7,
+            "title": "add widget",
+            "labels": [{"name": "priority:P2"}],
+            "assignees": [],
+            "body": WELL_FORMED_BODY,
+        }
+    ]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+    )
+    monkeypatch.setattr(orchestrator.ci, "wait_remote", lambda *a, **k: orchestrator.ci.TIMEOUT)
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.remote == "TIMEOUT"
+    assert result.merged is False
+    assert result.recovered is False
+    assert result.requeued is True
+    assert any("requeued" in n for n in result.notes)
+
+    # the PR is never closed and its branch is never deleted
+    assert not any(c[:3] == ["gh", "pr", "close"] for c in runner.calls)
+    # the ticket is released back to the backlog...
+    assert any(
+        c[:3] == ["gh", "issue", "edit"] and "--remove-assignee" in c for c in runner.calls
+    )
+    # ...but WITHOUT consuming an attempt: no attempts:N label is ever added
+    assert not any(
+        c[:3] == ["gh", "issue", "edit"] and any(a.startswith("attempts:") for a in c)
+        for c in runner.calls
+    )
+    assert not any(
+        c[:3] == ["gh", "issue", "edit"] and "blocked" in c for c in runner.calls
+    )
+    # the ledger records the distinct `timeout` outcome, not `recovered`
+    records = ledger.read_records(ledger.ledger_path(cfg, tmp_path))
+    assert [r.outcome for r in records] == ["timeout"]
+
+
+def test_run_once_requeues_on_bare_pending(tmp_path, monkeypatch):
+    """A raw PENDING (defensive: `wait_remote` should not normally return it)
+    is routed exactly like TIMEOUT - requeued, never treated as a FAILURE."""
+    cfg = load_config()
+    open_issues = [dict(WIDGET_ISSUE)]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+    )
+    monkeypatch.setattr(orchestrator.ci, "wait_remote", lambda *a, **k: orchestrator.ci.PENDING)
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.requeued is True
+    assert result.merged is False and result.recovered is False
+    assert not any(c[:3] == ["gh", "pr", "close"] for c in runner.calls)
+
+
+@pytest.mark.parametrize(
+    "remote,expect_merge",
+    [("SUCCESS", True), ("FAILURE", False), ("PENDING", False), ("TIMEOUT", False)],
+)
+def test_no_code_path_merges_a_pr_that_is_not_success(tmp_path, monkeypatch, remote, expect_merge):
+    """Drives SUCCESS/FAILURE/PENDING/TIMEOUT through `run_once`: `gh pr merge`
+    is invoked if and only if remote CI concluded SUCCESS."""
+    cfg = load_config()
+    open_issues = [dict(WIDGET_ISSUE)]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+    )
+    monkeypatch.setattr(orchestrator.ci, "wait_remote", lambda *a, **k: remote)
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.merged is expect_merge
+    assert any(c[:3] == ["gh", "pr", "merge"] for c in runner.calls) is expect_merge
+
+
+def test_worktree_is_removed_even_when_the_agent_call_raises(tmp_path):
+    """The `finally` in `run_once` runs on every exit path, including a raised
+    exception from mid-iteration (here: the `claude` invocation itself)."""
+    cfg = load_config()
+    open_issues = [dict(WIDGET_ISSUE)]
+
+    class RaisingRunner(FakeRunner):
+        def _dispatch(self, cmd, cwd=None):
+            if cmd[:1] == ["claude"]:
+                raise RuntimeError("boom: simulated agent crash mid-iteration")
+            return super()._dispatch(cmd, cwd)
+
+    runner = RaisingRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        run_once(
+            cfg, repo_dir=str(tmp_path), dry_run=False,
+            runner=runner, ai_runner=runner, iteration=1,
+        )
+
+    assert any(c[:3] == ["git", "worktree", "remove"] for c in runner.calls)
+
+
+def test_worktree_is_removed_when_ci_check_raises(tmp_path):
+    """Same guarantee, exercised from an earlier step (the CI recheck)."""
+    cfg = load_config()
+    open_issues = [dict(WIDGET_ISSUE)]
+
+    class RaisingRunner(FakeRunner):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self._pytest_calls = 0
+
+        def _dispatch(self, cmd, cwd=None):
+            if cmd == ["pytest"]:
+                self._pytest_calls += 1
+                if self._pytest_calls == 2:  # the post-agent re-check (step 6)
+                    raise RuntimeError("boom: simulated CI runner crash")
+            return super()._dispatch(cmd, cwd)
+
+    runner = RaisingRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        run_once(
+            cfg, repo_dir=str(tmp_path), dry_run=False,
+            runner=runner, ai_runner=runner, iteration=1,
+        )
+
+    assert any(c[:3] == ["git", "worktree", "remove"] for c in runner.calls)
+
+
+def test_dry_run_never_removes_the_repo_itself(tmp_path):
+    """`wt is repo_dir` in dry-run, so the `finally` must never call
+    `remove_worktree` there - that would delete the caller's own repo."""
+    cfg = load_config()
+    result = run_once(cfg, repo_dir=str(tmp_path), dry_run=True, iteration=1)
+    assert result.pr is None
+    assert (tmp_path / "knowledge" / "lessons").exists()  # the repo is intact
 
 
 def test_workflow_edits_are_reverted(tmp_path):

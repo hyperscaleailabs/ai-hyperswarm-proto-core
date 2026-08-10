@@ -64,6 +64,53 @@ def test_cycle_command_passes_resume_through(monkeypatch, capsys):
     assert "block 42 (resumed)" in out and "/tmp/j.jsonl" in out
 
 
+def test_parser_gc_defaults():
+    parser = build_parser()
+    args = parser.parse_args(["gc"])
+    assert args.command == "gc"
+    assert args.dry_run is False   # the CLI makes the choice explicit
+    assert args.older_than is None
+
+
+def test_gc_command_defaults_to_dry_run_flag_off_means_live(monkeypatch, capsys):
+    from hsai.gc import GcResult
+
+    seen = {}
+
+    def fake_run_gc(cfg, **kwargs):
+        seen.update(kwargs)
+        return GcResult(dry_run=kwargs["dry_run"], removed_worktrees=["/repo/.hsai/wt/x"])
+
+    monkeypatch.setattr(cli_module, "run_gc", fake_run_gc)
+
+    rc = main(["gc"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert seen["dry_run"] is False
+    assert "/repo/.hsai/wt/x" in out
+
+
+def test_gc_command_honors_dry_run_flag(monkeypatch, capsys):
+    from hsai.gc import GcResult
+
+    seen = {}
+
+    def fake_run_gc(cfg, **kwargs):
+        seen.update(kwargs)
+        return GcResult(dry_run=kwargs["dry_run"])
+
+    monkeypatch.setattr(cli_module, "run_gc", fake_run_gc)
+
+    rc = main(["gc", "--dry-run", "--older-than", "6"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert seen["dry_run"] is True
+    assert seen["stale_hours"] == 6
+    assert "dry-run" in out
+
+
 def test_parser_repro_check_defaults():
     parser = build_parser()
     args = parser.parse_args(["repro-check"])

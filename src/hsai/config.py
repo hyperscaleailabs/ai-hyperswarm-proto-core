@@ -46,7 +46,10 @@ class CoreConfig:
     agent_timeout: float | None
     ci_remote_timeout: float
     ci_poll_interval: float
+    ci_remote_max_interval: float
+    ci_backoff_multiplier: float
     max_ticket_attempts: int
+    worktree_gc_stale_hours: float
     tiers: dict[str, ModelTier]
     default_tier: str
     constraints: dict[str, Any]
@@ -137,7 +140,10 @@ def load_config(path: str | Path | None = None) -> CoreConfig:
         agent_timeout=execution.get("agent_timeout_seconds"),
         ci_remote_timeout=float(execution.get("ci_remote_timeout_seconds", 300)),
         ci_poll_interval=float(execution.get("ci_poll_interval_seconds", 10)),
+        ci_remote_max_interval=float(execution.get("ci_remote_max_timeout_seconds", 60)),
+        ci_backoff_multiplier=float(execution.get("ci_backoff_multiplier", 2.0)),
         max_ticket_attempts=int(execution.get("max_ticket_attempts", 2)),
+        worktree_gc_stale_hours=float(execution.get("worktree_gc_stale_hours", 12)),
         tiers=tiers,
         default_tier=models.get("default_tier", "standard"),
         constraints=data.get("constraints", {}),

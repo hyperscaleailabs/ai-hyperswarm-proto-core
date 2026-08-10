@@ -118,6 +118,7 @@ def _iteration_payload(res: IterationResult) -> dict:
         "pr": res.pr,
         "merged": bool(res.merged),
         "recovered": bool(res.recovered),
+        "requeued": bool(res.requeued),
     }
 
 
@@ -201,6 +202,8 @@ def _implementation_block(
             report.merged_prs.append(done["pr"])
         elif done["recovered"] and done["pr"]:
             report.recovered_prs.append(done["pr"])
+        elif done.get("requeued") and done["pr"]:
+            report.requeued_prs.append(done["pr"])
 
 
 def run_cycle(

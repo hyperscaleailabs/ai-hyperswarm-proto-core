@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 from hsai import ci
 from hsai.proc import Proc
@@ -58,6 +59,88 @@ def test_wait_remote_times_out_when_pending():
 
     result = ci.wait_remote(1, "o/r", timeout=0, interval=0, runner=fake, sleep=lambda *_: None)
     assert result == ci.TIMEOUT
+
+
+def test_wait_remote_uses_bounded_exponential_backoff(monkeypatch):
+    """A slow build is polled with growing (then capped) intervals, never
+    hammered every ``interval`` seconds for the whole wait window."""
+    clock = {"t": 0.0}
+    monkeypatch.setattr(ci, "time", SimpleNamespace(monotonic=lambda: clock["t"]))
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        clock["t"] += seconds
+
+    sleeps: list[float] = []
+
+    def fake_runner(cmd, **kwargs):
+        rollup = {"statusCheckRollup": [
+            {"__typename": "CheckRun", "status": "IN_PROGRESS", "conclusion": None}
+        ]}
+        return Proc(cmd, 0, json.dumps(rollup), "")
+
+    result = ci.wait_remote(
+        1, "o/r", timeout=50, interval=5, max_interval=20, backoff_multiplier=2.0,
+        runner=fake_runner, sleep=fake_sleep,
+    )
+
+    assert result == ci.TIMEOUT
+    # Doubles each round (checks were reporting every time), capped at 20.
+    assert sleeps == [5, 10, 20, 15]
+    assert max(sleeps) <= 20
+
+
+def test_wait_remote_does_not_back_off_while_no_checks_have_reported(monkeypatch):
+    """An empty rollup ('nothing reported yet') polls at the base interval,
+    not an already-inflated one - Actions hasn't even started the run."""
+    clock = {"t": 0.0}
+    monkeypatch.setattr(ci, "time", SimpleNamespace(monotonic=lambda: clock["t"]))
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        clock["t"] += seconds
+
+    sleeps: list[float] = []
+
+    def fake_runner(cmd, **kwargs):
+        return Proc(cmd, 0, json.dumps({"statusCheckRollup": []}), "")
+
+    result = ci.wait_remote(
+        1, "o/r", timeout=12, interval=5, max_interval=20,
+        runner=fake_runner, sleep=fake_sleep,
+    )
+
+    assert result == ci.TIMEOUT
+    assert sleeps == [5, 5, 2]  # never grows past the base interval
+
+
+def test_disposition_success_merges():
+    d = ci.disposition(ci.SUCCESS)
+    assert d.action == ci.MERGE
+    assert d.remote == ci.SUCCESS
+
+
+def test_disposition_failure_recovers():
+    d = ci.disposition(ci.FAILURE)
+    assert d.action == ci.RECOVER
+
+
+def test_disposition_timeout_requeues():
+    d = ci.disposition(ci.TIMEOUT)
+    assert d.action == ci.REQUEUE
+
+
+def test_disposition_pending_requeues():
+    """A bare PENDING (should not normally reach here after `wait_remote`) is
+    handled the same defensive way as TIMEOUT - never treated as a FAILURE."""
+    d = ci.disposition(ci.PENDING)
+    assert d.action == ci.REQUEUE
+
+
+def test_only_success_ever_merges():
+    """No rollup outcome other than SUCCESS may ever produce a MERGE disposition."""
+    for remote in (ci.FAILURE, ci.PENDING, ci.TIMEOUT, "UNKNOWN"):
+        assert ci.disposition(remote).action != ci.MERGE
 
 
 def test_run_local_matches_workflow_steps():

@@ -58,6 +58,26 @@ def test_brief_links_everything(tmp_path):
     assert "/review-next" in body
 
 
+def test_brief_lists_requeued_prs_separately_from_merged_and_recovered():
+    cfg = load_config()
+    report = BlockReport(cycle_index=9, merged_prs=[50], recovered_prs=[51], requeued_prs=[52])
+    body = render_brief(cfg, report)
+    assert "## PRs requeued" in body
+    assert "pull/52" in body
+    # the requeued entry appears under its own heading, not folded into merged/recovered
+    requeued_section = body.split("## PRs requeued")[1].split("## Cost")[0]
+    assert "pull/52" in requeued_section
+    assert "pull/50" not in requeued_section
+    assert "pull/51" not in requeued_section
+
+
+def test_brief_reports_none_when_nothing_was_requeued():
+    cfg = load_config()
+    body = render_brief(cfg, BlockReport(cycle_index=9))
+    section = body.split("## PRs requeued")[1].split("## Cost")[0]
+    assert "_none_" in section
+
+
 def test_preserved_notes_default_when_missing(tmp_path):
     assert "never overwritten" in preserved_notes(tmp_path / "nope.md")
 
