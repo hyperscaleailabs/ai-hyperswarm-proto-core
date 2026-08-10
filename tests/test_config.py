@@ -28,6 +28,19 @@ def test_execution_telemetry_defaults_when_keys_absent(tmp_path):
     cfg = load_config(core / "core.yaml")
     assert cfg.output_format == "json"          # structured envelope by default
     assert cfg.trajectory_retention_blocks == 8
+    # An un-migrated config has no retry_policy at all and must still validate;
+    # every class then falls back to the historical retry_same_tier behaviour.
+    assert cfg.retry_policy == {}
+    assert validate(cfg).ok
+
+
+def test_retry_policy_is_loaded_from_core_yaml():
+    cfg = load_config()
+    assert cfg.retry_policy["default"] == "retry_same_tier"
+    classes = cfg.retry_policy["classes"]
+    assert classes["workflow_tamper"] == "block_immediately"
+    assert classes["merge_conflict"] == "block_immediately"
+    assert classes["test_failure"] == "retry_with_remediation"
 
 
 def test_reference_set_meets_criteria():

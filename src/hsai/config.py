@@ -7,6 +7,8 @@ from typing import Any
 
 import yaml
 
+from .failures import ACTION_NAMES, CLASSES
+
 CORE_PATH = ".ai-swarm/core.yaml"
 
 
@@ -47,6 +49,7 @@ class CoreConfig:
     ci_remote_timeout: float
     ci_poll_interval: float
     max_ticket_attempts: int
+    retry_policy: dict[str, Any]
     tiers: dict[str, ModelTier]
     default_tier: str
     constraints: dict[str, Any]
@@ -138,6 +141,7 @@ def load_config(path: str | Path | None = None) -> CoreConfig:
         ci_remote_timeout=float(execution.get("ci_remote_timeout_seconds", 300)),
         ci_poll_interval=float(execution.get("ci_poll_interval_seconds", 10)),
         max_ticket_attempts=int(execution.get("max_ticket_attempts", 2)),
+        retry_policy=data.get("retry_policy", {}) or {},
         tiers=tiers,
         default_tier=models.get("default_tier", "standard"),
         constraints=data.get("constraints", {}),
@@ -177,5 +181,17 @@ def validate(cfg: CoreConfig) -> ValidationResult:
         warnings.append("ANTHROPIC_API_KEY not in constraints.forbid_env")
     if len(cfg.reference_top10) < 10:
         warnings.append(f"reference_set.top10 has {len(cfg.reference_top10)} entries (< 10)")
+
+    # A retry_policy typo silently falls back to the default action, so surface
+    # it here rather than letting a class quietly lose its intended handling.
+    classes = cfg.retry_policy.get("classes") or {}
+    for name, action in classes.items():
+        if name not in CLASSES:
+            warnings.append(f"retry_policy.classes has unknown failure class '{name}'")
+        if action not in ACTION_NAMES:
+            warnings.append(f"retry_policy.classes['{name}'] has unknown action '{action}'")
+    default_action = cfg.retry_policy.get("default")
+    if default_action is not None and default_action not in ACTION_NAMES:
+        warnings.append(f"retry_policy.default has unknown action '{default_action}'")
 
     return ValidationResult(ok=not errors, errors=errors, warnings=warnings)

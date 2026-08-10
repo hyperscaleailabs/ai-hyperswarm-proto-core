@@ -99,3 +99,34 @@ def test_brief_says_when_tokens_per_merged_pr_is_unavailable():
     cost = BlockAggregate(block=7, iterations=2, total_seconds=10.0)
     body = render_brief(cfg, BlockReport(cycle_index=7, cost=cost))
     assert "tokens per merged PR: _not available_" in body
+
+
+def test_brief_renders_the_failure_taxonomy_table():
+    """The architect should see failure *modes*, not just failure counts."""
+    cfg = load_config()
+    cost = BlockAggregate(
+        block=7, iterations=5, merged_iterations=2, total_seconds=300.0,
+        total_attempts=6,
+        failure_counts={"test_failure": 2, "workflow_tamper": 1},
+    )
+    body = render_brief(cfg, BlockReport(cycle_index=7, cost=cost))
+
+    assert "## Failure taxonomy" in body
+    assert "| failure class | count |" in body
+    assert "| `test_failure` | 2 |" in body
+    assert "| `workflow_tamper` | 1 |" in body
+    # Most frequent first: that is the class worth batch-fixing.
+    assert body.index("`test_failure`") < body.index("`workflow_tamper`")
+
+
+def test_brief_taxonomy_says_so_when_a_block_had_no_failures():
+    cfg = load_config()
+    cost = BlockAggregate(block=7, iterations=3, merged_iterations=3, total_seconds=90.0)
+    body = render_brief(cfg, BlockReport(cycle_index=7, cost=cost))
+    assert "## Failure taxonomy" in body
+    assert "_No failures recorded in this window._" in body
+
+    # ...and with no ledger at all, the section still renders rather than vanishing.
+    assert "_No failures recorded in this window._" in render_brief(
+        cfg, BlockReport(cycle_index=7)
+    )

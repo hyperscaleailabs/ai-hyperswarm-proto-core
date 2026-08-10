@@ -145,3 +145,38 @@ def test_synthesize_whitepaper_groups_outcomes_and_surfaces_recurring_failures(t
 
     path = kb.write_whitepaper(paper)
     assert "[[Whitepapers MOC]]" in path.read_text()
+
+
+def _one_lesson(kb):
+    kb.write_lesson(
+        Lesson(title="implement: widget", outcome="fail", kind="implement",
+               context="c", what_happened="w", lesson="pytest stayed red.")
+    )
+
+
+def test_whitepaper_renders_the_failure_taxonomy(tmp_path):
+    """A recurring failure mode belongs in the durable artifact, not only the
+    review issue that scrolls away."""
+    kb = KnowledgeBase(tmp_path, whitepaper_every=4)
+    _one_lesson(kb)
+
+    paper = kb.synthesize_whitepaper(
+        failure_counts={"test_failure": 3, "lint": 1}
+    )
+
+    assert "## Failure taxonomy" in paper.body
+    assert "| failure class | count |" in paper.body
+    assert "| `test_failure` | 3 |" in paper.body
+    assert "| `lint` | 1 |" in paper.body
+    assert paper.body.index("`test_failure`") < paper.body.index("`lint`")
+    # It survives into the written note, not just the in-memory object.
+    assert "| `test_failure` | 3 |" in kb.write_whitepaper(paper).read_text()
+
+
+def test_whitepaper_taxonomy_when_the_block_had_no_failures(tmp_path):
+    kb = KnowledgeBase(tmp_path, whitepaper_every=4)
+    _one_lesson(kb)
+    for counts in (None, {}):
+        body = kb.synthesize_whitepaper(failure_counts=counts).body
+        assert "## Failure taxonomy" in body
+        assert "_No failures recorded in this window._" in body

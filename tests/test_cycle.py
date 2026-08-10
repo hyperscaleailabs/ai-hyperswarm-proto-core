@@ -458,3 +458,72 @@ def test_a_second_dry_run_replays_the_journal_instead_of_re_executing(tmp_path, 
     # The rehearsal never touched - nor satisfied - the live journal.
     assert not (jpath.parent / journal.JOURNAL_FILE).exists()
     assert journal.latest_resumable(tmp_path) is None
+
+
+# --- the failure taxonomy, end to end through one block ---------------------
+
+def _make_mixed_run_once(ledger_file):
+    """One merged iteration, one test_failure, one workflow_tamper."""
+    plan = [
+        ("merged", "", True),
+        ("recovered", "test_failure", False),
+        ("workflow_tamper", "workflow_tamper", False),
+    ]
+
+    def fake(cfg, *, repo_dir, runner, ai_runner, iteration, demote_tier=False, dry_run=False):
+        position = iteration % 100
+        outcome, failure_class, merged = plan[(position - 1) % len(plan)]
+        ledger.append_record(
+            ledger_file,
+            ledger.LedgerRecord(
+                iteration=iteration, block=iteration // 100, ticket=iteration,
+                kind="implement", tier="standard", model="sonnet",
+                wall_clock_seconds=5.0, attempts=1, outcome=outcome,
+                failure_class=failure_class,
+            ),
+        )
+        return IterationResult(
+            kind="implement", ticket=iteration, pr=500 + position, model="sonnet",
+            merged=merged, recovered=not merged, failure_class=failure_class,
+        )
+
+    return fake
+
+
+def test_a_mixed_block_reports_its_failure_taxonomy(tmp_path, monkeypatch):
+    """One merged, one test_failure, one workflow_tamper -> counted everywhere."""
+    _seed_lesson(tmp_path)
+    cfg = _block_cfg(block_size=3)
+
+    runner = _GhRunner()
+    monkeypatch.setattr(
+        cycle, "run_once", _make_mixed_run_once(ledger.ledger_path(cfg, tmp_path))
+    )
+    monkeypatch.setattr(cycle, "synthesize", _fake_synthesize)
+    res = cycle.run_cycle(
+        cfg, repo_dir=str(tmp_path), cycle_index=BLOCK,
+        runner=runner, ai_runner=_article_runner,
+    )
+
+    # The aggregate the brief and the whitepaper are both built from.
+    assert res.report.cost is not None
+    assert res.report.cost.failure_counts == {"test_failure": 1, "workflow_tamper": 1}
+    assert res.report.cost.merged_iterations == 1
+
+    # 1. the review brief carries the table with the right counts
+    assert len(runner.review_bodies) == 1
+    brief = runner.review_bodies[0]
+    assert "## Failure taxonomy" in brief
+    assert "| failure class | count |" in brief
+    assert "| `test_failure` | 1 |" in brief
+    assert "| `workflow_tamper` | 1 |" in brief
+
+    # 2. and so does the durable whitepaper for the same block
+    paper = (tmp_path / "knowledge" / "whitepapers" / f"{res.report.whitepaper}.md").read_text()
+    assert "## Failure taxonomy" in paper
+    assert "| `test_failure` | 1 |" in paper
+    assert "| `workflow_tamper` | 1 |" in paper
+
+    # 3. the per-iteration classes are visible in the brief's Iterations list too
+    assert any("failure=test_failure" in line for line in res.report.iterations)
+    assert any("failure=workflow_tamper" in line for line in res.report.iterations)

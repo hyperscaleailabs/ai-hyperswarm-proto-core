@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 from uuid import uuid4
 
-from . import ai, ci, github, gitops, ledger, repro, trajectory
+from . import ai, ci, failures, github, gitops, ledger, repro, trajectory
 from .config import CoreConfig
 from .knowledge import KnowledgeBase, Lesson
 from .models import ModelChoice, Task, select
@@ -147,6 +147,8 @@ class IterationResult:
     remote: str = ""
     recovered: bool = False
     lesson_path: str = ""
+    failure_class: str = ""
+    retry_action: str = ""
     notes: list[str] = field(default_factory=list)
 
     def describe(self) -> str:
@@ -160,10 +162,37 @@ class IterationResult:
             f"merged={self.merged}",
             f"recovered={self.recovered}",
         ]
+        if self.failure_class:
+            parts.append(f"failure={self.failure_class}")
         return "iteration(" + ", ".join(parts) + ")"
 
 
-def _task_prompt(kind: str, cfg: CoreConfig, ticket_title: str, ticket_body: str) -> str:
+PREVIOUS_ATTEMPT_HEADER = "## Previous attempt failed"
+
+
+def _remediation_section(previous: trajectory.Trajectory | None) -> str:
+    """The bounded 'Previous attempt failed' block prepended on a retry.
+
+    Reflection before acting again (ChatDev): a second attempt that is handed
+    the first one's failure class, red CI step and last steps is materially
+    better informed than one that simply re-reads the same ticket.
+    """
+    if previous is None:
+        return ""
+    return (
+        f"\n\n{PREVIOUS_ATTEMPT_HEADER} - read this before you start, and do not "
+        "repeat it. This is evidence from the previous worker on this exact "
+        f"ticket, not part of the ticket itself.\n{previous.remediation()}\n"
+    )
+
+
+def _task_prompt(
+    kind: str,
+    cfg: CoreConfig,
+    ticket_title: str,
+    ticket_body: str,
+    previous: trajectory.Trajectory | None = None,
+) -> str:
     goals = "; ".join(f"{g.get('id')}:{g.get('title')}" for g in cfg.goals)
     common = (
         "You are a worker in the hsai autonomous loop for ai-hyperswarm-proto-core. "
@@ -171,10 +200,11 @@ def _task_prompt(kind: str, cfg: CoreConfig, ticket_title: str, ticket_body: str
         "code style consistent, and ensure `ruff check .` and `pytest` both pass. "
         f"Project goals: {goals}."
     )
+    tail = _remediation_section(previous)
     if kind == HEAL:
         return (
             f"{common}\nThe build is RED. Diagnose and fix it so CI is green. "
-            f"Ticket: {ticket_title}\n{ticket_body}"
+            f"Ticket: {ticket_title}\n{ticket_body}{tail}"
         )
     if kind == IMPLEMENT:
         return (
@@ -182,11 +212,11 @@ def _task_prompt(kind: str, cfg: CoreConfig, ticket_title: str, ticket_body: str
             "its Acceptance criteria and execute its Verification plan, adding tests "
             "as evidence. A knowledge-only or docs-only diff on a feat/skill/refactor "
             "ticket is an automatic failure - real code must change.\n"
-            f"Ticket: {ticket_title}\n{ticket_body}"
+            f"Ticket: {ticket_title}\n{ticket_body}{tail}"
         )
     return (
         f"{common}\nImplement this self-improvement, learning from the reference set "
-        f"pinned in .ai-swarm/core.yaml.\nTicket: {ticket_title}\n{ticket_body}"
+        f"pinned in .ai-swarm/core.yaml.\nTicket: {ticket_title}\n{ticket_body}{tail}"
     )
 
 
@@ -249,11 +279,14 @@ def run_once(
         wt = repo_dir
 
     # 2. CI check (skipped in dry-run so we never recurse into a real build)
+    phase_seconds: dict[str, float] = {}
+    ci_started = time.time()
     ci_before = (
         ci.run_local(cwd=wt, runner=runner)
         if not dry_run
         else ci.CIResult(ok=True, steps={}, log="dry-run")
     )
+    phase_seconds["ci_before"] = round(time.time() - ci_started, 3)
 
     # 3. choose work + claim a ticket (serialized so workers never collide)
     ticket_num: int | None = None
@@ -329,15 +362,34 @@ def run_once(
         return res
 
     # 4. model selection (recorded for audit); a soft budget breach biases it
-    # one tier cheaper.
-    task = Task(kind=kind, title=ticket_title, body=ticket_body, labels=(
-        tuple(claimed_issue.labels) if claimed_issue else ()
-    ))
-    choice = select(task, cfg, demote=demote_tier)
+    # one tier cheaper, and so does a `tier:demote` label left by a previous
+    # attempt whose failure class the retry policy answered with demote_tier.
+    ticket_labels = tuple(claimed_issue.labels) if claimed_issue else ()
+    task = Task(kind=kind, title=ticket_title, body=ticket_body, labels=ticket_labels)
+    choice = select(
+        task, cfg, demote=demote_tier or failures.DEMOTE_LABEL in ticket_labels
+    )
+
+    # The previous failed attempt on this ticket, if any: it feeds both the
+    # worker prompt (reflection before acting) and the escalated timeout.
+    previous = trajectory.last_failure_for_ticket(repo_dir, ticket_num) if not dry_run else None
+    agent_timeout = cfg.agent_timeout
+    if failures.ESCALATE_LABEL in ticket_labels and agent_timeout:
+        agent_timeout = float(agent_timeout) * 2
+        result_note = f"escalated agent timeout to {agent_timeout:.0f}s after a prior timeout"
+    else:
+        result_note = ""
 
     result = IterationResult(
         kind=kind, ticket=ticket_num, model=choice.model, ci_before=ci_before.ok
     )
+    if result_note:
+        result.notes.append(result_note)
+    if previous is not None:
+        result.notes.append(
+            f"retry: informed by trajectory {previous.identifier} "
+            f"({previous.failure_class or 'unclassified'})"
+        )
 
     # Quota ledger: every iteration that runs a model appends one cost record.
     # Written to the repo root (not the ephemeral worktree) so the block-level
@@ -347,12 +399,21 @@ def run_once(
     block = iteration // 100
     tokens: tuple[int, int] | None = None
     traj: trajectory.Trajectory | None = None
+    guards: dict[str, str] = {}
 
     def _record_cost(outcome: str) -> None:
         # Every terminal path passes through here, so it is also where the
-        # trajectory learns how its run ended.
+        # trajectory learns how its run ended and why.
         if traj is not None:
             traj.outcome = outcome
+            traj.guards = dict(guards)
+            traj.failure_class = result.failure_class
+            traj.retry_action = result.retry_action
+            traj.remote_ci = result.remote
+            traj.phase_seconds = {
+                **phase_seconds,
+                "total": round(max(0.0, time.time() - started), 3),
+            }
             trajectory.write(traj, repo_dir)
         ledger.append_record(
             ledger.ledger_path(cfg, repo_dir),
@@ -368,7 +429,27 @@ def run_once(
                 outcome=outcome,
                 input_tokens=tokens[0] if tokens else None,
                 output_tokens=tokens[1] if tokens else None,
+                failure_class=result.failure_class,
             ),
+        )
+
+    def _fail(remote_signal: str, *, pr_num: int = 0, failure_class: str = "", **signals) -> None:
+        """Classify this failure (unless already classified), apply the policy.
+
+        ``failure_class`` is passed pre-computed on the remote-CI path, where the
+        class has to be known early enough to be written into the lesson.
+        """
+        result.failure_class = failure_class or failures.classify(failed=True, **signals)
+        action = _recover_failed(
+            cfg, repo, pr_num, kind=kind, ticket_num=ticket_num,
+            claimed_issue=claimed_issue, login=login, remote=remote_signal,
+            runner=runner, failure_class=result.failure_class,
+        )
+        result.retry_action = action.name
+        result.recovered = True
+        result.notes.append(
+            f"failure={result.failure_class} -> retry policy `{action.name}`"
+            + ("" if action.consumes_attempt else " (no attempt consumed)")
         )
 
     # 5. run the agent (subscription-only)
@@ -376,12 +457,25 @@ def run_once(
     agent_err = ""
     reverted_workflows: list[str] = []
     repro_result: repro.ReproResult | None = None
-    if not dry_run:
-        prompt = _task_prompt(kind, cfg, ticket_title, ticket_body)
+    prompt = _task_prompt(kind, cfg, ticket_title, ticket_body, previous=previous)
+    if dry_run:
+        # A rehearsal still leaves exactly one trajectory - with an empty step
+        # stream and exit_status="dry-run", so it is never mistaken for a real
+        # run - which is what makes "one record per iteration" a true invariant
+        # rather than one that holds only on the live path.
+        traj = trajectory.record(
+            repo_dir,
+            iteration=iteration, ticket=ticket_num, kind=kind,
+            tier=choice.tier, model=choice.model, prompt=prompt, result=None,
+            block=block, branch=branch, strategy=choice.strategy, outcome="dry-run",
+        )
+        result.notes.append(f"trajectory={traj.identifier}")
+    else:
         agent_started = time.time()
         ares = ai.run_agent(
-            prompt, choice, cfg, cwd=wt, runner=ai_runner, timeout=cfg.agent_timeout
+            prompt, choice, cfg, cwd=wt, runner=ai_runner, timeout=agent_timeout
         )
+        phase_seconds["agent"] = round(time.time() - agent_started, 3)
         # Persist the trajectory FIRST: a guard below can return early, and the
         # run that gets aborted is exactly the one worth being able to replay.
         # It lands in the repo root (not the ephemeral worktree) and stays
@@ -390,8 +484,10 @@ def run_once(
             repo_dir,
             iteration=iteration, ticket=ticket_num, kind=kind,
             tier=choice.tier, model=choice.model, prompt=prompt, result=ares,
-            block=block, duration_seconds=time.time() - agent_started,
+            block=block, branch=branch, strategy=choice.strategy,
+            duration_seconds=phase_seconds["agent"],
         )
+        traj.local_ci["before"] = dict(ci_before.steps)
         result.notes.append(f"trajectory={traj.identifier}")
         agent_ok, agent_err = ares.ok, ares.error
         # Fed from the parsed envelope, not re-parsed from stdout: this is the
@@ -402,29 +498,41 @@ def run_once(
 
         # Guard: a task must not change the CI checks, or local and remote CI
         # would diverge (as happened once when a worker added mypy). Revert any
-        # workflow edits before they are committed and note it in the lesson.
+        # workflow edits before they are committed, then stop: tampering with
+        # the gate is structural, so the retry policy blocks the ticket
+        # immediately rather than letting a second identical attempt burn the
+        # remaining retry.
+        traj.changed_paths = list(gitops.changed_paths(cwd=wt, runner=runner))
         reverted_workflows = [
-            p for p in gitops.changed_paths(cwd=wt, runner=runner)
-            if p.startswith(".github/workflows/")
+            p for p in traj.changed_paths if p.startswith(".github/workflows/")
         ]
+        guards["workflow_revert"] = (
+            f"tampered: {reverted_workflows}" if reverted_workflows else "clean"
+        )
         if reverted_workflows:
             gitops.restore_pathspec(".github/workflows", cwd=wt, runner=runner)
             result.notes.append(f"reverted workflow edits: {reverted_workflows}")
+            _fail(
+                "WORKFLOW_TAMPER",
+                agent_ok=agent_ok, agent_error=agent_err,
+                workflow_paths=reverted_workflows,
+            )
+            _record_cost("workflow_tamper")
+            gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
+            return result
 
         # Completeness guard: a code ticket (feat/skill/refactor/fix) cannot be
         # satisfied by a knowledge-only diff. PR #17 once "closed" a feature
         # ticket by committing nothing but its own lesson file - never again.
         if _requires_code(ticket_title):
-            touched = gitops.changed_paths(cwd=wt, runner=runner)
-            code_files = [p for p in touched if not p.startswith("knowledge/")]
+            code_files = [p for p in traj.changed_paths if not p.startswith("knowledge/")]
+            guards["completeness"] = "ok" if code_files else "knowledge-only diff"
             if not code_files:
                 result.notes.append("completeness guard: knowledge-only diff on a code ticket")
-                _recover_failed(
-                    cfg, repo, 0, kind=kind, ticket_num=ticket_num,
-                    claimed_issue=claimed_issue, login=login,
-                    remote="INCOMPLETE", runner=runner,
+                _fail(
+                    "INCOMPLETE",
+                    agent_ok=agent_ok, agent_error=agent_err, guard="incomplete",
                 )
-                result.recovered = True
                 _record_cost("incomplete")
                 gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
                 return result
@@ -444,20 +552,21 @@ def run_once(
                 repo_root=repo_dir, wt=wt, base_ref=base_ref,
                 test_files=test_files, worktrees_dir=cfg.worktrees_dir, runner=runner,
             )
+            guards["repro"] = repro_result.reason
             result.notes.append(f"repro guard: {repro_result.reason}")
             if not repro_result.ok:
-                _recover_failed(
-                    cfg, repo, 0, kind=kind, ticket_num=ticket_num,
-                    claimed_issue=claimed_issue, login=login,
-                    remote="NO_REPRO", runner=runner,
+                _fail(
+                    "NO_REPRO",
+                    agent_ok=agent_ok, agent_error=agent_err, guard="no_repro",
                 )
-                result.recovered = True
                 _record_cost("no_repro")
                 gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
                 return result
 
     # 6. re-check CI
+    ci_started = time.time()
     ci_after = ci.run_local(cwd=wt, runner=runner) if not dry_run else ci_before
+    phase_seconds["ci_after"] = round(time.time() - ci_started, 3)
     result.ci_after = ci_after.ok
 
     # 7. lesson (ALWAYS, pass or fail)
@@ -466,6 +575,7 @@ def run_once(
         # The digest quoted below should state what is known now; `_record_cost`
         # refines it to the merge outcome once that is settled.
         traj.outcome = outcome
+        traj.local_ci["after"] = dict(ci_after.steps)
     kb = KnowledgeBase.from_config(cfg, wt)
     references = tuple(r.repo for r in cfg.reference_top10[:3])
     lesson = Lesson(
@@ -540,16 +650,36 @@ def run_once(
     # it is the source of truth for whether the change may merge, and arming
     # auto-merge first (as opposed to gating on this poll) raced GitHub's own
     # merge against our recovery bookkeeping.
+    remote_started = time.time()
     remote = ci.wait_remote(
         pr_num, repo,
         timeout=cfg.ci_remote_timeout, interval=cfg.ci_poll_interval, runner=runner,
     )
+    phase_seconds["remote_ci"] = round(time.time() - remote_started, 3)
     result.remote = remote
     result.notes.append(f"remote CI={remote}")
+
+    # Classify BEFORE the lesson is rewritten: the named cause is the most
+    # useful thing the knowledge base can carry about a failed iteration, and
+    # this is the last write of the lesson before the PR is judged.
+    remote_failure = (
+        ""
+        if remote == ci.SUCCESS
+        else failures.classify(
+            failed=True, agent_ok=agent_ok, agent_error=agent_err,
+            ci_steps=ci_after.steps, remote=remote,
+            merge_conflict=failures.has_merge_conflict(ci_after.log),
+        )
+    )
 
     # Record the true remote outcome in the lesson itself, then push that
     # update so it lands in the knowledge base once the PR merges.
     lesson.remote_ci = remote
+    if remote_failure:
+        lesson.lesson = (
+            f"Classified `{remote_failure}` (see the Failure taxonomy table in this "
+            f"block's whitepaper). {lesson.lesson}"
+        )
     kb.write_lesson(lesson)
     gitops.commit_all(
         f"docs: record remote CI outcome ({remote}) in lesson\n\nRefs #{ticket_num}",
@@ -557,16 +687,15 @@ def run_once(
     )
     gitops.push_branch(branch, cwd=wt, runner=runner)
 
+    # The merge gate is unchanged and unconditional: SUCCESS is the ONLY path to
+    # a merge. The failure class steers what happens to the *ticket* afterwards,
+    # never whether a red PR may land.
     if remote == ci.SUCCESS:
         github.merge_pr(repo, pr_num, auto=True, runner=runner)
         result.merged = True
     else:
         result.merged = False
-        _recover_failed(
-            cfg, repo, pr_num, kind=kind, ticket_num=ticket_num,
-            claimed_issue=claimed_issue, login=login, remote=remote, runner=runner,
-        )
-        result.recovered = True
+        _fail(remote, pr_num=pr_num, failure_class=remote_failure)
         result.notes.append("recovered: closed PR, returned ticket to backlog")
 
     _record_cost("merged" if result.merged else "recovered")
@@ -587,37 +716,62 @@ def _recover_failed(
     login: str,
     remote: str,
     runner: Runner,
-) -> None:
-    """A PR did not go green (or never got one): close it, and either return the
-    ticket to the backlog for another attempt or mark it ``blocked``."""
+    failure_class: str = "",
+) -> failures.RetryAction:
+    """A PR did not go green (or never got one): close it and apply the policy.
+
+    ``retry_policy`` in ``core.yaml`` decides what happens next, keyed by
+    ``failure_class``. The ticket is always labelled ``failure:<class>`` and
+    always left unassigned, so the next worker (or the architect) can see the
+    cause; what varies is whether the failure consumes one of the ticket's
+    ``execution.max_ticket_attempts`` retries and what the retry is told.
+
+    Returns the action applied so the caller can record it on the trajectory.
+    """
+    action = failures.action_for(failure_class, cfg.retry_policy)
     if pr_num:
         github.close_pr(
             repo, pr_num,
-            comment=f"Remote CI concluded {remote}; closing per retry policy.",
+            comment=(
+                f"Remote CI concluded {remote}; classified `{failure_class or 'unknown'}`, "
+                f"closing per retry policy (`{action.name}`)."
+            ),
             delete_branch=True, runner=runner,
         )
     if not ticket_num:
-        return
+        return action
 
     # Determine how many attempts this ticket has already had.
     issue = claimed_issue or github.get_issue(repo, ticket_num, runner=runner)
     prior = issue.attempts() if issue else 0
     nxt = prior + 1
 
-    if nxt >= cfg.max_ticket_attempts:
-        github.edit_labels(
-            repo, ticket_num, add=["blocked"], remove=[f"attempts:{prior}"] if prior else None,
-            runner=runner,
-        )
-        # Leave it unassigned but blocked so no worker retries it.
-        github.unassign(repo, ticket_num, login, runner=runner)
+    add = [failures.failure_label(failure_class or failures.UNKNOWN), *action.labels]
+    # Stale routing labels from an earlier attempt must not leak into this one:
+    # a timeout followed by a lint slip should escalate nothing.
+    remove = [
+        lbl for lbl in (failures.ESCALATE_LABEL, failures.DEMOTE_LABEL)
+        if issue and lbl in issue.labels and lbl not in add
+    ]
+    if issue:
+        remove += [
+            lbl for lbl in issue.labels
+            if lbl.startswith(failures.FAILURE_LABEL_PREFIX) and lbl not in add
+        ]
+
+    if action.blocks:
+        # Structural failure: block now, WITHOUT consuming a retry, so the
+        # ticket reaches the architect with its cause and its attempts intact.
+        add.insert(0, "blocked")
     else:
-        github.edit_labels(
-            repo, ticket_num,
-            add=[f"attempts:{nxt}"], remove=[f"attempts:{prior}"] if prior else None,
-            runner=runner,
-        )
-        github.unassign(repo, ticket_num, login, runner=runner)
+        add.insert(0, "blocked" if nxt >= cfg.max_ticket_attempts else f"attempts:{nxt}")
+        if prior:
+            remove.append(f"attempts:{prior}")
+    github.edit_labels(repo, ticket_num, add=add, remove=remove or None, runner=runner)
+    # Always unassigned: blocked tickets are skipped by future workers, and a
+    # retryable one must be claimable again.
+    github.unassign(repo, ticket_num, login, runner=runner)
+    return action
 
 
 def run_loop(

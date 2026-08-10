@@ -16,6 +16,7 @@ from pathlib import Path
 
 from . import github
 from .config import CoreConfig
+from .failures import render_taxonomy_table
 from .knowledge import KnowledgeBase
 from .ledger import BlockAggregate
 from .proc import Runner, run
@@ -168,6 +169,7 @@ def render_brief(cfg: CoreConfig, report: BlockReport) -> str:
     paper = f"`knowledge/whitepapers/{report.whitepaper}.md`" if report.whitepaper else "_none_"
     articles = "\n".join(f"- `{a}`" for a in report.articles) or "_none_"
     cost = _cost_summary(report.cost)
+    taxonomy = render_taxonomy_table(report.cost.failure_counts if report.cost else None)
     extra = "\n".join(f"- {n}" for n in report.notes)
     return f"""# Block review - cycle {report.cycle_index}
 
@@ -186,6 +188,13 @@ sequentially, records your feedback as ADRs, and ends with a merged PR.
 
 ## PRs recovered (failed the gate)
 {recovered}
+
+## Failure taxonomy
+Every failed iteration is classified by `hsai.failures` and the class drives
+`retry_policy` in `.ai-swarm/core.yaml`. A mode that recurs here is a class to
+fix once, not a run to re-read.
+
+{taxonomy}
 
 ## Cost this block (quota ledger)
 {cost}

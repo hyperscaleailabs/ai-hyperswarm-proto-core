@@ -14,6 +14,7 @@ so the decision logic stays pure and unit-tested.
 | `hsai.gitops` | worktrees, sync, branch, commit, push | git |
 | `hsai.github` | tickets, labels, PRs, merge | gh |
 | `hsai.ci` | local CI gate (ruff+pytest) + remote status | subprocess |
+| `hsai.failures` | classify a failed iteration; resolve its retry action | none (pure) |
 | `hsai.trajectory` | one durable record per agent run; redaction, replay | write files |
 | `hsai.journal` | append-only per-block step journal; `once()` replay | write files |
 | `hsai.knowledge` | lessons, whitepapers, MOC reindex (Obsidian) | write files |
@@ -84,9 +85,22 @@ single choke point right after `ai.run_agent` - *before* the completeness and
 reproduce-before-fix guards can return early - and writes one JSON file per run
 to `.hsai/traj/<block>/<iteration>.json`. The final outcome (`merged`,
 `recovered`, `incomplete`, `no_repro`, ...) is folded back in when the
-iteration's cost record is appended. Sharding by block is what makes the store
-bounded: `hsai cycle` prunes block directories beyond
-`execution.trajectory_retention_blocks`.
+iteration's cost record is appended, along with the iteration's context: each
+guard's verdict, the local ruff/pytest results before and after, the remote CI
+conclusion, the changed-path diffstat, per-phase wall clock, the redacted agent
+streams, and the failure class plus the retry action taken. Sharding by block is
+what makes the store bounded: `hsai cycle` prunes block directories beyond
+`execution.trajectory_retention_blocks`, and a single record is capped at
+`trajectory.MAX_RECORD_CHARS` - over the cap it sheds middle steps, then the
+streams and the prompt, and says so in its `truncated` field rather than
+silently presenting a partial run as a whole one.
+
+**Every iteration writes exactly one record**, including a `--dry-run`
+rehearsal (which records `exit_status: "dry-run"` with an empty step stream, so
+it can never be mistaken for a real model call) and a guard-aborted run. The one
+exception is an *idle* iteration that never claimed a ticket and never selected
+a model: it produces no trajectory and no ledger record, because no iteration
+happened.
 
 Two audiences, deliberately split:
 
@@ -192,3 +206,59 @@ and `main`; green-gated auto-merge serializes the actual integration.
   to the backlog with an incremented `attempts:N` label. After
   `execution.max_ticket_attempts`, the ticket is labelled `blocked` and left for
   a human; blocked/assigned tickets are skipped by future workers.
+
+## Failure taxonomy and the retry policy
+
+Every failed iteration used to be handled identically - close the PR, bump
+`attempts:N`, retry with the same tier and the same prompt - so a lint slip, an
+agent timeout, a red remote build, a merge conflict and a worker that edited
+`.github/workflows/**` were indistinguishable in the ledger, the lesson and the
+review brief. `hsai.failures` names the cause and routes the response.
+
+`failures.classify` is pure: it takes one iteration's signals and returns one
+class. The rules are **ordered**, and the order is the contract, because a
+failing iteration usually trips several signals at once:
+
+| # | class | fires when | precedence note |
+| --- | --- | --- | --- |
+| 1 | `workflow_tamper` | the diff touched `.github/workflows/**` | beats everything - the run moved the goalposts it is judged by |
+| 2 | `merge_conflict` | git's conflict vocabulary in the agent/CI output | the branch cannot integrate, so later verdicts describe a tree that will never merge |
+| 3 | `guard_incomplete` | completeness guard: knowledge-only diff on a code ticket | a **guard verdict beats a CI signal** - "was the work done" outranks "is the build happy about it" |
+| 4 | `guard_no_repro` | reproduce-before-fix guard rejected the change | as above |
+| 5 | `timeout` | the agent ran out of wall clock | **beats `agent_error`**: a killed agent also exits non-zero |
+| 6 | `lint` | local `ruff` red | ruff runs first, and a lint slip is the cheaper, more certain fix |
+| 7 | `test_failure` | local `pytest` red | both outrank `agent_error`: a red step *names* the repair |
+| 8 | `agent_error` | the run failed with nothing more specific said | |
+| 9 | `remote_infra` | local clean, remote CI not `SUCCESS` | the divergence is environmental, not in the diff |
+| 10 | `unknown` | it failed and no signal explains it | a growing count here means the taxonomy needs work |
+
+`retry_policy` in `.ai-swarm/core.yaml` maps each class to an action, applied by
+`_recover_failed`:
+
+| action | effect |
+| --- | --- |
+| `retry_same_tier` | return to the backlog unchanged (the historical behaviour) |
+| `retry_with_remediation` | retry; the next prompt quotes the prior failure |
+| `escalate_timeout` | retry with a doubled agent timeout (label `escalate:timeout`) |
+| `demote_tier` | retry one model tier cheaper (label `tier:demote`) |
+| `block_immediately` | block the ticket now, **without consuming an attempt** |
+
+`workflow_tamper` and `merge_conflict` block immediately: a second identical
+attempt cannot succeed, so burning the ticket's remaining retry only hides the
+cause behind a bare `blocked`. Every recovered ticket is labelled
+`failure:<class>` regardless of action, and per-class counts ride the ledger
+(`LedgerRecord.failure_class` → `BlockAggregate.failure_counts`) into the
+**Failure taxonomy** table rendered in both the review brief and the block
+whitepaper - so the architect fixes a class once instead of rediscovering it
+run by run.
+
+On a retry, `_task_prompt` prepends a bounded `## Previous attempt failed`
+excerpt drawn from the prior trajectory (`trajectory.last_failure_for_ticket` →
+`Trajectory.remediation`): the failure class, which CI step was red, the guard
+verdicts, the diffstat, and a redacted tail. Reflection before acting again,
+rather than a second blind attempt.
+
+**None of this touches the merge gate.** `remote == ci.SUCCESS` remains the sole
+path to `merge_pr`; the failure class only steers what happens to the *ticket*
+afterwards. Classification is also purely local - it reads text the loop already
+has, and adds no network or API call.

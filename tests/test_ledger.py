@@ -257,3 +257,62 @@ def test_tokens_per_merged_pr_is_undefined_without_merges_or_tokens():
 
     no_tokens = aggregate_block([_rec(block=1, outcome="merged")], block=1)
     assert no_tokens.tokens_per_merged_pr() is None
+
+
+# --- failure taxonomy (per-class counts ride the ledger) --------------------
+
+def test_ledger_record_carries_a_failure_class(tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    append_record(path, _rec(outcome="recovered", failure_class="test_failure"))
+    append_record(path, _rec(outcome="merged"))
+
+    stored = read_records(path)
+    assert [r.failure_class for r in stored] == ["test_failure", ""]
+    # It is a real column in the JSONL, readable without hsai.
+    assert json.loads(path.read_text().splitlines()[0])["failure_class"] == "test_failure"
+
+
+def test_aggregate_block_counts_failures_per_class():
+    records = [
+        _rec(block=2, outcome="merged"),
+        _rec(block=2, outcome="recovered", failure_class="test_failure"),
+        _rec(block=2, outcome="recovered", failure_class="test_failure"),
+        _rec(block=2, outcome="workflow_tamper", failure_class="workflow_tamper"),
+        _rec(block=9, outcome="recovered", failure_class="lint"),   # another block
+    ]
+    agg = aggregate_block(records, block=2)
+
+    assert agg.failure_counts == {"test_failure": 2, "workflow_tamper": 1}
+    assert agg.failed_iterations == 3
+    assert agg.iterations == 4
+    assert "failures[test_failure=2, workflow_tamper=1]" in agg.summary()
+
+
+def test_aggregate_block_without_failures_reports_none():
+    agg = aggregate_block([_rec(block=2, outcome="merged")], block=2)
+    assert agg.failure_counts == {}
+    assert agg.failed_iterations == 0
+    assert "failures[" not in agg.summary()
+    assert agg.failure_table() == "_No failures recorded in this window._"
+
+
+def test_failure_table_renders_a_markdown_table():
+    agg = BlockAggregate(block=1, failure_counts={"lint": 1, "timeout": 3})
+    table = agg.failure_table()
+    assert table.splitlines()[0] == "| failure class | count |"
+    assert "| `timeout` | 3 |" in table
+    assert table.index("`timeout`") < table.index("`lint`")   # most frequent first
+
+
+def test_read_records_tolerates_a_ledger_written_by_another_schema(tmp_path):
+    """The ledger is append-only, so the file outlives the schema."""
+    path = tmp_path / "ledger.jsonl"
+    append_record(path, _rec(outcome="merged"))
+    row = json.loads(path.read_text())
+    row["a_column_a_later_hsai_added"] = 42
+    del row["failure_class"]
+    path.write_text(json.dumps(row) + "\n")
+
+    stored = read_records(path)
+    assert len(stored) == 1
+    assert stored[0].failure_class == ""     # absent column falls back to its default

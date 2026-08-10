@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
+from .failures import CLASSES as _FAILURE_CLASSES
 from .proc import Proc, Runner, run
 
 PRIORITY_LABELS = ["priority:P0", "priority:P1", "priority:P2", "priority:P3"]
@@ -28,6 +29,15 @@ STANDARD_LABELS = {
     "attempts:1": ("ededed", "hsai retry counter"),
     "attempts:2": ("d4c5f9", "hsai retry counter"),
     "attempts:3": ("c2a3f5", "hsai retry counter"),
+    # Retry-routing labels written by orchestrator._recover_failed. The
+    # failure:<class> set mirrors hsai.failures.CLASSES so the backlog can be
+    # filtered by cause, which is what makes batch-fixing a class possible.
+    "escalate:timeout": ("fef2c0", "Retry this ticket with a longer agent timeout"),
+    "tier:demote": ("e4e669", "Retry this ticket one model tier cheaper"),
+    **{
+        f"failure:{name}": ("b60205", f"Previous hsai attempt failed: {name}")
+        for name in _FAILURE_CLASSES
+    },
 }
 
 

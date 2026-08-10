@@ -265,7 +265,8 @@ def run_cycle(
     # 4. Block whitepaper + persona articles + MOCs + DIRECTION refresh.
     kb = KnowledgeBase.from_config(cfg, repo_root)
     report.whitepaper = journal.once(
-        jr, "whitepaper", "block", lambda: _whitepaper_step(cfg, kb),
+        jr, "whitepaper", "block",
+        lambda: _whitepaper_step(cfg, kb, report.cost.failure_counts if report.cost else {}),
     )["note"]
     report.articles = journal.once(
         jr, "articles", "block",
@@ -314,7 +315,9 @@ def _sync_main(cfg: CoreConfig, *, repo_root: Path, runner: Runner) -> str:
     return cfg.default_branch
 
 
-def _whitepaper_step(cfg: CoreConfig, kb: KnowledgeBase) -> dict:
+def _whitepaper_step(
+    cfg: CoreConfig, kb: KnowledgeBase, failure_counts: dict[str, int] | None = None
+) -> dict:
     """Write the block whitepaper, or record that this block has none.
 
     The "is there anything to write about" test lives inside the step so a
@@ -323,7 +326,9 @@ def _whitepaper_step(cfg: CoreConfig, kb: KnowledgeBase) -> dict:
     """
     if not (cfg.cycle.get("whitepaper_per_block", True) and kb.lesson_notes()):
         return {"note": ""}
-    paper = kb.synthesize_whitepaper(n=int(cfg.cycle.get("block_size", 5)))
+    paper = kb.synthesize_whitepaper(
+        n=int(cfg.cycle.get("block_size", 5)), failure_counts=failure_counts
+    )
     kb.write_whitepaper(paper)
     return {"note": paper.note_name()}
 

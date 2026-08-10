@@ -96,6 +96,33 @@ execution:
   ci_poll_interval_seconds: 10   # poll cadence while waiting for remote CI
   max_ticket_attempts: 2         # retries before a ticket is marked 'blocked' for humans
 
+# What the loop DOES about a failure, keyed by the class `hsai.failures.classify`
+# attributes it to. Without this every failure was handled identically: close the
+# PR, bump attempts:N, retry with the same tier and the same prompt. Actions:
+#   retry_same_tier        - return to the backlog unchanged (the old behaviour)
+#   retry_with_remediation - retry, and quote the prior failure in the next prompt
+#   escalate_timeout       - retry with a doubled agent timeout (label escalate:timeout)
+#   demote_tier            - retry one tier cheaper (label tier:demote)
+#   block_immediately      - block the ticket now, WITHOUT consuming an attempt
+# Every recovered ticket is labelled failure:<class> either way, so the architect
+# sees the cause instead of a bare 'blocked'.
+retry_policy:
+  default: retry_same_tier
+  classes:
+    # A lint slip is cheap and mechanical - it does not justify a bigger model.
+    lint: demote_tier
+    test_failure: retry_with_remediation
+    timeout: escalate_timeout
+    guard_incomplete: retry_with_remediation
+    guard_no_repro: retry_with_remediation
+    # Both are structural: a second identical attempt cannot succeed, so they
+    # block immediately rather than burning the ticket's remaining retry.
+    workflow_tamper: block_immediately
+    merge_conflict: block_immediately
+    remote_infra: retry_same_tier
+    agent_error: retry_same_tier
+    unknown: retry_same_tier
+
 # Model-size selection is a first-class, LEARNED capability (see backlog).
 # The orchestrator picks a tier per task; tiers map to `claude --model` aliases.
 models:

@@ -51,7 +51,9 @@ class FakeRunner:
     Never touches the network or spawns a real subprocess - every git/gh/claude
     invocation is matched by command prefix and answered with a canned `Proc`.
     `ci_sequence` gives the ruff+pytest outcome for the Nth `ci.run_local()`
-    call (index 0 = ci_before, index 1 = ci_after, ...).
+    call (index 0 = ci_before, index 1 = ci_after, ...). `ruff_sequence`
+    overrides just the ruff leg, so a round can be red on pytest alone - which
+    is what separates a `test_failure` from a `lint` in the taxonomy.
     """
 
     def __init__(
@@ -65,10 +67,12 @@ class FakeRunner:
         repro_fix_ok: bool = True,
         repro_parent_ok: bool = False,
         agent_output: str = AGENT_JSON,
+        ruff_sequence: list[bool] | None = None,
     ) -> None:
         self.repo_root = repo_root
         self.agent_output = agent_output
         self.ci_sequence = ci_sequence
+        self.ruff_sequence = ruff_sequence
         self.open_issues = open_issues or []
         self.remote_ci = remote_ci
         self.worktree_status = worktree_status
@@ -107,7 +111,8 @@ class FakeRunner:
         if cmd[:2] in (["git", "checkout"], ["git", "clean"]):
             return Proc(cmd, 0, "", "")
         if cmd[:2] == ["ruff", "check"]:
-            ok = self.ci_sequence[self._ci_round]
+            seq = self.ruff_sequence or self.ci_sequence
+            ok = seq[self._ci_round]
             return Proc(cmd, 0 if ok else 1, "", "" if ok else "ruff: fake lint failure\n")
         if cmd == ["pytest"]:
             ok = self.ci_sequence[self._ci_round]
@@ -697,12 +702,22 @@ def test_one_trajectory_file_per_agent_invocation(tmp_path):
     assert all("--output-format" in c and "json" in c for c in claude_calls)
 
 
-def test_dry_run_writes_no_trajectory(tmp_path):
+def test_dry_run_writes_exactly_one_trajectory(tmp_path):
+    """Every iteration leaves one record - a rehearsal included, so the
+    invariant holds on every path and not only the live one."""
     cfg = load_config()
-    # A dry run makes no model call, so it must leave no artifact behind.
-    run_once(cfg, repo_dir=str(tmp_path), dry_run=True, iteration=1)
-    assert not (tmp_path / ".hsai" / "traj").exists()
-    assert _trajectory_files(tmp_path) == []
+    result = run_once(cfg, repo_dir=str(tmp_path), dry_run=True, iteration=1)
+
+    assert [p.name for p in _trajectory_files(tmp_path)] == ["1.json"]
+    traj = trajectory.load(tmp_path, "1")
+    # A dry run makes no model call, and the record says so unmistakably.
+    assert traj.exit_status == "dry-run"
+    assert traj.outcome == "pass"        # refined by _record_cost, as ever
+    assert traj.steps == [] and traj.usage is None
+    assert traj.prompt and traj.prompt_digest    # the prompt is still auditable
+    assert traj.branch and traj.strategy
+    assert traj.failure_class == ""
+    assert any(n == "trajectory=1" for n in result.notes)
 
 
 def test_token_counts_reach_the_ledger_and_the_block_aggregate(tmp_path):
@@ -871,6 +886,303 @@ def test_home_paths_never_reach_the_written_trajectory(tmp_path):
     assert "/Users/someuser" not in written
     assert "ghp_0123456789abcdefghij" not in written
     assert "~/repo" in written                       # still readable, just anonymised
+
+
+# --- failure taxonomy + adaptive retry policy -------------------------------
+
+def _issue_edits(runner: FakeRunner) -> list[list[str]]:
+    return [c for c in runner.calls if c[:3] == ["gh", "issue", "edit"]]
+
+
+def _labels_added(runner: FakeRunner) -> list[str]:
+    added: list[str] = []
+    for call in _issue_edits(runner):
+        added += [call[i + 1] for i, tok in enumerate(call) if tok == "--add-label"]
+    return added
+
+
+def _agent_prompts(runner: FakeRunner) -> list[str]:
+    # ai.build_command puts the prompt at argv[2]: ["claude", "-p", prompt, ...]
+    return [c[2] for c in runner.calls if c[:2] == ["claude", "-p"]]
+
+
+def test_workflow_tamper_blocks_the_ticket_without_consuming_a_retry(tmp_path):
+    """Editing the gate you are judged by is structural: no second attempt."""
+    cfg = load_config()
+    issue = dict(WIDGET_ISSUE, number=7, title="add widget")
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[issue],
+        worktree_status=" M .github/workflows/ci.yml\n?? src/hsai/new.py\n",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=31,
+    )
+
+    assert result.failure_class == "workflow_tamper"
+    assert result.retry_action == "block_immediately"
+    assert result.recovered is True
+    # The edit was reverted AND the run stopped: no PR, no merge, no second try.
+    assert any(c[:3] == ["git", "checkout", "HEAD"] for c in runner.calls)
+    assert not any(c[:3] == ["gh", "pr", "create"] for c in runner.calls)
+    assert result.pr is None and result.merged is False
+
+    added = _labels_added(runner)
+    assert "blocked" in added
+    assert "failure:workflow_tamper" in added
+    # The load-bearing part: the retry counter was NOT touched.
+    assert not any(lbl.startswith("attempts:") for lbl in added)
+    assert any(c[:3] == ["gh", "issue", "edit"] and "--remove-assignee" in c
+               for c in runner.calls)
+
+    # The cause is in the durable record, not only in the return value.
+    records = ledger.read_records(ledger.ledger_path(cfg, tmp_path))
+    assert [(r.outcome, r.failure_class) for r in records] == [
+        ("workflow_tamper", "workflow_tamper")
+    ]
+    traj = trajectory.load(tmp_path, "31")
+    assert traj.failure_class == "workflow_tamper"
+    assert traj.retry_action == "block_immediately"
+    assert traj.guards["workflow_revert"].startswith("tampered:")
+
+
+def test_test_failure_returns_the_ticket_to_the_backlog_with_its_class(tmp_path):
+    """A red pytest is retryable - labelled, counted, and unassigned."""
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), open_issues=[dict(WIDGET_ISSUE)],
+        # ci_before green; ci_after red on pytest only (ruff stays green).
+        ci_sequence=[True, False], ruff_sequence=[True, True],
+        remote_ci="FAILURE",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=32,
+    )
+
+    assert result.failure_class == "test_failure"
+    assert result.retry_action == "retry_with_remediation"
+    assert result.recovered is True and result.merged is False
+
+    added = _labels_added(runner)
+    assert "failure:test_failure" in added
+    assert "attempts:1" in added          # this one DOES consume an attempt
+    assert "blocked" not in added         # ...and is still retryable
+    assert any(c[:3] == ["gh", "issue", "edit"] and "--remove-assignee" in c
+               for c in runner.calls)
+    assert any(c[:3] == ["gh", "pr", "close"] for c in runner.calls)
+
+    records = ledger.read_records(ledger.ledger_path(cfg, tmp_path))
+    assert [(r.outcome, r.failure_class) for r in records] == [
+        ("recovered", "test_failure")
+    ]
+    traj = trajectory.load(tmp_path, "32")
+    assert traj.failure_class == "test_failure"
+    assert traj.local_ci == {"before": {"ruff": True, "pytest": True},
+                             "after": {"ruff": True, "pytest": False}}
+    assert traj.remote_ci == "FAILURE"
+    assert set(traj.phase_seconds) >= {"agent", "ci_before", "ci_after", "total"}
+
+    # The named cause reaches the knowledge base, not just the ledger.
+    assert "test_failure" in Path(result.lesson_path).read_text()
+
+
+def test_a_lint_slip_is_classified_and_demotes_the_next_attempt(tmp_path):
+    """ruff red beats pytest red: the cheaper, more certain fix is reported."""
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), open_issues=[dict(WIDGET_ISSUE)],
+        ci_sequence=[True, False], remote_ci="FAILURE",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=33,
+    )
+
+    assert result.failure_class == "lint"
+    assert result.retry_action == "demote_tier"
+    added = _labels_added(runner)
+    assert "failure:lint" in added and "tier:demote" in added and "attempts:1" in added
+
+
+def test_guard_verdicts_are_classified_not_lumped_together(tmp_path):
+    cfg = load_config()
+
+    incomplete = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[dict(WIDGET_ISSUE, number=9, title="feat: add widget")],
+        worktree_status="?? knowledge/lessons/2026-07-26-fake.md\n",
+    )
+    res = run_once(cfg, repo_dir=str(tmp_path), dry_run=False,
+                   runner=incomplete, ai_runner=incomplete, iteration=34)
+    assert res.failure_class == "guard_incomplete"
+    assert "failure:guard_incomplete" in _labels_added(incomplete)
+    assert trajectory.load(tmp_path, "34").guards["completeness"] == "knowledge-only diff"
+
+    no_repro = FakeRunner(repo_root=str(tmp_path), ci_sequence=[False, True])
+    res = run_once(cfg, repo_dir=str(tmp_path), dry_run=False,
+                   runner=no_repro, ai_runner=no_repro, iteration=35)
+    assert res.kind == HEAL and res.failure_class == "guard_no_repro"
+    assert "failure:guard_no_repro" in _labels_added(no_repro)
+    assert trajectory.load(tmp_path, "35").guards["repro"]
+
+
+def test_an_agent_timeout_escalates_instead_of_retrying_identically(tmp_path):
+    """proc.run renders an expired subprocess as 'timeout after <n>s'."""
+    cfg = load_config()
+
+    class TimingOutRunner(FakeRunner):
+        def _dispatch(self, cmd, cwd=None):
+            if cmd[:1] == ["claude"]:
+                return Proc(cmd, 124, "", f"timeout after {cfg.agent_timeout}s")
+            return super()._dispatch(cmd, cwd)
+
+    runner = TimingOutRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[dict(WIDGET_ISSUE)], remote_ci="FAILURE",
+    )
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=36,
+    )
+
+    # A killed agent also exits non-zero; the specific cause wins.
+    assert result.failure_class == "timeout"
+    assert result.retry_action == "escalate_timeout"
+    added = _labels_added(runner)
+    assert "failure:timeout" in added and "escalate:timeout" in added
+
+
+def test_an_escalated_ticket_gets_a_doubled_agent_timeout(tmp_path):
+    cfg = load_config()
+    issue = dict(
+        WIDGET_ISSUE,
+        labels=[{"name": "priority:P2"}, {"name": "escalate:timeout"},
+                {"name": "attempts:1"}],
+    )
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[issue]
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=37,
+    )
+
+    assert result.merged is True
+    assert any("escalated agent timeout" in n for n in result.notes)
+
+
+def test_the_merge_gate_is_untouched_by_the_taxonomy(tmp_path):
+    """Whatever the failure class, a PR whose remote CI is not SUCCESS never merges."""
+    cfg = load_config()
+    for i, (seq, ruff, status) in enumerate(
+        [
+            ([True, False], None, ""),                       # lint
+            ([True, False], [True, True], ""),               # test_failure
+            ([True, True], None, ""),                        # remote_infra
+        ]
+    ):
+        root = tmp_path / f"case{i}"
+        root.mkdir()
+        runner = FakeRunner(
+            repo_root=str(root), ci_sequence=seq, ruff_sequence=ruff,
+            open_issues=[dict(WIDGET_ISSUE)], worktree_status=status,
+            remote_ci="FAILURE",
+        )
+        result = run_once(
+            cfg, repo_dir=str(root), dry_run=False,
+            runner=runner, ai_runner=runner, iteration=40 + i,
+        )
+
+        assert result.remote == "FAILURE"
+        assert result.merged is False
+        assert result.failure_class in {"lint", "test_failure", "remote_infra"}
+        # The only call that could merge is never made.
+        assert not any(c[:3] == ["gh", "pr", "merge"] for c in runner.calls)
+        assert any(c[:3] == ["gh", "pr", "close"] for c in runner.calls)
+
+
+def test_a_retry_prompt_quotes_the_previous_attempts_failure(tmp_path):
+    """End to end: pytest fails, then the SECOND worker is told exactly that."""
+    cfg = load_config()
+
+    # --- attempt 1: green ruff, red pytest, red remote --------------------
+    first = FakeRunner(
+        repo_root=str(tmp_path), open_issues=[dict(WIDGET_ISSUE)],
+        ci_sequence=[True, False], ruff_sequence=[True, True], remote_ci="FAILURE",
+    )
+    res1 = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=first, ai_runner=first, iteration=51,
+    )
+    assert res1.failure_class == "test_failure"
+    assert "## Previous attempt failed" not in _agent_prompts(first)[0]
+
+    # --- attempt 2: the ticket comes back labelled by the recovery --------
+    retried = dict(
+        WIDGET_ISSUE,
+        labels=[{"name": "priority:P2"}, {"name": "attempts:1"},
+                {"name": "failure:test_failure"}],
+    )
+    second = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[retried]
+    )
+    res2 = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=second, ai_runner=second, iteration=52,
+    )
+
+    assert res2.ticket == 7 and res2.merged is True
+    prompt = _agent_prompts(second)[0]
+
+    assert orchestrator.PREVIOUS_ATTEMPT_HEADER in prompt
+    assert "failure class: `test_failure`" in prompt
+    assert "local CI red: after:pytest" in prompt
+    assert "remote CI: FAILURE" in prompt
+    assert "add widget" in prompt                 # still the ticket's own prompt
+    # Bounded: the excerpt cannot crowd out the ticket it is meant to support.
+    excerpt = prompt.split(orchestrator.PREVIOUS_ATTEMPT_HEADER, 1)[1]
+    assert len(excerpt) <= trajectory.REMEDIATION_CHARS + 500
+    assert any("retry: informed by trajectory 51" in n for n in res2.notes)
+
+
+def test_the_first_attempt_carries_no_remediation_section(tmp_path):
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[dict(WIDGET_ISSUE)]
+    )
+    run_once(cfg, repo_dir=str(tmp_path), dry_run=False,
+             runner=runner, ai_runner=runner, iteration=53)
+    assert orchestrator.PREVIOUS_ATTEMPT_HEADER not in _agent_prompts(runner)[0]
+
+
+def test_failure_classes_reach_the_block_aggregate(tmp_path):
+    """What the review brief and the whitepaper render is built from here."""
+    cfg = load_config()
+    path = ledger.ledger_path(cfg, tmp_path)
+    for i, (outcome, cls) in enumerate(
+        [("merged", ""), ("recovered", "test_failure"),
+         ("workflow_tamper", "workflow_tamper"), ("recovered", "test_failure")]
+    ):
+        ledger.append_record(path, ledger.LedgerRecord(
+            iteration=i, block=3, ticket=1, kind=IMPLEMENT, tier="standard",
+            model="sonnet", wall_clock_seconds=1.0, attempts=1,
+            outcome=outcome, failure_class=cls,
+        ))
+
+    agg = ledger.aggregate_block(ledger.read_records(path), block=3)
+    assert agg.failure_counts == {"test_failure": 2, "workflow_tamper": 1}
+    assert agg.failed_iterations == 3
+    assert agg.merged_iterations == 1
+    assert "failures[test_failure=2, workflow_tamper=1]" in agg.summary()
+
+    table = agg.failure_table()
+    assert "| `test_failure` | 2 |" in table
+    assert "| `workflow_tamper` | 1 |" in table
 
 
 def test_malformed_ticket_is_refused_and_labeled(tmp_path):

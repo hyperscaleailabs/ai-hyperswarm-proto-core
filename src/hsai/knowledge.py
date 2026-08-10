@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 
 from .config import CoreConfig
+from .failures import render_taxonomy_table
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _TAG_RE = re.compile(r"^\s*-\s+(\S.*)$", re.MULTILINE)
@@ -179,9 +181,16 @@ class KnowledgeBase:
             sections[heading] = body.strip()
         return sections
 
-    def synthesize_whitepaper(self, n: int | None = None) -> Whitepaper:
+    def synthesize_whitepaper(
+        self, n: int | None = None, failure_counts: Mapping[str, int] | None = None
+    ) -> Whitepaper:
         """Synthesize a whitepaper by grouping the last `n` lessons by outcome/kind
         and surfacing themes that recur across more than one of them.
+
+        ``failure_counts`` comes from the block's ledger aggregate
+        (:attr:`hsai.ledger.BlockAggregate.failure_counts`). Rendering the
+        taxonomy here means a recurring failure mode is visible in the durable
+        knowledge artifact, not only in the review issue that scrolls away.
         """
         window = n if n is not None else self.whitepaper_every
         all_lessons = self.read_lessons()
@@ -232,6 +241,12 @@ class KnowledgeBase:
 
 ## Recurring failures
 {failure_lines}
+
+## Failure taxonomy
+Classes attributed by `hsai.failures.classify` across this block's iterations;
+each one routes its own retry via `retry_policy` in `.ai-swarm/core.yaml`.
+
+{render_taxonomy_table(failure_counts)}
 
 ## Recurring themes
 {theme_lines}"""

@@ -25,11 +25,12 @@ from __future__ import annotations
 
 import json
 import threading
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import CoreConfig
+from .failures import render_taxonomy_table
 
 # Budget-gate statuses.
 OK = "ok"
@@ -64,6 +65,10 @@ class LedgerRecord:
     outcome: str
     input_tokens: int | None = None
     output_tokens: int | None = None
+    # Why this iteration failed, per :mod:`hsai.failures` ("" when it did not).
+    # Carried here so the block aggregate - and therefore the review brief and
+    # the whitepaper - can report failure modes without re-reading trajectories.
+    failure_class: str = ""
     created: str = field(default_factory=_now)
 
     def to_json(self) -> str:
@@ -93,11 +98,15 @@ def read_records(path: str | Path) -> list[LedgerRecord]:
     if not path.exists():
         return []
     records: list[LedgerRecord] = []
+    known = {f.name for f in fields(LedgerRecord)}
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
             continue
-        records.append(LedgerRecord(**json.loads(line)))
+        # Append-only means the file outlives the schema: ignore columns a
+        # later hsai added, and let removed ones fall back to their defaults.
+        data = json.loads(line)
+        records.append(LedgerRecord(**{k: v for k, v in data.items() if k in known}))
     return records
 
 
@@ -145,10 +154,19 @@ class BlockAggregate:
     input_tokens: int = 0
     output_tokens: int = 0
     tier_counts: dict[str, int] = field(default_factory=dict)
+    failure_counts: dict[str, int] = field(default_factory=dict)
 
     @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
+
+    @property
+    def failed_iterations(self) -> int:
+        return sum(self.failure_counts.values())
+
+    def failure_table(self) -> str:
+        """The block's failure taxonomy as a markdown table."""
+        return render_taxonomy_table(self.failure_counts)
 
     def tokens_per_merged_pr(self) -> float | None:
         """Quota spent per unit of delivered work - the block's efficiency.
@@ -162,12 +180,16 @@ class BlockAggregate:
 
     def summary(self) -> str:
         tiers = ", ".join(f"{t}={self.tier_counts[t]}" for t in sorted(self.tier_counts))
+        fails = ", ".join(
+            f"{c}={self.failure_counts[c]}" for c in sorted(self.failure_counts)
+        )
         toks = self.total_tokens
         per_pr = self.tokens_per_merged_pr()
         return (
             f"{self.iterations} iterations, heavy-tier={self.heavy_iterations}, "
             f"{self.total_seconds:.0f}s wall-clock, {self.total_attempts} attempts"
             + (f", tiers[{tiers}]" if tiers else "")
+            + (f", failures[{fails}]" if fails else "")
             + (f", {toks} tokens" if toks else "")
             + (f", {per_pr:.0f} tokens/merged PR" if per_pr else "")
         )
@@ -187,6 +209,10 @@ def aggregate_block(records: list[LedgerRecord], block: int) -> BlockAggregate:
             agg.heavy_iterations += 1
         if r.outcome == "merged":
             agg.merged_iterations += 1
+        if r.failure_class:
+            agg.failure_counts[r.failure_class] = (
+                agg.failure_counts.get(r.failure_class, 0) + 1
+            )
         agg.input_tokens += r.input_tokens or 0
         agg.output_tokens += r.output_tokens or 0
     agg.total_seconds = round(agg.total_seconds, 3)
