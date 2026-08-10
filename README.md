@@ -71,6 +71,7 @@ hsai loop          # one real iteration (opens & merges a PR on green)
 hsai loop --max-parallel 3 -n 1   # ramp to the swarm (after proving one iteration)
 hsai traj 12       # print what agent run (iteration) 12 did (spends no quota)
 hsai cycle --resume   # finish an interrupted governance block, replaying what completed
+hsai gc --dry-run  # preview orphaned worktrees/branches; drop --dry-run to reclaim them
 ```
 
 Every agent run persists a **trajectory** - prompt, step stream, exit status,

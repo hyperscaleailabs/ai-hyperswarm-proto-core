@@ -49,3 +49,25 @@ def test_ramp_config():
     assert cfg.proven_at == 1
     assert cfg.ramp_target == 3
     assert cfg.max_parallel >= 1
+
+
+def test_ci_backoff_settings():
+    cfg = load_config()
+    # the ceiling must be at least the base timeout, or requeue could trigger
+    # before a slow-but-healthy build ever gets a fair chance
+    assert cfg.ci_remote_max_timeout >= cfg.ci_remote_timeout
+    assert cfg.ci_poll_backoff_factor > 1.0
+
+
+def test_ci_backoff_defaults_when_keys_absent(tmp_path):
+    core = tmp_path / ".ai-swarm"
+    core.mkdir()
+    (core / "core.yaml").write_text(
+        "identity:\n  owner: someone\n"
+        "models:\n  tiers:\n    standard:\n      model: sonnet\n"
+        "  default_tier: standard\n"
+    )
+    cfg = load_config(core / "core.yaml")
+    assert cfg.ci_remote_timeout == 300
+    assert cfg.ci_remote_max_timeout == 900
+    assert cfg.ci_poll_backoff_factor == 2.0

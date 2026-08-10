@@ -92,9 +92,13 @@ execution:
                                  # to drop the flag if a CLI change ever breaks it.
   trajectory_retention_blocks: 8 # how many blocks of .hsai/traj/ to keep (0 = keep all)
   agent_timeout_seconds: 1200    # hard cap per claude -p worker so a hang cannot stall the loop
-  ci_remote_timeout_seconds: 300 # how long to wait for a PR's remote CI to conclude
-  ci_poll_interval_seconds: 10   # poll cadence while waiting for remote CI
-  max_ticket_attempts: 2         # retries before a ticket is marked 'blocked' for humans
+  ci_remote_timeout_seconds: 300      # base wait for a PR's remote CI to conclude
+  ci_remote_max_timeout_seconds: 900  # hard ceiling after exponential backoff; a build
+                                      # still unresolved here is requeued (TIMEOUT), never
+                                      # scored as a failure - see hsai.ci.disposition
+  ci_poll_interval_seconds: 10        # starting poll cadence while waiting for remote CI
+  ci_poll_backoff_factor: 2.0         # exponential backoff multiplier once checks are running
+  max_ticket_attempts: 2              # retries before a ticket is marked 'blocked' for humans
 
 # Model-size selection is a first-class, LEARNED capability (see backlog).
 # The orchestrator picks a tier per task; tiers map to `claude --model` aliases.

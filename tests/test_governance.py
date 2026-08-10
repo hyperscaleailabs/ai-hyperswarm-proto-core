@@ -58,6 +58,26 @@ def test_brief_links_everything(tmp_path):
     assert "/review-next" in body
 
 
+def test_brief_lists_requeued_prs_separately_from_merged_and_recovered():
+    cfg = load_config()
+    report = BlockReport(
+        cycle_index=7, merged_prs=[40], recovered_prs=[41], requeued_prs=[42],
+    )
+    body = render_brief(cfg, report)
+    assert "## PRs requeued (remote CI still unresolved)" in body
+    assert "pull/42" in body
+    assert "no attempt charged" in body
+    # requeued PRs never show up under merged or recovered
+    merged_section = body.split("## PRs merged")[1].split("## PRs recovered")[0]
+    assert "pull/42" not in merged_section
+
+
+def test_brief_requeued_section_says_none_when_empty():
+    cfg = load_config()
+    body = render_brief(cfg, BlockReport(cycle_index=7))
+    assert "## PRs requeued (remote CI still unresolved)\n_none_" in body
+
+
 def test_preserved_notes_default_when_missing(tmp_path):
     assert "never overwritten" in preserved_notes(tmp_path / "nope.md")
 

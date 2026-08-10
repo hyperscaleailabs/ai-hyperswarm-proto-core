@@ -146,6 +146,7 @@ class IterationResult:
     merged: bool = False
     remote: str = ""
     recovered: bool = False
+    requeued: bool = False
     lesson_path: str = ""
     notes: list[str] = field(default_factory=list)
 
@@ -159,6 +160,7 @@ class IterationResult:
             f"remote={self.remote or '-'}",
             f"merged={self.merged}",
             f"recovered={self.recovered}",
+            f"requeued={self.requeued}",
         ]
         return "iteration(" + ", ".join(parts) + ")"
 
@@ -248,6 +250,43 @@ def run_once(
     else:
         wt = repo_dir
 
+    try:
+        return _run_once_in_worktree(
+            cfg, repo=repo, login=login, started=started, branch=branch, wt=wt,
+            repo_dir=repo_dir, dry_run=dry_run, runner=runner, ai_runner=ai_runner,
+            iteration=iteration, demote_tier=demote_tier,
+        )
+    finally:
+        # Cleanup runs on EVERY exit path - including an exception raised
+        # anywhere below - so a crashed iteration never leaks a worktree. A
+        # dry run never created one (`wt` is just `repo_dir`), so it must
+        # never be "removed".
+        if not dry_run:
+            gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
+
+
+def _run_once_in_worktree(
+    cfg: CoreConfig,
+    *,
+    repo: str,
+    login: str,
+    started: float,
+    branch: str,
+    wt: str,
+    repo_dir: str,
+    dry_run: bool,
+    runner: Runner,
+    ai_runner: Runner,
+    iteration: int,
+    demote_tier: bool,
+) -> IterationResult:
+    """The body of one iteration, once its worktree exists.
+
+    Split out of :func:`run_once` so that function's ``try/finally`` covers
+    every line of real work - every ``return`` in here (guard rejections,
+    dry-run, the final merge/recover/requeue) still runs the caller's
+    worktree cleanup, and so does an uncaught exception.
+    """
     # 2. CI check (skipped in dry-run so we never recurse into a real build)
     ci_before = (
         ci.run_local(cwd=wt, runner=runner)
@@ -325,7 +364,6 @@ def run_once(
     if idle_reason:
         res = IterationResult(kind=kind, ci_before=ci_before.ok)
         res.notes.append(idle_reason)
-        gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
         return res
 
     # 4. model selection (recorded for audit); a soft budget breach biases it
@@ -426,7 +464,6 @@ def run_once(
                 )
                 result.recovered = True
                 _record_cost("incomplete")
-                gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
                 return result
 
         # Reproduce-before-fix guard: heal/bugfix tickets must add or modify a
@@ -453,7 +490,6 @@ def run_once(
                 )
                 result.recovered = True
                 _record_cost("no_repro")
-                gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
                 return result
 
     # 6. re-check CI
@@ -539,10 +575,14 @@ def run_once(
     # 12. Poll the REAL (remote) CI to conclusion BEFORE relying on auto-merge -
     # it is the source of truth for whether the change may merge, and arming
     # auto-merge first (as opposed to gating on this poll) raced GitHub's own
-    # merge against our recovery bookkeeping.
+    # merge against our recovery bookkeeping. Bounded exponential backoff means
+    # a slow-but-healthy build is not hammered with polls, and TIMEOUT is only
+    # returned once the checks are still genuinely unresolved at the ceiling.
     remote = ci.wait_remote(
         pr_num, repo,
-        timeout=cfg.ci_remote_timeout, interval=cfg.ci_poll_interval, runner=runner,
+        timeout=cfg.ci_remote_timeout, max_timeout=cfg.ci_remote_max_timeout,
+        interval=cfg.ci_poll_interval, backoff_factor=cfg.ci_poll_backoff_factor,
+        runner=runner,
     )
     result.remote = remote
     result.notes.append(f"remote CI={remote}")
@@ -557,23 +597,80 @@ def run_once(
     )
     gitops.push_branch(branch, cwd=wt, runner=runner)
 
-    if remote == ci.SUCCESS:
+    # The disposition is the ONLY thing allowed to decide whether a PR merges:
+    # `ci.disposition` merges on SUCCESS and nothing else, so a PENDING or any
+    # other stray rollup value can never slip through as a merge.
+    disp = ci.disposition(remote)
+    if disp.should_merge:
         github.merge_pr(repo, pr_num, auto=True, runner=runner)
         result.merged = True
+        final_outcome = "merged"
+    elif disp.action == ci.REQUEUE:
+        # Remote CI never resolved within the backoff ceiling - that is
+        # infrastructure latency, not a verdict on the model's work. Leave the
+        # PR open and the branch intact so it can still go green, and return
+        # the ticket to the backlog WITHOUT charging an attempt.
+        _requeue(repo, ticket_num, login=login, runner=runner)
+        result.requeued = True
+        result.notes.append(
+            "requeued: remote CI timed out; PR left open, branch kept, "
+            "no attempt charged"
+        )
+        final_outcome = "timeout"
     else:
-        result.merged = False
         _recover_failed(
             cfg, repo, pr_num, kind=kind, ticket_num=ticket_num,
             claimed_issue=claimed_issue, login=login, remote=remote, runner=runner,
         )
         result.recovered = True
         result.notes.append("recovered: closed PR, returned ticket to backlog")
+        final_outcome = "recovered"
 
-    _record_cost("merged" if result.merged else "recovered")
-
-    # 13. cleanup worktree
-    gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
+    _record_cost(final_outcome)
     return result
+
+
+def _close_recovered_pr(
+    repo: str, pr_num: int, *, remote: str, runner: Runner
+) -> None:
+    """Close a PR that did not go green, deleting its now-dead branch."""
+    if pr_num:
+        github.close_pr(
+            repo, pr_num,
+            comment=f"Remote CI concluded {remote}; closing per retry policy.",
+            delete_branch=True, runner=runner,
+        )
+
+
+def _bump_attempts(
+    cfg: CoreConfig,
+    repo: str,
+    ticket_num: int | None,
+    *,
+    claimed_issue: github.Issue | None,
+    login: str,
+    runner: Runner,
+) -> None:
+    """Consume one retry attempt, blocking the ticket once they're exhausted."""
+    if not ticket_num:
+        return
+    issue = claimed_issue or github.get_issue(repo, ticket_num, runner=runner)
+    prior = issue.attempts() if issue else 0
+    nxt = prior + 1
+
+    if nxt >= cfg.max_ticket_attempts:
+        github.edit_labels(
+            repo, ticket_num, add=["blocked"], remove=[f"attempts:{prior}"] if prior else None,
+            runner=runner,
+        )
+    else:
+        github.edit_labels(
+            repo, ticket_num,
+            add=[f"attempts:{nxt}"], remove=[f"attempts:{prior}"] if prior else None,
+            runner=runner,
+        )
+    # Leave it unassigned either way so no worker keeps holding it.
+    github.unassign(repo, ticket_num, login, runner=runner)
 
 
 def _recover_failed(
@@ -590,34 +687,18 @@ def _recover_failed(
 ) -> None:
     """A PR did not go green (or never got one): close it, and either return the
     ticket to the backlog for another attempt or mark it ``blocked``."""
-    if pr_num:
-        github.close_pr(
-            repo, pr_num,
-            comment=f"Remote CI concluded {remote}; closing per retry policy.",
-            delete_branch=True, runner=runner,
-        )
+    _close_recovered_pr(repo, pr_num, remote=remote, runner=runner)
+    _bump_attempts(cfg, repo, ticket_num, claimed_issue=claimed_issue, login=login, runner=runner)
+
+
+def _requeue(repo: str, ticket_num: int | None, *, login: str, runner: Runner) -> None:
+    """Remote CI timed out: return the ticket to the backlog untouched - no
+    attempt charged, no label change beyond the assignment itself. The PR and
+    its branch are left exactly as they are; only :func:`_recover_failed`
+    closes a PR and deletes a branch."""
     if not ticket_num:
         return
-
-    # Determine how many attempts this ticket has already had.
-    issue = claimed_issue or github.get_issue(repo, ticket_num, runner=runner)
-    prior = issue.attempts() if issue else 0
-    nxt = prior + 1
-
-    if nxt >= cfg.max_ticket_attempts:
-        github.edit_labels(
-            repo, ticket_num, add=["blocked"], remove=[f"attempts:{prior}"] if prior else None,
-            runner=runner,
-        )
-        # Leave it unassigned but blocked so no worker retries it.
-        github.unassign(repo, ticket_num, login, runner=runner)
-    else:
-        github.edit_labels(
-            repo, ticket_num,
-            add=[f"attempts:{nxt}"], remove=[f"attempts:{prior}"] if prior else None,
-            runner=runner,
-        )
-        github.unassign(repo, ticket_num, login, runner=runner)
+    github.unassign(repo, ticket_num, login, runner=runner)
 
 
 def run_loop(

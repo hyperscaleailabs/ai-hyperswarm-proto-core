@@ -7,6 +7,7 @@ Commands:
   hsai cycle [--cycle-index N] [--resume] [--dry-run]          one governance block
   hsai reindex                                                 rebuild knowledge MOCs
   hsai doctor                                                  verify environment + invariants
+  hsai gc [--dry-run] [--older-than HOURS]                     reclaim orphaned worktrees/branches
   hsai traj <iteration> [--json]                               print a stored agent run
   hsai replay <iteration> [--json]                             alias of `hsai traj`
 """
@@ -15,8 +16,9 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 
-from . import __version__, ai, repro, trajectory
+from . import __version__, ai, gc, repro, trajectory
 from .config import CoreConfig, load_config, validate
 from .knowledge import KnowledgeBase
 from .orchestrator import run_loop
@@ -171,6 +173,31 @@ def cmd_run_once(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_gc(args: argparse.Namespace) -> int:
+    """Reclaim registered-but-stale worktrees and their local branches.
+
+    Defaults to acting; ``--dry-run`` previews the exact same plan without
+    calling :func:`hsai.gc.apply_gc`, so it is always safe to run first.
+    """
+    cfg = _load(args)
+    plan = gc.plan_gc(
+        cfg, older_than_seconds=args.older_than * 3600.0, now=time.time(), cwd=".",
+    )
+    verb = "would remove" if args.dry_run else "removing"
+    for path in plan.stale_worktrees:
+        print(f"{verb} worktree {path}")
+    verb = "would delete" if args.dry_run else "deleting"
+    for branch in plan.removable_branches:
+        print(f"{verb} branch {branch}")
+    for branch in plan.kept_branches:
+        print(f"keeping branch {branch} (stale worktree, but has an open PR and isn't merged)")
+    if not plan.stale_worktrees:
+        print("nothing to reclaim")
+    elif not args.dry_run:
+        gc.apply_gc(plan, cwd=".")
+    return 0
+
+
 def cmd_loop(args: argparse.Namespace) -> int:
     cfg = _load(args)
     workers = args.max_parallel if args.max_parallel is not None else 1
@@ -211,6 +238,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     ri = sub.add_parser("reindex", help="rebuild knowledge-base MOCs")
     ri.set_defaults(func=cmd_reindex)
+
+    gc_p = sub.add_parser(
+        "gc", help="reclaim orphaned worktrees and their stale local branches"
+    )
+    gc_p.add_argument(
+        "--dry-run", action="store_true",
+        help="report what would be removed without changing anything",
+    )
+    gc_p.add_argument(
+        "--older-than", type=float, default=2.0, metavar="HOURS",
+        help="only touch worktrees at least this many hours old (default: 2.0)",
+    )
+    gc_p.set_defaults(func=cmd_gc)
 
     cy = sub.add_parser("cycle", help="run one half-day governance block")
     cy.add_argument("--index", "--cycle-index", dest="index", type=int, default=None,
