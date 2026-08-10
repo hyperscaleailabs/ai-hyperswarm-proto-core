@@ -198,3 +198,73 @@ def test_replay_unknown_id_exits_nonzero(tmp_path, monkeypatch, capsys):
     rc = main(["replay", "999", "--root", str(tmp_path)])
     assert rc == 1
     assert "no trajectory" in capsys.readouterr().err
+
+
+# --- gc (reclaim orphaned worktrees/branches) --------------------------------
+
+def test_parser_gc_defaults():
+    parser = build_parser()
+    args = parser.parse_args(["gc"])
+    assert args.dry_run is False
+    assert args.older_than == 2.0
+
+    args = parser.parse_args(["gc", "--dry-run", "--older-than", "6"])
+    assert args.dry_run is True
+    assert args.older_than == 6.0
+
+
+def test_gc_dry_run_lists_the_plan_and_changes_nothing(monkeypatch, capsys):
+    from hsai.gc import GcPlan
+
+    plan = GcPlan(
+        stale_worktrees=["/repo/.hsai/worktrees/hsai/iter-old"],
+        removable_branches=["hsai/iter-old"],
+        kept_branches=["hsai/iter-kept"],
+    )
+    monkeypatch.setattr(cli_module.gc, "plan_gc", lambda *a, **k: plan)
+    applied = []
+    monkeypatch.setattr(cli_module.gc, "apply_gc", lambda *a, **k: applied.append(a))
+
+    rc = main(["gc", "--dry-run"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "would remove worktree /repo/.hsai/worktrees/hsai/iter-old" in out
+    assert "would delete branch hsai/iter-old" in out
+    assert "keeping branch hsai/iter-kept" in out
+    assert applied == []  # dry-run never calls apply_gc
+
+
+def test_gc_without_dry_run_applies_the_plan(monkeypatch, capsys):
+    from hsai.gc import GcPlan
+
+    plan = GcPlan(
+        stale_worktrees=["/repo/.hsai/worktrees/hsai/iter-old"],
+        removable_branches=["hsai/iter-old"],
+    )
+    monkeypatch.setattr(cli_module.gc, "plan_gc", lambda *a, **k: plan)
+    applied = []
+    monkeypatch.setattr(cli_module.gc, "apply_gc", lambda p, **k: applied.append(p))
+
+    rc = main(["gc"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "removing worktree /repo/.hsai/worktrees/hsai/iter-old" in out
+    assert "deleting branch hsai/iter-old" in out
+    assert applied == [plan]
+
+
+def test_gc_reports_nothing_to_reclaim_when_plan_is_empty(monkeypatch, capsys):
+    from hsai.gc import GcPlan
+
+    monkeypatch.setattr(cli_module.gc, "plan_gc", lambda *a, **k: GcPlan())
+    applied = []
+    monkeypatch.setattr(cli_module.gc, "apply_gc", lambda *a, **k: applied.append(a))
+
+    rc = main(["gc"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "nothing to reclaim" in out
+    assert applied == []

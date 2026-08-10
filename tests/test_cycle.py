@@ -22,6 +22,7 @@ import pytest
 
 from hsai import cycle, github, journal, ledger, trajectory
 from hsai.config import load_config
+from hsai.governance import BlockReport
 from hsai.knowledge import KnowledgeBase, Lesson
 from hsai.orchestrator import IterationResult
 from hsai.proc import Proc
@@ -131,6 +132,40 @@ def test_block_soft_biases_then_hard_halts_but_inflight_merges(tmp_path, monkeyp
     assert len(lines) == 3
     for line in lines:
         json.loads(line)
+
+
+def test_implementation_block_routes_requeued_iterations_separately(tmp_path, monkeypatch):
+    """A requeued (TIMEOUT) iteration lands in `requeued_prs`, never merged or
+    recovered - block economics must not blame the model for infra latency."""
+    cfg = load_config()
+    cfg.cycle["block_size"] = 1
+    ledger_file = ledger.ledger_path(cfg, tmp_path)
+    report = BlockReport(cycle_index=1)
+
+    def fake_run_once(cfg, *, repo_dir, runner, ai_runner, iteration, demote_tier=False,
+                       dry_run=False):
+        ledger.append_record(
+            ledger_file,
+            ledger.LedgerRecord(
+                iteration=iteration, block=1, ticket=iteration, kind="implement",
+                tier="standard", model="sonnet", wall_clock_seconds=1.0, attempts=1,
+                outcome="timeout",
+            ),
+        )
+        return IterationResult(kind="implement", ticket=iteration, pr=600, requeued=True)
+
+    monkeypatch.setattr(cycle, "run_once", fake_run_once)
+
+    cycle._implementation_block(
+        cfg, report, None, idx=1, repo_root=tmp_path, ledger_file=ledger_file,
+        runner=lambda *a, **k: Proc([], 0, "", ""),
+        ai_runner=lambda *a, **k: Proc([], 0, "", ""),
+        dry_run=False,
+    )
+
+    assert report.requeued_prs == [600]
+    assert report.merged_prs == []
+    assert report.recovered_prs == []
 
 
 # --- plain-text agent output must not break article generation --------------

@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from hsai import ledger, orchestrator, trajectory
+from hsai import ci, ledger, orchestrator, trajectory
 from hsai.config import load_config
 from hsai.models import ModelChoice
 from hsai.orchestrator import (
@@ -506,6 +506,110 @@ def test_run_once_recovers_when_remote_ci_fails(tmp_path):
     )
     # retry counter bumped (attempts:1, below max_ticket_attempts=2)
     assert any("attempts:1" in c for c in runner.calls)
+
+
+@pytest.mark.parametrize("remote_value", [ci.TIMEOUT, ci.FAILURE, ci.PENDING])
+def test_run_once_never_merges_unless_remote_ci_is_success(tmp_path, monkeypatch, remote_value):
+    """No code path may merge a PR whose remote CI is anything but SUCCESS -
+    drive TIMEOUT, FAILURE and PENDING (a defensive case `wait_remote` itself
+    never produces) straight through `run_once` via the disposition gate."""
+    cfg = load_config()
+    open_issues = [
+        {
+            "number": 7,
+            "title": "add widget",
+            "labels": [{"name": "priority:P2"}],
+            "assignees": [],
+            "body": WELL_FORMED_BODY,
+        }
+    ]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+    )
+    monkeypatch.setattr(orchestrator.ci, "wait_remote", lambda *a, **k: remote_value)
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.remote == remote_value
+    assert result.merged is False
+    assert not any(c[:3] == ["gh", "pr", "merge"] for c in runner.calls)
+
+
+def test_run_once_timeout_requeues_without_closing_pr_or_charging_an_attempt(
+    tmp_path, monkeypatch
+):
+    cfg = load_config()
+    open_issues = [
+        {
+            "number": 7,
+            "title": "add widget",
+            "labels": [{"name": "priority:P2"}],
+            "assignees": [],
+            "body": WELL_FORMED_BODY,
+        }
+    ]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+    )
+    monkeypatch.setattr(orchestrator.ci, "wait_remote", lambda *a, **k: ci.TIMEOUT)
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.remote == ci.TIMEOUT
+    assert result.merged is False
+    assert result.requeued is True
+    assert result.recovered is False
+
+    # the PR is never closed and the branch is never deleted
+    assert not any(c[:3] == ["gh", "pr", "close"] for c in runner.calls)
+
+    # the ticket is unassigned (back on the backlog)...
+    assert any(
+        c[:3] == ["gh", "issue", "edit"] and "--remove-assignee" in c for c in runner.calls
+    )
+    # ...but no attempt was charged: no attempts:N or blocked label anywhere
+    assert not any(
+        tok.startswith("attempts:") or tok == "blocked" for c in runner.calls for tok in c
+    )
+
+    records = ledger.read_records(ledger.ledger_path(cfg, tmp_path))
+    assert records[-1].outcome == "timeout"
+
+
+def test_worktree_is_removed_even_when_the_agent_call_raises(tmp_path, monkeypatch):
+    cfg = load_config()
+    open_issues = [
+        {
+            "number": 7,
+            "title": "add widget",
+            "labels": [{"name": "priority:P2"}],
+            "assignees": [],
+            "body": WELL_FORMED_BODY,
+        }
+    ]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+    )
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("agent crashed mid-run")
+
+    monkeypatch.setattr(orchestrator.ai, "run_agent", boom)
+
+    with pytest.raises(RuntimeError, match="agent crashed mid-run"):
+        run_once(
+            cfg, repo_dir=str(tmp_path), dry_run=False,
+            runner=runner, ai_runner=runner, iteration=1,
+        )
+
+    # the finally-block cleanup ran despite the exception propagating out
+    assert any(c[:3] == ["git", "worktree", "remove"] for c in runner.calls)
 
 
 def test_workflow_edits_are_reverted(tmp_path):

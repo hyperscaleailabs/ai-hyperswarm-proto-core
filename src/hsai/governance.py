@@ -42,6 +42,7 @@ class BlockReport:
     iterations: list[str] = field(default_factory=list)   # IterationResult.describe() lines
     merged_prs: list[int] = field(default_factory=list)
     recovered_prs: list[int] = field(default_factory=list)
+    requeued_prs: list[int] = field(default_factory=list)   # remote CI timed out; PR left open
     whitepaper: str = ""                                   # note name
     articles: list[str] = field(default_factory=list)      # file paths
     cost: BlockAggregate | None = None                     # quota-ledger aggregate
@@ -165,6 +166,10 @@ def render_brief(cfg: CoreConfig, report: BlockReport) -> str:
         f"- https://github.com/{repo}/pull/{n} (closed by retry policy)"
         for n in report.recovered_prs
     ) or "_none_"
+    requeued = "\n".join(
+        f"- https://github.com/{repo}/pull/{n} (remote CI timed out; left open, no attempt charged)"
+        for n in report.requeued_prs
+    ) or "_none_"
     paper = f"`knowledge/whitepapers/{report.whitepaper}.md`" if report.whitepaper else "_none_"
     articles = "\n".join(f"- `{a}`" for a in report.articles) or "_none_"
     cost = _cost_summary(report.cost)
@@ -186,6 +191,9 @@ sequentially, records your feedback as ADRs, and ends with a merged PR.
 
 ## PRs recovered (failed the gate)
 {recovered}
+
+## PRs requeued (remote CI still unresolved)
+{requeued}
 
 ## Cost this block (quota ledger)
 {cost}

@@ -45,6 +45,8 @@ class CoreConfig:
     trajectory_retention_blocks: int
     agent_timeout: float | None
     ci_remote_timeout: float
+    ci_remote_max_timeout: float
+    ci_poll_backoff_factor: float
     ci_poll_interval: float
     max_ticket_attempts: int
     tiers: dict[str, ModelTier]
@@ -136,6 +138,11 @@ def load_config(path: str | Path | None = None) -> CoreConfig:
         trajectory_retention_blocks=int(execution.get("trajectory_retention_blocks", 8)),
         agent_timeout=execution.get("agent_timeout_seconds"),
         ci_remote_timeout=float(execution.get("ci_remote_timeout_seconds", 300)),
+        # A conservative ceiling above the base timeout: `wait_remote` backs off
+        # exponentially between polls but never waits past this before
+        # returning TIMEOUT (requeued, never scored as a failure - see ci.py).
+        ci_remote_max_timeout=float(execution.get("ci_remote_max_timeout_seconds", 900)),
+        ci_poll_backoff_factor=float(execution.get("ci_poll_backoff_factor", 2.0)),
         ci_poll_interval=float(execution.get("ci_poll_interval_seconds", 10)),
         max_ticket_attempts=int(execution.get("max_ticket_attempts", 2)),
         tiers=tiers,
