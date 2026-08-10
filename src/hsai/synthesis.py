@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from . import github
 from .ai import run_agent
 from .config import CoreConfig
+from .knowledge import KnowledgeBase
 from .models import ModelChoice
 from .proc import Runner, run
 from .tickets import TicketSpec
@@ -86,7 +87,48 @@ def build_context_pack(
     return ContextPack(repos=repos, sections=sections)
 
 
-def build_prompt(cfg: CoreConfig, pack: ContextPack) -> str:
+TRIED_HEADING = "Already tried in this repo"
+
+
+def build_tried_digest(
+    cfg: CoreConfig,
+    *,
+    root: str = ".",
+    runner: Runner = run,
+    max_lessons: int = 25,
+) -> str:
+    """What this repo has already attempted: lessons (with outcomes) + open tickets.
+
+    Without it the planner keeps re-proposing ideas that were tried and failed,
+    because its only context is a freshly fetched digest of OTHER projects.
+    Failures are listed first - they are the ones worth not repeating.
+    """
+    lines: list[str] = []
+    try:
+        records = KnowledgeBase.from_config(cfg, root).read_lessons()
+    except OSError:
+        records = []
+    if records:
+        # Failures first, then by note name: a total, reproducible order.
+        window = sorted(
+            records[-max_lessons:], key=lambda r: (r.outcome != "fail", r.note_name)
+        )
+        lines.append("Lessons already recorded (outcome - title):")
+        lines.extend(f"- **{r.outcome}** - {r.title}" for r in window)
+
+    filed = [
+        i.title for i in github.list_open_issues(cfg.repo_slug, runner=runner)
+        if "self-improve" in i.labels
+    ]
+    if filed:
+        lines.append("")
+        lines.append("Synthesis tickets already filed and still open:")
+        lines.extend(f"- {t}" for t in sorted(set(filed)))
+
+    return "\n".join(lines) or "_(nothing recorded yet - this is an early cycle)_"
+
+
+def build_prompt(cfg: CoreConfig, pack: ContextPack, tried: str = "") -> str:
     goals = "\n".join(f"- {g.get('id')}: {g.get('title')} - {g.get('description', '')}"
                       for g in cfg.goals)
     ideas = int(cfg.synthesis.get("ideas_target", 10))
@@ -103,6 +145,11 @@ Project goals:
 
 Study digest of reference projects for this cycle:
 {pack.render()}
+
+{TRIED_HEADING} - this is our OWN history, not another project's. Do NOT
+re-propose an idea whose lesson is listed here, and never duplicate the title of
+a ticket that is still open; build on them instead:
+{tried or "_(nothing recorded yet - this is an early cycle)_"}
 
 Work in three explicit phases and show them all in your output:
 
@@ -169,12 +216,14 @@ def synthesize(
     cfg: CoreConfig,
     *,
     cycle_index: int = 0,
+    root: str = ".",
     runner: Runner = run,
     ai_runner: Runner = run,
 ) -> SynthesisResult:
     """Run one synthesis pass and file the resulting tickets."""
     repos = pick_rotation(cfg, cycle_index)
     pack = build_context_pack(repos, runner=runner)
+    tried = build_tried_digest(cfg, root=root, runner=runner)
     tier = cfg.synthesis.get("tier", "heavy")
     model = cfg.tiers[tier].model if tier in cfg.tiers else cfg.tiers[cfg.default_tier].model
     choice = ModelChoice(
@@ -183,7 +232,7 @@ def synthesize(
         strategy="synthesis-v1",
     )
     ares = run_agent(
-        build_prompt(cfg, pack), choice, cfg,
+        build_prompt(cfg, pack, tried), choice, cfg,
         timeout=float(cfg.synthesis.get("timeout_seconds", 2400)),
         runner=ai_runner,
     )

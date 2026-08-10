@@ -1,4 +1,12 @@
-from hsai.knowledge import KnowledgeBase, Lesson, LessonRecord, Whitepaper, slugify
+from hsai.knowledge import (
+    KnowledgeBase,
+    Lesson,
+    LessonRecord,
+    Whitepaper,
+    parse_note,
+    slugify,
+    split_sections,
+)
 
 
 def test_slugify():
@@ -99,6 +107,44 @@ def test_read_lessons_round_trips_written_lessons(tmp_path):
     assert r.kind == "implement"
     assert r.lesson_text == "small steps win"
     assert r.what_happened == "did the thing"
+
+
+def test_recalled_notes_are_written_as_a_frontmatter_list(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    lesson = Lesson(
+        title="implement: gate on remote CI",
+        outcome="pass",
+        kind="implement",
+        context="c",
+        what_happened="w",
+        lesson="l",
+        recalled=("2026-01-01-a", "2026-01-02-b"),
+    )
+    path = kb.write_lesson(lesson)
+    frontmatter = path.read_text().split("---\n")[1]
+    assert "recalled:\n  - 2026-01-01-a\n  - 2026-01-02-b\n" in frontmatter
+
+    # the recalled list is a SEPARATE key: it must not leak back in as a tag
+    record = parse_note(path)
+    assert record.tags == ("lesson", "outcome/pass", "kind/implement")
+    assert record.outcome == "pass" and record.kind == "implement"
+
+    # nothing recalled -> the key is absent entirely, so a run with recall
+    # disabled renders exactly as it did before recall existed
+    lesson.recalled = ()
+    assert "recalled" not in kb.write_lesson(lesson).read_text().split("---\n")[1]
+
+
+def test_parse_note_reads_any_vault_note_not_just_lessons(tmp_path):
+    path = tmp_path / "0007-some-adr.md"
+    path.write_text("# ADR-0007: Some decision\n\n## Decision\nDo the thing.\n")
+    record = parse_note(path)
+    assert record.note_name == "0007-some-adr"
+    assert record.title == "ADR-0007: Some decision"
+    # no outcome/kind tags on an ADR - they degrade, they do not crash
+    assert record.outcome == "unknown" and record.kind == "unknown"
+    assert record.body.startswith("# ADR-0007")
+    assert split_sections(record.body)["decision"] == "Do the thing."
 
 
 def test_synthesize_whitepaper_groups_outcomes_and_surfaces_recurring_failures(tmp_path):

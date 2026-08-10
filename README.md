@@ -45,7 +45,7 @@ The orchestrator picks a model *tier* per task - `light` (haiku) / `standard`
 (sonnet) / `heavy` (opus) - from complexity signals, and records the choice on
 the PR. Improving this heuristic is itself tracked as a backlog skill.
 
-## The knowledge base is an Obsidian vault
+## The knowledge base is an Obsidian vault - and an input, not just an output
 
 Clone the repo and **open the folder as an Obsidian vault** - the committed
 `.obsidian/` config and `[[wikilinks]]` give you a working graph immediately.
@@ -60,6 +60,22 @@ knowledge/
 
 `hsai reindex` rebuilds the MOCs from what is on disk.
 
+**The loop reads the vault back.** Before an agent starts, `hsai.recall` builds
+a BM25 index over `knowledge/lessons`, `knowledge/whitepapers` and `docs/adr`
+and injects the most relevant prior notes into the worker's prompt - failures
+first, and biased toward notes whose `kind/` matches the task at hand. The
+planner gets the same treatment: an *Already tried in this repo* digest so it
+stops re-proposing ideas that were tried and failed. Retrieval is
+deterministic, costs no quota, and adds no dependency; what it returned is
+recorded in the lesson's `recalled:` frontmatter and on the PR, so it stays
+auditable. Tune it under `knowledge.recall` in `.ai-swarm/core.yaml`
+(`enabled`, `k`, `max_chars`, `fail_weight`, `kind_weight`), or set
+`enabled: false` to restore the previous prompt exactly.
+
+```bash
+hsai recall "remote CI gate"       # what would a worker be shown for this task?
+```
+
 ## Quickstart
 
 ```bash
@@ -70,6 +86,7 @@ hsai loop --dry-run   # a full iteration with no side effects
 hsai loop          # one real iteration (opens & merges a PR on green)
 hsai loop --max-parallel 3 -n 1   # ramp to the swarm (after proving one iteration)
 hsai traj 12       # print what agent run (iteration) 12 did (spends no quota)
+hsai recall "knowledge-only diff on a code ticket"   # rank prior lessons for a task
 hsai cycle --resume   # finish an interrupted governance block, replaying what completed
 ```
 

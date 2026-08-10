@@ -64,6 +64,52 @@ def test_cycle_command_passes_resume_through(monkeypatch, capsys):
     assert "block 42 (resumed)" in out and "/tmp/j.jsonl" in out
 
 
+def test_parser_recall_defaults():
+    parser = build_parser()
+    args = parser.parse_args(["recall", "remote CI gate"])
+    assert args.command == "recall"
+    assert args.query == "remote CI gate"
+    assert args.k == 5 and args.kind == "" and args.root == "."
+
+
+def test_recall_command_prints_ranked_notes_with_scores(tmp_path, capsys):
+    lessons = tmp_path / "knowledge" / "lessons"
+    lessons.mkdir(parents=True)
+    (lessons / "2026-01-01-remote-ci-gate.md").write_text(
+        "---\ntags:\n  - lesson\n  - outcome/fail\n  - kind/implement\n---\n\n"
+        "# Remote CI gate\n\n## Lesson learned\nPoll the rollup before merging.\n"
+    )
+    (lessons / "2026-01-02-unrelated.md").write_text(
+        "---\ntags:\n  - lesson\n  - outcome/pass\n  - kind/improve\n---\n\n"
+        "# Obsidian layout\n\n## Lesson learned\nWikilinks make a graph.\n"
+    )
+
+    rc = main(["recall", "remote CI gate", "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "2026-01-01-remote-ci-gate" in out
+    assert "(fail/implement)" in out
+    # a score is printed alongside every name
+    first = out.splitlines()[0].split()
+    assert float(first[0]) > 0 and first[1] == "2026-01-01-remote-ci-gate"
+
+
+def test_recall_command_reports_an_empty_vault_without_crashing(tmp_path, capsys):
+    rc = main(["recall", "anything", "--root", str(tmp_path)])
+    assert rc == 1
+    assert "no indexable notes" in capsys.readouterr().err
+
+
+def test_recall_command_reports_a_miss(tmp_path, capsys):
+    lessons = tmp_path / "knowledge" / "lessons"
+    lessons.mkdir(parents=True)
+    (lessons / "n.md").write_text("# A note\n\n## Lesson learned\nSomething.\n")
+    rc = main(["recall", "zzzznomatch", "--root", str(tmp_path)])
+    assert rc == 1
+    assert "no match" in capsys.readouterr().err
+
+
 def test_parser_repro_check_defaults():
     parser = build_parser()
     args = parser.parse_args(["repro-check"])

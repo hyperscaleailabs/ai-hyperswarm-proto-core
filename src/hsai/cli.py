@@ -6,6 +6,7 @@ Commands:
   hsai status                                                  config + backlog snapshot
   hsai cycle [--cycle-index N] [--resume] [--dry-run]          one governance block
   hsai reindex                                                 rebuild knowledge MOCs
+  hsai recall "<query>" [--k N] [--kind K]                     rank prior lessons/ADRs
   hsai doctor                                                  verify environment + invariants
   hsai traj <iteration> [--json]                               print a stored agent run
   hsai replay <iteration> [--json]                             alias of `hsai traj`
@@ -16,7 +17,7 @@ import argparse
 import os
 import sys
 
-from . import __version__, ai, repro, trajectory
+from . import __version__, ai, recall, repro, trajectory
 from .config import CoreConfig, load_config, validate
 from .knowledge import KnowledgeBase
 from .orchestrator import run_loop
@@ -76,6 +77,26 @@ def cmd_reindex(args: argparse.Namespace) -> int:
     written = kb.reindex_mocs()
     for p in written:
         print(f"reindexed {p}")
+    return 0
+
+
+def cmd_recall(args: argparse.Namespace) -> int:
+    """Spot-check what a worker would be shown for a given task.
+
+    Pure reading: builds the BM25 index over knowledge/ + docs/adr and prints
+    the ranking. No model call, no network, no quota.
+    """
+    cfg = _load(args)
+    corpus = recall.Corpus.load(args.root, cfg)
+    if not len(corpus):
+        print(f"recall: no indexable notes under {args.root}", file=sys.stderr)
+        return 1
+    notes = corpus.search(args.query, args.k, kind=args.kind or "")
+    if not notes:
+        print(f"recall: no match for {args.query!r} in {len(corpus)} note(s)", file=sys.stderr)
+        return 1
+    for note in notes:
+        print(f"{note.score:8.3f}  {note.note_name}  ({note.label()})")
     return 0
 
 
@@ -211,6 +232,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     ri = sub.add_parser("reindex", help="rebuild knowledge-base MOCs")
     ri.set_defaults(func=cmd_reindex)
+
+    rl = sub.add_parser("recall", help="rank prior lessons/whitepapers/ADRs for a query")
+    rl.add_argument("query", help="what the task is about, in plain words")
+    rl.add_argument("--k", type=int, default=5, help="how many notes to print")
+    rl.add_argument("--kind", default="", help="bias toward this task kind (heal/implement/improve)")
+    rl.add_argument("--root", default=".", help="repo root holding knowledge/ and docs/adr")
+    rl.set_defaults(func=cmd_recall)
 
     cy = sub.add_parser("cycle", help="run one half-day governance block")
     cy.add_argument("--index", "--cycle-index", dest="index", type=int, default=None,
