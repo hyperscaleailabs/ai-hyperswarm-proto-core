@@ -2,14 +2,14 @@
 tags:
   - moc
   - lessons
-updated: 2026-08-09
+updated: 2026-08-10
 ---
 
 # Lessons MOC
 
 Up: [[Knowledge Base MOC]]
 
-Every hsai iteration leaves a lesson here - pass or fail. Total: **22**.
+Every hsai iteration leaves a lesson here - pass or fail. Total: **23**.
 
 - [[2026-07-25-bootstrap-the-hsai-loop]]
 - [[2026-07-26-architect-steering-quality-over-throughput]]
@@ -33,3 +33,4 @@ Every hsai iteration leaves a lesson here - pass or fail. Total: **22**.
 - [[2026-08-08-implement-chore-governance-artifacts-for-block-41343]]
 - [[2026-08-08-implement-chore-governance-artifacts-for-block-41345]]
 - [[2026-08-09-implement-chore-governance-artifacts-for-block-41347]]
+- [[2026-08-10-implement-chore-governance-artifacts-for-block-41349]]
