@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 from uuid import uuid4
 
-from . import ai, ci, github, gitops, ledger, repro, trajectory
+from . import ai, ci, github, gitops, ledger, recall, repro, trajectory
 from .config import CoreConfig
 from .knowledge import KnowledgeBase, Lesson
 from .models import ModelChoice, Task, select
@@ -98,6 +98,7 @@ def build_pr_body(
     kind: str = "",
     references: tuple[str, ...] = (),
     trajectory_digest: str = "",
+    recalled: tuple[str, ...] = (),
 ) -> str:
     """Assemble a PR body that satisfies the traceability invariants.
 
@@ -108,6 +109,12 @@ def build_pr_body(
     refs = ", ".join(f"`{r}`" for r in references) or "_(none)_"
     artifacts = _phase_artifacts(kind) if kind else ""
     artifacts_section = f"\n## Phase artifacts\n{artifacts}\n" if artifacts else ""
+    # Which prior notes the worker was shown - retrieval is only trustworthy if
+    # it is auditable after the fact.
+    recalled_links = "\n".join(f"- [[{n}]]" for n in recalled)
+    recalled_section = (
+        f"\n## Prior lessons consulted\n{recalled_links}\n" if recalled else ""
+    )
     # What the run cost and how it ended, visible on the PR itself - the full
     # record stays in the local (gitignored) trajectory store.
     traj_section = (
@@ -126,7 +133,7 @@ def build_pr_body(
 {lesson_summary}
 
 See [[{lesson_note}]] in the knowledge base.
-
+{recalled_section}
 ## Reference-set evidence
 {refs}
 
@@ -147,6 +154,7 @@ class IterationResult:
     remote: str = ""
     recovered: bool = False
     lesson_path: str = ""
+    recalled: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
     def describe(self) -> str:
@@ -163,7 +171,13 @@ class IterationResult:
         return "iteration(" + ", ".join(parts) + ")"
 
 
-def _task_prompt(kind: str, cfg: CoreConfig, ticket_title: str, ticket_body: str) -> str:
+def _task_prompt(
+    kind: str,
+    cfg: CoreConfig,
+    ticket_title: str,
+    ticket_body: str,
+    lessons: str = "",
+) -> str:
     goals = "; ".join(f"{g.get('id')}:{g.get('title')}" for g in cfg.goals)
     common = (
         "You are a worker in the hsai autonomous loop for ai-hyperswarm-proto-core. "
@@ -171,10 +185,13 @@ def _task_prompt(kind: str, cfg: CoreConfig, ticket_title: str, ticket_body: str
         "code style consistent, and ensure `ruff check .` and `pytest` both pass. "
         f"Project goals: {goals}."
     )
+    # Retrieved prior notes, if any: appended last so the ticket stays the
+    # instruction and the lessons stay context (empty string => nothing renders).
+    recalled = f"\n\n{lessons}" if lessons else ""
     if kind == HEAL:
         return (
             f"{common}\nThe build is RED. Diagnose and fix it so CI is green. "
-            f"Ticket: {ticket_title}\n{ticket_body}"
+            f"Ticket: {ticket_title}\n{ticket_body}{recalled}"
         )
     if kind == IMPLEMENT:
         return (
@@ -182,11 +199,11 @@ def _task_prompt(kind: str, cfg: CoreConfig, ticket_title: str, ticket_body: str
             "its Acceptance criteria and execute its Verification plan, adding tests "
             "as evidence. A knowledge-only or docs-only diff on a feat/skill/refactor "
             "ticket is an automatic failure - real code must change.\n"
-            f"Ticket: {ticket_title}\n{ticket_body}"
+            f"Ticket: {ticket_title}\n{ticket_body}{recalled}"
         )
     return (
         f"{common}\nImplement this self-improvement, learning from the reference set "
-        f"pinned in .ai-swarm/core.yaml.\nTicket: {ticket_title}\n{ticket_body}"
+        f"pinned in .ai-swarm/core.yaml.\nTicket: {ticket_title}\n{ticket_body}{recalled}"
     )
 
 
@@ -335,9 +352,19 @@ def run_once(
     ))
     choice = select(task, cfg, demote=demote_tier)
 
-    result = IterationResult(
-        kind=kind, ticket=ticket_num, model=choice.model, ci_before=ci_before.ok
+    # Read side of the knowledge base: pull the most relevant prior notes for
+    # this ticket out of the vault in the worktree. Computed before the agent
+    # runs (and regardless of dry-run) so the lesson can record what was shown.
+    recalled = recall.for_task(
+        wt, cfg, title=ticket_title, body=ticket_body, kind=kind
     )
+
+    result = IterationResult(
+        kind=kind, ticket=ticket_num, model=choice.model, ci_before=ci_before.ok,
+        recalled=list(recalled.note_names),
+    )
+    if recalled.notes:
+        result.notes.append(f"recalled {len(recalled.notes)} prior note(s)")
 
     # Quota ledger: every iteration that runs a model appends one cost record.
     # Written to the repo root (not the ephemeral worktree) so the block-level
@@ -377,7 +404,7 @@ def run_once(
     reverted_workflows: list[str] = []
     repro_result: repro.ReproResult | None = None
     if not dry_run:
-        prompt = _task_prompt(kind, cfg, ticket_title, ticket_body)
+        prompt = _task_prompt(kind, cfg, ticket_title, ticket_body, recalled.section)
         agent_started = time.time()
         ares = ai.run_agent(
             prompt, choice, cfg, cwd=wt, runner=ai_runner, timeout=cfg.agent_timeout
@@ -501,6 +528,7 @@ def run_once(
         model=choice.model,
         references=references,
         repro_evidence=repro.render_evidence(repro_result) if repro_result else "",
+        recalled=recalled.note_names,
     )
     # Each PR commits ONLY its own uniquely-named lesson file. The MOC indexes
     # and whitepapers are regenerated by the serialized `hsai reindex`
@@ -529,6 +557,7 @@ def run_once(
         kind=kind,
         references=references,
         trajectory_digest=traj.digest() if traj else "",
+        recalled=recalled.note_names,
     )
     pr_num = github.create_pr(
         repo, branch, f"{kind}: {ticket_title}"[:120], pr_body,

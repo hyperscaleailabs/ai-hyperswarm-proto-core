@@ -59,6 +59,7 @@ class Lesson:
     created: str = field(default_factory=_today)
     remote_ci: str = ""  # SUCCESS | FAILURE | TIMEOUT, filled in once gh checks conclude
     repro_evidence: str = ""  # heal/bugfix only: failing-then-passing reproduction proof
+    recalled: tuple[str, ...] = ()  # prior notes injected into this run's prompt
 
     def note_name(self) -> str:
         return f"{self.created}-{slugify(self.title)}"
@@ -75,6 +76,68 @@ class LessonRecord:
     tags: tuple[str, ...]
     lesson_text: str
     what_happened: str = ""
+    body: str = ""  # everything after the frontmatter; what the recall index reads
+
+
+def split_sections(text: str) -> dict[str, str]:
+    """Map lowercased ``## headings`` to their bodies."""
+    parts = _SECTION_RE.split(text)
+    # parts[0] is the preamble; the rest alternates heading, body, heading, body...
+    sections: dict[str, str] = {}
+    for i in range(1, len(parts), 2):
+        heading = parts[i].strip().lower()
+        body = parts[i + 1] if i + 1 < len(parts) else ""
+        sections[heading] = body.strip()
+    return sections
+
+
+def _frontmatter_tags(fm: str) -> tuple[str, ...]:
+    """List items under the ``tags:`` key only.
+
+    Frontmatter now holds a second list (``recalled:``), so a blanket "every
+    ``- item`` line is a tag" scan would file recalled note names as tags.
+    """
+    tags: list[str] = []
+    in_tags = False
+    for line in fm.splitlines():
+        if line.strip() and not line.startswith((" ", "\t", "-")):
+            in_tags = line.strip() == "tags:"
+            continue
+        match = _TAG_RE.match(line)
+        if in_tags and match:
+            tags.append(match.group(1).strip())
+    return tuple(tags)
+
+
+def parse_note(path: str | Path) -> LessonRecord:
+    """Parse any Obsidian note in the vault into a :class:`LessonRecord`.
+
+    Lessons carry ``outcome/*`` and ``kind/*`` frontmatter tags; whitepapers and
+    ADRs do not, and come back as ``unknown``. This is the single place those
+    tags are interpreted - both :meth:`KnowledgeBase.read_lessons` and the
+    :mod:`hsai.recall` index read notes through it.
+    """
+    path = Path(path)
+    text = path.read_text()
+    fm_match = _FRONTMATTER_RE.match(text)
+    fm = fm_match.group(1) if fm_match else ""
+    body = text[fm_match.end():] if fm_match else text
+    tags = _frontmatter_tags(fm)
+    outcome = next((t.split("/", 1)[1] for t in tags if t.startswith("outcome/")), "unknown")
+    kind = next((t.split("/", 1)[1] for t in tags if t.startswith("kind/")), "unknown")
+    title_match = _TITLE_RE.search(text)
+    title = title_match.group(1).strip() if title_match else path.stem
+    sections = split_sections(text)
+    return LessonRecord(
+        note_name=path.stem,
+        title=title,
+        outcome=outcome,
+        kind=kind,
+        tags=tags,
+        lesson_text=sections.get("lesson learned", ""),
+        what_happened=sections.get("what happened", ""),
+        body=body.strip(),
+    )
 
 
 @dataclass
@@ -149,35 +212,7 @@ class KnowledgeBase:
         return [self._parse_lesson(name) for name in self.lesson_notes()]
 
     def _parse_lesson(self, note_name: str) -> LessonRecord:
-        text = (self.lessons_dir / f"{note_name}.md").read_text()
-        fm_match = _FRONTMATTER_RE.match(text)
-        fm = fm_match.group(1) if fm_match else ""
-        tags = tuple(m.group(1).strip() for m in _TAG_RE.finditer(fm))
-        outcome = next((t.split("/", 1)[1] for t in tags if t.startswith("outcome/")), "unknown")
-        kind = next((t.split("/", 1)[1] for t in tags if t.startswith("kind/")), "unknown")
-        title_match = _TITLE_RE.search(text)
-        title = title_match.group(1).strip() if title_match else note_name
-        sections = self._split_sections(text)
-        return LessonRecord(
-            note_name=note_name,
-            title=title,
-            outcome=outcome,
-            kind=kind,
-            tags=tags,
-            lesson_text=sections.get("lesson learned", ""),
-            what_happened=sections.get("what happened", ""),
-        )
-
-    @staticmethod
-    def _split_sections(text: str) -> dict[str, str]:
-        parts = _SECTION_RE.split(text)
-        # parts[0] is the preamble; the rest alternates heading, body, heading, body...
-        sections: dict[str, str] = {}
-        for i in range(1, len(parts), 2):
-            heading = parts[i].strip().lower()
-            body = parts[i + 1] if i + 1 < len(parts) else ""
-            sections[heading] = body.strip()
-        return sections
+        return parse_note(self.lessons_dir / f"{note_name}.md")
 
     def synthesize_whitepaper(self, n: int | None = None) -> Whitepaper:
         """Synthesize a whitepaper by grouping the last `n` lessons by outcome/kind
@@ -260,21 +295,32 @@ class KnowledgeBase:
 
     # --- rendering ------------------------------------------------------------
     @staticmethod
-    def _frontmatter(tags: tuple[str, ...], extra: dict[str, str] | None = None) -> str:
+    def _frontmatter(
+        tags: tuple[str, ...], extra: dict[str, str | tuple[str, ...]] | None = None
+    ) -> str:
         lines = ["---", "tags:"]
         for t in tags:
             lines.append(f"  - {t}")
         for key, value in (extra or {}).items():
-            lines.append(f"{key}: {value}")
+            if isinstance(value, (list, tuple)):
+                lines.append(f"{key}:")
+                lines.extend(f"  - {item}" for item in value)
+            else:
+                lines.append(f"{key}: {value}")
         lines.append("---")
         return "\n".join(lines)
 
     def _render_lesson(self, lesson: Lesson) -> str:
         tags = ("lesson", f"outcome/{lesson.outcome}", f"kind/{lesson.kind}", *lesson.tags)
-        fm = self._frontmatter(
-            tags,
-            {"created": lesson.created, "iteration": str(lesson.iteration)},
-        )
+        extra: dict[str, str | tuple[str, ...]] = {
+            "created": lesson.created,
+            "iteration": str(lesson.iteration),
+        }
+        # Only present when retrieval actually fired, so a run with recall
+        # disabled renders byte-for-byte as it did before recall existed.
+        if lesson.recalled:
+            extra["recalled"] = lesson.recalled
+        fm = self._frontmatter(tags, extra)
         refs = "\n".join(f"- `{r}`" for r in lesson.references) or "- _(none cited)_"
         ticket = f"#{lesson.ticket}" if lesson.ticket else "_(none)_"
         pr = f"#{lesson.pr}" if lesson.pr else "_(none)_"

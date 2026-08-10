@@ -1,10 +1,14 @@
+import json
+
 from hsai import ai
 from hsai.config import load_config
 from hsai.models import ModelChoice
 from hsai.proc import Proc
 from hsai.synthesis import (
+    TRIED_HEADING,
     ContextPack,
     build_prompt,
+    build_tried_digest,
     parse_ticket_specs,
     pick_rotation,
     synthesize,
@@ -104,3 +108,81 @@ def test_synthesize_survives_output_without_a_json_envelope():
     assert res.ok is True
     assert res.filed == [321]
     assert res.error == ""
+
+
+# --- "already tried here": the planner reads our own history -----------------
+
+OPEN_ISSUES = [
+    {
+        "number": 40, "title": "feat: lesson-retrieval memory",
+        "labels": [{"name": "self-improve"}, {"name": "priority:P2"}],
+        "assignees": [], "body": "",
+    },
+    {
+        "number": 41, "title": "ci: main is red - auto-heal",
+        "labels": [{"name": "ci"}], "assignees": [], "body": "",
+    },
+]
+
+
+def _issue_runner(issues=None):
+    def runner(cmd, *, cwd=None, env=None, timeout=None, input_text=None):
+        if cmd[:3] == ["gh", "issue", "list"]:
+            return Proc(cmd, 0, json.dumps(OPEN_ISSUES if issues is None else issues), "")
+        return Proc(cmd, 0, "", "")
+
+    return runner
+
+
+def _write_lesson(root, name, *, outcome, title):
+    directory = root / "knowledge" / "lessons"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"{name}.md").write_text(
+        f"---\ntags:\n  - lesson\n  - outcome/{outcome}\n  - kind/implement\n"
+        f"created: 2026-01-01\n---\n\n# {title}\n\n## Lesson learned\nSomething.\n"
+    )
+
+
+def test_tried_digest_lists_lesson_outcomes_and_open_synthesis_tickets(tmp_path):
+    cfg = _cfg()
+    _write_lesson(tmp_path, "2026-01-01-a", outcome="pass", title="Poll remote CI")
+    _write_lesson(tmp_path, "2026-01-02-b", outcome="fail", title="Edit the workflows")
+
+    digest = build_tried_digest(cfg, root=str(tmp_path), runner=_issue_runner())
+
+    assert "**fail** - Edit the workflows" in digest
+    assert "**pass** - Poll remote CI" in digest
+    # failures lead: they are the ones worth not repeating
+    assert digest.index("Edit the workflows") < digest.index("Poll remote CI")
+    # only self-improve tickets count as "already proposed"
+    assert "feat: lesson-retrieval memory" in digest
+    assert "ci: main is red - auto-heal" not in digest
+
+
+def test_tried_digest_degrades_to_a_placeholder_when_there_is_no_history(tmp_path):
+    digest = build_tried_digest(_cfg(), root=str(tmp_path), runner=_issue_runner([]))
+    assert digest == "_(nothing recorded yet - this is an early cycle)_"
+
+
+def test_prompt_tells_the_planner_what_this_repo_already_tried(tmp_path):
+    cfg = _cfg()
+    pack = ContextPack(repos=["a/b"], sections={"a/b": "digest"})
+    _write_lesson(tmp_path, "2026-01-02-b", outcome="fail", title="Edit the workflows")
+    digest = build_tried_digest(cfg, root=str(tmp_path), runner=_issue_runner())
+
+    prompt = build_prompt(cfg, pack, digest)
+    assert TRIED_HEADING in prompt
+    assert digest in prompt
+    assert "Do NOT" in prompt          # an explicit instruction, not a hint
+    # the heading survives even with nothing to report, so the planner always
+    # knows this section exists
+    assert TRIED_HEADING in build_prompt(cfg, pack)
+    assert "nothing recorded yet" in build_prompt(cfg, pack)
+
+
+def test_synthesize_feeds_the_tried_digest_to_the_model():
+    cfg = _cfg()
+    runner = _plain_text_runner()
+    synthesize(cfg, cycle_index=0, root=".", runner=runner, ai_runner=runner)
+    claude_call = next(c for c in runner.calls if c[:1] == ["claude"])
+    assert TRIED_HEADING in claude_call[2]

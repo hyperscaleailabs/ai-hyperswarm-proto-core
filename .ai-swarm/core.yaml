@@ -177,6 +177,16 @@ knowledge:
   templates_dir: knowledge/templates
   whitepaper_every_lessons: 10       # synthesize a whitepaper every N new lessons
   obsidian_ready: true               # wikilinks + committed .obsidian config
+  # Lesson retrieval (see src/hsai/recall.py): the read half of the knowledge
+  # base. A deterministic BM25 index over lessons + whitepapers + ADRs injects
+  # the most relevant prior notes into every worker prompt. No model call, no
+  # third-party dependency. Set enabled: false to restore pre-recall prompts.
+  recall:
+    enabled: true                    # inject 'Prior lessons from this repo' into prompts
+    k: 3                             # max notes shown per prompt
+    max_chars: 1200                  # hard ceiling on the injected text
+    fail_weight: 1.6                 # score multiplier for outcome/fail notes
+    kind_weight: 1.25                # score multiplier when kind/ matches the task
 
 # Ranked snapshot pinned on 2026-07-25. Criteria: >= 10k stars, permissive
 # license (MIT or Apache-2.0), quality README, relevance to swarm / multi-agent.

@@ -1,10 +1,11 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from hsai import ledger, orchestrator, trajectory
+from hsai import ledger, orchestrator, recall, trajectory
 from hsai.config import load_config
 from hsai.models import ModelChoice
 from hsai.orchestrator import (
@@ -13,6 +14,7 @@ from hsai.orchestrator import (
     IMPROVE,
     _format_error_with_context,
     _phase_artifacts,
+    _task_prompt,
     build_pr_body,
     decide_path,
     run_once,
@@ -900,3 +902,150 @@ def test_malformed_ticket_is_refused_and_labeled(tmp_path):
         if c[:3] == ["gh", "issue", "edit"] and "needs-refinement" in c and "11" in c
     ]
     assert labeled, "vague ticket should be labeled needs-refinement"
+
+
+# --- lesson recall: the knowledge base as an INPUT ---------------------------
+
+RECALL_TICKET_TITLE = "feat: gate merges on the remote CI rollup"
+
+
+def _seed_recall_corpus(root: Path) -> None:
+    """Plant a small vault in the tree the iteration will read from."""
+    lessons = root / "knowledge" / "lessons"
+    lessons.mkdir(parents=True, exist_ok=True)
+    (lessons / "2026-01-01-remote-ci-is-the-only-gate.md").write_text(
+        "---\ntags:\n  - lesson\n  - outcome/fail\n  - kind/implement\n"
+        "created: 2026-01-01\n---\n\n"
+        "# Remote CI rollup is the only merge gate\n\n"
+        "## Lesson learned\nLocal green is not remote green; poll the rollup first.\n"
+    )
+    (lessons / "2026-01-02-obsidian-vault-layout.md").write_text(
+        "---\ntags:\n  - lesson\n  - outcome/pass\n  - kind/improve\n"
+        "created: 2026-01-02\n---\n\n"
+        "# Obsidian vault layout\n\n"
+        "## Lesson learned\nWikilinks up to a MOC make the graph view useful.\n"
+    )
+
+
+def _implement_run(cfg, tmp_path, monkeypatch, iteration: int):
+    """One fake-runner implement iteration; returns (prompt, pr_body, result)."""
+    wt = _pin_worktree_path(monkeypatch, tmp_path, cfg, iteration)
+    _seed_recall_corpus(wt)
+    open_issues = [
+        {
+            "number": 7,
+            "title": RECALL_TICKET_TITLE,
+            "labels": [{"name": "priority:P2"}],
+            "assignees": [],
+            "body": WELL_FORMED_BODY,
+        }
+    ]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+        worktree_status="?? src/hsai/gate.py\n",
+    )
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=iteration,
+    )
+    prompt = next(c for c in runner.calls if c[:1] == ["claude"])[2]
+    pr_create = next(c for c in runner.calls if c[:3] == ["gh", "pr", "create"])
+    return prompt, pr_create[pr_create.index("--body") + 1], result
+
+
+def _with_recall(**overrides):
+    cfg = load_config()
+    knowledge = dict(cfg.knowledge)
+    knowledge["recall"] = {**(knowledge.get("recall") or {}), **overrides}
+    return replace(cfg, knowledge=knowledge)
+
+
+def test_task_prompt_renders_recalled_lessons_only_when_there_are_some():
+    cfg = load_config()
+    section = f"{recall.HEADING}:\n- [[a-note]] (fail/heal) - do not do that"
+    for kind in (HEAL, IMPLEMENT, IMPROVE):
+        bare = _task_prompt(kind, cfg, "t", "b")
+        assert recall.HEADING not in bare
+        # an empty recall changes nothing at all - byte-for-byte
+        assert _task_prompt(kind, cfg, "t", "b", "") == bare
+
+        with_lessons = _task_prompt(kind, cfg, "t", "b", section)
+        assert with_lessons == f"{bare}\n\n{section}"
+        assert with_lessons.endswith(section)   # the ticket stays the instruction
+
+
+def test_build_pr_body_renders_prior_lessons_consulted():
+    choice = ModelChoice(tier="standard", model="sonnet", rationale="x")
+    kwargs = dict(
+        ticket=42, choice=choice, lesson_note="2026-01-03-note",
+        lesson_summary="s", ci_summary="green", kind=IMPLEMENT,
+    )
+    body = build_pr_body(**kwargs, recalled=("2026-01-01-a", "2026-01-02-b"))
+    assert "## Prior lessons consulted" in body
+    assert "- [[2026-01-01-a]]" in body and "- [[2026-01-02-b]]" in body
+
+    # with nothing recalled the section vanishes and the surrounding text is
+    # exactly what it was before recall existed
+    plain = build_pr_body(**kwargs)
+    assert "## Prior lessons consulted" not in plain
+    assert plain == build_pr_body(**kwargs, recalled=())
+    assert (
+        "See [[2026-01-03-note]] in the knowledge base.\n\n## Reference-set evidence"
+        in plain
+    )
+
+
+def test_recalled_lessons_reach_the_prompt_the_lesson_and_the_pr_body(
+    tmp_path, monkeypatch
+):
+    cfg = load_config()
+    budget = recall.RecallConfig.from_core(cfg)
+    prompt, pr_body, result = _implement_run(cfg, tmp_path, monkeypatch, 1)
+
+    # 1. the worker was shown prior lessons, bounded by the configured budget
+    assert recall.HEADING in prompt
+    injected = prompt[prompt.index(recall.HEADING):]   # recall is appended last
+    assert len(injected) <= budget.max_chars
+    assert 0 < injected.count("- [[") <= budget.k
+    # failures outrank successes, so the failing note leads
+    assert "[[2026-01-01-remote-ci-is-the-only-gate]]" in injected
+
+    # 2. the retrieval is carried on the result...
+    assert "2026-01-01-remote-ci-is-the-only-gate" in result.recalled
+    assert len(result.recalled) == injected.count("- [[")
+
+    # 3. ...written into the lesson's frontmatter...
+    frontmatter = Path(result.lesson_path).read_text().split("---\n")[1]
+    assert "recalled:" in frontmatter
+    for name in result.recalled:
+        assert f"  - {name}" in frontmatter
+
+    # 4. ...and rendered on the PR for after-the-fact audit
+    assert "## Prior lessons consulted" in pr_body
+    for name in result.recalled:
+        assert f"- [[{name}]]" in pr_body
+
+
+def test_disabling_recall_restores_the_pre_change_prompt_and_pr_body(
+    tmp_path, monkeypatch
+):
+    off = _with_recall(enabled=False)
+    prompt, pr_body, result = _implement_run(off, tmp_path, monkeypatch, 2)
+
+    # byte-identical to what _task_prompt produced before recall existed
+    assert prompt == _task_prompt(IMPLEMENT, off, RECALL_TICKET_TITLE, WELL_FORMED_BODY)
+    assert recall.HEADING not in prompt
+    assert "## Prior lessons consulted" not in pr_body
+    assert result.recalled == []
+    assert "recalled:" not in Path(result.lesson_path).read_text().split("---\n")[1]
+
+
+def test_dry_run_still_records_what_it_recalled(tmp_path):
+    cfg = load_config()
+    _seed_recall_corpus(tmp_path)
+
+    result = run_once(cfg, repo_dir=str(tmp_path), dry_run=True, iteration=1)
+
+    assert result.kind == IMPROVE
+    assert result.recalled                       # retrieval runs without an agent
+    assert "recalled:" in Path(result.lesson_path).read_text().split("---\n")[1]

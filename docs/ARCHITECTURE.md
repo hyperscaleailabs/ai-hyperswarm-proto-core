@@ -17,6 +17,7 @@ so the decision logic stays pure and unit-tested.
 | `hsai.trajectory` | one durable record per agent run; redaction, replay | write files |
 | `hsai.journal` | append-only per-block step journal; `once()` replay | write files |
 | `hsai.knowledge` | lessons, whitepapers, MOC reindex (Obsidian) | write files |
+| `hsai.recall` | BM25 index over the vault; retrieve prior notes | read files |
 | `hsai.orchestrator` | one iteration; `decide_path`, `build_pr_body` (pure) | composes above |
 | `hsai.swarm` | run N iterations concurrently | threads |
 | `hsai.cli` | `hsai` entry point | - |
@@ -32,11 +33,14 @@ sequenceDiagram
     participant A as ai (agent)
     participant T as trajectory
     participant K as knowledge
+    participant R as recall
 
     O->>G: sync_main + create_worktree
     O->>C: run_local (CI before)
     O->>H: claim ticket (heal / implement / improve)
-    O->>A: run_agent(prompt, model choice)
+    O->>R: for_task(ticket title + body + kind)
+    R-->>O: top-k prior notes (bounded text + names)
+    O->>A: run_agent(prompt + prior lessons, model choice)
     A-->>O: ok / error + steps + usage (JSON envelope)
     O->>T: record (before any guard can abort)
     O->>C: run_local (CI after)
@@ -52,6 +56,37 @@ sequenceDiagram
     end
     O->>G: remove_worktree
 ```
+
+## The knowledge base is read-write
+
+For a long time the vault was write-only: every iteration appended a lesson and
+no iteration ever read one, so each hard-won conclusion had to be re-encoded as
+a hard-coded guard and the same classes of mistake recurred. `hsai.recall`
+closes the loop.
+
+- **Index.** `Corpus.load(root, cfg)` builds a BM25 index, on demand and in
+  memory, over `knowledge/lessons`, `knowledge/whitepapers` and `docs/adr`.
+  No third-party dependency, no model call, no network - so retrieval is free
+  and its ranking is exactly reproducible (ties break on note name).
+- **Bias.** Notes tagged `outcome/fail` are up-weighted by
+  `knowledge.recall.fail_weight`; notes whose `kind/` matches the current task
+  are up-weighted by `kind_weight`. Failures are the expensive knowledge, and a
+  heal worker should see heal history.
+- **Inject.** `orchestrator._task_prompt` appends a *Prior lessons from this
+  repo* section of at most `k` wikilinked notes, hard-capped at `max_chars`;
+  whole notes are dropped to fit, never truncated mid-line. An empty corpus or
+  `enabled: false` renders nothing at all.
+- **Plan.** `synthesis.build_prompt` carries an *Already tried in this repo*
+  digest - prior lesson titles with pass/fail outcomes plus the titles of
+  synthesis tickets still open - so the planner stops re-proposing dead ideas.
+- **Audit.** What was retrieved is recorded three times: on `IterationResult`,
+  as a `recalled:` list in the lesson's frontmatter, and as a
+  *Prior lessons consulted* section on the PR. `hsai recall "<query>"` prints
+  the same ranking by hand.
+
+Reference-set lineage: retrieval-before-planning from `assafelovic/gpt-researcher`,
+index-then-retrieve with metadata preserved from `run-llama/llama_index`, and
+scoped agent memory from `OpenBMB/ChatDev`.
 
 ## Testability
 
