@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
+from . import failures
 from .proc import Proc, Runner, run
 
 PRIORITY_LABELS = ["priority:P0", "priority:P1", "priority:P2", "priority:P3"]
@@ -29,6 +30,17 @@ STANDARD_LABELS = {
     "attempts:2": ("d4c5f9", "hsai retry counter"),
     "attempts:3": ("c2a3f5", "hsai retry counter"),
 }
+
+# One label per failure class. The label is not decoration: it is the durable,
+# auditable channel by which one attempt's diagnosis reaches the next one - the
+# claiming worker reads it back, resolves the configured retry action, and
+# adjusts tier, timeout and prompt accordingly.
+STANDARD_LABELS.update(
+    {
+        failures.label_for(name): ("e11d21", f"hsai failure class: {name}")
+        for name in failures.CLASSES
+    }
+)
 
 
 @dataclass

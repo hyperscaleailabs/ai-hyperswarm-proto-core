@@ -152,7 +152,7 @@ def cmd_repro_check(args: argparse.Namespace) -> int:
 
 
 def _print_trajectory(args: argparse.Namespace, label: str) -> int:
-    """Reconstruct a stored agent run from the local trajectory store.
+    """Reconstruct a stored iteration from the trajectory store.
 
     Pure reading: no ``claude`` subprocess, no network, no quota spent.
     """
@@ -264,7 +264,8 @@ def build_parser() -> argparse.ArgumentParser:
         tp = sub.add_parser(name, help=f"{help_text} (spends no quota)")
         tp.add_argument("trajectory_id", metavar="iteration",
                         help="iteration number, or a path to a trajectory file")
-        tp.add_argument("--root", default=".", help="repo root holding .hsai/traj")
+        tp.add_argument("--root", default=".",
+                        help="repo root holding knowledge/trajectories")
         tp.add_argument("--json", action="store_true", help="print the raw trajectory JSON")
         tp.set_defaults(func=func)
 

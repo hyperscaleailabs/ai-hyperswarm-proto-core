@@ -16,6 +16,7 @@ from pathlib import Path
 
 from . import github
 from .config import CoreConfig
+from .failures import render_failure_table
 from .knowledge import KnowledgeBase
 from .ledger import BlockAggregate
 from .proc import Runner, run
@@ -150,6 +151,26 @@ def _cost_summary(cost: BlockAggregate | None) -> str:
     return f"{cost.summary()}\n\n**Efficiency:** {efficiency}"
 
 
+def _failure_taxonomy(cost: BlockAggregate | None) -> str:
+    """How this block failed, grouped by class (see :mod:`hsai.failures`).
+
+    The point of the table is to make a *mode* visible at review time: three
+    `guard_incomplete` rows say the prompt is wrong, three `remote_infra` rows
+    say the environments diverged. Both used to read as "3 failed iterations".
+    """
+    if cost is None or cost.iterations == 0:
+        return "_no ledger records for this block_"
+    table = render_failure_table(cost.failure_counts)
+    if not cost.failed_iterations:
+        return table
+    return (
+        f"{table}\n\n{cost.failed_iterations} of {cost.iterations} iteration(s) "
+        "failed. The retry action taken for each class is configured in "
+        "`execution.retry_policy` (`.ai-swarm/core.yaml`); a failed ticket "
+        "carries its class as a `failure:<class>` label."
+    )
+
+
 def render_brief(cfg: CoreConfig, report: BlockReport) -> str:
     """The review-issue body for one block: everything clickable in one place."""
     repo = cfg.repo_slug
@@ -168,6 +189,7 @@ def render_brief(cfg: CoreConfig, report: BlockReport) -> str:
     paper = f"`knowledge/whitepapers/{report.whitepaper}.md`" if report.whitepaper else "_none_"
     articles = "\n".join(f"- `{a}`" for a in report.articles) or "_none_"
     cost = _cost_summary(report.cost)
+    taxonomy = _failure_taxonomy(report.cost)
     extra = "\n".join(f"- {n}" for n in report.notes)
     return f"""# Block review - cycle {report.cycle_index}
 
@@ -189,6 +211,9 @@ sequentially, records your feedback as ADRs, and ends with a merged PR.
 
 ## Cost this block (quota ledger)
 {cost}
+
+## Failure taxonomy
+{taxonomy}
 
 ## Knowledge produced
 - Whitepaper: {paper}

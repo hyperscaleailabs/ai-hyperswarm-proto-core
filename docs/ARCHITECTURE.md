@@ -14,7 +14,8 @@ so the decision logic stays pure and unit-tested.
 | `hsai.gitops` | worktrees, sync, branch, commit, push | git |
 | `hsai.github` | tickets, labels, PRs, merge | gh |
 | `hsai.ci` | local CI gate (ruff+pytest) + remote status | subprocess |
-| `hsai.trajectory` | one durable record per agent run; redaction, replay | write files |
+| `hsai.failures` | failure taxonomy + retry policy (`classify`, `action_for`) | none (pure) |
+| `hsai.trajectory` | one durable record per iteration; redaction, replay | write files |
 | `hsai.journal` | append-only per-block step journal; `once()` replay | write files |
 | `hsai.knowledge` | lessons, whitepapers, MOC reindex (Obsidian) | write files |
 | `hsai.recall` | BM25 index over the vault; retrieve prior notes | read files |
@@ -40,7 +41,7 @@ sequenceDiagram
     O->>H: claim ticket (heal / implement / improve)
     O->>R: for_task(ticket title + body + kind)
     R-->>O: top-k prior notes (bounded text + names)
-    O->>A: run_agent(prompt + prior lessons, model choice)
+    O->>A: run_agent(prompt + prior lessons + prior failure, model choice)
     A-->>O: ok / error + steps + usage (JSON envelope)
     O->>T: record (before any guard can abort)
     O->>C: run_local (CI after)
@@ -52,8 +53,9 @@ sequenceDiagram
     alt remote CI success
         O->>H: merge_pr (auto)
     else remote CI failure
-        O->>H: close_pr + return ticket to backlog
+        O->>H: close_pr + label failure:<class> + apply retry policy
     end
+    O->>T: refresh record (outcome + failure class)
     O->>G: remove_worktree
 ```
 
@@ -115,33 +117,114 @@ change: setting the key to `text` drops the flag and every consumer falls back
 to the plain-text path.
 
 `orchestrator.run_once` hands that envelope to `trajectory.record` at the
-single choke point right after `ai.run_agent` - *before* the completeness and
-reproduce-before-fix guards can return early - and writes one JSON file per run
-to `.hsai/traj/<block>/<iteration>.json`. The final outcome (`merged`,
-`recovered`, `incomplete`, `no_repro`, ...) is folded back in when the
-iteration's cost record is appended. Sharding by block is what makes the store
-bounded: `hsai cycle` prunes block directories beyond
-`execution.trajectory_retention_blocks`.
+single choke point right after `ai.run_agent` - *before* the workflow,
+completeness and reproduce-before-fix guards can return early - and writes one
+JSON file per iteration to
+`knowledge/trajectories/<block>/<iteration>-<branch>.json`. **Every** iteration
+gets exactly one, including a dry run (which records that no model was called -
+itself an auditable fact about the block) and one a guard aborted seconds
+later. The record is refreshed, not duplicated, at each terminal exit, so the
+final outcome (`merged`, `recovered`, `incomplete`, `no_repro`,
+`workflow_tamper`, ...) and the failure class are folded back in.
 
-Two audiences, deliberately split:
+One record is the whole forensic picture of an iteration, not just the agent
+call: the prompt and its digest, model / tier / selection strategy, each
+guard's verdict, local CI step results before and after, the remote CI
+conclusion, a changed-path diffstat, per-phase durations, the failure class and
+its reason, and a truncated tail of the agent's stdout and stderr.
 
-- **Local and complete.** Trajectories quote repo content, so they are
-  gitignored and never pushed. Everything is redacted on the way to disk -
-  credentials *and* absolute home paths - so an artifact can be shared as-is.
-  `hsai traj <iteration> [--json]` reconstructs one - prompt, step stream, exit
-  status, usage - purely by reading the file, with no `claude` subprocess and
-  no quota spent. (`hsai replay` is an alias.)
-- **Committed and redacted.** The lesson and the PR body carry
-  `Trajectory.digest()` - tokens, duration, exit status, first failing step -
-  plus, in the lesson, `Trajectory.excerpt()`: a secrets-scrubbed tail of the
-  last few steps. The audit trail is visible on the PR; the knowledge base
-  gains signal without mirroring the working tree.
+Two properties make it safe to commit these:
+
+- **Redacted.** `Trajectory.as_record()` runs `redact_value` over every string
+  before anything reaches disk: API-key-shaped values, gh tokens, `KEY=VALUE`
+  pairs whose key looks secret, and absolute home paths (which name the machine
+  *and* its user, and appear in every worker prompt). A trajectory can be
+  shared as-is.
+- **Bounded.** `MAX_RECORD_CHARS` caps one record: a run that would exceed it
+  sheds its earliest steps - a failure shows up at the *end* of a run - then
+  clips its long free-text fields, and says `truncated: true`. `hsai cycle`
+  prunes whole block directories beyond `execution.trajectory_retention_blocks`,
+  so the store is bounded per record *and* over time. Git history keeps what
+  the working tree drops.
+
+`hsai traj <iteration> [--json]` reconstructs one - prompt, step stream, guard
+verdicts, exit status, usage - purely by reading the file, with no `claude`
+subprocess and no quota spent. (`hsai replay` is an alias.) The lesson and PR
+body still carry only `Trajectory.digest()` plus, in the lesson,
+`Trajectory.excerpt()` - a secrets-scrubbed tail - because a lesson is prose
+for a human and a trajectory is evidence for a machine.
 
 The same envelope feeds `ledger.parse_tokens` (which accepts the parsed payload
 directly), so the quota ledger's token columns - and the block aggregate in the
 review brief, including **tokens per merged PR** - report real numbers instead
 of nulls. Output that is not JSON (an older `claude` binary) degrades to a
 single-step trajectory with null usage rather than breaking the loop.
+
+## Failure taxonomy and the adaptive retry policy
+
+Every failed iteration used to be handled identically: close the PR, bump
+`attempts:N`, unassign, and let the next worker retry with the same tier and a
+byte-identical prompt. `hsai.failures` replaces that with a diagnosis.
+
+**Classify.** `failures.classify(signals)` is pure: it reduces everything one
+iteration observed - guard verdicts, agent exit status, local CI steps, the
+remote conclusion, a rejected push - to exactly one class over an ordered rule
+list. Signals co-occur constantly, so the order *is* the specification:
+
+| # | class | fires when |
+| --- | --- | --- |
+| 1 | `workflow_tamper` | the worker edited `.github/workflows/**` |
+| 2 | `guard_incomplete` | a code ticket produced a knowledge-only diff |
+| 3 | `guard_no_repro` | no failing-then-passing reproduction |
+| 4 | `merge_conflict` | the branch could not be pushed cleanly |
+| 5 | `timeout` | the agent, or the remote poll, ran out of clock |
+| 6 | `agent_error` | `claude -p` exited non-zero |
+| 7 | `lint` | `ruff check` failed locally |
+| 8 | `test_failure` | `pytest` failed locally |
+| 9 | `remote_infra` | remote CI was not green while local CI was |
+| 10 | `unknown` | it failed and left no recognised signal |
+
+Three precedence rules are load-bearing. Tampering beats everything: moving the
+goalposts is a safety event, not a build error. A guard verdict beats a CI
+signal: the guards reason about the *diff*, local CI only about the tree that
+diff produced. `timeout` beats `agent_error`: a killed agent also exits
+non-zero, so the generic signal would always mask the actionable one.
+
+**Act.** `execution.retry_policy` in `core.yaml` maps each class to one of
+`retry_same_tier`, `retry_with_remediation`, `escalate_timeout`, `demote_tier`
+or `block_immediately`; unset classes fall back to
+`failures.DEFAULT_RETRY_POLICY`, and a typo surfaces as a `hsai doctor`
+warning rather than silent drift. `_recover_failed` consults it, labels the
+ticket `failure:<class>`, and applies the action.
+`workflow_tamper` and `merge_conflict` block immediately - neither is fixable
+by running the same prompt again - and blocking deliberately does **not**
+consume an attempt, so the ticket reaches the architect with its retry budget
+intact.
+
+**Carry it forward.** The `failure:<class>` label is the durable channel
+between attempts. The next worker to claim the ticket reads it back, resolves
+the same action, and applies it: one tier cheaper (`demote_tier`), a doubled
+agent timeout (`escalate_timeout`), and/or a bounded *Previous attempt failed*
+section in its prompt, drawn from the prior trajectory's
+`failure_excerpt()` - the class, why it fired, the guard and CI verdicts, and a
+short redacted tail. The stale label is cleared on claim so this attempt's
+verdict is unambiguous.
+
+**Surface it.** `LedgerRecord.failure_class` puts the class in the ledger,
+`BlockAggregate.failure_counts` folds a block's classes together, and a
+**Failure taxonomy** table renders in both the review brief and the block
+whitepaper (built from the `failure/<class>` tag on each lesson, so the
+whitepaper needs only the vault). Three `guard_incomplete` rows say the prompt
+is wrong; three `remote_infra` rows say the environments diverged. Both used to
+read as "3 failed iterations".
+
+Reference-set lineage: `run-llama/llama_index` (`issue_classifier.yml` -
+classify incoming work so it can be routed rather than hand-triaged; and its
+treatment of per-run telemetry as a shipped feature), `SWE-agent` (trajectory
+files as the unit of debugging an autonomous run), `OpenBMB/ChatDev` (reflect
+between phases before acting again) and `assafelovic/gpt-researcher` (its
+batch-by-theme history: group failures into classes first, then fix them as a
+class).
 
 ## Durability: the cycle journal
 
@@ -172,8 +255,9 @@ pre-iteration budget verdict is journaled alongside the iteration itself:
 re-grading it from the ledger on a replay would see the whole block's spend
 before iteration 0 and halt immediately.
 
-The store lives under `.hsai/` (gitignored) for the same reason trajectories do
-- local operational forensics, not repo content. `--dry-run` journals into
+The journal lives under `.hsai/` (gitignored): it is local operational state
+for resuming a block, not evidence about a change - unlike a trajectory, which
+is committed. `--dry-run` journals into
 `journal.dry-run.jsonl` so a rehearsal can neither satisfy nor poison a later
 live run of the same block.
 
@@ -220,10 +304,17 @@ and `main`; green-gated auto-merge serializes the actual integration.
   local approximation.
 - **Local == remote by construction.** A task must not change the CI checks, or
   local and remote would diverge. The orchestrator reverts any edits under
-  `.github/workflows/**` before committing (and notes it in the lesson), so a
-  worker cannot (accidentally or otherwise) move the goalposts it is judged by.
+  `.github/workflows/**` *and stops the iteration* (`workflow_tamper`): a
+  half-reverted diff whose remaining half assumed the new workflow is not worth
+  shipping, and a worker moving the goalposts it is judged by is a safety event
+  that belongs with a human.
+- **A failed push is not a PR.** If `git push` is rejected the iteration stops
+  rather than opening a PR against a branch that is not on origin (which used
+  to yield PR #0 and a nonsense remote poll). A rejected push classifies as
+  `merge_conflict` and blocks.
 - **No ticket is stranded on failure.** If remote CI does not go green,
-  `_recover_failed` closes the PR (deleting the branch) and returns the ticket
-  to the backlog with an incremented `attempts:N` label. After
+  `_recover_failed` closes the PR (deleting the branch), labels the ticket with
+  its failure class, and applies the configured retry action - normally
+  returning it to the backlog with an incremented `attempts:N` label. After
   `execution.max_ticket_attempts`, the ticket is labelled `blocked` and left for
   a human; blocked/assigned tickets are skipped by future workers.

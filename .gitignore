@@ -1,9 +1,7 @@
-# hsai runtime
+# hsai runtime (worktrees, cycle journals). Worker trajectories are NOT here:
+# they are audit evidence and live, redacted and size-capped, under
+# knowledge/trajectories/ - inspect one with `hsai traj <iteration>`.
 .hsai/
-# Raw worker trajectories quote repo content: they stay local (inspect them
-# with `hsai traj <iteration>`); only a digest line and a redacted tail are
-# committed, inside the lesson and the PR body.
-.hsai/traj/
 *.log
 
 # Python

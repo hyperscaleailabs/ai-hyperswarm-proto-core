@@ -14,6 +14,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 from .config import CoreConfig
+from .failures import render_failure_table
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _TAG_RE = re.compile(r"^\s*-\s+(\S.*)$", re.MULTILINE)
@@ -60,6 +61,7 @@ class Lesson:
     remote_ci: str = ""  # SUCCESS | FAILURE | TIMEOUT, filled in once gh checks conclude
     repro_evidence: str = ""  # heal/bugfix only: failing-then-passing reproduction proof
     recalled: tuple[str, ...] = ()  # prior notes injected into this run's prompt
+    failure_class: str = ""  # hsai.failures class; "" when the iteration was clean
 
     def note_name(self) -> str:
         return f"{self.created}-{slugify(self.title)}"
@@ -77,6 +79,7 @@ class LessonRecord:
     lesson_text: str
     what_happened: str = ""
     body: str = ""  # everything after the frontmatter; what the recall index reads
+    failure_class: str = ""  # from the `failure/<class>` tag; "" when clean
 
 
 def split_sections(text: str) -> dict[str, str]:
@@ -125,6 +128,7 @@ def parse_note(path: str | Path) -> LessonRecord:
     tags = _frontmatter_tags(fm)
     outcome = next((t.split("/", 1)[1] for t in tags if t.startswith("outcome/")), "unknown")
     kind = next((t.split("/", 1)[1] for t in tags if t.startswith("kind/")), "unknown")
+    failure = next((t.split("/", 1)[1] for t in tags if t.startswith("failure/")), "")
     title_match = _TITLE_RE.search(text)
     title = title_match.group(1).strip() if title_match else path.stem
     sections = split_sections(text)
@@ -137,6 +141,7 @@ def parse_note(path: str | Path) -> LessonRecord:
         lesson_text=sections.get("lesson learned", ""),
         what_happened=sections.get("what happened", ""),
         body=body.strip(),
+        failure_class=failure,
     )
 
 
@@ -224,6 +229,7 @@ class KnowledgeBase:
 
         outcome_counts = Counter(r.outcome for r in covered)
         kind_counts = Counter(r.kind for r in covered)
+        failure_counts = Counter(r.failure_class for r in covered if r.failure_class)
         failures = [r for r in covered if r.outcome == "fail"]
 
         word_sources: dict[str, set[str]] = {}
@@ -264,6 +270,9 @@ class KnowledgeBase:
 | kind | count |
 | --- | --- |
 {kind_table}
+
+## Failure taxonomy
+{render_failure_table(failure_counts)}
 
 ## Recurring failures
 {failure_lines}
@@ -311,7 +320,13 @@ class KnowledgeBase:
         return "\n".join(lines)
 
     def _render_lesson(self, lesson: Lesson) -> str:
-        tags = ("lesson", f"outcome/{lesson.outcome}", f"kind/{lesson.kind}", *lesson.tags)
+        # The failure tag is what lets `synthesize_whitepaper` build its
+        # taxonomy table from the vault alone, without re-reading the ledger.
+        failure_tag = (f"failure/{lesson.failure_class}",) if lesson.failure_class else ()
+        tags = (
+            "lesson", f"outcome/{lesson.outcome}", f"kind/{lesson.kind}",
+            *failure_tag, *lesson.tags,
+        )
         extra: dict[str, str | tuple[str, ...]] = {
             "created": lesson.created,
             "iteration": str(lesson.iteration),
@@ -340,6 +355,7 @@ class KnowledgeBase:
 | pull request | {pr} |
 | model | `{lesson.model}` |
 | remote CI | {lesson.remote_ci or "_(pending)_"} |
+| failure class | {f"`{lesson.failure_class}`" if lesson.failure_class else "_(none)_"} |
 
 ## Context
 {lesson.context}

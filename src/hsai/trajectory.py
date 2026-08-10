@@ -1,33 +1,45 @@
-"""Worker trajectories: the durable record of what one agent run actually did.
+"""Worker trajectories: the durable record of what one iteration actually did.
 
 Before this module a ``claude -p`` run left nothing behind but a boolean and a
 truncated stderr excerpt, so the loop could not answer forensic questions about
 its own behaviour - what a failed worker tried, where the quota went, whether a
 retry differed from its predecessor. A :class:`Trajectory` is that record: one
-JSON file per agent run under ``.hsai/traj/<block>/<iteration>.json``, written
-at the single invocation choke point (right after ``ai.run_agent``) so every
-run is captured, including the ones a guard aborts moments later.
+JSON file per iteration under
+``knowledge/trajectories/<block>/<iteration>-<branch>.json``, written at the
+single invocation choke point (right after ``ai.run_agent``) and refreshed at
+every terminal exit, so *every* iteration is captured - pass, fail, dry-run, or
+guard-aborted.
 
-Sharding by block is what makes the store bounded: :func:`prune` drops whole
-block directories beyond ``execution.trajectory_retention_blocks`` on each
-cycle, so forensics stay available for the recent past without growing without
-limit.
+What one record holds is deliberately the whole forensic picture of an
+iteration, not just the agent call: the prompt and its hash, the model / tier /
+selection strategy, each guard's verdict, the local CI step results before and
+after, the remote CI conclusion, a changed-path diffstat, per-phase durations,
+the failure class, and a truncated tail of the agent's stdout and stderr.
 
-Two audiences, deliberately separated:
+Two invariants keep it safe to commit:
 
-- **local, complete** - the trajectory file itself. It quotes repo content and
-  therefore stays out of git (``.hsai/`` is ignored); ``hsai replay <id>``
-  reconstructs it without spending any quota.
-- **committed, redacted** - :meth:`Trajectory.excerpt`, a secrets-scrubbed tail
-  of the last few steps embedded in the lesson note. The knowledge base gains
-  signal without becoming a mirror of the working tree.
+- **Redacted.** Nothing reaches disk before :func:`redact_value` has scrubbed
+  every string in the record - API-key-shaped values, gh tokens, ``KEY=VALUE``
+  pairs whose key looks secret, and absolute home paths.
+- **Bounded.** :data:`MAX_RECORD_CHARS` caps one record; a run that would
+  exceed it sheds its earliest steps (a failure shows up at the *end* of a run)
+  and then clips its long free-text fields, marking itself ``truncated``.
+  :func:`prune` drops whole block directories beyond
+  ``execution.trajectory_retention_blocks``, so the store stays bounded over
+  time as well as per record.
+
+The lesson still quotes only :meth:`Trajectory.digest` and
+:meth:`Trajectory.excerpt` - a counter line and a short redacted tail - because
+a lesson is prose for a human and a trajectory is evidence for a machine.
+``hsai traj <id>`` reconstructs a record without spending any quota.
 
 Synthesis: SWE-agent (persist a ``.traj`` per run and build a replay/inspector
 on it - the run record, not just the final patch, is the primary artifact),
-microsoft/JARVIS (intermediate stage results must be separately addressable,
-hence per-step data rather than a final blob), langchain (observability as a
-cross-cutting layer captured at one choke point) and openai/swarm (the runner
-returns the full message list, so callers never reconstruct what happened).
+run-llama/llama_index (per-run instrumentation shipped as a feature, not bolted
+on), microsoft/JARVIS (intermediate stage results must be separately
+addressable, hence per-step data rather than a final blob) and openai/swarm
+(the runner returns the full message list, so callers never reconstruct what
+happened).
 """
 from __future__ import annotations
 
@@ -39,13 +51,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-TRAJECTORY_DIR = ".hsai/traj"
+from .failures import slug
+
+#: Obsidian-adjacent, and committed: a trajectory is audit evidence (G2), so it
+#: ships through the same governance PR as the ledger and the lessons. Mirrored
+#: by ``knowledge.trajectories_dir`` in ``.ai-swarm/core.yaml``.
+TRAJECTORY_DIR = "knowledge/trajectories"
 
 # Per-step text is clipped so one runaway tool result cannot bloat the store.
 STEP_CHARS = 2000
+# Raw stdout/stderr are kept only as a tail - enough to see how a run ended.
+TAIL_CHARS = 1200
+# Hard ceiling on one written record. See `_fit_to_cap`.
+MAX_RECORD_CHARS = 32_000
 # What the committed lesson may quote: a short tail, tightly clipped.
 EXCERPT_STEPS = 5
 EXCERPT_CHARS = 240
+# What a retry prompt may quote about the attempt before it.
+PREVIOUS_ATTEMPT_CHARS = 1200
 
 REDACTED = "[redacted]"
 
@@ -100,6 +123,32 @@ def redact_value(value: Any) -> Any:
 def _clip(text: str, limit: int = STEP_CHARS) -> str:
     text = (text or "").strip()
     return text if len(text) <= limit else text[:limit] + f"... [+{len(text) - limit} chars]"
+
+
+# Changed-path buckets. A path falls in exactly the first bucket that claims
+# it, so `total` always equals the sum of the rest.
+_DIFF_BUCKETS: tuple[tuple[str, Any], ...] = (
+    ("workflows", lambda p: p.startswith(".github/workflows/")),
+    ("tests", lambda p: p.startswith("tests/") or Path(p).name.startswith("test_")),
+    ("knowledge", lambda p: p.startswith("knowledge/")),
+    ("docs", lambda p: p.startswith("docs/") or p.endswith(".md")),
+    ("code", lambda p: p.endswith(".py")),
+)
+
+
+def diffstat(paths: list[str] | tuple[str, ...]) -> dict[str, int]:
+    """Bucket changed paths into a small, stable shape.
+
+    Coarse on purpose: the question a reader asks of a failed iteration is
+    "did it touch code at all, or only notes?", not "how many lines".
+    """
+    stat = {name: 0 for name, _ in _DIFF_BUCKETS}
+    stat["other"] = 0
+    for path in paths or ():
+        bucket = next((name for name, match in _DIFF_BUCKETS if match(path)), "other")
+        stat[bucket] += 1
+    stat["total"] = len(paths or ())
+    return stat
 
 
 @dataclass
@@ -176,9 +225,36 @@ def steps_from_output(raw: dict[str, Any] | None, output: str) -> list[Step]:
     return steps
 
 
+def _dumps(data: dict[str, Any]) -> str:
+    return json.dumps(data, indent=2, sort_keys=True)
+
+
+def _fit_to_cap(data: dict[str, Any], cap: int) -> dict[str, Any]:
+    """Shrink an already-redacted record until its JSON form fits under ``cap``.
+
+    Sheds the *earliest* steps first: a run's failure is at its end, so the
+    tail is the part worth keeping. Only if dropping every step is still not
+    enough do the long free-text fields get clipped. Either way the result
+    stays a complete, parseable record that says ``truncated: true``.
+    """
+    if len(_dumps(data)) <= cap:
+        return data
+    data = {**data, "truncated": True}
+    steps = list(data.get("steps") or [])
+    while steps and len(_dumps({**data, "steps": steps})) > cap:
+        steps.pop(0)
+    data["steps"] = steps
+    for name in ("prompt", "stdout_tail", "stderr_tail", "error"):
+        if len(_dumps(data)) <= cap:
+            break
+        if data.get(name):
+            data[name] = _clip(str(data[name]), 400)
+    return data
+
+
 @dataclass
 class Trajectory:
-    """One agent run, start to finish - the unit the store persists."""
+    """One iteration, start to finish - the unit the store persists."""
 
     iteration: int
     ticket: int | None
@@ -187,6 +263,8 @@ class Trajectory:
     model: str
     prompt: str
     block: int = 0
+    branch: str = ""
+    strategy: str = ""
     prompt_digest: str = ""
     session_id: str = ""
     steps: list[Step] = field(default_factory=list)
@@ -196,11 +274,29 @@ class Trajectory:
     usage: dict[str, Any] | None = None
     duration_seconds: float = 0.0
     outcome: str = "ran"
+    # --- forensics ----------------------------------------------------------
+    #: Each guard's verdict, keyed by guard name (`workflow`, `completeness`,
+    #: `repro`). Present even when a guard passed, so silence is not ambiguous.
+    guards: dict[str, str] = field(default_factory=dict)
+    #: Local CI step results, before and after the agent ran.
+    ci_before: dict[str, bool] = field(default_factory=dict)
+    ci_after: dict[str, bool] = field(default_factory=dict)
+    #: The remote check rollup's conclusion, when the iteration got that far.
+    remote_ci: str = ""
+    changed_paths: list[str] = field(default_factory=list)
+    diffstat: dict[str, int] = field(default_factory=dict)
+    #: Seconds spent per phase (`agent`, `ci_before`, `ci_after`, `remote_ci`).
+    phases: dict[str, float] = field(default_factory=dict)
+    stdout_tail: str = ""
+    stderr_tail: str = ""
+    failure_class: str = ""
+    failure_reason: str = ""
+    truncated: bool = False
     created: str = field(default_factory=_now)
 
     @property
     def identifier(self) -> str:
-        """Stable id, and the file stem: the iteration number.
+        """Stable id, and the file stem's head: the iteration number.
 
         Iterations are globally unique (a block numbers its runs
         ``block * 100 + n``), so this addresses exactly one run and is what
@@ -208,8 +304,12 @@ class Trajectory:
         """
         return str(self.iteration)
 
+    def as_record(self) -> dict[str, Any]:
+        """The exact dict that gets written: redacted, then capped."""
+        return _fit_to_cap(redact_value(asdict(self)), MAX_RECORD_CHARS)
+
     def to_json(self) -> str:
-        return json.dumps(redact_value(asdict(self)), indent=2, sort_keys=True)
+        return _dumps(self.as_record())
 
     def tokens(self) -> tuple[int, int] | None:
         """``(input, output)`` token counts, or ``None`` if unreported."""
@@ -246,6 +346,7 @@ class Trajectory:
         return (
             f"tokens={tokens}, duration={self.duration_seconds:.1f}s, "
             f"exit={self.exit_status}, outcome={self.outcome}, "
+            f"failure={self.failure_class or 'none'}, "
             f"first-failing-step={self.first_failing_step()}, "
             f"replay=`hsai traj {self.identifier}`"
         )
@@ -265,13 +366,49 @@ class Trajectory:
             lines.insert(0, f"... {dropped} earlier step(s) elided")
         return "\n".join(redact(line) for line in lines)
 
+    def failure_excerpt(self, limit: int = PREVIOUS_ATTEMPT_CHARS) -> str:
+        """What the NEXT attempt on this ticket is shown about this one.
+
+        Bounded and redacted like everything else that leaves the store, and
+        deliberately evidence-shaped: the class, why it fired, the guard and CI
+        verdicts, then a short tail. A worker that sees this should not need to
+        rediscover the failure to avoid repeating it.
+        """
+        guards = ", ".join(f"{k}={v}" for k, v in sorted(self.guards.items())) or "none run"
+        ci = ", ".join(
+            f"{k}={'pass' if v else 'FAIL'}" for k, v in sorted(self.ci_after.items())
+        ) or "not run"
+        lines = [
+            f"- failure class: `{self.failure_class or 'unknown'}`"
+            + (f" - {self.failure_reason}" if self.failure_reason else ""),
+            f"- iteration {self.iteration} on `{self.branch or '(unknown branch)'}`, "
+            f"model `{self.model}` (tier `{self.tier}`)",
+            f"- guards: {guards}",
+            f"- local CI after that attempt: {ci}",
+            f"- remote CI: {self.remote_ci or 'not reached'}",
+            "- tail of that run:",
+            self.excerpt(steps=3, limit=200),
+        ]
+        return _clip(redact("\n".join(lines)), limit)
+
     def render(self) -> str:
         """Human-readable reconstruction (what ``hsai replay`` prints)."""
         ticket = f"#{self.ticket}" if self.ticket else "(none)"
+        guards = ", ".join(f"{k}={v}" for k, v in sorted(self.guards.items())) or "(none)"
+        phases = ", ".join(f"{k}={v:.2f}s" for k, v in sorted(self.phases.items())) or "(none)"
         head = [
             f"trajectory {self.identifier}  [{self.kind}] ticket {ticket} block {self.block}",
-            f"model: {self.model} (tier={self.tier})  duration: {self.duration_seconds:.3f}s",
+            f"branch: {self.branch or '(none)'}",
+            f"model: {self.model} (tier={self.tier}, strategy={self.strategy or 'n/a'})"
+            f"  duration: {self.duration_seconds:.3f}s",
             f"exit: {self.exit_status}  ok={self.ok}  outcome: {self.outcome}",
+            f"failure: {self.failure_class or 'none'}"
+            + (f" - {self.failure_reason}" if self.failure_reason else ""),
+            f"guards: {guards}",
+            f"CI before: {self.ci_before or '(not run)'}  after: {self.ci_after or '(not run)'}"
+            f"  remote: {self.remote_ci or '(not reached)'}",
+            f"diffstat: {self.diffstat or '(none)'}",
+            f"phases: {phases}",
             self.usage_summary(),
             f"session: {self.session_id or '(not reported)'}",
             f"prompt digest: {self.prompt_digest or '(none)'}",
@@ -297,24 +434,35 @@ def block_dir(repo_root: str | Path, block: int) -> Path:
     return trajectory_dir(repo_root) / str(block)
 
 
-def path_for(repo_root: str | Path, identifier: str, block: int) -> Path:
-    return block_dir(repo_root, block) / f"{identifier}.json"
+def file_stem(identifier: str, branch: str = "") -> str:
+    """``<iteration>-<branch>`` - the branch makes a record self-describing."""
+    tail = slug(branch)
+    return f"{identifier}-{tail}" if tail else str(identifier)
+
+
+def path_for(
+    repo_root: str | Path, identifier: str, block: int, branch: str = ""
+) -> Path:
+    return block_dir(repo_root, block) / f"{file_stem(identifier, branch)}.json"
 
 
 def find(repo_root: str | Path, identifier: str) -> Path | None:
-    """Locate one iteration's trajectory without knowing which block it is in."""
+    """Locate one iteration's trajectory without knowing its block or branch."""
     # Ids only - a path is resolved by the caller, never fed to glob().
     if not identifier or not identifier.isdigit():
         return None
-    matches = sorted(trajectory_dir(repo_root).glob(f"*/{identifier}.json"))
+    root = trajectory_dir(repo_root)
+    matches = sorted(root.glob(f"*/{identifier}.json")) + sorted(
+        root.glob(f"*/{identifier}-*.json")
+    )
     return matches[0] if matches else None
 
 
 def write(traj: Trajectory, repo_root: str | Path) -> Path:
     """Persist (or refresh) one trajectory as a single redacted JSON file."""
-    path = path_for(repo_root, traj.identifier, traj.block)
+    path = path_for(repo_root, traj.identifier, traj.block, traj.branch)
     path.parent.mkdir(parents=True, exist_ok=True)
-    # to_json() redacts: nothing reaches disk before the scrub pass.
+    # as_record() redacts and caps: nothing reaches disk before the scrub pass.
     path.write_text(traj.to_json(), encoding="utf-8")
     return path
 
@@ -337,11 +485,34 @@ def load(repo_root: str | Path, identifier: str) -> Trajectory:
     )
 
 
+def latest_for_ticket(repo_root: str | Path, ticket: int | None) -> Trajectory | None:
+    """The most recent *failed* trajectory recorded against ``ticket``.
+
+    This is what turns a retry into an informed second attempt: the previous
+    attempt's record is right there on disk, so the next prompt can quote it
+    without re-running anything. Returns ``None`` when the ticket has no failed
+    predecessor (a first attempt, or one whose record has been pruned).
+    """
+    if not ticket:
+        return None
+    best: Trajectory | None = None
+    for path in sorted(trajectory_dir(repo_root).glob("*/*.json")):
+        try:
+            traj = read(path)
+        except (OSError, ValueError, TypeError):
+            continue  # a half-written or foreign file must not break a run
+        if traj.ticket != ticket or not traj.failure_class:
+            continue
+        if best is None or traj.iteration > best.iteration:
+            best = traj
+    return best
+
+
 def prune(repo_root: str | Path, keep_blocks: int) -> list[int]:
     """Drop trajectory block directories older than the newest ``keep_blocks``.
 
-    Trajectories are local forensics, not repo content: they are worth keeping
-    for the recent past and worth bounding beyond it. Returns the blocks removed
+    Records are worth keeping for the recent past and worth bounding beyond it;
+    git history retains what the working tree drops. Returns the blocks removed
     (a non-positive ``keep_blocks`` disables pruning entirely).
     """
     root = trajectory_dir(repo_root)
@@ -373,17 +544,24 @@ def record(
     tier: str,
     model: str,
     prompt: str,
-    result: Any,
+    result: Any = None,
     block: int = 0,
+    branch: str = "",
+    strategy: str = "",
     duration_seconds: float = 0.0,
     outcome: str = "ran",
 ) -> Trajectory:
     """Build a trajectory from an :class:`hsai.ai.AIResult` and persist it.
 
     ``result`` is duck-typed (``ok``/``output``/``error``/``usage``/``payload``)
-    so this module stays independent of :mod:`hsai.ai`.
+    so this module stays independent of :mod:`hsai.ai`, and may be ``None`` for
+    an iteration that never called a model (a dry run) - which still gets a
+    record, because "we chose not to spend quota here" is itself an auditable
+    fact about the block.
     """
     payload = getattr(result, "payload", None)
+    output = str(getattr(result, "output", "") or "")
+    error = str(getattr(result, "error", "") or "")
     traj = Trajectory(
         iteration=iteration,
         ticket=ticket,
@@ -392,15 +570,22 @@ def record(
         model=model,
         prompt=prompt,
         block=block,
+        branch=branch,
+        strategy=strategy,
         prompt_digest=prompt_digest(prompt),
         session_id=str(getattr(result, "session_id", "") or ""),
-        steps=steps_from_output(payload, getattr(result, "output", "")),
-        ok=bool(getattr(result, "ok", False)),
-        exit_status="ok" if getattr(result, "ok", False) else "error",
-        error=redact(_clip(getattr(result, "error", "") or "")),
+        steps=steps_from_output(payload, output) if result is not None else [],
+        ok=bool(getattr(result, "ok", False)) if result is not None else True,
+        exit_status=(
+            "not-run" if result is None
+            else "ok" if getattr(result, "ok", False) else "error"
+        ),
+        error=redact(_clip(error)),
         usage=getattr(result, "usage", None),
         duration_seconds=round(max(0.0, duration_seconds), 3),
         outcome=outcome,
+        stdout_tail=redact(_clip(output[-TAIL_CHARS:], TAIL_CHARS)),
+        stderr_tail=redact(_clip(error[-TAIL_CHARS:], TAIL_CHARS)),
     )
     write(traj, repo_root)
     return traj

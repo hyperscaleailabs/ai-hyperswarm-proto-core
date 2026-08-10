@@ -7,6 +7,8 @@ from typing import Any
 
 import yaml
 
+from . import failures
+
 CORE_PATH = ".ai-swarm/core.yaml"
 
 
@@ -47,6 +49,9 @@ class CoreConfig:
     ci_remote_timeout: float
     ci_poll_interval: float
     max_ticket_attempts: int
+    #: failure class -> retry action, consulted by ``orchestrator._recover_failed``.
+    #: Unset classes fall back to :data:`hsai.failures.DEFAULT_RETRY_POLICY`.
+    retry_policy: dict[str, str]
     tiers: dict[str, ModelTier]
     default_tier: str
     constraints: dict[str, Any]
@@ -138,6 +143,9 @@ def load_config(path: str | Path | None = None) -> CoreConfig:
         ci_remote_timeout=float(execution.get("ci_remote_timeout_seconds", 300)),
         ci_poll_interval=float(execution.get("ci_poll_interval_seconds", 10)),
         max_ticket_attempts=int(execution.get("max_ticket_attempts", 2)),
+        retry_policy={
+            str(k): str(v) for k, v in (execution.get("retry_policy") or {}).items()
+        },
         tiers=tiers,
         default_tier=models.get("default_tier", "standard"),
         constraints=data.get("constraints", {}),
@@ -177,5 +185,14 @@ def validate(cfg: CoreConfig) -> ValidationResult:
         warnings.append("ANTHROPIC_API_KEY not in constraints.forbid_env")
     if len(cfg.reference_top10) < 10:
         warnings.append(f"reference_set.top10 has {len(cfg.reference_top10)} entries (< 10)")
+    # A typo here silently reverts a class to the default action, which is
+    # exactly the kind of quiet drift the taxonomy exists to prevent.
+    for klass, action in cfg.retry_policy.items():
+        if klass not in failures.CLASSES:
+            warnings.append(f"execution.retry_policy has unknown failure class '{klass}'")
+        if action not in failures.ACTIONS:
+            warnings.append(
+                f"execution.retry_policy['{klass}'] names unknown action '{action}'"
+            )
 
     return ValidationResult(ok=not errors, errors=errors, warnings=warnings)

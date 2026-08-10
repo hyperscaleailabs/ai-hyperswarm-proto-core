@@ -104,9 +104,9 @@ def test_write_read_roundtrip(tmp_path):
     traj = _traj(usage={"input_tokens": 10, "output_tokens": 4}, duration_seconds=1.25)
     path = trajectory.write(traj, tmp_path)
 
-    # One JSON artifact per run, sharded by block so pruning can drop whole
-    # blocks: .hsai/traj/<block>/<iteration>.json
-    assert path == tmp_path / ".hsai" / "traj" / "0" / "12.json"
+    # One JSON artifact per iteration, sharded by block so pruning can drop
+    # whole blocks: knowledge/trajectories/<block>/<iteration>.json
+    assert path == tmp_path / "knowledge" / "trajectories" / "0" / "12.json"
     back = trajectory.read(path)
     assert back == traj
     assert back.steps[0] == Step(index=1, kind="assistant", text="step 1")
@@ -116,8 +116,20 @@ def test_write_read_roundtrip(tmp_path):
 
 def test_write_shards_by_block(tmp_path):
     path = trajectory.write(_traj(iteration=703, block=7), tmp_path)
-    assert path == tmp_path / ".hsai" / "traj" / "7" / "703.json"
+    assert path == tmp_path / "knowledge" / "trajectories" / "7" / "703.json"
     assert trajectory.load(tmp_path, "703").iteration == 703
+
+
+def test_the_branch_is_part_of_the_file_name(tmp_path):
+    """A record names the branch it came from, so it is self-describing."""
+    path = trajectory.write(_traj(iteration=41, branch="hsai/iter-17-4-abc123"), tmp_path)
+
+    assert path.name == "41-hsai-iter-17-4-abc123.json"      # the `/` is slugged away
+    assert path.parent == tmp_path / "knowledge" / "trajectories" / "0"
+    # It is still addressed by iteration alone - the branch is not part of the id.
+    assert trajectory.load(tmp_path, "41").branch == "hsai/iter-17-4-abc123"
+    assert trajectory.find(tmp_path, "41") == path
+    assert trajectory.find(tmp_path, "4") is None            # no prefix collisions
 
 
 def test_identifier_is_the_iteration():
@@ -301,3 +313,217 @@ def test_render_shows_prompt_steps_and_usage():
 
 def test_render_reports_missing_usage():
     assert "usage: (not reported)" in _traj(usage=None).render()
+
+
+def test_render_shows_the_forensic_fields():
+    out = _traj(
+        branch="hsai/iter-9", strategy="heuristic-v1",
+        guards={"workflow": "clean", "completeness": "ok", "repro": "n/a"},
+        ci_before={"ruff": True, "pytest": False},
+        ci_after={"ruff": True, "pytest": True},
+        remote_ci="FAILURE", diffstat={"total": 3, "code": 2, "tests": 1},
+        phases={"agent": 12.5, "ci_after": 3.0},
+        failure_class="remote_infra", failure_reason="remote CI concluded FAILURE",
+    ).render()
+    assert "branch: hsai/iter-9" in out
+    assert "strategy=heuristic-v1" in out
+    assert "failure: remote_infra - remote CI concluded FAILURE" in out
+    assert "workflow=clean" in out and "completeness=ok" in out
+    assert "remote: FAILURE" in out
+    assert "agent=12.50s" in out
+
+
+# --- the schema one iteration records ---------------------------------------
+
+def test_a_record_carries_the_whole_forensic_picture(tmp_path):
+    """Every field the review of a failed iteration needs, in one artifact."""
+    traj = _traj(
+        branch="hsai/iter-3", strategy="heuristic-v1",
+        guards={"workflow": "clean", "completeness": "ok", "repro": "n/a"},
+        ci_before={"ruff": True, "pytest": True},
+        ci_after={"ruff": True, "pytest": False},
+        remote_ci="FAILURE",
+        changed_paths=["src/hsai/widget.py", "tests/test_widget.py"],
+        diffstat=trajectory.diffstat(["src/hsai/widget.py", "tests/test_widget.py"]),
+        phases={"agent": 30.0, "ci_before": 4.0, "ci_after": 5.0, "total": 42.0},
+        stdout_tail="pytest: 1 failed", stderr_tail="",
+        failure_class="test_failure", failure_reason="pytest failed locally",
+        usage={"input_tokens": 10, "output_tokens": 4},
+    )
+    stored = json.loads(trajectory.write(traj, tmp_path).read_text())
+
+    # prompt text and hash, model/tier/strategy
+    assert stored["prompt"] == "Implement the widget."
+    assert stored["prompt_digest"] == trajectory.prompt_digest("Implement the widget.")
+    assert (stored["model"], stored["tier"], stored["strategy"]) == (
+        "sonnet", "standard", "heuristic-v1"
+    )
+    # every guard verdict, local CI steps, remote outcome
+    assert set(stored["guards"]) == {"workflow", "completeness", "repro"}
+    assert stored["ci_before"] == {"ruff": True, "pytest": True}
+    assert stored["ci_after"] == {"ruff": True, "pytest": False}
+    assert stored["remote_ci"] == "FAILURE"
+    # changed-path diffstat and phase durations
+    assert stored["diffstat"] == {
+        "workflows": 0, "tests": 1, "knowledge": 0, "docs": 0, "code": 1,
+        "other": 0, "total": 2,
+    }
+    assert stored["phases"]["agent"] == 30.0
+    # agent output tails and the classification
+    assert stored["stdout_tail"] == "pytest: 1 failed"
+    assert stored["failure_class"] == "test_failure"
+    assert stored["truncated"] is False
+    # ...and it parses straight back into a Trajectory.
+    assert trajectory.read(trajectory.path_for(tmp_path, "12", 0, "hsai/iter-3")) == traj
+
+
+def test_diffstat_buckets_each_path_exactly_once():
+    stat = trajectory.diffstat([
+        ".github/workflows/ci.yml",
+        "tests/test_a.py",
+        "src/hsai/b.py",
+        "knowledge/lessons/x.md",
+        "docs/ARCHITECTURE.md",
+        "Makefile",
+    ])
+    assert stat == {
+        "workflows": 1, "tests": 1, "code": 1, "knowledge": 1, "docs": 1,
+        "other": 1, "total": 6,
+    }
+    # `total` always equals the sum of the buckets - no double counting.
+    assert stat["total"] == sum(v for k, v in stat.items() if k != "total")
+    assert trajectory.diffstat([])["total"] == 0
+
+
+# --- the size cap ------------------------------------------------------------
+
+def test_a_huge_run_is_capped_and_keeps_its_tail(tmp_path):
+    """A runaway agent must not write a megabyte into the knowledge base."""
+    traj = _traj(steps=[
+        Step(index=i, kind="tool_result", text=f"MARKER-{i} " + "x" * 1500)
+        for i in range(1, 200)
+    ])
+    path = trajectory.write(traj, tmp_path)
+    written = path.read_text()
+
+    assert len(written) <= trajectory.MAX_RECORD_CHARS
+    back = trajectory.read(path)                    # still a complete record
+    assert back.truncated is True
+    assert back.iteration == 12 and back.model == "sonnet"
+    # The END of the run survives - that is where a failure shows up.
+    assert back.steps, "the cap must not empty the step stream"
+    assert back.steps[-1].index == 199
+    assert "MARKER-1 " not in written               # the earliest steps were shed
+
+
+def test_a_pathological_prompt_is_clipped_rather_than_dropped(tmp_path):
+    """Even with no steps to shed, the record stays parseable and capped."""
+    traj = _traj(steps=[], prompt="P" * (trajectory.MAX_RECORD_CHARS * 2))
+    path = trajectory.write(traj, tmp_path)
+
+    assert len(path.read_text()) <= trajectory.MAX_RECORD_CHARS
+    back = trajectory.read(path)
+    assert back.truncated is True
+    assert "chars]" in back.prompt                  # clipped, with the count kept
+
+
+def test_an_ordinary_run_is_not_marked_truncated(tmp_path):
+    stored = json.loads(trajectory.write(_traj(), tmp_path).read_text())
+    assert stored["truncated"] is False
+
+
+# --- redaction of agent output (the invariant that makes committing safe) ----
+
+def test_api_keys_and_gh_tokens_in_agent_output_never_reach_disk(tmp_path):
+    from hsai.ai import AIResult
+
+    api_key = "sk-ant-api03-AAAABBBBCCCCDDDD"
+    gh_token = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"
+    payload = {
+        "result": f"exported ANTHROPIC_API_KEY={api_key} then ran gh",
+        "messages": [
+            {"role": "assistant", "content": f"GH_TOKEN={gh_token} authenticated"},
+        ],
+    }
+    ares = AIResult(
+        ok=True, model="sonnet", output=json.dumps(payload),
+        error=f"warning: {gh_token} leaked to stderr", cmd=["claude"], payload=payload,
+    )
+
+    traj = trajectory.record(
+        tmp_path, iteration=21, ticket=7, kind="implement", tier="standard",
+        model="sonnet", prompt=f"do it with {api_key}", result=ares,
+        block=0, branch="hsai/iter-21",
+    )
+    written = trajectory.path_for(tmp_path, "21", 0, "hsai/iter-21").read_text()
+
+    for secret in (api_key, gh_token):
+        assert secret not in written
+        assert secret not in traj.to_json()
+        assert secret not in traj.failure_excerpt()
+        assert secret not in traj.excerpt()
+    assert REDACTED in written
+    # The stdout/stderr tails are captured, and scrubbed, not simply dropped.
+    assert traj.stdout_tail and traj.stderr_tail
+    assert "leaked to stderr" in traj.stderr_tail
+
+
+# --- what a retry is shown about the attempt before it ----------------------
+
+def test_failure_excerpt_is_bounded_evidence_not_a_transcript():
+    traj = _traj(
+        branch="hsai/iter-8", failure_class="test_failure",
+        failure_reason="pytest failed locally",
+        guards={"completeness": "ok", "repro": "n/a"},
+        ci_after={"ruff": True, "pytest": False},
+        remote_ci="FAILURE",
+    )
+    excerpt = traj.failure_excerpt()
+
+    assert len(excerpt) <= trajectory.PREVIOUS_ATTEMPT_CHARS
+    assert "`test_failure`" in excerpt and "pytest failed locally" in excerpt
+    assert "hsai/iter-8" in excerpt
+    assert "completeness=ok" in excerpt
+    assert "pytest=FAIL" in excerpt and "ruff=pass" in excerpt
+    assert "remote CI: FAILURE" in excerpt
+    assert "step 8" in excerpt                     # the tail of the run
+    assert "Implement the widget." not in excerpt  # never the prompt
+
+
+def test_failure_excerpt_respects_its_own_limit():
+    traj = _traj(
+        failure_class="lint",
+        failure_reason="ruff check failed locally: " + "detail " * 500,
+        steps=[Step(index=1, kind="tool_result", text="y" * 5000)],
+    )
+    excerpt = traj.failure_excerpt(limit=300)
+    assert len(excerpt) <= 300 + 40                # the clip marker is not free
+    assert "chars]" in excerpt
+
+
+def test_latest_for_ticket_finds_the_most_recent_failed_attempt(tmp_path):
+    trajectory.write(_traj(iteration=1, ticket=7, failure_class="lint"), tmp_path)
+    trajectory.write(_traj(iteration=5, ticket=7, failure_class="test_failure"), tmp_path)
+    trajectory.write(_traj(iteration=6, ticket=7, failure_class=""), tmp_path)  # clean
+    trajectory.write(_traj(iteration=9, ticket=8, failure_class="timeout"), tmp_path)
+
+    found = trajectory.latest_for_ticket(tmp_path, 7)
+    assert found is not None
+    assert found.iteration == 5 and found.failure_class == "test_failure"
+
+    assert trajectory.latest_for_ticket(tmp_path, 99) is None   # no history
+    assert trajectory.latest_for_ticket(tmp_path, None) is None
+
+
+def test_latest_for_ticket_survives_a_corrupt_record(tmp_path):
+    """A half-written file must not take down the next iteration."""
+    trajectory.write(_traj(iteration=2, ticket=7, failure_class="lint"), tmp_path)
+    (trajectory.block_dir(tmp_path, 0) / "junk.json").write_text("{not json")
+
+    found = trajectory.latest_for_ticket(tmp_path, 7)
+    assert found is not None and found.iteration == 2
+
+
+def test_digest_names_the_failure_class():
+    assert "failure=test_failure" in _traj(failure_class="test_failure").digest()
+    assert "failure=none" in _traj().digest()

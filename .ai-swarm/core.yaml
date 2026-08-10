@@ -90,11 +90,34 @@ execution:
   output_format: json            # `claude -p --output-format`: the structured envelope that
                                  # feeds the quota ledger + trajectory store. Set to `text`
                                  # to drop the flag if a CLI change ever breaks it.
-  trajectory_retention_blocks: 8 # how many blocks of .hsai/traj/ to keep (0 = keep all)
+  trajectory_retention_blocks: 8 # blocks of knowledge/trajectories/ to keep (0 = keep all)
   agent_timeout_seconds: 1200    # hard cap per claude -p worker so a hang cannot stall the loop
   ci_remote_timeout_seconds: 300 # how long to wait for a PR's remote CI to conclude
   ci_poll_interval_seconds: 10   # poll cadence while waiting for remote CI
   max_ticket_attempts: 2         # retries before a ticket is marked 'blocked' for humans
+
+  # What to do about each class of failure (see src/hsai/failures.py). Every
+  # failed iteration is classified from the signals it left behind, the ticket
+  # is labelled `failure:<class>`, and the NEXT worker to claim it resolves the
+  # action below - so a retry differs from the attempt that just failed instead
+  # of repeating it verbatim. Actions:
+  #   retry_same_tier        - hand it back unchanged; the cause was not ours
+  #   retry_with_remediation - hand it back WITH the prior attempt's evidence
+  #   escalate_timeout       - remediate, and give the next run a longer clock
+  #   demote_tier            - remediate, and run one model tier cheaper
+  #   block_immediately      - straight to a human, WITHOUT consuming a retry
+  # Anything unset here falls back to failures.DEFAULT_RETRY_POLICY.
+  retry_policy:
+    lint: retry_with_remediation
+    test_failure: retry_with_remediation
+    timeout: escalate_timeout
+    guard_incomplete: retry_with_remediation
+    guard_no_repro: retry_with_remediation
+    workflow_tamper: block_immediately    # moved the goalposts: needs a human
+    merge_conflict: block_immediately     # re-running the same prompt cannot fix it
+    remote_infra: retry_same_tier         # local was green; the environments diverged
+    agent_error: demote_tier
+    unknown: retry_same_tier
 
 # Model-size selection is a first-class, LEARNED capability (see backlog).
 # The orchestrator picks a tier per task; tiers map to `claude --model` aliases.
@@ -175,6 +198,11 @@ knowledge:
   whitepapers_dir: knowledge/whitepapers
   mocs_dir: knowledge/MOCs
   templates_dir: knowledge/templates
+  # One JSON record per iteration, sharded by block (see src/hsai/trajectory.py).
+  # Obsidian-adjacent and committed: a trajectory is audit evidence (G2), and
+  # `.obsidian/app.json` sets showUnsupportedFiles: false so the JSON never
+  # clutters the vault's graph. Redacted and size-capped before it hits disk.
+  trajectories_dir: knowledge/trajectories
   whitepaper_every_lessons: 10       # synthesize a whitepaper every N new lessons
   obsidian_ready: true               # wikilinks + committed .obsidian config
   # Lesson retrieval (see src/hsai/recall.py): the read half of the knowledge
