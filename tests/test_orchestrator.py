@@ -108,6 +108,14 @@ class FakeRunner:
             return Proc(cmd, 0, "", "")
         if cmd[:2] in (["git", "checkout"], ["git", "clean"]):
             return Proc(cmd, 0, "", "")
+        if cmd[:3] == ["git", "ls-tree", "-r"]:
+            # Protected-surface test-integrity guard: no test files at the base
+            # ref by default, so test_delta stays 0 unless a test overrides this.
+            return Proc(cmd, 0, "", "")
+        if cmd[:2] == ["git", "show"]:
+            return Proc(cmd, 1, "", "fatal: path not in tree")
+        if cmd[:2] == ["git", "ls-files"]:
+            return Proc(cmd, 0, "", "")
         if cmd[:2] == ["ruff", "check"]:
             ok = self.ci_sequence[self._ci_round]
             return Proc(cmd, 0 if ok else 1, "", "" if ok else "ruff: fake lint failure\n")
@@ -535,6 +543,111 @@ def test_workflow_edits_are_reverted(tmp_path):
     assert any(c[:3] == ["git", "checkout", "HEAD"] for c in runner.calls)
     assert any(c[:2] == ["git", "clean"] for c in runner.calls)
     assert any("reverted workflow edits" in n for n in result.notes)
+
+
+def test_policy_violation_blocks_protected_surface_edit_without_label(tmp_path):
+    """Protected-surface policy: a require_label surface touched without the
+    escape-hatch label is recovered before any PR opens."""
+    cfg = load_config()
+    open_issues = [
+        {
+            "number": 9,
+            "title": "feat: bump budget ceiling",
+            "labels": [{"name": "priority:P2"}],
+            "assignees": [],
+            "body": WELL_FORMED_BODY,
+        }
+    ]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+        worktree_status="?? src/hsai/new.py\n M .ai-swarm/core.yaml\n",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.recovered is True
+    assert result.pr is None
+    assert result.merged is False
+    assert any("policy violation" in n for n in result.notes)
+    assert any(".ai-swarm/core.yaml" in n for n in result.notes)
+    assert not any(c[:3] == ["gh", "pr", "create"] for c in runner.calls)
+
+    # the violation is auditable in the lesson...
+    assert result.lesson_path
+    lesson_text = Path(result.lesson_path).read_text()
+    assert ".ai-swarm/core.yaml" in lesson_text
+    assert "guards-approved" in lesson_text
+
+    # ...and in the ledger record
+    records = ledger.read_records(ledger.ledger_path(cfg, tmp_path))
+    assert [r.outcome for r in records] == ["policy_violation"]
+
+    # the ticket is returned to the backlog, same recovery path as every
+    # other pre-PR guard
+    assert any(
+        c[:3] == ["gh", "issue", "edit"] and "--remove-assignee" in c for c in runner.calls
+    )
+
+
+def test_guards_approved_label_lets_a_protected_surface_edit_through(tmp_path):
+    """The architect's escape hatch: a ticket carrying `guards-approved` may
+    touch a require_label surface and proceed exactly like any other change."""
+    cfg = load_config()
+    open_issues = [
+        {
+            "number": 9,
+            "title": "feat: bump budget ceiling",
+            "labels": [{"name": "priority:P2"}, {"name": "guards-approved"}],
+            "assignees": [],
+            "body": WELL_FORMED_BODY,
+        }
+    ]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+        worktree_status=" M .ai-swarm/core.yaml\n",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.recovered is False
+    assert result.pr is not None
+    assert result.merged is True
+    assert not any("policy violation" in n for n in result.notes)
+
+
+def test_deny_mode_surface_blocks_even_with_guards_approved(tmp_path):
+    """A deny-mode surface (the append-only ledger) cannot be waived by any
+    label - it is not a require_label surface."""
+    cfg = load_config()
+    open_issues = [
+        {
+            "number": 9,
+            "title": "feat: rewrite a ledger record",
+            "labels": [{"name": "priority:P2"}, {"name": "guards-approved"}],
+            "assignees": [],
+            "body": WELL_FORMED_BODY,
+        }
+    ]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+        worktree_status=" M knowledge/ledger/iterations.jsonl\n",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.recovered is True
+    assert result.pr is None
+    assert any("policy violation" in n for n in result.notes)
+    assert any("knowledge/ledger" in n for n in result.notes)
 
 
 def test_completeness_guard_blocks_knowledge_only_diff_on_code_ticket(tmp_path):

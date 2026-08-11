@@ -57,6 +57,7 @@ class CoreConfig:
     synthesis: dict[str, Any]
     budget: dict[str, Any]
     personas: tuple[dict[str, Any], ...]
+    protected_surfaces: tuple[dict[str, Any], ...]
 
     # --- convenience accessors -------------------------------------------------
     @property
@@ -148,6 +149,7 @@ def load_config(path: str | Path | None = None) -> CoreConfig:
         synthesis=data.get("synthesis", {}),
         budget=data.get("budget", {}),
         personas=tuple(data.get("personas", [])),
+        protected_surfaces=tuple(data.get("protected_surfaces", [])),
     )
 
 

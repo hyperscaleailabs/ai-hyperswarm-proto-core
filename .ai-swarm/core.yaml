@@ -169,6 +169,59 @@ constraints:
   require_green_ci_to_merge: true
   require_lesson_per_pr: true
 
+# The allowlist of what a worker's diff may touch (src/hsai/policy.py). A
+# self-improving loop that can edit its own guardrails has preferences, not
+# invariants - this is what keeps G2 (traceability) and G4 (safety) durable
+# across iterations, not just per-PR. Modes:
+#   revert        - silently restored to HEAD before commit (today's
+#                    .github/workflows behaviour, generalized).
+#   require_label - blocked unless the ticket carries the `guards-approved`
+#                    label (the architect's explicit escape hatch).
+#   deny          - always blocked; append-only invariants no ticket can waive.
+# This block itself, plus src/hsai/policy.py and its tests, are protected
+# under require_label below - the gate cannot quietly disable itself.
+protected_surfaces:
+  - glob: ".github/workflows/**"
+    mode: revert
+    rationale: >
+      Local and remote CI must stay identical by construction; a worker
+      cannot move the goalposts it is judged by (learned from a worker once
+      slipping mypy into the CI workflow).
+  - glob: ".ai-swarm/core.yaml"
+    mode: require_label
+    rationale: >
+      Budget ceilings, protected_surfaces, and every other loop invariant
+      live here - raising a ceiling or narrowing this policy must be an
+      explicit, architect-approved change, not a side effect of an unrelated
+      ticket.
+  - glob: "src/hsai/policy.py"
+    mode: require_label
+    rationale: The policy engine cannot quietly disable itself.
+  - glob: "tests/test_policy.py"
+    mode: require_label
+    rationale: Its tests are as protected as the policy engine they pin down.
+  - glob: "src/hsai/tickets.py"
+    mode: require_label
+    rationale: >
+      The well-formedness gate is what keeps vague tickets from being
+      "satisfied" by a trivial diff; weakening it must be deliberate.
+  - glob: "tests/test_tickets.py"
+    mode: require_label
+    rationale: Its tests are as protected as the well-formedness gate they pin down.
+  - glob: "src/hsai/repro.py"
+    mode: require_label
+    rationale: >
+      The reproduce-before-fix contract is what proves a heal/bugfix PR
+      fixed a real bug rather than going green for the wrong reason.
+  - glob: "tests/test_repro.py"
+    mode: require_label
+    rationale: Its tests are as protected as the repro guard they pin down.
+  - glob: "knowledge/ledger/**"
+    mode: deny
+    rationale: >
+      The quota/cost ledger is append-only; no ticket, approved or not,
+      may rewrite or delete a past record.
+
 knowledge:
   root: knowledge                    # Obsidian vault content lives under the repo root
   lessons_dir: knowledge/lessons

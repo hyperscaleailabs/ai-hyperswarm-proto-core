@@ -141,6 +141,59 @@ def test_repro_check_command_passes_and_exits_zero(monkeypatch, capsys):
     assert "PASS" in out
 
 
+def test_parser_policy_check_defaults():
+    parser = build_parser()
+    args = parser.parse_args(["policy-check"])
+    assert args.command == "policy-check"
+    assert args.base_ref == "origin/main"
+    assert args.labels is None
+
+
+def test_policy_check_command_blocks_and_exits_nonzero(monkeypatch, capsys):
+    monkeypatch.setattr(cli_module.gitops, "diff_paths", lambda *a, **k: [".ai-swarm/core.yaml"])
+    monkeypatch.setattr(cli_module.policy, "test_function_delta_for_tree", lambda **k: 0)
+
+    rc = main(["policy-check", "--base-ref", "origin/main"])
+    out = capsys.readouterr().out
+
+    assert rc == 1
+    assert "BLOCKED" in out
+    assert ".ai-swarm/core.yaml" in out
+
+
+def test_policy_check_command_passes_and_exits_zero(monkeypatch, capsys):
+    monkeypatch.setattr(cli_module.gitops, "diff_paths", lambda *a, **k: ["README.md"])
+    monkeypatch.setattr(cli_module.policy, "test_function_delta_for_tree", lambda **k: 0)
+
+    rc = main(["policy-check", "--base-ref", "origin/main"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "PASS" in out
+
+
+def test_policy_check_command_respects_guards_approved_label(monkeypatch, capsys):
+    monkeypatch.setattr(cli_module.gitops, "diff_paths", lambda *a, **k: [".ai-swarm/core.yaml"])
+    monkeypatch.setattr(cli_module.policy, "test_function_delta_for_tree", lambda **k: 0)
+
+    rc = main(["policy-check", "--base-ref", "origin/main", "--labels", "priority:P2,guards-approved"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "PASS" in out
+
+
+def test_policy_check_command_reads_labels_from_env(monkeypatch, capsys):
+    monkeypatch.setattr(cli_module.gitops, "diff_paths", lambda *a, **k: [".ai-swarm/core.yaml"])
+    monkeypatch.setattr(cli_module.policy, "test_function_delta_for_tree", lambda **k: 0)
+    monkeypatch.setenv("PR_LABELS", "guards-approved")
+
+    rc = main(["policy-check"])
+
+    assert rc == 0
+    assert "PASS" in capsys.readouterr().out
+
+
 # --- replay (reads the local trajectory store, spends no quota) -------------
 
 class _RunnerSpy:

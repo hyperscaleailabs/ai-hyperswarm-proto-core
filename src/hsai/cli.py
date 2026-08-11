@@ -10,6 +10,8 @@ Commands:
   hsai doctor                                                  verify environment + invariants
   hsai traj <iteration> [--json]                               print a stored agent run
   hsai replay <iteration> [--json]                             alias of `hsai traj`
+  hsai repro-check --base-ref origin/main                      reproduce-before-fix CI gate
+  hsai policy-check --base-ref origin/main                     protected-surface CI gate
 """
 from __future__ import annotations
 
@@ -17,7 +19,7 @@ import argparse
 import os
 import sys
 
-from . import __version__, ai, recall, repro, trajectory
+from . import __version__, ai, gitops, policy, recall, repro, trajectory
 from .config import CoreConfig, load_config, validate
 from .knowledge import KnowledgeBase
 from .orchestrator import run_loop
@@ -151,6 +153,33 @@ def cmd_repro_check(args: argparse.Namespace) -> int:
     return 0 if result.ok else 1
 
 
+def cmd_policy_check(args: argparse.Namespace) -> int:
+    """Remote-CI counterpart of the orchestrator's protected-surface guard.
+
+    Runs as a pre-merge gate on GitHub for EVERY pull request - human or
+    loop-authored - mirroring how ``hsai repro-check`` binds the
+    reproduce-before-fix contract: diffs the PR branch against ``--base-ref``,
+    counts test functions by AST on both sides, and grades the result against
+    ``protected_surfaces`` in core.yaml. Exits non-zero (naming every violated
+    surface) on a violation, zero on a clean diff.
+    """
+    cfg = _load(args)
+    labels_raw = args.labels if args.labels is not None else os.environ.get("PR_LABELS", "")
+    labels = [lbl.strip() for lbl in labels_raw.split(",") if lbl.strip()]
+    changed = gitops.diff_paths(args.base_ref, cwd=".")
+    test_delta = policy.test_function_delta_for_tree(
+        base_ref=args.base_ref, repo_dir=".", worktree=".",
+    )
+    verdict = policy.evaluate(changed, test_delta, labels, cfg.protected_surfaces)
+    if verdict.allowed:
+        print("policy-check: PASS - no protected-surface violations")
+        return 0
+    print("policy-check: BLOCKED")
+    for v in verdict.violations:
+        print(f"  - {v.describe()}")
+    return 1
+
+
 def _print_trajectory(args: argparse.Namespace, label: str) -> int:
     """Reconstruct a stored agent run from the local trajectory store.
 
@@ -276,6 +305,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--base-ref", default="origin/main", help="pre-fix ref to diff/checkout against"
     )
     rc.set_defaults(func=cmd_repro_check)
+
+    pc = sub.add_parser(
+        "policy-check", help="protected-surface guard for every PR, human or loop-authored (CI gate)"
+    )
+    pc.add_argument(
+        "--base-ref", default="origin/main", help="ref to diff the current tree against"
+    )
+    pc.add_argument(
+        "--labels", default=None,
+        help="comma-separated PR labels, for the guards-approved escape hatch (default: $PR_LABELS)",
+    )
+    pc.set_defaults(func=cmd_policy_check)
 
     return p
 

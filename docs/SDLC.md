@@ -7,9 +7,9 @@ without evidence does not merge.
 | phase | what happens | evidence required |
 | --- | --- | --- |
 | **1. Plan** | A structured ticket exists: Problem, Proposal, Acceptance criteria (>= 2 checkboxes), Verification plan, size label | Ticket link (`Closes #N`) in the PR body; orchestrator refuses `needs-refinement` tickets |
-| **2. Implement** | Code changes on an isolated branch/worktree; model recorded | `## Model used` section in the PR body; workflow edits auto-reverted (CI parity) |
-| **3. Verify** | Local pre-flight: `ruff check .` + `pytest`; completeness guard (code tickets need code diffs); reproduce-before-fix guard for `heal`/`fix:` tickets | `## CI` section; knowledge-only diffs on code tickets are auto-recovered, never merged; heal/bugfix PRs without a test that fails pre-fix and passes post-fix are auto-recovered, never merged |
-| **4. QA** | Remote CI (the source of truth) runs the same checks on GitHub, including a `repro-guard` job re-running the reproduce-before-fix check; PR-body evidence checked | Required `ci` + `repro-guard` status checks green; evidence step passes |
+| **2. Implement** | Code changes on an isolated branch/worktree; model recorded | `## Model used` section in the PR body; workflow edits auto-reverted (CI parity); a diff touching a `protected_surfaces` entry is graded (revert / require `guards-approved` / deny) before anything else |
+| **3. Verify** | Local pre-flight: `ruff check .` + `pytest`; completeness guard (code tickets need code diffs); reproduce-before-fix guard for `heal`/`fix:` tickets; AST test-count comparison against the base ref | `## CI` section; knowledge-only diffs on code tickets are auto-recovered, never merged; heal/bugfix PRs without a test that fails pre-fix and passes post-fix are auto-recovered, never merged; a net test-function decrease without `guards-approved` is auto-recovered |
+| **4. QA** | Remote CI (the source of truth) re-runs lint + tests on GitHub and additionally runs `hsai policy-check` against the PR's base ref, so the protected-surface guard binds human PRs too; PR-body evidence checked | Required `ci` status check green (bundling lint, tests, SDLC evidence, and the policy-check step) |
 | **5. Integrate** | Green-gated squash merge; ticket auto-closes; lesson lands in the knowledge base | `## Lesson learned` section + lesson file in `knowledge/lessons/` |
 
 ## Governance rhythm around the SDLC

@@ -49,3 +49,22 @@ def test_ramp_config():
     assert cfg.proven_at == 1
     assert cfg.ramp_target == 3
     assert cfg.max_parallel >= 1
+
+
+def test_protected_surfaces_are_declared_and_self_protecting():
+    cfg = load_config()
+    assert len(cfg.protected_surfaces) >= 5
+    modes = {s["glob"]: s["mode"] for s in cfg.protected_surfaces}
+
+    # the seeded surfaces from the ticket
+    assert modes[".github/workflows/**"] == "revert"
+    assert modes[".ai-swarm/core.yaml"] == "require_label"
+    assert modes["knowledge/ledger/**"] == "deny"
+
+    # the gate cannot quietly disable itself: policy.py and its tests, plus
+    # the other guard modules it replaces, are require_label surfaces too
+    for glob in ("src/hsai/policy.py", "tests/test_policy.py", "src/hsai/tickets.py",
+                 "src/hsai/repro.py"):
+        assert modes[glob] == "require_label"
+
+    assert all(s.get("rationale") for s in cfg.protected_surfaces)

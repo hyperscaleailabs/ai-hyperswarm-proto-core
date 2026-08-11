@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 from uuid import uuid4
 
-from . import ai, ci, github, gitops, ledger, recall, repro, trajectory
+from . import ai, ci, github, gitops, ledger, policy, recall, repro, trajectory
 from .config import CoreConfig
 from .knowledge import KnowledgeBase, Lesson
 from .models import ModelChoice, Task, select
@@ -427,16 +427,64 @@ def run_once(
         if agent_err:
             agent_err = _format_error_with_context(agent_err, kind, ticket_num)
 
-        # Guard: a task must not change the CI checks, or local and remote CI
-        # would diverge (as happened once when a worker added mypy). Revert any
-        # workflow edits before they are committed and note it in the lesson.
-        reverted_workflows = [
-            p for p in gitops.changed_paths(cwd=wt, runner=runner)
-            if p.startswith(".github/workflows/")
-        ]
+        # Guard: grade the diff against protected_surfaces before it is
+        # committed - a self-improving loop cannot be trusted to grade its own
+        # guardrails (policy.evaluate; see docs/adr/0002-protected-surface-policy.md).
+        # revert-mode paths (e.g. .github/workflows/**) are restored exactly as
+        # the old ad-hoc guard did; require_label/deny violations abort the
+        # iteration into _recover_failed before a PR is ever opened.
+        base_ref = gitops.merge_base(
+            "HEAD", f"origin/{cfg.default_branch}", cwd=wt, runner=runner,
+        ) or f"origin/{cfg.default_branch}"
+        touched = gitops.changed_paths(cwd=wt, runner=runner)
+        test_delta = policy.test_function_delta_for_tree(
+            base_ref=base_ref, repo_dir=repo_dir, worktree=wt, runner=runner,
+        )
+        verdict = policy.evaluate(touched, test_delta, task.labels, cfg.protected_surfaces)
+        for surface in verdict.actions:
+            reverted = [p for p in touched if policy.matches(p, surface.glob)]
+            if reverted:
+                gitops.restore_pathspec(policy.revert_pathspec(surface.glob), cwd=wt, runner=runner)
+                reverted_workflows.extend(reverted)
         if reverted_workflows:
-            gitops.restore_pathspec(".github/workflows", cwd=wt, runner=runner)
             result.notes.append(f"reverted workflow edits: {reverted_workflows}")
+
+        if not verdict.allowed:
+            violation_summary = verdict.summary()
+            result.notes.append(f"policy violation: {violation_summary}")
+            kb = KnowledgeBase.from_config(cfg, wt)
+            lesson = Lesson(
+                title=f"{kind}: {ticket_title}"[:120],
+                outcome="fail",
+                kind=kind,
+                context=(
+                    f"Iteration {iteration}. Ticket #{ticket_num}. "
+                    "Protected-surface policy violation."
+                ),
+                what_happened=(
+                    f"Model `{choice.model}` ({choice.tier}) produced a diff that violates "
+                    f"protected_surfaces: {violation_summary}"
+                ),
+                lesson=(
+                    "Blocked before a PR was opened - a diff cannot touch a protected "
+                    f"surface without the '{policy.GUARDS_APPROVED_LABEL}' label. Apply it to "
+                    "the ticket if the change is architect-approved, or scope the change "
+                    "away from the protected surface."
+                ),
+                iteration=iteration, ticket=ticket_num, model=choice.model,
+                references=tuple(r.repo for r in cfg.reference_top10[:3]),
+                recalled=recalled.note_names,
+            )
+            result.lesson_path = str(kb.write_lesson(lesson))
+            _recover_failed(
+                cfg, repo, 0, kind=kind, ticket_num=ticket_num,
+                claimed_issue=claimed_issue, login=login,
+                remote="POLICY_VIOLATION", runner=runner,
+            )
+            result.recovered = True
+            _record_cost("policy_violation")
+            gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
+            return result
 
         # Completeness guard: a code ticket (feat/skill/refactor/fix) cannot be
         # satisfied by a knowledge-only diff. PR #17 once "closed" a feature
@@ -461,9 +509,7 @@ def run_once(
         # branch, proving the bug was real (llama_index's fix-stream
         # discipline). Docs/chore tickets are exempt.
         if repro.requires_repro_guard(kind, ticket_title):
-            base_ref = gitops.merge_base(
-                "HEAD", f"origin/{cfg.default_branch}", cwd=wt, runner=runner,
-            ) or f"origin/{cfg.default_branch}"
+            # base_ref was already resolved by the protected-surface guard above.
             test_files = repro.changed_test_files(
                 gitops.changed_paths(cwd=wt, runner=runner)
             )

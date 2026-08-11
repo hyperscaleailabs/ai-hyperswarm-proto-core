@@ -32,6 +32,26 @@ Every PR is held to three **traceability invariants**:
 | records the model used | model + tier + selection rationale in the PR body |
 | carries a lesson learned (pass **or** fail) | written to `knowledge/lessons/` every iteration |
 
+## Protected surfaces: the loop cannot edit its own guardrails
+
+A self-improving loop that can edit its own guardrails has preferences, not
+invariants. `protected_surfaces` in [`.ai-swarm/core.yaml`](.ai-swarm/core.yaml)
+is the declared allowlist of what a diff may touch, graded by `src/hsai/policy.py`:
+
+| mode | effect | seeded surfaces |
+| --- | --- | --- |
+| `revert` | silently restored to `HEAD` before commit | `.github/workflows/**` |
+| `require_label` | blocked unless the ticket carries `guards-approved` | `.ai-swarm/core.yaml`, `src/hsai/{policy,tickets,repro}.py` + their tests |
+| `deny` | always blocked - no label can waive it | `knowledge/ledger/**` (append-only) |
+
+A net *decrease* in AST-counted test functions between the base ref and the
+PR tree is graded the same way (a `require_label` violation) - deleting a
+test to turn a red build green needs the same explicit approval. The
+architect's escape hatch is applying the `guards-approved` label to the
+ticket; `hsai policy-check --base-ref origin/main` runs the identical guard
+as a CI gate, so the policy binds human PRs too, not only the loop. See
+[ADR-0002](docs/adr/0002-protected-surface-policy.md).
+
 ## Subscription-only, no metered API
 
 The loop drives **Claude Code headless (`claude -p`)**, so all model usage runs
@@ -88,6 +108,7 @@ hsai loop --max-parallel 3 -n 1   # ramp to the swarm (after proving one iterati
 hsai traj 12       # print what agent run (iteration) 12 did (spends no quota)
 hsai recall "knowledge-only diff on a code ticket"   # rank prior lessons for a task
 hsai cycle --resume   # finish an interrupted governance block, replaying what completed
+hsai policy-check --base-ref origin/main   # protected-surface guard (also runs in CI)
 ```
 
 Every agent run persists a **trajectory** - prompt, step stream, exit status,
@@ -118,7 +139,8 @@ The loop is governed, not just autonomous - see [docs/SDLC.md](docs/SDLC.md) and
    `docs/adr/` plus refined tickets, closed with a merged PR.
 2. **Quality** - a five-phase SDLC (Plan → Implement → Verify → QA → Integrate),
    each phase leaving CI-checked evidence. Vague tickets are refused
-   (`needs-refinement`); code tickets cannot merge with code-free diffs.
+   (`needs-refinement`); code tickets cannot merge with code-free diffs; a
+   diff touching a protected surface (see above) is graded before either.
 3. **Scheduled cycles** - `hsai cycle` runs the two-phase engine: heavy-model
    **synthesis** (combining practices from >= 3 reference projects, with an
    explicit reflection pass) files substantial tickets; cheaper agents implement
