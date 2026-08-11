@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 from hsai import cli as cli_module
 from hsai import trajectory
@@ -141,7 +142,7 @@ def test_repro_check_command_passes_and_exits_zero(monkeypatch, capsys):
     assert "PASS" in out
 
 
-# --- replay (reads the local trajectory store, spends no quota) -------------
+# --- traj (reads the local trajectory store, spends no quota) ---------------
 
 class _RunnerSpy:
     """Records - and refuses - any attempt to shell out."""
@@ -198,11 +199,11 @@ def test_traj_unknown_iteration_exits_nonzero(tmp_path, monkeypatch, capsys):
     assert "no trajectory" in capsys.readouterr().err
 
 
-def test_replay_prints_a_human_reconstruction(tmp_path, monkeypatch, capsys):
+def test_traj_prints_a_human_reconstruction(tmp_path, monkeypatch, capsys):
     _seed_trajectory(tmp_path)
     spy = _no_subprocess(monkeypatch)
 
-    rc = main(["replay", "12", "--root", str(tmp_path)])
+    rc = main(["traj", "12", "--root", str(tmp_path)])
     out = capsys.readouterr().out
 
     assert rc == 0
@@ -214,11 +215,11 @@ def test_replay_prints_a_human_reconstruction(tmp_path, monkeypatch, capsys):
     assert spy.calls == []                                 # no `claude`, no network
 
 
-def test_replay_json_flag_round_trips(tmp_path, monkeypatch, capsys):
+def test_traj_json_flag_round_trips(tmp_path, monkeypatch, capsys):
     traj = _seed_trajectory(tmp_path)
     spy = _no_subprocess(monkeypatch)
 
-    rc = main(["replay", "12", "--root", str(tmp_path), "--json"])
+    rc = main(["traj", "12", "--root", str(tmp_path), "--json"])
     out = capsys.readouterr().out
 
     assert rc == 0
@@ -230,17 +231,80 @@ def test_replay_json_flag_round_trips(tmp_path, monkeypatch, capsys):
     assert spy.calls == []
 
 
-def test_replay_accepts_a_file_path(tmp_path, monkeypatch, capsys):
+def test_traj_accepts_a_file_path(tmp_path, monkeypatch, capsys):
     _seed_trajectory(tmp_path)
     _no_subprocess(monkeypatch)
     path = trajectory.path_for(tmp_path, "12", 0)
 
-    assert main(["replay", str(path)]) == 0
+    assert main(["traj", str(path)]) == 0
     assert "trajectory 12" in capsys.readouterr().out
 
 
-def test_replay_unknown_id_exits_nonzero(tmp_path, monkeypatch, capsys):
+def test_traj_unknown_id_exits_nonzero(tmp_path, monkeypatch, capsys):
     _no_subprocess(monkeypatch)
-    rc = main(["replay", "999", "--root", str(tmp_path)])
+    rc = main(["traj", "999", "--root", str(tmp_path)])
     assert rc == 1
     assert "no trajectory" in capsys.readouterr().err
+
+
+# --- replay (re-drives a recorded iteration; no claude, no gh, no quota) ----
+
+FIXTURES = Path(__file__).parent / "fixtures" / "trajectories"
+
+
+def test_replay_reproduces_a_passing_iteration(monkeypatch, capsys):
+    """The headline contract: a committed fixture replays green, for free."""
+    spy = _no_subprocess(monkeypatch)
+
+    rc = main(["replay", str(FIXTURES / "implement-green.jsonl")])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "kind=implement" in out and "ticket=4242" in out
+    assert "ci:True->True" in out and "merged=True" in out
+    assert spy.calls == []           # no `claude`, no `git push`, no `gh`
+
+
+def test_replay_reproduces_a_blocked_heal(monkeypatch, capsys):
+    spy = _no_subprocess(monkeypatch)
+
+    rc = main(["replay", str(FIXTURES / "heal-red.jsonl"), "--strict"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "kind=heal" in out and "recovered=True" in out
+    assert "repro guard" in out
+    assert spy.calls == []
+
+
+def test_replay_reports_prompt_drift(tmp_path, monkeypatch, capsys):
+    """A changed worker prompt must fail loudly, naming the phase."""
+    _no_subprocess(monkeypatch)
+    drifted = _drifted_fixture(tmp_path, FIXTURES / "implement-green.jsonl")
+
+    rc = main(["replay", str(drifted), "--strict"])
+    err = capsys.readouterr().err
+
+    assert rc == 1
+    assert "prompt drift" in err
+    assert "agent:implement" in err                  # the offending phase
+
+
+def test_replay_missing_file_exits_nonzero(capsys):
+    assert main(["replay", "tests/fixtures/trajectories/nope.jsonl"]) == 1
+    assert "no trajectory" in capsys.readouterr().err
+
+
+def _drifted_fixture(tmp_path, source):
+    """Copy a fixture with the recorded agent prompt mutated."""
+    lines = source.read_text(encoding="utf-8").splitlines()
+    out = []
+    for line in lines:
+        event = json.loads(line)
+        if event.get("prompt"):
+            event["prompt"] += "\nAn extra instruction the template did not have."
+            event.pop("prompt_sha256", None)
+        out.append(json.dumps(event))
+    target = tmp_path / "drifted.jsonl"
+    target.write_text("\n".join(out) + "\n", encoding="utf-8")
+    return target

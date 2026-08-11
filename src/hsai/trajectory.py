@@ -1,5 +1,16 @@
 """Worker trajectories: the durable record of what one agent run actually did.
 
+Two records live here, at two levels of resolution:
+
+- :class:`Trajectory` - one JSON file per *agent run* under
+  ``.hsai/traj/<block>/<iteration>.json``. Human-facing forensics: the prompt,
+  the step stream, usage, and the digest/excerpt the lesson quotes.
+- :class:`TrajectoryEvent` + :class:`Recorder` - an append-only JSONL *event
+  stream* per iteration under ``.hsai/trajectories/<iteration>.jsonl``, one
+  event per subprocess the iteration ran (agent, git, gh, ruff, pytest). It is
+  machine-facing: :mod:`hsai.replay` turns one back into a ``Runner`` and
+  re-drives ``orchestrator.run_once`` with zero quota and zero network.
+
 Before this module a ``claude -p`` run left nothing behind but a boolean and a
 truncated stderr excerpt, so the loop could not answer forensic questions about
 its own behaviour - what a failed worker tried, where the quota went, whether a
@@ -24,20 +35,29 @@ Two audiences, deliberately separated:
 
 Synthesis: SWE-agent (persist a ``.traj`` per run and build a replay/inspector
 on it - the run record, not just the final patch, is the primary artifact),
+langchain (record/replay cassettes turn previously-live interactions into
+deterministic, zero-cost CI fixtures), FoundationAgents/MetaGPT (an SOP emits an
+explicit artifact at every phase boundary, hence phase-tagged events),
 microsoft/JARVIS (intermediate stage results must be separately addressable,
-hence per-step data rather than a final blob), langchain (observability as a
-cross-cutting layer captured at one choke point) and openai/swarm (the runner
+hence per-step data rather than a final blob) and openai/swarm (the runner
 returns the full message list, so callers never reconstruct what happened).
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
-from dataclasses import asdict, dataclass, field
+import threading
+import time
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from .config import CoreConfig
+from .proc import Proc, Runner
 
 TRAJECTORY_DIR = ".hsai/traj"
 
@@ -361,7 +381,261 @@ def prune(repo_root: str | Path, keep_blocks: int) -> list[int]:
 
 def prompt_digest(prompt: str) -> str:
     """Short content hash of a prompt - enough to tell two runs apart."""
-    return hashlib.sha256((prompt or "").encode("utf-8")).hexdigest()[:12]
+    return sha256_of(prompt)[:12]
+
+
+# --- event stream: the deterministic, replayable record ----------------------
+#
+# The JSON store above answers "what did that agent do?". This one answers the
+# harder question: "can I run that iteration again, exactly, for free?". One
+# append-only JSONL file per iteration, one event per subprocess, recorded at
+# the `Runner` choke point - which is precisely the seam `hsai.replay` needs to
+# stand in for `claude`, `git` and `gh`.
+
+# Serializes appends so parallel workers never interleave a partial line
+# (the same lock-and-append discipline as `ledger.append_record`).
+_EVENT_LOCK = threading.Lock()
+
+# Env values shorter than this are too generic to substitute blindly - replacing
+# a two-character value would shred every unrelated string in the record.
+MIN_SECRET_CHARS = 4
+
+
+def sha256_of(text: str) -> str:
+    """Full content hash - the identity a replay compares prompts on."""
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+@dataclass
+class TrajectoryEvent:
+    """One subprocess an iteration ran, recorded well enough to replay it.
+
+    ``phase`` is the SOP step the loop was in when the call happened
+    (``ci-before``, ``agent:implement``, ``repro-guard``, ``publish``, ...), so
+    a trajectory reads as a sequence of phases rather than an undifferentiated
+    log - and so a replay failure can name *where* it diverged.
+    """
+
+    timestamp: str
+    iteration: str
+    phase: str
+    command: list[str] = field(default_factory=list)
+    exit_code: int = 0
+    stdout: str = ""
+    stderr: str = ""
+    duration_s: float = 0.0
+    # Agent events only; empty for git/gh/ruff/pytest calls.
+    tier: str = ""
+    model: str = ""
+    prompt: str = ""
+    prompt_sha256: str = ""
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+    @property
+    def is_agent(self) -> bool:
+        return bool(self.prompt_sha256) or self.command[:1] == ["claude"]
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), sort_keys=True)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> TrajectoryEvent:
+        """Parse one recorded line, ignoring keys a future version may add.
+
+        A hand-curated fixture may omit ``prompt_sha256``; it is then derived
+        from the recorded prompt, which is exactly what the recorder stores.
+        """
+        known = {f.name for f in fields(cls)}
+        event = cls(**{k: v for k, v in data.items() if k in known})
+        if event.prompt and not event.prompt_sha256:
+            event.prompt_sha256 = sha256_of(event.prompt)
+        return event
+
+
+class Redactor:
+    """Scrubs an event before it can reach disk.
+
+    Three layers, most specific first: the exact *values* of the environment
+    variables named in ``constraints.forbid_env`` (the credentials the loop
+    already refuses to hand a worker), then the configured
+    ``trajectories.redact_patterns`` deny-regexes, then the shared
+    :func:`redact` pass for generic credential shapes and home paths.
+    """
+
+    def __init__(self, secrets: Iterable[str] = (), patterns: Iterable[str] = ()) -> None:
+        # Longest first: a secret that contains another must be masked whole.
+        self.secrets = tuple(sorted(
+            {s for s in secrets if s and len(s) >= MIN_SECRET_CHARS},
+            key=len, reverse=True,
+        ))
+        self.patterns = tuple(re.compile(p) for p in patterns if p)
+
+    @classmethod
+    def from_config(
+        cls, cfg: CoreConfig, env: Mapping[str, str] | None = None
+    ) -> Redactor:
+        environ = os.environ if env is None else env
+        return cls(
+            secrets=[environ.get(name, "") for name in cfg.forbidden_env],
+            patterns=cfg.trajectory_redact_patterns,
+        )
+
+    def __call__(self, text: str) -> str:
+        out = text or ""
+        for secret in self.secrets:
+            out = out.replace(secret, REDACTED)
+        for pattern in self.patterns:
+            out = pattern.sub(REDACTED, out)
+        return redact(out)
+
+    def scrub(self, event: TrajectoryEvent) -> TrajectoryEvent:
+        """Return a copy of ``event`` with every free-text field scrubbed.
+
+        The prompt hash is recomputed over the *scrubbed* prompt, so the
+        invariant ``prompt_sha256 == sha256_of(prompt)`` holds for everything on
+        disk - a reader can verify a committed fixture without trusting it.
+        """
+        prompt = self(event.prompt)
+        return replace(
+            event,
+            command=[self(arg) for arg in event.command],
+            stdout=self(event.stdout),
+            stderr=self(event.stderr),
+            prompt=prompt,
+            prompt_sha256=sha256_of(prompt) if prompt else "",
+        )
+
+
+class Recorder:
+    """Append-only JSONL writer for one iteration's event stream."""
+
+    def __init__(
+        self,
+        path: str | Path,
+        iteration: str | int,
+        redactor: Redactor | None = None,
+        *,
+        phase: str = "start",
+    ) -> None:
+        self.path = Path(path)
+        self.iteration = str(iteration)
+        self.redactor = redactor or Redactor()
+        self.phase = phase
+
+    @classmethod
+    def for_iteration(
+        cls, repo_root: str | Path, cfg: CoreConfig, iteration: int
+    ) -> Recorder | None:
+        """Open this iteration's stream, or ``None`` when recording is off.
+
+        Creating the file up front is what lets retention prune *including* the
+        run about to be recorded, so the store settles at exactly
+        ``trajectories.retention_count`` files instead of one more.
+        """
+        if not cfg.trajectories_enabled:
+            return None
+        path = Path(repo_root) / cfg.trajectories_dir / f"{iteration}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+        prune_events(path.parent, cfg.trajectory_retention_count)
+        return cls(path, iteration, Redactor.from_config(cfg))
+
+    def append(self, event: TrajectoryEvent) -> TrajectoryEvent:
+        """Scrub, then append as one JSON line. Returns what actually landed."""
+        scrubbed = self.redactor.scrub(event)
+        line = scrubbed.to_json() + "\n"
+        with _EVENT_LOCK:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a", encoding="utf-8") as fh:
+                fh.write(line)
+        return scrubbed
+
+    def record(
+        self,
+        command: Sequence[str],
+        *,
+        exit_code: int,
+        stdout: str = "",
+        stderr: str = "",
+        duration_s: float = 0.0,
+        phase: str = "",
+        tier: str = "",
+        model: str = "",
+        prompt: str = "",
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+    ) -> TrajectoryEvent:
+        return self.append(TrajectoryEvent(
+            timestamp=_now(),
+            iteration=self.iteration,
+            phase=phase or self.phase,
+            command=list(command),
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            duration_s=round(max(0.0, duration_s), 3),
+            tier=tier,
+            model=model,
+            prompt=prompt,
+            prompt_sha256=sha256_of(prompt) if prompt else "",
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        ))
+
+    def wrap(self, runner: Runner) -> Runner:
+        """Return ``runner`` with an event appended after every call.
+
+        One decorator at the seam covers git, gh, ruff and pytest; the agent
+        call records itself in :func:`hsai.ai.run_agent`, which is the only
+        place that knows the tier, model, prompt and token counts.
+        """
+
+        def recording_runner(cmd: Sequence[str], **kwargs: Any) -> Proc:
+            started = time.monotonic()
+            proc = runner(cmd, **kwargs)
+            self.record(
+                cmd,
+                exit_code=proc.code,
+                stdout=proc.stdout,
+                stderr=proc.stderr,
+                duration_s=time.monotonic() - started,
+            )
+            return proc
+
+        return recording_runner
+
+
+def read_events(path: str | Path) -> list[TrajectoryEvent]:
+    """Parse one trajectory's events back off disk, in recorded order."""
+    lines = Path(path).read_text(encoding="utf-8").splitlines()
+    return [TrajectoryEvent.from_dict(json.loads(line)) for line in lines if line.strip()]
+
+
+def prune_events(directory: str | Path, keep: int) -> list[Path]:
+    """Drop all but the newest ``keep`` trajectories (``0`` keeps everything).
+
+    Trajectories are local forensics, not repo content: worth keeping for the
+    recent past, worth bounding beyond it.
+    """
+    directory = Path(directory)
+    if keep <= 0 or not directory.is_dir():
+        return []
+    files = sorted(directory.glob("*.jsonl"), key=_recency)
+    dropped = files[:-keep] if len(files) > keep else []
+    for path in dropped:
+        path.unlink()
+    return dropped
+
+
+def _recency(path: Path) -> tuple[float, int]:
+    """Sort key for retention: mtime, with the iteration number as tiebreak.
+
+    Iteration numbers only increase, so the tiebreak keeps pruning deterministic
+    on filesystems whose timestamps are too coarse to separate two fast runs.
+    """
+    stem = path.stem
+    return path.stat().st_mtime, int(stem) if stem.isdigit() else 0
 
 
 def record(

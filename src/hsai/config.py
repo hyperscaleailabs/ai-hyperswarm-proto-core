@@ -9,6 +9,10 @@ import yaml
 
 CORE_PATH = ".ai-swarm/core.yaml"
 
+# Where the replayable per-iteration event streams land (see hsai.trajectory).
+DEFAULT_TRAJECTORIES_DIR = ".hsai/trajectories"
+DEFAULT_TRAJECTORY_FIXTURES_DIR = "tests/fixtures/trajectories"
+
 
 @dataclass(frozen=True)
 class ModelTier:
@@ -57,6 +61,7 @@ class CoreConfig:
     synthesis: dict[str, Any]
     budget: dict[str, Any]
     personas: tuple[dict[str, Any], ...]
+    trajectories: dict[str, Any] = field(default_factory=dict)
 
     # --- convenience accessors -------------------------------------------------
     @property
@@ -66,6 +71,33 @@ class CoreConfig:
     @property
     def forbidden_env(self) -> tuple[str, ...]:
         return tuple(self.constraints.get("forbid_env", []) or [])
+
+    # --- trajectories (hsai.trajectory / hsai.replay) --------------------------
+    @property
+    def trajectories_enabled(self) -> bool:
+        """Whether ``run_once`` records a replayable event stream at all."""
+        return bool(self.trajectories.get("enabled", True))
+
+    @property
+    def trajectories_dir(self) -> str:
+        return str(self.trajectories.get("dir") or DEFAULT_TRAJECTORIES_DIR)
+
+    @property
+    def trajectory_retention_count(self) -> int:
+        """How many recorded iterations to keep locally (``0`` = keep all)."""
+        return int(self.trajectories.get("retention_count", 50))
+
+    @property
+    def trajectory_redact_patterns(self) -> tuple[str, ...]:
+        """Extra deny-regexes applied to every recorded string before write."""
+        return tuple(self.trajectories.get("redact_patterns", []) or [])
+
+    @property
+    def trajectory_fixtures_dir(self) -> str:
+        """Where the curated, committed replay fixtures live."""
+        return str(
+            self.trajectories.get("commit_fixtures_dir") or DEFAULT_TRAJECTORY_FIXTURES_DIR
+        )
 
     @property
     def subscription_only(self) -> bool:
@@ -148,6 +180,7 @@ def load_config(path: str | Path | None = None) -> CoreConfig:
         synthesis=data.get("synthesis", {}),
         budget=data.get("budget", {}),
         personas=tuple(data.get("personas", [])),
+        trajectories=data.get("trajectories", {}) or {},
     )
 
 

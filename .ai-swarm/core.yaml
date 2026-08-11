@@ -169,6 +169,19 @@ constraints:
   require_green_ci_to_merge: true
   require_lesson_per_pr: true
 
+# Replayable worker trajectories (see src/hsai/trajectory.py + src/hsai/replay.py).
+# Every iteration records one append-only JSONL event stream - one event per
+# subprocess - so `hsai replay <file>` can re-drive that exact iteration with no
+# quota and no network. Raw streams quote repo content and stay local; the two
+# curated fixtures under commit_fixtures_dir are the committed, zero-cost CI
+# regression corpus (langchain's record/replay cassette discipline).
+trajectories:
+  enabled: true                      # false: run_once writes no trajectory files
+  dir: .hsai/trajectories            # gitignored; local forensics only
+  retention_count: 50                # keep the newest N iterations (0 = keep all)
+  redact_patterns: []                # extra deny-regexes, on top of constraints.forbid_env
+  commit_fixtures_dir: tests/fixtures/trajectories
+
 knowledge:
   root: knowledge                    # Obsidian vault content lives under the repo root
   lessons_dir: knowledge/lessons
