@@ -89,7 +89,7 @@ def test_recall_command_prints_ranked_notes_with_scores(tmp_path, capsys):
 
     assert rc == 0
     assert "2026-01-01-remote-ci-gate" in out
-    assert "(fail/implement)" in out
+    assert "(lesson, outcome: fail, kind: implement)" in out
     # a score is printed alongside every name
     first = out.splitlines()[0].split()
     assert float(first[0]) > 0 and first[1] == "2026-01-01-remote-ci-gate"

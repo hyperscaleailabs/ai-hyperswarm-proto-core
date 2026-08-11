@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from . import github
 from .ai import run_agent
@@ -27,17 +27,28 @@ from .config import CoreConfig
 from .knowledge import KnowledgeBase
 from .models import ModelChoice
 from .proc import Runner, run
+from .recall import Corpus, Recall, RecallConfig
+from .recall import render as render_recall
 from .tickets import TicketSpec
 
 _JSON_BLOCK = re.compile(r"```(?:json)?\s*(\[.*?\])\s*```", re.DOTALL)
 
+# Enough of the digest to characterise what this cycle is studying; the whole
+# thing would be mostly README boilerplate diluting the query.
+_RECALL_QUERY_CHARS = 4000
+
 
 @dataclass
 class ContextPack:
-    """What the synthesizer knows about the reference projects this cycle."""
+    """What the synthesizer knows about the reference projects this cycle.
+
+    Plus - via ``recalled`` - what THIS repo already learned about the same
+    ground, so planning and implementation read from one memory.
+    """
 
     repos: list[str]
     sections: dict[str, str]  # repo -> digest text
+    recalled: Recall = field(default_factory=Recall)
 
     def render(self) -> str:
         parts = [f"### {repo}\n{text}" for repo, text in self.sections.items()]
@@ -56,9 +67,19 @@ def pick_rotation(cfg: CoreConfig, cycle_index: int) -> list[str]:
 
 
 def build_context_pack(
-    repos: list[str], *, runner: Runner = run, commits: int = 30
+    repos: list[str],
+    *,
+    runner: Runner = run,
+    commits: int = 30,
+    cfg: CoreConfig | None = None,
+    root: str = ".",
 ) -> ContextPack:
-    """Fetch a compact study digest for each repo via the GitHub API."""
+    """Fetch a compact study digest for each repo via the GitHub API.
+
+    When ``cfg`` is supplied the pack also carries the vault notes most relevant
+    to that digest, so the planner and the workers share one memory. Pass no
+    ``cfg`` (the default) to fetch the reference material alone.
+    """
     sections: dict[str, str] = {}
     for repo in repos:
         parts: list[str] = []
@@ -84,7 +105,27 @@ def build_context_pack(
         if workflows.ok and workflows.stdout.strip():
             parts.append("CI workflows:\n" + workflows.stdout[:500])
         sections[repo] = "\n\n".join(parts) or "(no data fetched)"
-    return ContextPack(repos=repos, sections=sections)
+    return ContextPack(repos=repos, sections=sections, recalled=_recall_for(sections, cfg, root))
+
+
+def _recall_for(sections: dict[str, str], cfg: CoreConfig | None, root: str) -> Recall:
+    """Retrieve this repo's own notes against what the cycle is about to study.
+
+    The query is the digest itself rather than a fixed keyword list, so recall
+    follows the reference-set rotation. A missing cfg, a disabled recall block
+    or an empty vault all yield an empty :class:`Recall`, and the prompt then
+    renders exactly as it did before.
+    """
+    if cfg is None:
+        return Recall()
+    rcfg = RecallConfig.from_core(cfg)
+    if not rcfg.enabled:
+        return Recall()
+    corpus = Corpus.load(root, cfg)
+    if not len(corpus):
+        return Recall()
+    query = " ".join(sections.values())[:_RECALL_QUERY_CHARS]
+    return render_recall(corpus.search(query, rcfg.k), rcfg.max_chars)
 
 
 TRIED_HEADING = "Already tried in this repo"
@@ -134,6 +175,9 @@ def build_prompt(cfg: CoreConfig, pack: ContextPack, tried: str = "") -> str:
     ideas = int(cfg.synthesis.get("ideas_target", 10))
     top = int(cfg.synthesis.get("file_top", 3))
     combine = int(cfg.synthesis.get("min_projects_combined", 3))
+    # Retrieval-ranked notes, on top of the flat `tried` digest: the digest says
+    # WHAT was attempted, these say what each attempt concluded.
+    prior = f"\n{pack.recalled.section}\n" if pack.recalled else ""
     return f"""You are the SYNTHESIS planner for ai-hyperswarm-proto-core, an
 autonomous self-improving AI-swarm harness. Your job is NOT to copy one idea
 from one project, but to COMBINE practices across projects into substantial,
@@ -150,7 +194,7 @@ Study digest of reference projects for this cycle:
 re-propose an idea whose lesson is listed here, and never duplicate the title of
 a ticket that is still open; build on them instead:
 {tried or "_(nothing recorded yet - this is an early cycle)_"}
-
+{prior}
 Work in three explicit phases and show them all in your output:
 
 PHASE 1 - DIVERGE: generate {ideas} candidate improvements. Each MUST combine
@@ -222,7 +266,7 @@ def synthesize(
 ) -> SynthesisResult:
     """Run one synthesis pass and file the resulting tickets."""
     repos = pick_rotation(cfg, cycle_index)
-    pack = build_context_pack(repos, runner=runner)
+    pack = build_context_pack(repos, runner=runner, cfg=cfg, root=root)
     tried = build_tried_digest(cfg, root=root, runner=runner)
     tier = cfg.synthesis.get("tier", "heavy")
     model = cfg.tiers[tier].model if tier in cfg.tiers else cfg.tiers[cfg.default_tier].model

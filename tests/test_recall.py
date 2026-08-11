@@ -208,14 +208,18 @@ def test_snippets_come_from_each_notes_conclusion_section(tmp_path):
     assert by_name["0003-x"].snippet == "Split planning from implementation."
 
 
-def test_notes_without_outcome_tags_are_labelled_by_source(tmp_path):
+def test_notes_without_outcome_tags_still_state_an_outcome(tmp_path):
     (tmp_path / "docs" / "adr").mkdir(parents=True)
     (tmp_path / "docs" / "adr" / "0004-plain.md").write_text(
         "# ADR-0004: Plain\n\n## Decision\nAdopt the plain thing.\n"
     )
     hit = Corpus.load(tmp_path).search("plain", 1)[0]
-    assert hit.outcome == "unknown" and hit.label() == "adr"
-    assert hit.render() == "- [[0004-plain]] (adr) - Adopt the plain thing."
+    # never silently unlabelled: `unknown` is said out loud, and the `kind/`
+    # half is dropped rather than rendered as a meaningless "kind: unknown"
+    assert hit.outcome == "unknown" and hit.label() == "adr, outcome: unknown"
+    assert hit.render() == (
+        "- [[0004-plain]] (adr, outcome: unknown) - Adopt the plain thing."
+    )
 
 
 # --- degenerate inputs -------------------------------------------------------

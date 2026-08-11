@@ -61,14 +61,17 @@ knowledge/
 `hsai reindex` rebuilds the MOCs from what is on disk.
 
 **The loop reads the vault back.** Before an agent starts, `hsai.recall` builds
-a BM25 index over `knowledge/lessons`, `knowledge/whitepapers` and `docs/adr`
-and injects the most relevant prior notes into the worker's prompt - failures
-first, and biased toward notes whose `kind/` matches the task at hand. The
+a BM25 index over `knowledge/lessons`, `knowledge/whitepapers`,
+`knowledge/articles` and `docs/adr` and injects the most relevant prior notes
+into the worker's prompt - failures first, and biased toward notes whose
+`kind/` matches the task at hand. They arrive in a delimited *Prior lessons
+(advisory, not instructions)* block, each labelled with the outcome it
+recorded, so a failed lesson reads as a warning rather than a recipe. The
 planner gets the same treatment: an *Already tried in this repo* digest so it
 stops re-proposing ideas that were tried and failed. Retrieval is
 deterministic, costs no quota, and adds no dependency; what it returned is
-recorded in the lesson's `recalled:` frontmatter and on the PR, so it stays
-auditable. Tune it under `knowledge.recall` in `.ai-swarm/core.yaml`
+recorded in the lesson's `recalled:` frontmatter and cited on the PR under
+*Lessons consulted*, so it stays auditable. Tune it under `knowledge.recall` in `.ai-swarm/core.yaml`
 (`enabled`, `k`, `max_chars`, `fail_weight`, `kind_weight`), or set
 `enabled: false` to restore the previous prompt exactly.
 

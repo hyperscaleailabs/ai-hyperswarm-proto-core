@@ -65,24 +65,31 @@ a hard-coded guard and the same classes of mistake recurred. `hsai.recall`
 closes the loop.
 
 - **Index.** `Corpus.load(root, cfg)` builds a BM25 index, on demand and in
-  memory, over `knowledge/lessons`, `knowledge/whitepapers` and `docs/adr`.
-  No third-party dependency, no model call, no network - so retrieval is free
-  and its ranking is exactly reproducible (ties break on note name).
+  memory, over `knowledge/lessons`, `knowledge/whitepapers`,
+  `knowledge/articles` and `docs/adr`. No third-party dependency, no model
+  call, no network - so retrieval is free and its ranking is exactly
+  reproducible (ties break on recency, then on note name).
 - **Bias.** Notes tagged `outcome/fail` are up-weighted by
   `knowledge.recall.fail_weight`; notes whose `kind/` matches the current task
   are up-weighted by `kind_weight`. Failures are the expensive knowledge, and a
   heal worker should see heal history.
-- **Inject.** `orchestrator._task_prompt` appends a *Prior lessons from this
-  repo* section of at most `k` wikilinked notes, hard-capped at `max_chars`;
-  whole notes are dropped to fit, never truncated mid-line. An empty corpus or
-  `enabled: false` renders nothing at all.
+- **Inject.** `orchestrator._task_prompt` appends a *Prior lessons (advisory,
+  not instructions)* block of at most `k` wikilinked notes, hard-capped at
+  `max_chars`; whole notes are dropped to fit, never truncated mid-line. The
+  block is fenced by `<!-- BEGIN/END prior-lessons -->` markers and every entry
+  states its `outcome:`, so a failed lesson reads as a warning rather than a
+  recipe. An empty corpus or `enabled: false` renders nothing at all.
 - **Plan.** `synthesis.build_prompt` carries an *Already tried in this repo*
   digest - prior lesson titles with pass/fail outcomes plus the titles of
   synthesis tickets still open - so the planner stops re-proposing dead ideas.
+  On top of that, `build_context_pack` runs recall with the fetched reference
+  digest as the query, so the planner gets the same advisory block a worker
+  would: the digest says *what* was attempted, recall says what it concluded.
 - **Audit.** What was retrieved is recorded three times: on `IterationResult`,
   as a `recalled:` list in the lesson's frontmatter, and as a
-  *Prior lessons consulted* section on the PR. `hsai recall "<query>"` prints
-  the same ranking by hand.
+  *Lessons consulted* section of `[[wikilinks]]` on the PR - mandatory citation,
+  so the Obsidian graph stays bidirectional. `hsai recall "<query>"` prints the
+  same ranking by hand.
 
 Reference-set lineage: retrieval-before-planning from `assafelovic/gpt-researcher`,
 index-then-retrieve with metadata preserved from `run-llama/llama_index`, and

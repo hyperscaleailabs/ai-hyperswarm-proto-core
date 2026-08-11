@@ -12,6 +12,7 @@ from hsai.orchestrator import (
     HEAL,
     IMPLEMENT,
     IMPROVE,
+    LESSONS_CONSULTED_HEADING,
     _format_error_with_context,
     _phase_artifacts,
     _task_prompt,
@@ -962,7 +963,10 @@ def _with_recall(**overrides):
 
 def test_task_prompt_renders_recalled_lessons_only_when_there_are_some():
     cfg = load_config()
-    section = f"{recall.HEADING}:\n- [[a-note]] (fail/heal) - do not do that"
+    section = (
+        f"{recall.HEADING}\n- [[a-note]] (lesson, outcome: fail, kind: heal)"
+        " - do not do that"
+    )
     for kind in (HEAL, IMPLEMENT, IMPROVE):
         bare = _task_prompt(kind, cfg, "t", "b")
         assert recall.HEADING not in bare
@@ -974,20 +978,20 @@ def test_task_prompt_renders_recalled_lessons_only_when_there_are_some():
         assert with_lessons.endswith(section)   # the ticket stays the instruction
 
 
-def test_build_pr_body_renders_prior_lessons_consulted():
+def test_build_pr_body_renders_lessons_consulted():
     choice = ModelChoice(tier="standard", model="sonnet", rationale="x")
     kwargs = dict(
         ticket=42, choice=choice, lesson_note="2026-01-03-note",
         lesson_summary="s", ci_summary="green", kind=IMPLEMENT,
     )
     body = build_pr_body(**kwargs, recalled=("2026-01-01-a", "2026-01-02-b"))
-    assert "## Prior lessons consulted" in body
+    assert LESSONS_CONSULTED_HEADING in body
     assert "- [[2026-01-01-a]]" in body and "- [[2026-01-02-b]]" in body
 
     # with nothing recalled the section vanishes and the surrounding text is
     # exactly what it was before recall existed
     plain = build_pr_body(**kwargs)
-    assert "## Prior lessons consulted" not in plain
+    assert LESSONS_CONSULTED_HEADING not in plain
     assert plain == build_pr_body(**kwargs, recalled=())
     assert (
         "See [[2026-01-03-note]] in the knowledge base.\n\n## Reference-set evidence"
@@ -1021,7 +1025,7 @@ def test_recalled_lessons_reach_the_prompt_the_lesson_and_the_pr_body(
         assert f"  - {name}" in frontmatter
 
     # 4. ...and rendered on the PR for after-the-fact audit
-    assert "## Prior lessons consulted" in pr_body
+    assert LESSONS_CONSULTED_HEADING in pr_body
     for name in result.recalled:
         assert f"- [[{name}]]" in pr_body
 
@@ -1035,7 +1039,7 @@ def test_disabling_recall_restores_the_pre_change_prompt_and_pr_body(
     # byte-identical to what _task_prompt produced before recall existed
     assert prompt == _task_prompt(IMPLEMENT, off, RECALL_TICKET_TITLE, WELL_FORMED_BODY)
     assert recall.HEADING not in prompt
-    assert "## Prior lessons consulted" not in pr_body
+    assert LESSONS_CONSULTED_HEADING not in pr_body
     assert result.recalled == []
     assert "recalled:" not in Path(result.lesson_path).read_text().split("---\n")[1]
 

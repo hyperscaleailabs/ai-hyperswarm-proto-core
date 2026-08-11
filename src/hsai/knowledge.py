@@ -18,6 +18,7 @@ from .config import CoreConfig
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _TAG_RE = re.compile(r"^\s*-\s+(\S.*)$", re.MULTILINE)
 _FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
+_CREATED_RE = re.compile(r"^created:\s*(\S+)\s*$", re.MULTILINE)
 _TITLE_RE = re.compile(r"^# (.+)$", re.MULTILINE)
 _SECTION_RE = re.compile(r"^## (.+)$", re.MULTILINE)
 _WORD_RE = re.compile(r"[a-zA-Z][a-zA-Z-]{3,}")
@@ -77,6 +78,7 @@ class LessonRecord:
     lesson_text: str
     what_happened: str = ""
     body: str = ""  # everything after the frontmatter; what the recall index reads
+    created: str = ""  # `created:` frontmatter, when the note carries one
 
 
 def split_sections(text: str) -> dict[str, str]:
@@ -112,8 +114,8 @@ def _frontmatter_tags(fm: str) -> tuple[str, ...]:
 def parse_note(path: str | Path) -> LessonRecord:
     """Parse any Obsidian note in the vault into a :class:`LessonRecord`.
 
-    Lessons carry ``outcome/*`` and ``kind/*`` frontmatter tags; whitepapers and
-    ADRs do not, and come back as ``unknown``. This is the single place those
+    Lessons carry ``outcome/*`` and ``kind/*`` frontmatter tags; whitepapers,
+    articles and ADRs do not, and come back as ``unknown``. This is the single place those
     tags are interpreted - both :meth:`KnowledgeBase.read_lessons` and the
     :mod:`hsai.recall` index read notes through it.
     """
@@ -127,6 +129,7 @@ def parse_note(path: str | Path) -> LessonRecord:
     kind = next((t.split("/", 1)[1] for t in tags if t.startswith("kind/")), "unknown")
     title_match = _TITLE_RE.search(text)
     title = title_match.group(1).strip() if title_match else path.stem
+    created_match = _CREATED_RE.search(fm)
     sections = split_sections(text)
     return LessonRecord(
         note_name=path.stem,
@@ -137,6 +140,7 @@ def parse_note(path: str | Path) -> LessonRecord:
         lesson_text=sections.get("lesson learned", ""),
         what_happened=sections.get("what happened", ""),
         body=body.strip(),
+        created=created_match.group(1).strip() if created_match else "",
     )
 
 
