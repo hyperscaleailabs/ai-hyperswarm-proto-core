@@ -213,6 +213,17 @@ def _requires_code(ticket_title: str) -> bool:
     return lowered.startswith(("feat:", "fix:", "skill:", "refactor:", "perf:", "test:"))
 
 
+def _phase(recorder: trajectory.Recorder | None, name: str) -> None:
+    """Tag the events that follow with the SOP step the loop has reached.
+
+    Adopted from FoundationAgents/MetaGPT: every phase boundary is explicit, so
+    a trajectory reads as a sequence of steps and a replay divergence can name
+    where the harness moved.
+    """
+    if recorder is not None:
+        recorder.phase = name
+
+
 def _improvement_idea(cfg: CoreConfig) -> tuple[str, str]:
     """Pick one improvement toward the goals when the backlog is empty.
 
@@ -249,12 +260,22 @@ def run_once(
     runs a model appends a cost record to the quota ledger.
     """
     repo = cfg.repo_slug
+    # Trajectory: one append-only JSONL event stream for this iteration, taken
+    # at the `Runner` seam so `hsai replay` can re-drive exactly this run with
+    # no quota and no network. Wrapping happens before the first subprocess so
+    # the recording starts at the true beginning of the iteration; `ai_runner`
+    # is left bare because `ai.run_agent` records its own, richer event.
+    recorder = trajectory.Recorder.for_iteration(repo_dir, cfg, iteration)
+    if recorder is not None:
+        runner = recorder.wrap(runner)
+    _phase(recorder, "startup")
     login = github.current_login(runner=runner) if not dry_run else "hsai-bot"
     started = time.time()
 
     # 1. sync main + fresh worktree (serialized: touches shared .git)
     # Branch name is unique per worker even within the same second.
     branch = f"hsai/iter-{int(time.time())}-{iteration}-{uuid4().hex[:6]}"
+    _phase(recorder, "sync")
     if not dry_run:
         with _SERIAL:
             gitops.sync_main(cfg.default_branch, cwd=repo_dir, runner=runner)
@@ -266,6 +287,7 @@ def run_once(
         wt = repo_dir
 
     # 2. CI check (skipped in dry-run so we never recurse into a real build)
+    _phase(recorder, "ci-before")
     ci_before = (
         ci.run_local(cwd=wt, runner=runner)
         if not dry_run
@@ -273,6 +295,7 @@ def run_once(
     )
 
     # 3. choose work + claim a ticket (serialized so workers never collide)
+    _phase(recorder, "claim-ticket")
     ticket_num: int | None = None
     ticket_title = ""
     ticket_body = ""
@@ -342,6 +365,7 @@ def run_once(
     if idle_reason:
         res = IterationResult(kind=kind, ci_before=ci_before.ok)
         res.notes.append(idle_reason)
+        _phase(recorder, "cleanup")
         gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
         return res
 
@@ -407,7 +431,8 @@ def run_once(
         prompt = _task_prompt(kind, cfg, ticket_title, ticket_body, recalled.section)
         agent_started = time.time()
         ares = ai.run_agent(
-            prompt, choice, cfg, cwd=wt, runner=ai_runner, timeout=cfg.agent_timeout
+            prompt, choice, cfg, cwd=wt, runner=ai_runner, timeout=cfg.agent_timeout,
+            recorder=recorder, phase=f"agent:{kind}",
         )
         # Persist the trajectory FIRST: a guard below can return early, and the
         # run that gets aborted is exactly the one worth being able to replay.
@@ -430,6 +455,7 @@ def run_once(
         # Guard: a task must not change the CI checks, or local and remote CI
         # would diverge (as happened once when a worker added mypy). Revert any
         # workflow edits before they are committed and note it in the lesson.
+        _phase(recorder, "workflow-guard")
         reverted_workflows = [
             p for p in gitops.changed_paths(cwd=wt, runner=runner)
             if p.startswith(".github/workflows/")
@@ -442,10 +468,12 @@ def run_once(
         # satisfied by a knowledge-only diff. PR #17 once "closed" a feature
         # ticket by committing nothing but its own lesson file - never again.
         if _requires_code(ticket_title):
+            _phase(recorder, "completeness-guard")
             touched = gitops.changed_paths(cwd=wt, runner=runner)
             code_files = [p for p in touched if not p.startswith("knowledge/")]
             if not code_files:
                 result.notes.append("completeness guard: knowledge-only diff on a code ticket")
+                _phase(recorder, "recover")
                 _recover_failed(
                     cfg, repo, 0, kind=kind, ticket_num=ticket_num,
                     claimed_issue=claimed_issue, login=login,
@@ -461,6 +489,7 @@ def run_once(
         # branch, proving the bug was real (llama_index's fix-stream
         # discipline). Docs/chore tickets are exempt.
         if repro.requires_repro_guard(kind, ticket_title):
+            _phase(recorder, "repro-guard")
             base_ref = gitops.merge_base(
                 "HEAD", f"origin/{cfg.default_branch}", cwd=wt, runner=runner,
             ) or f"origin/{cfg.default_branch}"
@@ -473,6 +502,7 @@ def run_once(
             )
             result.notes.append(f"repro guard: {repro_result.reason}")
             if not repro_result.ok:
+                _phase(recorder, "recover")
                 _recover_failed(
                     cfg, repo, 0, kind=kind, ticket_num=ticket_num,
                     claimed_issue=claimed_issue, login=login,
@@ -484,6 +514,7 @@ def run_once(
                 return result
 
     # 6. re-check CI
+    _phase(recorder, "ci-after")
     ci_after = ci.run_local(cwd=wt, runner=runner) if not dry_run else ci_before
     result.ci_after = ci_after.ok
 
@@ -544,6 +575,7 @@ def run_once(
         return result
 
     # 8-11. commit, push, PR (linked + model + lesson), merge on green
+    _phase(recorder, "publish")
     commit_msg = f"{kind}: {ticket_title}\n\nRefs #{ticket_num}\nModel: {choice.model}"
     gitops.commit_all(commit_msg, cwd=wt, runner=runner)
     gitops.push_branch(branch, cwd=wt, runner=runner)
@@ -569,6 +601,7 @@ def run_once(
     # it is the source of truth for whether the change may merge, and arming
     # auto-merge first (as opposed to gating on this poll) raced GitHub's own
     # merge against our recovery bookkeeping.
+    _phase(recorder, "remote-ci")
     remote = ci.wait_remote(
         pr_num, repo,
         timeout=cfg.ci_remote_timeout, interval=cfg.ci_poll_interval, runner=runner,
@@ -586,6 +619,7 @@ def run_once(
     )
     gitops.push_branch(branch, cwd=wt, runner=runner)
 
+    _phase(recorder, "merge" if remote == ci.SUCCESS else "recover")
     if remote == ci.SUCCESS:
         github.merge_pr(repo, pr_num, auto=True, runner=runner)
         result.merged = True
@@ -601,6 +635,7 @@ def run_once(
     _record_cost("merged" if result.merged else "recovered")
 
     # 13. cleanup worktree
+    _phase(recorder, "cleanup")
     gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
     return result
 

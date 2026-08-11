@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -16,6 +17,7 @@ from typing import Any
 from .config import CoreConfig
 from .models import ModelChoice
 from .proc import Proc, Runner, run
+from .trajectory import Recorder
 
 
 class SubscriptionGuardError(RuntimeError):
@@ -139,12 +141,37 @@ def run_agent(
     permission_mode: str | None = None,
     timeout: float | None = None,
     runner: Runner = run,
+    recorder: Recorder | None = None,
+    phase: str = "agent",
 ) -> AIResult:
-    """Run a headless Claude Code agent for one task."""
+    """Run a headless Claude Code agent for one task.
+
+    When ``recorder`` is given, the invocation appends exactly one event to the
+    iteration's trajectory. It is recorded *here* rather than by the recorder's
+    generic runner wrapper because this is the only place that knows the tier,
+    the model, the prompt and the token counts - the fields a replay and a
+    post-mortem actually need.
+    """
     preflight(cfg)
     cmd = build_command(prompt, choice, cfg, permission_mode=permission_mode)
+    started = time.monotonic()
     proc: Proc = runner(cmd, cwd=cwd, env=_sanitized_env(cfg), timeout=timeout)
+    duration = time.monotonic() - started
     payload, usage = parse_output(proc.stdout)
+    if recorder is not None:
+        recorder.record(
+            cmd,
+            exit_code=proc.code,
+            stdout=proc.stdout,
+            stderr=proc.stderr,
+            duration_s=duration,
+            phase=phase,
+            tier=choice.tier,
+            model=choice.model,
+            prompt=prompt,
+            input_tokens=(usage or {}).get("input_tokens"),
+            output_tokens=(usage or {}).get("output_tokens"),
+        )
     return AIResult(
         ok=proc.ok,
         model=choice.model,

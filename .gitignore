@@ -4,6 +4,9 @@
 # with `hsai traj <iteration>`); only a digest line and a redacted tail are
 # committed, inside the lesson and the PR body.
 .hsai/traj/
+# Recorded per-iteration event streams (`hsai replay`). Same rule: local only.
+# The committed replay corpus lives in tests/fixtures/trajectories/ instead.
+.hsai/trajectories/
 *.log
 
 # Python
