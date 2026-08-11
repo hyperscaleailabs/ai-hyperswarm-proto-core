@@ -19,7 +19,7 @@ iteration: 4135305
 | ticket | #182 |
 | pull request | _(none)_ |
 | model | `sonnet` |
-| remote CI | _(pending)_ |
+| remote CI | SUCCESS |
 
 ## Context
 Iteration 4135305. Ticket #182. CI before: CI green (ruff=pass, pytest=pass).
