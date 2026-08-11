@@ -2,14 +2,14 @@
 tags:
   - moc
   - whitepapers
-updated: 2026-08-09
+updated: 2026-08-11
 ---
 
 # Whitepapers MOC
 
 Up: [[Knowledge Base MOC]]
 
-Periodic syntheses of accumulated lessons. Total: **6**.
+Periodic syntheses of accumulated lessons. Total: **7**.
 
 - [[2026-07-25-founding-study-top-10-ai-swarm-projects]]
 - [[2026-07-26-synthesis-after-14-lessons]]
@@ -17,3 +17,4 @@ Periodic syntheses of accumulated lessons. Total: **6**.
 - [[2026-08-04-synthesis-after-17-lessons]]
 - [[2026-08-08-synthesis-after-20-lessons]]
 - [[2026-08-09-synthesis-after-22-lessons]]
+- [[2026-08-11-synthesis-after-23-lessons]]
