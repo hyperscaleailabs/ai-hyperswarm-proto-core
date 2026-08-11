@@ -88,6 +88,12 @@ def decide_path(ci_green: bool, has_tickets: bool) -> str:
     return IMPROVE
 
 
+# Mandatory citation of what retrieval fed the worker, borrowed from
+# gpt-researcher: a claim is only auditable if its sources are named on the
+# artifact itself. Wikilinks keep the Obsidian graph bidirectional.
+LESSONS_CONSULTED_HEADING = "## Lessons consulted"
+
+
 def build_pr_body(
     *,
     ticket: int,
@@ -113,7 +119,7 @@ def build_pr_body(
     # it is auditable after the fact.
     recalled_links = "\n".join(f"- [[{n}]]" for n in recalled)
     recalled_section = (
-        f"\n## Prior lessons consulted\n{recalled_links}\n" if recalled else ""
+        f"\n{LESSONS_CONSULTED_HEADING}\n{recalled_links}\n" if recalled else ""
     )
     # What the run cost and how it ended, visible on the PR itself - the full
     # record stays in the local (gitignored) trajectory store.

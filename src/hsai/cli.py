@@ -6,7 +6,7 @@ Commands:
   hsai status                                                  config + backlog snapshot
   hsai cycle [--cycle-index N] [--resume] [--dry-run]          one governance block
   hsai reindex                                                 rebuild knowledge MOCs
-  hsai recall "<query>" [--k N] [--kind K]                     rank prior lessons/ADRs
+  hsai recall "<query>" [--k N] [--kind K]                     rank prior vault notes
   hsai doctor                                                  verify environment + invariants
   hsai traj <iteration> [--json]                               print a stored agent run
   hsai replay <iteration> [--json]                             alias of `hsai traj`
@@ -233,7 +233,9 @@ def build_parser() -> argparse.ArgumentParser:
     ri = sub.add_parser("reindex", help="rebuild knowledge-base MOCs")
     ri.set_defaults(func=cmd_reindex)
 
-    rl = sub.add_parser("recall", help="rank prior lessons/whitepapers/ADRs for a query")
+    rl = sub.add_parser(
+        "recall", help="rank prior lessons/whitepapers/articles/ADRs for a query"
+    )
     rl.add_argument("query", help="what the task is about, in plain words")
     rl.add_argument("--k", type=int, default=5, help="how many notes to print")
     rl.add_argument("--kind", default="", help="bias toward this task kind (heal/implement/improve)")
