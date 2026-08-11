@@ -215,3 +215,65 @@ def open_review_issue(
         [label],
         runner=runner,
     )
+
+
+# --- backlog hygiene findings (read by the vault watchdog) --------------------
+# Two classes of decay a PR's own lifetime can never surface: a ticket left
+# `claimed` by a worker that crashed mid-run, and a ticket that has exhausted
+# `max_ticket_attempts` without ever being labelled `blocked`. Both sit in the
+# Issues Map forever unless something reads the backlog on a schedule.
+
+_TICKET_REF_RE = re.compile(r"(?:closes|fixes|resolves|refs)\s+#(\d+)", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class BacklogFinding:
+    kind: str  # "claimed-abandoned" | "attempts-exhausted"
+    number: int
+    title: str
+    detail: str
+
+    def line(self) -> str:
+        return f"[{self.kind}] #{self.number} {self.title}: {self.detail}"
+
+
+def _referenced_tickets(prs: list[github.Pr]) -> set[int]:
+    """Ticket numbers any open PR body references (``Closes #N`` etc.)."""
+    refs: set[int] = set()
+    for pr in prs:
+        refs.update(int(n) for n in _TICKET_REF_RE.findall(pr.body))
+    return refs
+
+
+def backlog_findings(cfg: CoreConfig, *, runner: Runner = run) -> list[BacklogFinding]:
+    """Backlog decay invisible to the current gates - read-only, reuses
+    ``github.list_open_issues``/``list_open_prs``. Never edits anything; the
+    caller (``hsai vault file-ticket``) only ever files or updates a ticket.
+    """
+    repo = cfg.repo_slug
+    issues = github.list_open_issues(repo, runner=runner)
+    referenced = _referenced_tickets(github.list_open_prs(repo, runner=runner))
+
+    findings: list[BacklogFinding] = []
+    for issue in issues:
+        if issue.assignees and issue.number not in referenced:
+            findings.append(
+                BacklogFinding(
+                    kind="claimed-abandoned",
+                    number=issue.number,
+                    title=issue.title,
+                    detail=f"claimed by {', '.join(issue.assignees)}; "
+                    "no open PR references it",
+                )
+            )
+        if issue.attempts() >= cfg.max_ticket_attempts and not issue.is_blocked:
+            findings.append(
+                BacklogFinding(
+                    kind="attempts-exhausted",
+                    number=issue.number,
+                    title=issue.title,
+                    detail=f"attempts={issue.attempts()} >= "
+                    f"max_ticket_attempts={cfg.max_ticket_attempts}, missing 'blocked' label",
+                )
+            )
+    return findings

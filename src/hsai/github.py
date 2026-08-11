@@ -104,6 +104,13 @@ def create_issue(
     return _parse_issue_number(p.stdout)
 
 
+def comment_issue(repo: str, number: int, body: str, *, runner: Runner = run) -> Proc:
+    return _gh(
+        ["issue", "comment", str(number), "--repo", repo, "--body", body],
+        runner=runner,
+    )
+
+
 def list_open_issues(repo: str, *, runner: Runner = run) -> list[Issue]:
     """List open issues, highest priority first."""
     p = _gh(
@@ -188,6 +195,39 @@ def get_issue(repo: str, number: int, *, runner: Runner = run) -> Issue | None:
         assignees=tuple(a["login"] for a in item.get("assignees", [])),
         body=item.get("body", "") or "",
     )
+
+
+@dataclass
+class Pr:
+    number: int
+    title: str
+    body: str
+    head_ref: str = ""
+
+
+def list_open_prs(repo: str, *, runner: Runner = run) -> list[Pr]:
+    """List open PRs (used by the hygiene watchdog to spot abandoned claims)."""
+    p = _gh(
+        [
+            "pr", "list", "--repo", repo, "--state", "open",
+            "--limit", "100",
+            "--json", "number,title,body,headRefName",
+        ],
+        runner=runner,
+    )
+    try:
+        data = json.loads(p.stdout or "[]")
+    except json.JSONDecodeError:
+        return []
+    return [
+        Pr(
+            number=item["number"],
+            title=item.get("title", ""),
+            body=item.get("body", "") or "",
+            head_ref=item.get("headRefName", ""),
+        )
+        for item in data
+    ]
 
 
 def close_pr(
