@@ -230,3 +230,157 @@ def latest_resumable(repo_root: str | Path, *, dry_run: bool = False) -> int | N
     """The most recent unfinished block, or ``None`` when there is nothing to resume."""
     indices = resumable_indices(repo_root, dry_run=dry_run)
     return indices[-1] if indices else None
+
+
+# --- stage timing journal ---------------------------------------------------
+# A second, independent record from the step journal above. The step journal
+# exists to make a step idempotent (run once, replay the payload on resume);
+# this one exists to answer "where did the time go" inside a single run -
+# every stage transition appends an event, replayed or not, so `hsai journal
+# <cycle>` and the block review's slowest-stage line have something to read.
+#
+# A stage-journal write must never be able to fail the run it is describing:
+# unlike the step journal (whose write failing IS a real problem - a step
+# would silently re-run on resume), losing one timing line is an acceptable
+# cost next to aborting an otherwise-successful iteration or block. So
+# `record_stage` catches everything and reports failure as a returned string
+# instead of raising; callers fold that into their own notes.
+
+STAGE_DIR = ".hsai/journal"
+
+
+def stage_path(repo_root: str | Path, cycle_index: int) -> Path:
+    return Path(repo_root) / STAGE_DIR / f"{cycle_index}.jsonl"
+
+
+@dataclass
+class StageEvent:
+    """One stage transition's timing - the unit ``hsai journal <cycle>`` reads."""
+
+    stage: str
+    iteration: int | None
+    ticket: int | None
+    started: float  # time.time() when the stage began
+    duration: float  # seconds
+    outcome: str
+    note: str = ""
+    created: str = field(default_factory=_now)
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), sort_keys=True)
+
+
+def read_stage_events(path: str | Path) -> list[StageEvent]:
+    """Parse every stage event back off disk (empty list if absent or torn)."""
+    path = Path(path)
+    if not path.exists():
+        return []
+    events: list[StageEvent] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+        except ValueError:
+            continue
+        events.append(StageEvent(**data))
+    return events
+
+
+def record_stage(
+    repo_root: str | Path,
+    cycle_index: int,
+    stage: str,
+    *,
+    started: float,
+    duration: float,
+    outcome: str = DONE,
+    iteration: int | None = None,
+    ticket: int | None = None,
+    note: str = "",
+) -> str:
+    """Append one stage-timing event. Never raises.
+
+    Returns ``""`` on success, or a short description of what went wrong -
+    the caller decides what to do with it (typically: fold it into the
+    iteration/block's own notes so the failure is visible without being
+    fatal).
+    """
+    event = StageEvent(
+        stage=stage, iteration=iteration, ticket=ticket,
+        started=started, duration=round(max(0.0, duration), 3),
+        outcome=outcome, note=note,
+    )
+    try:
+        path = stage_path(repo_root, cycle_index)
+        line = event.to_json() + "\n"
+        with _JOURNAL_LOCK:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(line)
+        return ""
+    except OSError as exc:
+        return f"journal: failed to record stage {stage!r}: {exc}"
+
+
+@dataclass(frozen=True)
+class StageBreakdown:
+    """One stage's folded timing across every event recorded for a cycle."""
+
+    stage: str
+    count: int
+    total_seconds: float
+    max_seconds: float
+
+    def line(self) -> str:
+        return (
+            f"{self.stage:<18} {self.count:>3}x  total={self.total_seconds:8.2f}s"
+            f"  max={self.max_seconds:8.2f}s"
+        )
+
+
+def stage_breakdown(events: list[StageEvent]) -> list[StageBreakdown]:
+    """Fold stage events into one row per stage, slowest total first."""
+    by_stage: dict[str, list[StageEvent]] = {}
+    for e in events:
+        by_stage.setdefault(e.stage, []).append(e)
+    rows = [
+        StageBreakdown(
+            stage=stage,
+            count=len(es),
+            total_seconds=round(sum(e.duration for e in es), 3),
+            max_seconds=round(max(e.duration for e in es), 3),
+        )
+        for stage, es in by_stage.items()
+    ]
+    return sorted(rows, key=lambda r: r.total_seconds, reverse=True)
+
+
+def slowest_stage(events: list[StageEvent]) -> StageBreakdown | None:
+    """The stage that consumed the most cumulative time, or ``None``."""
+    rows = stage_breakdown(events)
+    return rows[0] if rows else None
+
+
+def render_stage_breakdown(cycle_index: int, events: list[StageEvent]) -> str:
+    """The ``hsai journal <cycle>`` report: one line per stage, slowest first."""
+    if not events:
+        return f"journal: no stage events recorded for cycle {cycle_index}"
+    rows = stage_breakdown(events)
+    lines = [
+        f"cycle {cycle_index}: {len(events)} stage event(s), {len(rows)} distinct stage(s)"
+    ]
+    lines += [row.line() for row in rows]
+    return "\n".join(lines)
+
+
+def slowest_stage_line(cycle_index: int, events: list[StageEvent]) -> str:
+    """The one-line summary ``governance.render_brief`` includes per block."""
+    row = slowest_stage(events)
+    if row is None:
+        return ""
+    return (
+        f"slowest stage: `{row.stage}` - {row.total_seconds:.1f}s total across "
+        f"{row.count} run(s) (max {row.max_seconds:.1f}s)"
+    )

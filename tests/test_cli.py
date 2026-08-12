@@ -64,6 +64,39 @@ def test_cycle_command_passes_resume_through(monkeypatch, capsys):
     assert "block 42 (resumed)" in out and "/tmp/j.jsonl" in out
 
 
+def test_parser_journal_args():
+    parser = build_parser()
+    args = parser.parse_args(["journal", "5"])
+    assert args.command == "journal" and args.cycle == 5
+
+
+def test_journal_command_prints_the_stage_breakdown(tmp_path, monkeypatch, capsys):
+    from hsai import journal as journal_module
+
+    monkeypatch.chdir(tmp_path)
+    journal_module.record_stage(
+        tmp_path, 5, "agent_run", started=0.0, duration=3.0, outcome="ok"
+    )
+    journal_module.record_stage(
+        tmp_path, 5, "merge", started=0.0, duration=1.0, outcome="merged"
+    )
+
+    rc = main(["journal", "5"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "cycle 5" in out
+    assert "agent_run" in out and "merge" in out
+
+
+def test_journal_command_reports_no_events_and_exits_nonzero(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    rc = main(["journal", "9"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "no stage events" in out
+
+
 def test_parser_recall_defaults():
     parser = build_parser()
     args = parser.parse_args(["recall", "remote CI gate"])

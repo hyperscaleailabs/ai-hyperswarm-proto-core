@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from uuid import uuid4
 
-from . import ai, ci, github, gitops, ledger, recall, repro, review, trajectory
+from . import ai, ci, github, gitops, journal, ledger, recall, repro, review, trajectory
 from .config import CoreConfig
 from .knowledge import KnowledgeBase, Lesson
 from .models import ModelChoice, Task, select
@@ -47,6 +47,31 @@ def _format_error_with_context(
         context_parts.append(f"ticket=#{ticket}")
     context = ", ".join(context_parts)
     return f"[{context}] {error}"
+
+
+def _journal_stage(
+    repo_dir: str,
+    block: int,
+    stage: str,
+    *,
+    iteration: int,
+    ticket: int | None,
+    started: float,
+    outcome: str,
+    note: str = "",
+) -> str:
+    """Record one guard/agent stage's timing for the block's stage journal.
+
+    Never raises - `journal.record_stage` catches its own write failures - so
+    a bad `.hsai/journal/` path can only ever cost a missing timing line, not
+    the iteration. A non-empty return is a note for the caller to fold into
+    `IterationResult.notes` so the failure stays visible.
+    """
+    err = journal.record_stage(
+        repo_dir, block, stage, iteration=iteration, ticket=ticket,
+        started=started, duration=time.time() - started, outcome=outcome, note=note,
+    )
+    return err
 
 
 def _phase_artifacts(kind: str) -> str:
@@ -436,10 +461,18 @@ def run_once(
         tokens = ledger.parse_tokens(ares.payload)
         if agent_err:
             agent_err = _format_error_with_context(agent_err, kind, ticket_num)
+        stage_note = _journal_stage(
+            repo_dir, block, "agent_run", iteration=iteration, ticket=ticket_num,
+            started=agent_started, outcome="ok" if agent_ok else "error",
+            note=agent_err[:200] if agent_err else "",
+        )
+        if stage_note:
+            result.notes.append(stage_note)
 
         # Guard: a task must not change the CI checks, or local and remote CI
         # would diverge (as happened once when a worker added mypy). Revert any
         # workflow edits before they are committed and note it in the lesson.
+        guard_started = time.time()
         reverted_workflows = [
             p for p in gitops.changed_paths(cwd=wt, runner=runner)
             if p.startswith(".github/workflows/")
@@ -447,15 +480,28 @@ def run_once(
         if reverted_workflows:
             gitops.restore_pathspec(".github/workflows", cwd=wt, runner=runner)
             result.notes.append(f"reverted workflow edits: {reverted_workflows}")
+        stage_note = _journal_stage(
+            repo_dir, block, "workflow_revert", iteration=iteration, ticket=ticket_num,
+            started=guard_started, outcome="reverted" if reverted_workflows else "ok",
+        )
+        if stage_note:
+            result.notes.append(stage_note)
 
         # Completeness guard: a code ticket (feat/skill/refactor/fix) cannot be
         # satisfied by a knowledge-only diff. PR #17 once "closed" a feature
         # ticket by committing nothing but its own lesson file - never again.
         if _requires_code(ticket_title):
+            guard_started = time.time()
             touched = gitops.changed_paths(cwd=wt, runner=runner)
             code_files = [p for p in touched if not p.startswith("knowledge/")]
             if not code_files:
                 result.notes.append("completeness guard: knowledge-only diff on a code ticket")
+                stage_note = _journal_stage(
+                    repo_dir, block, "completeness_guard", iteration=iteration,
+                    ticket=ticket_num, started=guard_started, outcome="blocked",
+                )
+                if stage_note:
+                    result.notes.append(stage_note)
                 _recover_failed(
                     cfg, repo, 0, kind=kind, ticket_num=ticket_num,
                     claimed_issue=claimed_issue, login=login,
@@ -465,12 +511,19 @@ def run_once(
                 _record_cost("incomplete")
                 gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
                 return result
+            stage_note = _journal_stage(
+                repo_dir, block, "completeness_guard", iteration=iteration,
+                ticket=ticket_num, started=guard_started, outcome="ok",
+            )
+            if stage_note:
+                result.notes.append(stage_note)
 
         # Reproduce-before-fix guard: heal/bugfix tickets must add or modify a
         # test that FAILS on the pre-fix (parent) tree and PASSES on the fix
         # branch, proving the bug was real (llama_index's fix-stream
         # discipline). Docs/chore tickets are exempt.
         if repro.requires_repro_guard(kind, ticket_title):
+            guard_started = time.time()
             base_ref = gitops.merge_base(
                 "HEAD", f"origin/{cfg.default_branch}", cwd=wt, runner=runner,
             ) or f"origin/{cfg.default_branch}"
@@ -482,6 +535,13 @@ def run_once(
                 test_files=test_files, worktrees_dir=cfg.worktrees_dir, runner=runner,
             )
             result.notes.append(f"repro guard: {repro_result.reason}")
+            stage_note = _journal_stage(
+                repo_dir, block, "repro_guard", iteration=iteration, ticket=ticket_num,
+                started=guard_started, outcome="ok" if repro_result.ok else "blocked",
+                note=repro_result.reason[:200],
+            )
+            if stage_note:
+                result.notes.append(stage_note)
             if not repro_result.ok:
                 _recover_failed(
                     cfg, repo, 0, kind=kind, ticket_num=ticket_num,
@@ -494,8 +554,16 @@ def run_once(
                 return result
 
     # 6. re-check CI
+    ci_started = time.time()
     ci_after = ci.run_local(cwd=wt, runner=runner) if not dry_run else ci_before
     result.ci_after = ci_after.ok
+    if not dry_run:
+        stage_note = _journal_stage(
+            repo_dir, block, "ci_local", iteration=iteration, ticket=ticket_num,
+            started=ci_started, outcome="ok" if ci_after.ok else "red",
+        )
+        if stage_note:
+            result.notes.append(stage_note)
 
     # 6b. Independent review gate: a SECOND opinion, from a different tier than
     # the author, on whether the diff actually satisfies the ticket. Every other
@@ -628,12 +696,19 @@ def run_once(
     # it is the source of truth for whether the change may merge, and arming
     # auto-merge first (as opposed to gating on this poll) raced GitHub's own
     # merge against our recovery bookkeeping.
+    remote_started = time.time()
     remote = ci.wait_remote(
         pr_num, repo,
         timeout=cfg.ci_remote_timeout, interval=cfg.ci_poll_interval, runner=runner,
     )
     result.remote = remote
     result.notes.append(f"remote CI={remote}")
+    stage_note = _journal_stage(
+        repo_dir, block, "remote_ci", iteration=iteration, ticket=ticket_num,
+        started=remote_started, outcome=remote,
+    )
+    if stage_note:
+        result.notes.append(stage_note)
 
     # Record the true remote outcome in the lesson itself, then push that
     # update so it lands in the knowledge base once the PR merges.
@@ -645,6 +720,7 @@ def run_once(
     )
     gitops.push_branch(branch, cwd=wt, runner=runner)
 
+    merge_started = time.time()
     if remote == ci.SUCCESS:
         github.merge_pr(repo, pr_num, auto=True, runner=runner)
         result.merged = True
@@ -656,6 +732,12 @@ def run_once(
         )
         result.recovered = True
         result.notes.append("recovered: closed PR, returned ticket to backlog")
+    stage_note = _journal_stage(
+        repo_dir, block, "merge", iteration=iteration, ticket=ticket_num,
+        started=merge_started, outcome="merged" if result.merged else "not_merged",
+    )
+    if stage_note:
+        result.notes.append(stage_note)
 
     _record_cost("merged" if result.merged else "recovered")
 

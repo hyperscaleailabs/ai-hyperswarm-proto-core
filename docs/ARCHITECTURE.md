@@ -185,6 +185,24 @@ The store lives under `.hsai/` (gitignored) for the same reason trajectories do
 `journal.dry-run.jsonl` so a rehearsal can neither satisfy nor poison a later
 live run of the same block.
 
+### Stage timing journal
+
+A second, independent journal answers a different question: not "did this step
+already run" but "where did the time go". Every guard boundary inside
+`run_once` (agent run, workflow-revert check, completeness guard, repro guard,
+local CI, remote CI wait, merge) and every top-level boundary inside
+`run_cycle` (synthesis, the implementation block, whitepaper, brief) calls
+`journal.record_stage`, which appends a `(stage, iteration, ticket, started,
+duration, outcome, note)` event to `.hsai/journal/<cycle_index>.jsonl` -
+replayed steps included, so a near-instant resume pass still shows up.
+`hsai journal <cycle>` folds those events into a per-stage breakdown (count,
+total, max), and `run_cycle` folds the same events into the one-line
+`slowest stage: ...` summary that `governance.render_brief` prints in every
+review issue. `record_stage` never raises: a write failure (a bad path, a full
+disk) is caught and returned as a string for the caller to fold into its own
+notes, so a broken `.hsai/journal/` can cost a missing timing line but never an
+iteration or a block.
+
 ## Headless permission mode
 
 `claude -p` runs with `execution.permission_mode` from `core.yaml`

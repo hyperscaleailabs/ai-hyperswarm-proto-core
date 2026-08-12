@@ -45,6 +45,7 @@ class BlockReport:
     whitepaper: str = ""                                   # note name
     articles: list[str] = field(default_factory=list)      # file paths
     cost: BlockAggregate | None = None                     # quota-ledger aggregate
+    slowest_stage: str = ""                                 # journal.slowest_stage_line()
     notes: list[str] = field(default_factory=list)
 
 
@@ -168,6 +169,7 @@ def render_brief(cfg: CoreConfig, report: BlockReport) -> str:
     paper = f"`knowledge/whitepapers/{report.whitepaper}.md`" if report.whitepaper else "_none_"
     articles = "\n".join(f"- `{a}`" for a in report.articles) or "_none_"
     cost = _cost_summary(report.cost)
+    timing = report.slowest_stage or "slowest stage: _no stage timing recorded for this block_"
     extra = "\n".join(f"- {n}" for n in report.notes)
     return f"""# Block review - cycle {report.cycle_index}
 
@@ -189,6 +191,8 @@ sequentially, records your feedback as ADRs, and ends with a merged PR.
 
 ## Cost this block (quota ledger)
 {cost}
+
+{timing}
 
 ## Knowledge produced
 - Whitepaper: {paper}

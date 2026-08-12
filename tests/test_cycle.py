@@ -133,6 +133,30 @@ def test_block_soft_biases_then_hard_halts_but_inflight_merges(tmp_path, monkeyp
         json.loads(line)
 
 
+def test_run_cycle_records_block_level_stage_events_and_slowest_stage(tmp_path, monkeypatch):
+    """`run_cycle`'s synthesis/block/whitepaper/brief boundaries all journal."""
+    cfg = load_config()
+    cfg.cycle["block_size"] = 1
+    runner = _Runner()
+    ledger_file = ledger.ledger_path(cfg, tmp_path)
+    fake, state = _make_fake_run_once(ledger_file, tier="standard", seconds=1.0)
+
+    monkeypatch.setattr(cycle, "run_once", fake)
+    monkeypatch.setattr(cycle, "_well_formed_backlog", lambda cfg, *, runner: 999)
+    monkeypatch.setattr(cycle, "_governance_pr", lambda *a, **k: 0)
+
+    res = cycle.run_cycle(cfg, repo_dir=str(tmp_path), cycle_index=3, runner=runner)
+
+    events = journal.read_stage_events(journal.stage_path(tmp_path, 3))
+    stages = {e.stage for e in events}
+    assert {"synthesis", "block", "whitepaper", "brief"} <= stages
+
+    # The slowest-stage line is folded into the report and reaches the brief.
+    assert res.report.slowest_stage.startswith("slowest stage: `")
+    assert runner.review_bodies
+    assert res.report.slowest_stage in runner.review_bodies[-1]
+
+
 # --- plain-text agent output must not break article generation --------------
 
 def test_persona_articles_survive_output_without_a_json_envelope(tmp_path):

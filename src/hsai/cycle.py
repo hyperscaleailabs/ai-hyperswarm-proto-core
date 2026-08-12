@@ -41,6 +41,16 @@ class CycleResult:
     resumed: bool = False
 
 
+def _stage(
+    repo_root: Path, idx: int, stage: str, started: float, outcome: str, note: str = ""
+) -> str:
+    """Record one block-level stage's timing (never raises - see `journal.record_stage`)."""
+    return journal.record_stage(
+        repo_root, idx, stage, started=started, duration=time.time() - started,
+        outcome=outcome, note=note,
+    )
+
+
 def _well_formed_backlog(cfg: CoreConfig, *, runner: Runner) -> int:
     issues = [
         i for i in github.list_open_issues(cfg.repo_slug, runner=runner)
@@ -226,6 +236,7 @@ def run_cycle(
     report = BlockReport(cycle_index=idx)
 
     # 1. Synthesize substantial tickets when the well-formed backlog is thin.
+    synth_started = time.time()
     synth = journal.once(
         jr, "synthesis", "block",
         lambda: _synthesis_step(
@@ -235,13 +246,21 @@ def run_cycle(
     report.synthesized = list(synth["filed"])
     if synth["ran"] and not report.synthesized:
         report.notes.append(f"synthesis produced no tickets: {synth['error']}")
+    err = _stage(repo_root, idx, "synthesis", synth_started,
+                 "ok" if not synth["error"] else "error", synth["error"])
+    if err:
+        report.notes.append(err)
 
     # 2. Sequential implementation block, under the quota budget gate.
+    block_started = time.time()
     ledger_file = ledger.ledger_path(cfg, repo_root)
     _implementation_block(
         cfg, report, jr, idx=idx, repo_root=repo_root, ledger_file=ledger_file,
         runner=runner, ai_runner=ai_runner, dry_run=dry_run,
     )
+    err = _stage(repo_root, idx, "block", block_started, "ok")
+    if err:
+        report.notes.append(err)
 
     # Fold the block's ledger records into the summary the review brief surfaces.
     # Derived from the durable ledger, so it needs no journal record of its own.
@@ -264,18 +283,33 @@ def run_cycle(
 
     # 4. Block whitepaper + persona articles + MOCs + DIRECTION refresh.
     kb = KnowledgeBase.from_config(cfg, repo_root)
+    whitepaper_started = time.time()
     report.whitepaper = journal.once(
         jr, "whitepaper", "block", lambda: _whitepaper_step(cfg, kb),
     )["note"]
+    err = _stage(repo_root, idx, "whitepaper", whitepaper_started,
+                 "ok" if report.whitepaper else "skipped")
+    if err:
+        report.notes.append(err)
     report.articles = journal.once(
         jr, "articles", "block",
         lambda: {"paths": [] if dry_run else _persona_articles(
             cfg, kb, report.whitepaper, repo_root=repo_root, ai_runner=ai_runner
         )},
     )["paths"]
+    brief_started = time.time()
     journal.once(
         jr, "direction", "block",
         lambda: _direction_step(cfg, kb, repo_root=repo_root, runner=runner),
+    )
+    err = _stage(repo_root, idx, "brief", brief_started, "ok")
+    if err:
+        report.notes.append(err)
+
+    # Slowest-stage summary for the review brief - folded from every stage
+    # event recorded for this block, iterations included.
+    report.slowest_stage = journal.slowest_stage_line(
+        idx, journal.read_stage_events(journal.stage_path(repo_root, idx))
     )
 
     # A resumed block says so in the brief, in one line, before it is rendered.
