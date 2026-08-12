@@ -60,6 +60,7 @@ class Lesson:
     remote_ci: str = ""  # SUCCESS | FAILURE | TIMEOUT, filled in once gh checks conclude
     repro_evidence: str = ""  # heal/bugfix only: failing-then-passing reproduction proof
     recalled: tuple[str, ...] = ()  # prior notes injected into this run's prompt
+    review_verdict: str = ""  # the independent reviewer's verdict, verbatim
 
     def note_name(self) -> str:
         return f"{self.created}-{slugify(self.title)}"
@@ -325,6 +326,8 @@ class KnowledgeBase:
         ticket = f"#{lesson.ticket}" if lesson.ticket else "_(none)_"
         pr = f"#{lesson.pr}" if lesson.pr else "_(none)_"
         repro = lesson.repro_evidence or "_(not applicable: not a heal/bugfix ticket)_"
+        # Who checked the work, not just who wrote it (G2).
+        review = lesson.review_verdict or "_(no independent review recorded)_"
         return f"""{fm}
 
 # {lesson.title}
@@ -349,6 +352,9 @@ class KnowledgeBase:
 
 ## Lesson learned
 {lesson.lesson}
+
+## Independent review
+{review}
 
 ## Reproduction evidence
 {repro}

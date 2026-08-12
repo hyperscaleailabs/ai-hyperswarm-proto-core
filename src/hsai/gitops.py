@@ -85,6 +85,16 @@ def diff_paths(base_ref: str, *, cwd: str | None = None, runner: Runner = run) -
     return [line.strip() for line in p.stdout.splitlines() if line.strip()]
 
 
+def diff_text(base_ref: str, *, cwd: str | None = None, runner: Runner = run) -> str:
+    """The full textual diff between ``base_ref`` and HEAD.
+
+    What the independent review gate (:mod:`hsai.review`) actually reads: paths
+    alone say what was touched, not whether the change is correct.
+    """
+    p = _git(["diff", f"{base_ref}...HEAD"], cwd=cwd, runner=runner)
+    return p.stdout
+
+
 def has_changes(*, cwd: str, runner: Runner = run) -> bool:
     p = _git(["status", "--porcelain"], cwd=cwd, runner=runner)
     return bool(p.stdout.strip())

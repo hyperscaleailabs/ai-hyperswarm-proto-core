@@ -76,6 +76,19 @@ auditable. Tune it under `knowledge.recall` in `.ai-swarm/core.yaml`
 hsai recall "remote CI gate"       # what would a worker be shown for this task?
 ```
 
+**Nothing merges on the author's word alone.** Once local CI is green and the
+work is committed, `hsai.review` hands the branch diff, the ticket and its
+parsed acceptance criteria to a model on a *different tier* than the one that
+wrote it, and requires a fenced JSON verdict back. Output it cannot parse is
+fail-closed (a non-approval). A blocking verdict opens no PR at all: the ticket
+goes back through the ordinary retry policy (`attempts:N`, then `blocked`).
+Every review is metered in the quota ledger as `kind='review'`, and a hard
+budget breach skips the gate rather than stalling the block. The verdict is
+recorded verbatim under `## Independent review` on the PR and in the lesson, so
+the vault records who *checked* the work, not only who wrote it. Tune it under
+`review` in `.ai-swarm/core.yaml` (`enabled`, `tier_policy`,
+`max_blocking_findings`, `max_diff_chars`, `timeout_seconds`).
+
 ## Quickstart
 
 ```bash

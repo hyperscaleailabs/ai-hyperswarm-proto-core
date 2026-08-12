@@ -53,6 +53,20 @@ _LIGHT_SIGNALS = (
     "whitespace",
 )
 
+# Tiers ordered cheap -> expensive; used to find a reviewer tier that is not the
+# author's (mirrors ledger._TIER_ORDER, kept local to avoid a circular import).
+_TIER_ORDER = ("light", "standard", "heavy")
+
+# Who reviews whom (see :mod:`hsai.review`). Overridable via ``review.tier_policy``
+# in core.yaml. Deliberately biased cheap: a review runs on EVERY change, and a
+# heavy-tier reviewer would exhaust the block's heavy budget on critique alone
+# (OpenBMB/ChatDev runs review phases on cheaper agents for the same reason).
+DEFAULT_REVIEWER_TIERS = {
+    "heavy": "standard",
+    "standard": "light",
+    "light": "standard",
+}
+
 
 @dataclass(frozen=True)
 class Task:
@@ -178,3 +192,38 @@ def select(task: Task, cfg: CoreConfig, *, demote: bool = False) -> ModelChoice:
     model = cfg.tiers[tier].model
     rationale = f"score={score} -> {tier} ({why})"
     return ModelChoice(tier=tier, model=model, rationale=rationale, strategy="heuristic-v1")
+
+
+def _adjacent_tier(tier: str, cfg: CoreConfig) -> str:
+    """A configured tier that is NOT ``tier`` - one step cheaper where possible."""
+    order = [t for t in _TIER_ORDER if t in cfg.tiers] or [cfg.default_tier]
+    if tier not in order:
+        return order[0]
+    i = order.index(tier)
+    if i > 0:
+        return order[i - 1]
+    return order[1] if len(order) > 1 else tier
+
+
+def select_reviewer(author: ModelChoice, cfg: CoreConfig) -> ModelChoice:
+    """Pick the model that reviews ``author``'s work - never the author's tier.
+
+    The whole point of the review gate is that the critique does not come from
+    the author grading itself (FoundationAgents/MetaGPT separates the engineer
+    and reviewer roles), so a different tier is an invariant here, not a
+    preference: a policy that maps a tier to itself - or to a tier this repo has
+    not configured - is discarded in favour of an adjacent one.
+    """
+    policy = dict(DEFAULT_REVIEWER_TIERS)
+    policy.update({str(k): str(v) for k, v in (cfg.review.get("tier_policy") or {}).items()})
+    tier = policy.get(author.tier, "")
+    why = f"policy {author.tier}->{tier}"
+    if tier not in cfg.tiers or tier == author.tier:
+        tier = _adjacent_tier(author.tier, cfg)
+        why = f"no usable policy for author tier '{author.tier}'; adjacent tier {tier}"
+    return ModelChoice(
+        tier=tier,
+        model=cfg.tiers[tier].model,
+        rationale=f"independent review of a `{author.tier}` author ({why})",
+        strategy="reviewer-v1",
+    )

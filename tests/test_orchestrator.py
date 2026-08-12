@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from hsai import ledger, orchestrator, recall, trajectory
+from hsai import ledger, orchestrator, recall, review, trajectory
 from hsai.config import load_config
 from hsai.models import ModelChoice
 from hsai.orchestrator import (
@@ -47,13 +47,62 @@ AGENT_JSON = json.dumps(
 )
 
 
+def _reviewer_envelope(verdict: dict, *, prose: str = "Checked the diff.") -> str:
+    """What the independent reviewer prints: prose plus a fenced JSON verdict."""
+    return json.dumps(
+        {
+            "type": "result",
+            "result": f"{prose}\n\n```json\n{json.dumps(verdict)}\n```\n",
+            "usage": {"input_tokens": 400, "output_tokens": 60},
+        }
+    )
+
+
+REVIEW_APPROVE = _reviewer_envelope(
+    {
+        "approve": True,
+        "blocking": [],
+        "advisory": ["consider naming the helper"],
+        "rationale": "Every acceptance criterion is covered by code and a test.",
+    }
+)
+REVIEW_BLOCK = _reviewer_envelope(
+    {
+        "approve": False,
+        "blocking": ["src/hsai/widget.py: criterion 2 has no test proving it"],
+        "advisory": [],
+        "rationale": "The diff claims a criterion it never demonstrates.",
+    }
+)
+
+
+def _claude_prompts(runner) -> list[str]:
+    return [c[2] for c in runner.calls if c[:1] == ["claude"]]
+
+
+def _worker_prompts(runner) -> list[str]:
+    return [p for p in _claude_prompts(runner) if review.PROMPT_MARKER not in p]
+
+
+def _review_prompts(runner) -> list[str]:
+    return [p for p in _claude_prompts(runner) if review.PROMPT_MARKER in p]
+
+
+def _iteration_records(cfg, root) -> list[ledger.LedgerRecord]:
+    """Ledger records for the iteration itself, without the review's own line."""
+    records = ledger.read_records(ledger.ledger_path(cfg, root))
+    return [r for r in records if r.kind != "review"]
+
+
 class FakeRunner:
     """Deterministic stand-in for a :class:`hsai.proc.Runner`.
 
     Never touches the network or spawns a real subprocess - every git/gh/claude
     invocation is matched by command prefix and answered with a canned `Proc`.
     `ci_sequence` gives the ruff+pytest outcome for the Nth `ci.run_local()`
-    call (index 0 = ci_before, index 1 = ci_after, ...).
+    call (index 0 = ci_before, index 1 = ci_after, ...). A `claude` call is
+    answered as the worker or as the independent reviewer depending on which
+    prompt it carries.
     """
 
     def __init__(
@@ -67,9 +116,11 @@ class FakeRunner:
         repro_fix_ok: bool = True,
         repro_parent_ok: bool = False,
         agent_output: str = AGENT_JSON,
+        review_output: str = REVIEW_APPROVE,
     ) -> None:
         self.repo_root = repo_root
         self.agent_output = agent_output
+        self.review_output = review_output
         self.ci_sequence = ci_sequence
         self.open_issues = open_issues or []
         self.remote_ci = remote_ci
@@ -100,6 +151,11 @@ class FakeRunner:
             return Proc(cmd, 0, f"{self.repo_root}\n", "")
         if cmd[:2] == ["git", "merge-base"]:
             return Proc(cmd, 0, "parentsha\n", "")
+        if cmd[:2] == ["git", "diff"]:
+            # What the review gate reads off the branch: paths, then the diff.
+            if "--name-only" in cmd:
+                return Proc(cmd, 0, "src/hsai/widget.py\ntests/test_widget.py\n", "")
+            return Proc(cmd, 0, "diff --git a/src/hsai/widget.py\n+def widget(): ...\n", "")
         if cmd[:3] in (["git", "worktree", "add"], ["git", "worktree", "remove"]):
             return Proc(cmd, 0, "", "")
         if cmd[:2] == ["git", "status"]:
@@ -129,6 +185,9 @@ class FakeRunner:
         if cmd[:3] == ["gh", "issue", "edit"]:
             return Proc(cmd, 0, "", "")
         if cmd[:1] == ["claude"]:
+            prompt = cmd[2] if len(cmd) > 2 else ""
+            if review.PROMPT_MARKER in prompt:
+                return Proc(cmd, 0, self.review_output, "")
             return Proc(cmd, 0, self.agent_output, "")
         if cmd[:3] == ["gh", "pr", "create"]:
             self._pr_seq += 1
@@ -320,9 +379,10 @@ def test_run_once_heal_path_with_fake_runner(tmp_path, monkeypatch):
     assert result.model in body
     assert "Lesson learned" in body
 
-    # exactly one headless claude invocation, no real subprocess ever ran
-    claude_calls = [c for c in runner.calls if c[:1] == ["claude"]]
-    assert len(claude_calls) == 1
+    # one headless worker invocation plus one independent reviewer, no real
+    # subprocess ever ran
+    assert len(_worker_prompts(runner)) == 1
+    assert len(_review_prompts(runner)) == 1
     assert all(c[0] in {"git", "gh", "ruff", "pytest", "claude"} for c in runner.calls)
 
 
@@ -430,8 +490,8 @@ def test_run_once_implement_path_with_fake_runner(tmp_path):
     assert result.model in body
     assert "Lesson learned" in body
 
-    claude_calls = [c for c in runner.calls if c[:1] == ["claude"]]
-    assert len(claude_calls) == 1
+    assert len(_worker_prompts(runner)) == 1
+    assert len(_review_prompts(runner)) == 1
     assert all(c[0] in {"git", "gh", "ruff", "pytest", "claude"} for c in runner.calls)
 
 
@@ -570,6 +630,182 @@ def test_completeness_guard_blocks_knowledge_only_diff_on_code_ticket(tmp_path):
     )
 
 
+# --- independent review gate (a second opinion before any PR opens) ---------
+
+CODE_ISSUE = {
+    "number": 9,
+    "title": "feat: add widget",
+    "labels": [{"name": "priority:P2"}],
+    "assignees": [],
+    "body": WELL_FORMED_BODY,
+}
+
+
+def _review_run(tmp_path, *, review_output, issue=None, remote_ci="SUCCESS", cfg=None):
+    cfg = cfg or load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[dict(issue or CODE_ISSUE)],
+        worktree_status="?? src/hsai/widget.py\n",
+        review_output=review_output, remote_ci=remote_ci,
+    )
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+    return cfg, runner, result
+
+
+def test_a_blocking_review_verdict_never_opens_a_pr_and_costs_one_attempt(tmp_path):
+    cfg, runner, result = _review_run(tmp_path, review_output=REVIEW_BLOCK)
+
+    # The gate refused the change: no branch pushed, no PR, no merge.
+    assert result.review == "blocked"
+    assert result.recovered is True
+    assert result.pr is None and result.merged is False
+    assert not any(c[:3] == ["gh", "pr", "create"] for c in runner.calls)
+    assert not any(c[:3] == ["gh", "pr", "merge"] for c in runner.calls)
+    assert not any(c[:2] == ["git", "push"] for c in runner.calls)
+
+    # It routed through the SAME retry policy a red PR uses - attempts:1, still
+    # unassigned, no new label and no new stall state.
+    assert any("attempts:1" in c for c in runner.calls)
+    assert any(
+        c[:3] == ["gh", "issue", "edit"] and "--remove-assignee" in c for c in runner.calls
+    )
+    assert not any("blocked" in c for c in runner.calls)
+    assert any("independent review" in n for n in result.notes)
+
+    # Both the review and the blocked iteration are on the ledger.
+    records = ledger.read_records(ledger.ledger_path(cfg, tmp_path))
+    assert [(r.kind, r.outcome) for r in records] == [
+        ("review", "blocked"), (IMPLEMENT, "review_blocked"),
+    ]
+
+
+def test_a_blocking_review_at_the_last_attempt_blocks_the_ticket_as_usual(tmp_path):
+    issue = dict(CODE_ISSUE, labels=[{"name": "priority:P2"}, {"name": "attempts:1"}])
+    _cfg, runner, result = _review_run(tmp_path, review_output=REVIEW_BLOCK, issue=issue)
+
+    # max_ticket_attempts=2: the second failure hands the ticket to a human -
+    # exactly what a second red CI would have done.
+    assert result.recovered is True and result.pr is None
+    edits = [c for c in runner.calls if c[:3] == ["gh", "issue", "edit"]]
+    assert any("blocked" in c for c in edits)
+    assert any("--remove-label" in c and "attempts:1" in c for c in edits)
+
+
+def test_an_approving_verdict_is_recorded_on_the_pr_and_in_the_lesson(tmp_path):
+    cfg, runner, result = _review_run(tmp_path, review_output=REVIEW_APPROVE)
+
+    assert result.review == "approve" and result.merged is True
+    assert "review=approve" in result.describe()
+
+    pr_create = next(c for c in runner.calls if c[:3] == ["gh", "pr", "create"])
+    pr_body = pr_create[pr_create.index("--body") + 1]
+    lesson_text = Path(result.lesson_path).read_text()
+    for text in (pr_body, lesson_text):
+        assert "## Independent review" in text
+        assert "**APPROVED**" in text
+        assert "Every acceptance criterion is covered by code and a test." in text
+        assert "consider naming the helper" in text        # advisory findings too
+
+    # The reviewer is a different model on a different tier than the author.
+    review_record = next(
+        r for r in ledger.read_records(ledger.ledger_path(cfg, tmp_path))
+        if r.kind == "review"
+    )
+    assert review_record.model != result.model
+    assert review_record.tier != "standard"
+    assert f"`{review_record.model}`" in pr_body
+
+
+def test_the_reviewer_is_shown_the_criteria_and_the_branch_diff(tmp_path):
+    _cfg, runner, _result = _review_run(tmp_path, review_output=REVIEW_APPROVE)
+
+    prompt = _review_prompts(runner)[0]
+    assert "- widget builds" in prompt and "- widget tested" in prompt
+    assert "src/hsai/widget.py" in prompt
+    assert "+def widget(): ..." in prompt
+    # and it is told a different model wrote the change
+    assert "You did not write it" in prompt
+
+
+def test_a_red_local_build_skips_the_review_and_says_so(tmp_path):
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, False],
+        open_issues=[dict(CODE_ISSUE)], worktree_status="?? src/hsai/widget.py\n",
+        remote_ci="FAILURE",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    # Nothing to second-guess: the CI gate already owns this outcome.
+    assert result.ci_after is False
+    assert result.review == "skipped"
+    assert _review_prompts(runner) == []
+    assert not any(r.kind == "review" for r in ledger.read_records(
+        ledger.ledger_path(cfg, tmp_path)
+    ))
+    pr_create = next(c for c in runner.calls if c[:3] == ["gh", "pr", "create"])
+    body = pr_create[pr_create.index("--body") + 1]
+    assert "## Independent review" in body
+    assert "_(not run: local CI is red" in body
+
+
+def test_an_approved_change_still_cannot_merge_without_a_green_remote_ci(tmp_path):
+    """The gate is additive: approval is necessary, never sufficient."""
+    cfg, runner, result = _review_run(
+        tmp_path, review_output=REVIEW_APPROVE, remote_ci="FAILURE"
+    )
+
+    assert result.review == "approve"
+    assert result.remote == "FAILURE"
+    assert result.merged is False and result.recovered is True
+    assert not any(c[:3] == ["gh", "pr", "merge"] for c in runner.calls)
+    assert any(c[:3] == ["gh", "pr", "close"] for c in runner.calls)
+    assert ledger.read_records(ledger.ledger_path(cfg, tmp_path))[-1].outcome == "recovered"
+
+
+def test_disabling_the_review_gate_restores_the_pre_review_flow(tmp_path):
+    cfg = replace(load_config(), review={"enabled": False})
+    _cfg, runner, result = _review_run(
+        tmp_path, review_output=REVIEW_BLOCK, cfg=cfg
+    )
+
+    # Even a blocking reviewer is never consulted, and the PR merges as before.
+    assert _review_prompts(runner) == []
+    assert result.review == "skipped" and result.merged is True
+    assert [r.kind for r in ledger.read_records(ledger.ledger_path(cfg, tmp_path))] == [
+        IMPLEMENT
+    ]
+
+
+def test_build_pr_body_always_carries_an_independent_review_section():
+    choice = ModelChoice(tier="standard", model="sonnet", rationale="x")
+    kwargs = dict(
+        ticket=42, choice=choice, lesson_note="2026-08-12-note",
+        lesson_summary="kept it small", ci_summary="green", kind=IMPLEMENT,
+    )
+    verdict = review.ReviewVerdict(
+        approve=True, advisory=["nit"], rationale="Covered end to end.",
+        reviewer_model="haiku", reviewer_tier="light",
+    )
+    body = build_pr_body(**kwargs, review_verdict=verdict.render())
+    assert "## Independent review" in body
+    assert "**APPROVED**" in body and "`haiku`" in body
+    assert "Covered end to end." in body
+
+    # A PR without a verdict says so rather than staying silent about it.
+    plain = build_pr_body(**kwargs)
+    assert "## Independent review" in plain
+    assert "_(no independent review recorded)_" in plain
+
+
 # --- trajectory store (one durable record per agent run) --------------------
 
 WIDGET_ISSUE = {
@@ -597,8 +833,8 @@ def test_agent_run_is_persisted_as_a_trajectory(tmp_path):
     )
 
     assert result.merged is True
-    # Exactly one trajectory file for the one `claude` invocation, sharded by block.
-    assert len([c for c in runner.calls if c[:1] == ["claude"]]) == 1
+    # Exactly one trajectory file for the one worker invocation, sharded by block.
+    assert len(_worker_prompts(runner)) == 1
     assert [p.name for p in _trajectory_files(tmp_path)] == ["4.json"]
     assert _trajectory_files(tmp_path)[0].parent.name == "0"   # block 4 // 100
 
@@ -692,10 +928,12 @@ def test_one_trajectory_file_per_agent_invocation(tmp_path):
             runner=runner, ai_runner=runner, iteration=i,
         )
 
-    claude_calls = [c for c in runner.calls if c[:1] == ["claude"]]
-    assert len(claude_calls) == len(_trajectory_files(tmp_path)) == 2
+    # One trajectory per WORKER run; the reviewer's own calls are metered in the
+    # ledger, not replayed as authored work.
+    assert len(_worker_prompts(runner)) == len(_trajectory_files(tmp_path)) == 2
     assert [p.name for p in _trajectory_files(tmp_path)] == ["1.json", "2.json"]
     # Every invocation asked the CLI for the structured envelope.
+    claude_calls = [c for c in runner.calls if c[:1] == ["claude"]]
     assert all("--output-format" in c and "json" in c for c in claude_calls)
 
 
@@ -719,16 +957,20 @@ def test_token_counts_reach_the_ledger_and_the_block_aggregate(tmp_path):
     )
 
     records = ledger.read_records(ledger.ledger_path(cfg, tmp_path))
-    assert len(records) == 1
-    assert records[0].input_tokens == 1500 and records[0].output_tokens == 320
+    # The independent review is metered like any other spend, so the block
+    # carries one 'review' line next to the iteration's own.
+    assert [r.kind for r in records] == ["review", IMPLEMENT]
+    authored = _iteration_records(cfg, tmp_path)[0]
+    assert authored.input_tokens == 1500 and authored.output_tokens == 320
 
     agg = ledger.aggregate_block(records, block=0)
-    assert agg.input_tokens == 1500 and agg.output_tokens == 320
-    assert "1820 tokens" in agg.summary()      # no longer reporting zero
-    # Tokens per merged PR is the block's efficiency signal (G4).
+    assert agg.input_tokens == 1900 and agg.output_tokens == 380   # 1500/320 + 400/60
+    assert "2280 tokens" in agg.summary()      # no longer reporting zero
+    # Tokens per merged PR is the block's efficiency signal (G4), and reviewing
+    # a change is part of what delivering it costs.
     assert agg.merged_iterations == 1
-    assert agg.tokens_per_merged_pr() == 1820
-    assert "1820 tokens/merged PR" in agg.summary()
+    assert agg.tokens_per_merged_pr() == 2280
+    assert "2280 tokens/merged PR" in agg.summary()
 
 
 def test_trajectory_digest_reaches_the_lesson_and_the_pr_body(tmp_path):
@@ -777,8 +1019,8 @@ def test_non_json_agent_output_still_produces_an_iteration_and_trajectory(tmp_pa
     assert traj.steps[0].text == "widget added, tests green"
 
     # The ledger record still exists; its token columns are simply null.
-    records = ledger.read_records(ledger.ledger_path(cfg, tmp_path))
-    assert records[0].input_tokens is None and records[0].output_tokens is None
+    authored = _iteration_records(cfg, tmp_path)[0]
+    assert authored.input_tokens is None and authored.output_tokens is None
 
 
 LOUD_AGENT_JSON = json.dumps(

@@ -248,6 +248,46 @@ def test_tokens_per_merged_pr():
     assert "1200 tokens/merged PR" in agg.summary()
 
 
+def test_review_spend_is_aggregated_alongside_the_work_it_reviewed(tmp_path):
+    """A second opinion is spend like any other: metered, folded in, budgeted."""
+    path = tmp_path / "ledger.jsonl"
+    append_record(path, _rec(block=1, input_tokens=1000, output_tokens=200))
+    append_record(path, LedgerRecord(
+        iteration=101, block=1, ticket=7, kind="review", tier="light", model="haiku",
+        wall_clock_seconds=8.0, attempts=1, outcome="approve",
+        input_tokens=400, output_tokens=60,
+    ))
+
+    records = read_records(path)
+    assert [r.kind for r in records] == ["implement", "review"]
+
+    agg = aggregate_block(records, block=1)
+    assert agg.iterations == 2
+    assert agg.total_tokens == 1660           # the review's tokens count too
+    assert agg.total_seconds == 18.0
+    assert agg.tier_counts == {"standard": 1, "light": 1}
+    assert agg.merged_iterations == 1         # a review never counts as delivery
+    assert agg.heavy_iterations == 0
+    # ...and the brief says how much of the block was second opinions.
+    assert agg.review_iterations == 1
+    assert "1 independent review(s)" in agg.summary()
+
+
+def test_review_seconds_can_trip_the_same_budget_ceiling(tmp_path):
+    """Review time is not free time: it counts against the block's budget."""
+    path = tmp_path / "ledger.jsonl"
+    append_record(path, _rec(block=1, seconds=40.0))
+    append_record(path, LedgerRecord(
+        iteration=101, block=1, ticket=7, kind="review", tier="light", model="haiku",
+        wall_clock_seconds=70.0, attempts=1, outcome="blocked",
+    ))
+    budget = {"max_seconds_per_block": 100, "soft_ratio": 0.8}
+
+    decision = evaluate_budget(aggregate_block(read_records(path), block=1), budget)
+    assert decision.status == HARD
+    assert decision.halt is True
+
+
 def test_tokens_per_merged_pr_is_undefined_without_merges_or_tokens():
     nothing_merged = aggregate_block(
         [_rec(block=1, outcome="recovered", input_tokens=500, output_tokens=100)], block=1
