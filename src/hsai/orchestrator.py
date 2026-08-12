@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from uuid import uuid4
 
-from . import ai, ci, github, gitops, ledger, recall, repro, review, trajectory
+from . import ai, ci, github, gitops, ledger, memory, recall, repro, review, trajectory
 from .config import CoreConfig
 from .knowledge import KnowledgeBase, Lesson
 from .models import ModelChoice, Task, select
@@ -187,6 +187,7 @@ def _task_prompt(
     ticket_title: str,
     ticket_body: str,
     lessons: str = "",
+    memories: str = "",
 ) -> str:
     goals = "; ".join(f"{g.get('id')}:{g.get('title')}" for g in cfg.goals)
     common = (
@@ -195,13 +196,19 @@ def _task_prompt(
         "code style consistent, and ensure `ruff check .` and `pytest` both pass. "
         f"Project goals: {goals}."
     )
-    # Retrieved prior notes, if any: appended last so the ticket stays the
-    # instruction and the lessons stay context (empty string => nothing renders).
+    # Retrieved context, if any: appended after the ticket so the ticket stays
+    # the instruction and retrieval stays context (empty string => nothing
+    # renders). Memory (outcomes + cost) leads and the reading list closes.
     recalled = f"\n\n{lessons}" if lessons else ""
+    # Re-clamped here as well as at render time: whatever a caller passes, the
+    # ticket text can never be crowded out by an oversized corpus.
+    budget = memory.MemoryConfig.from_core(cfg).max_prompt_chars
+    remembered = f"\n\n{memory.clamp(memories, budget)}" if memories else ""
+    context = f"{remembered}{recalled}"
     if kind == HEAL:
         return (
             f"{common}\nThe build is RED. Diagnose and fix it so CI is green. "
-            f"Ticket: {ticket_title}\n{ticket_body}{recalled}"
+            f"Ticket: {ticket_title}\n{ticket_body}{context}"
         )
     if kind == IMPLEMENT:
         return (
@@ -209,11 +216,11 @@ def _task_prompt(
             "its Acceptance criteria and execute its Verification plan, adding tests "
             "as evidence. A knowledge-only or docs-only diff on a feat/skill/refactor "
             "ticket is an automatic failure - real code must change.\n"
-            f"Ticket: {ticket_title}\n{ticket_body}{recalled}"
+            f"Ticket: {ticket_title}\n{ticket_body}{context}"
         )
     return (
         f"{common}\nImplement this self-improvement, learning from the reference set "
-        f"pinned in .ai-swarm/core.yaml.\nTicket: {ticket_title}\n{ticket_body}{recalled}"
+        f"pinned in .ai-swarm/core.yaml.\nTicket: {ticket_title}\n{ticket_body}{context}"
     )
 
 
@@ -368,6 +375,14 @@ def run_once(
     recalled = recall.for_task(
         wt, cfg, title=ticket_title, body=ticket_body, kind=kind
     )
+    # A second read of the same vault asking a different question: not "which
+    # notes are relevant" but "how did attempts like this one end, and what did
+    # they cost". Notes recall already showed are excluded, so the prompt never
+    # states the same thing twice.
+    memories = memory.for_task(
+        wt, cfg, title=ticket_title, body=ticket_body, kind=kind,
+        exclude=recalled.note_names,
+    )
 
     result = IterationResult(
         kind=kind, ticket=ticket_num, model=choice.model, ci_before=ci_before.ok,
@@ -375,6 +390,8 @@ def run_once(
     )
     if recalled.notes:
         result.notes.append(f"recalled {len(recalled.notes)} prior note(s)")
+    if memories.note_names:
+        result.notes.append(f"remembered {len(memories.note_names)} prior outcome(s)")
 
     # Quota ledger: every iteration that runs a model appends one cost record.
     # Written to the repo root (not the ephemeral worktree) so the block-level
@@ -414,7 +431,9 @@ def run_once(
     reverted_workflows: list[str] = []
     repro_result: repro.ReproResult | None = None
     if not dry_run:
-        prompt = _task_prompt(kind, cfg, ticket_title, ticket_body, recalled.section)
+        prompt = _task_prompt(
+            kind, cfg, ticket_title, ticket_body, recalled.section, memories.section
+        )
         agent_started = time.time()
         ares = ai.run_agent(
             prompt, choice, cfg, cwd=wt, runner=ai_runner, timeout=cfg.agent_timeout
@@ -648,6 +667,22 @@ def run_once(
     if remote == ci.SUCCESS:
         github.merge_pr(repo, pr_num, auto=True, runner=runner)
         result.merged = True
+        # Provenance: one queryable line per merged practice, so G1's "every
+        # improvement traces back to a field observation" stops being prose the
+        # planner has to re-derive from titles. Written to the repo root (like
+        # the ledger) because this branch is already pushed; the governance PR
+        # commits it.
+        memory.append_practice(
+            memory.practices_path(cfg, repo_dir),
+            memory.PracticeRecord(
+                ticket=ticket_num,
+                pr=pr_num,
+                title=ticket_title,
+                reference_repos=references,
+                lesson_note=lesson.note_name(),
+                note=lesson.lesson,
+            ),
+        )
     else:
         result.merged = False
         _recover_failed(

@@ -21,7 +21,7 @@ import json
 import re
 from dataclasses import dataclass
 
-from . import github
+from . import github, memory
 from .ai import run_agent
 from .config import CoreConfig
 from .knowledge import KnowledgeBase
@@ -56,9 +56,17 @@ def pick_rotation(cfg: CoreConfig, cycle_index: int) -> list[str]:
 
 
 def build_context_pack(
-    repos: list[str], *, runner: Runner = run, commits: int = 30
+    repos: list[str], *, runner: Runner = run, commits: int = 30, issues: int = 20
 ) -> ContextPack:
-    """Fetch a compact study digest for each repo via the GitHub API."""
+    """Fetch a compact study digest for each repo via the GitHub API.
+
+    core.yaml declares ``learn_from: [source_code, commit_history, ci_cd,
+    issue_history, harness_design, readme]``; a listing of workflow FILENAMES
+    and no issue history at all did not match that promise, so this also pulls
+    recently CLOSED issues and the contents of one workflow file. Every fetch is
+    independent and optional: any `gh` call that fails simply contributes
+    nothing, and the digest degrades to whatever did succeed.
+    """
     sections: dict[str, str] = {}
     for repo in repos:
         parts: list[str] = []
@@ -83,11 +91,53 @@ def build_context_pack(
         )
         if workflows.ok and workflows.stdout.strip():
             parts.append("CI workflows:\n" + workflows.stdout[:500])
+            parts.extend(_workflow_source(repo, workflows.stdout, runner=runner))
+        closed = runner(
+            [
+                "gh", "api", f"repos/{repo}/issues?state=closed&per_page={issues}",
+                "--jq", r'.[] | "- \(.title)  [\(.labels | map(.name) | join(", "))]"',
+            ]
+        )
+        if closed.ok and closed.stdout.strip():
+            parts.append("Recently closed issues (title [labels]):\n" + closed.stdout[:1500])
         sections[repo] = "\n\n".join(parts) or "(no data fetched)"
     return ContextPack(repos=repos, sections=sections)
 
 
+def _workflow_source(repo: str, listing: str, *, runner: Runner) -> list[str]:
+    """The CONTENTS of one workflow - a filename teaches nothing reusable.
+
+    One file, deterministically chosen, keeps the digest bounded; an empty list
+    on any failure keeps this strictly additive to the rest of the pack.
+    """
+    names = sorted(
+        n.strip() for n in listing.splitlines() if n.strip().endswith((".yml", ".yaml"))
+    )
+    if not names:
+        return []
+    got = runner(
+        [
+            "gh", "api", f"repos/{repo}/contents/.github/workflows/{names[0]}",
+            "-H", "Accept: application/vnd.github.raw",
+        ]
+    )
+    if not got.ok or not got.stdout.strip():
+        return []
+    return [f"Workflow `{names[0]}` (truncated):\n" + got.stdout[:2000]]
+
+
 TRIED_HEADING = "Already tried in this repo"
+ADOPTED_HEADING = "Already adopted in this repo"
+
+
+def build_adopted_digest(cfg: CoreConfig, *, root: str = ".") -> str:
+    """Practices this repo already MERGED, read off the provenance registry.
+
+    ``build_tried_digest`` reports lesson titles - what was attempted. This
+    reports what actually shipped, with the reference repos each one cited, so
+    the planner can build on settled work instead of re-proposing it.
+    """
+    return memory.adopted_digest(cfg, root=root)
 
 
 def build_tried_digest(
@@ -128,7 +178,9 @@ def build_tried_digest(
     return "\n".join(lines) or "_(nothing recorded yet - this is an early cycle)_"
 
 
-def build_prompt(cfg: CoreConfig, pack: ContextPack, tried: str = "") -> str:
+def build_prompt(
+    cfg: CoreConfig, pack: ContextPack, tried: str = "", adopted: str = ""
+) -> str:
     goals = "\n".join(f"- {g.get('id')}: {g.get('title')} - {g.get('description', '')}"
                       for g in cfg.goals)
     ideas = int(cfg.synthesis.get("ideas_target", 10))
@@ -150,6 +202,11 @@ Study digest of reference projects for this cycle:
 re-propose an idea whose lesson is listed here, and never duplicate the title of
 a ticket that is still open; build on them instead:
 {tried or "_(nothing recorded yet - this is an early cycle)_"}
+
+{ADOPTED_HEADING} - these practices are MERGED and settled, each with the
+reference repos it already cited. Do NOT re-propose any of them; if you want to
+touch one, propose a concrete extension and say what it adds:
+{adopted or "_(no practices recorded in the provenance registry yet)_"}
 
 Work in three explicit phases and show them all in your output:
 
@@ -224,6 +281,7 @@ def synthesize(
     repos = pick_rotation(cfg, cycle_index)
     pack = build_context_pack(repos, runner=runner)
     tried = build_tried_digest(cfg, root=root, runner=runner)
+    adopted = build_adopted_digest(cfg, root=root)
     tier = cfg.synthesis.get("tier", "heavy")
     model = cfg.tiers[tier].model if tier in cfg.tiers else cfg.tiers[cfg.default_tier].model
     choice = ModelChoice(
@@ -232,7 +290,7 @@ def synthesize(
         strategy="synthesis-v1",
     )
     ares = run_agent(
-        build_prompt(cfg, pack, tried), choice, cfg,
+        build_prompt(cfg, pack, tried, adopted), choice, cfg,
         timeout=float(cfg.synthesis.get("timeout_seconds", 2400)),
         runner=ai_runner,
     )

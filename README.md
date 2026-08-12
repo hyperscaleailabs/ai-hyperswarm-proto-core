@@ -76,6 +76,24 @@ auditable. Tune it under `knowledge.recall` in `.ai-swarm/core.yaml`
 hsai recall "remote CI gate"       # what would a worker be shown for this task?
 ```
 
+**And it reads back what that cost.** `hsai.memory` asks the other half of the
+question: not *which notes are relevant* but *how did attempts like this one
+end, and what did they cost*. It joins each lesson with its row in
+`knowledge/ledger/iterations.jsonl` by ticket number, ranks them by TF-IDF term
+overlap with a recency tiebreak, and injects failures as explicit **AVOID**
+warnings and merged work as precedent - hard-capped at `memory.max_prompt_chars`
+so ticket text is never crowded out. Every merged iteration also appends one
+line to `knowledge/registry/practices.jsonl` (ticket, PR, reference repos,
+lesson note), which makes the synthesis planner's *Already adopted in this repo*
+section - and G1's "every improvement traces back to a field observation" -
+queryable rather than prose. Tune it under `knowledge.memory` in
+`.ai-swarm/core.yaml`.
+
+```bash
+hsai memory "remote CI gate"              # what the loop remembers, with cost
+hsai memory "workflow edits" --prefer fail   # only the expensive knowledge
+```
+
 **Nothing merges on the author's word alone.** Once local CI is green and the
 work is committed, `hsai.review` hands the branch diff, the ticket and its
 parsed acceptance criteria to a model on a *different tier* than the one that
@@ -100,6 +118,7 @@ hsai loop          # one real iteration (opens & merges a PR on green)
 hsai loop --max-parallel 3 -n 1   # ramp to the swarm (after proving one iteration)
 hsai traj 12       # print what agent run (iteration) 12 did (spends no quota)
 hsai recall "knowledge-only diff on a code ticket"   # rank prior lessons for a task
+hsai memory "knowledge-only diff on a code ticket"   # ...and what those attempts cost
 hsai cycle --resume   # finish an interrupted governance block, replaying what completed
 ```
 
