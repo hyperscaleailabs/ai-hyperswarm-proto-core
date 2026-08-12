@@ -1,5 +1,7 @@
+from dataclasses import replace
+
 from hsai.config import load_config
-from hsai.models import Task, select
+from hsai.models import ModelChoice, Task, select, select_reviewer
 
 
 def _cfg():
@@ -204,3 +206,39 @@ class TestEdgeCases:
         )
         choice = select(task, cfg)
         assert choice.tier == "standard"
+
+
+class TestReviewerSelection:
+    """The reviewer must never be the author grading its own work."""
+
+    def test_reviewer_tier_always_differs_from_the_author(self):
+        cfg = _cfg()
+        for tier in ("heavy", "standard", "light"):
+            author = ModelChoice(tier=tier, model=cfg.tiers[tier].model, rationale="x")
+            reviewer = select_reviewer(author, cfg)
+            assert reviewer.tier != author.tier, tier
+            assert reviewer.tier in cfg.tiers
+            assert reviewer.model == cfg.tiers[reviewer.tier].model
+            assert reviewer.model != author.model
+            assert reviewer.strategy == "reviewer-v1"
+            assert tier in reviewer.rationale       # auditable: who reviewed whom
+
+    def test_default_policy_keeps_the_gate_affordable(self):
+        cfg = _cfg()
+        heavy = ModelChoice(tier="heavy", model=cfg.tiers["heavy"].model, rationale="x")
+        # A heavy author is reviewed one tier down, not by another heavy run:
+        # the gate fires on every change, so it must not eat the heavy budget.
+        assert select_reviewer(heavy, cfg).tier == "standard"
+
+    def test_a_self_referential_policy_is_discarded(self):
+        cfg = replace(_cfg(), review={"tier_policy": {"standard": "standard"}})
+        author = ModelChoice(tier="standard", model="sonnet", rationale="x")
+        reviewer = select_reviewer(author, cfg)
+        assert reviewer.tier != "standard"
+        assert "no usable policy" in reviewer.rationale
+
+    def test_an_unconfigured_policy_target_falls_back_to_an_adjacent_tier(self):
+        cfg = replace(_cfg(), review={"tier_policy": {"light": "nonexistent"}})
+        author = ModelChoice(tier="light", model="haiku", rationale="x")
+        reviewer = select_reviewer(author, cfg)
+        assert reviewer.tier in cfg.tiers and reviewer.tier != "light"

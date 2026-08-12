@@ -18,6 +18,7 @@ so the decision logic stays pure and unit-tested.
 | `hsai.journal` | append-only per-block step journal; `once()` replay | write files |
 | `hsai.knowledge` | lessons, whitepapers, MOC reindex (Obsidian) | write files |
 | `hsai.recall` | BM25 index over the vault; retrieve prior notes | read files |
+| `hsai.review` | independent, different-tier review of the branch diff | subprocess |
 | `hsai.orchestrator` | one iteration; `decide_path`, `build_pr_body` (pure) | composes above |
 | `hsai.swarm` | run N iterations concurrently | threads |
 | `hsai.cli` | `hsai` entry point | - |
@@ -34,6 +35,7 @@ sequenceDiagram
     participant T as trajectory
     participant K as knowledge
     participant R as recall
+    participant V as review
 
     O->>G: sync_main + create_worktree
     O->>C: run_local (CI before)
@@ -44,9 +46,15 @@ sequenceDiagram
     A-->>O: ok / error + steps + usage (JSON envelope)
     O->>T: record (before any guard can abort)
     O->>C: run_local (CI after)
-    O->>K: write_lesson (always, pass or fail)
+    O->>G: commit_all (so the reviewer has a diff to read)
+    O->>V: review_change (different tier than the author)
+    V-->>O: verdict (approve / blocking findings)
+    alt blocking verdict
+        O->>H: no PR; return ticket to backlog (attempts:N)
+    end
+    O->>K: write_lesson (always, pass or fail; carries the verdict)
     O->>G: commit_all + push_branch
-    O->>H: create_pr (linked to ticket, model, lesson)
+    O->>H: create_pr (linked to ticket, model, lesson, verdict)
     O->>C: wait_remote (poll real GitHub checks)
     C-->>O: success / failure
     alt remote CI success

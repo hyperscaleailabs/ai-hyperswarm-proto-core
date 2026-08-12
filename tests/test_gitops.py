@@ -26,6 +26,14 @@ def test_diff_paths_parses_name_only_output():
     assert runner.calls[0][0] == ["git", "diff", "--name-only", "origin/main...HEAD"]
 
 
+def test_diff_text_returns_the_branch_diff_verbatim():
+    """What the review gate reads: paths say what changed, not whether it is right."""
+    patch = "diff --git a/src/hsai/ci.py b/src/hsai/ci.py\n+def gate(): ...\n"
+    runner = _fake(patch)
+    assert gitops.diff_text("deadbeef", cwd="/repo", runner=runner) == patch
+    assert runner.calls[0][0] == ["git", "diff", "deadbeef...HEAD"]
+
+
 def test_create_detached_worktree_builds_expected_path():
     def runner(cmd, **kwargs):
         cmd = list(cmd)

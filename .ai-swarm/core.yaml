@@ -147,6 +147,25 @@ budget:
   max_seconds_per_block: 5400         # cumulative wall-clock across the block (90 min)
   soft_ratio: 0.8                     # fraction of a ceiling that triggers a soft breach
 
+# Independent review gate (see src/hsai/review.py). After local CI passes and
+# BEFORE a PR is opened, a model on a DIFFERENT tier than the author reviews the
+# branch diff against the ticket's acceptance criteria and answers with a fenced
+# JSON verdict. An unparseable verdict is fail-closed (non-approving); a blocking
+# verdict routes through the normal retry policy (attempts:N / blocked), never a
+# new stall state. Set enabled: false to restore the pre-review flow.
+review:
+  enabled: true
+  # Who reviews whom. Never maps a tier to itself: the author must not grade its
+  # own work. Biased cheap on purpose - the gate runs on EVERY change, so a
+  # heavy reviewer would spend the block's heavy budget on critique alone.
+  tier_policy:
+    heavy: standard
+    standard: light
+    light: standard
+  max_blocking_findings: 5     # findings beyond this are elided from the verdict
+  max_diff_chars: 20000        # hard ceiling on the diff handed to the reviewer
+  timeout_seconds: 900         # cap per reviewer run so the gate cannot hang the loop
+
 personas:                      # article targets generated from each whitepaper
   - id: cto
     audience: CTO level - business impact, risk posture, strategic direction

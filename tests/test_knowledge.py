@@ -35,6 +35,31 @@ def test_lesson_records_remote_ci_conclusion(tmp_path):
     assert "SUCCESS" in path.read_text()
 
 
+def test_lesson_records_the_independent_review_verdict(tmp_path):
+    """G2: the vault says who CHECKED the work, not only who wrote it."""
+    kb = KnowledgeBase(tmp_path)
+    lesson = Lesson(
+        title="implement: add widget",
+        outcome="pass",
+        kind="implement",
+        context="ctx",
+        what_happened="did the thing",
+        lesson="kept it small",
+        ticket=7,
+    )
+    path = kb.write_lesson(lesson)
+    assert "## Independent review" in path.read_text()
+    assert "_(no independent review recorded)_" in path.read_text()
+
+    lesson.review_verdict = "- verdict: **APPROVED**\n- reviewer: `haiku`"
+    kb.write_lesson(lesson)
+    text = path.read_text()
+    assert "## Independent review" in text
+    assert "**APPROVED**" in text and "`haiku`" in text
+    # and the surrounding sections are untouched
+    assert "## Lesson learned" in text and "## Reproduction evidence" in text
+
+
 def test_write_lesson_and_reindex(tmp_path):
     kb = KnowledgeBase(tmp_path)
     lesson = Lesson(

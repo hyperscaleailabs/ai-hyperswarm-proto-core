@@ -140,6 +140,7 @@ class BlockAggregate:
     iterations: int = 0
     heavy_iterations: int = 0
     merged_iterations: int = 0
+    review_iterations: int = 0  # kind='review': second opinions, not authored work
     total_seconds: float = 0.0
     total_attempts: int = 0
     input_tokens: int = 0
@@ -167,6 +168,10 @@ class BlockAggregate:
         return (
             f"{self.iterations} iterations, heavy-tier={self.heavy_iterations}, "
             f"{self.total_seconds:.0f}s wall-clock, {self.total_attempts} attempts"
+            + (
+                f", {self.review_iterations} independent review(s)"
+                if self.review_iterations else ""
+            )
             + (f", tiers[{tiers}]" if tiers else "")
             + (f", {toks} tokens" if toks else "")
             + (f", {per_pr:.0f} tokens/merged PR" if per_pr else "")
@@ -187,6 +192,8 @@ def aggregate_block(records: list[LedgerRecord], block: int) -> BlockAggregate:
             agg.heavy_iterations += 1
         if r.outcome == "merged":
             agg.merged_iterations += 1
+        if r.kind == "review":
+            agg.review_iterations += 1
         agg.input_tokens += r.input_tokens or 0
         agg.output_tokens += r.output_tokens or 0
     agg.total_seconds = round(agg.total_seconds, 3)

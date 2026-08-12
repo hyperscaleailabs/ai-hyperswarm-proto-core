@@ -1,3 +1,4 @@
+from hsai import review
 from hsai.config import load_config, validate
 
 
@@ -28,6 +29,31 @@ def test_execution_telemetry_defaults_when_keys_absent(tmp_path):
     cfg = load_config(core / "core.yaml")
     assert cfg.output_format == "json"          # structured envelope by default
     assert cfg.trajectory_retention_blocks == 8
+
+
+def test_review_gate_is_configured_and_enabled():
+    """The independent review gate is config, not code."""
+    cfg = load_config()
+    assert cfg.review["enabled"] is True
+    assert cfg.review["max_blocking_findings"] >= 1
+    assert cfg.review["timeout_seconds"] > 0
+    # No tier reviews itself - that is the whole point of the gate.
+    for author, reviewer in cfg.review["tier_policy"].items():
+        assert reviewer != author
+        assert reviewer in cfg.tiers
+
+
+def test_review_defaults_to_enabled_when_the_block_is_absent(tmp_path):
+    core = tmp_path / ".ai-swarm"
+    core.mkdir()
+    (core / "core.yaml").write_text(
+        "identity:\n  owner: someone\n"
+        "models:\n  tiers:\n    standard:\n      model: sonnet\n"
+        "  default_tier: standard\n"
+    )
+    cfg = load_config(core / "core.yaml")
+    assert cfg.review == {}
+    assert review.is_enabled(cfg) is True     # additive by default, opt-out only
 
 
 def test_reference_set_meets_criteria():
