@@ -5,6 +5,7 @@ Commands:
   hsai run-once [--dry-run]                                    a single iteration
   hsai status                                                  config + backlog snapshot
   hsai cycle [--cycle-index N] [--resume] [--dry-run]          one governance block
+  hsai journal <cycle>                                          per-stage timing breakdown
   hsai reindex                                                 rebuild knowledge MOCs
   hsai recall "<query>" [--k N] [--kind K]                     rank prior lessons/ADRs
   hsai doctor                                                  verify environment + invariants
@@ -117,6 +118,15 @@ def cmd_cycle(args: argparse.Namespace) -> int:
     for line in res.report.iterations:
         print(f"  {line}")
     return 0
+
+
+def cmd_journal(args: argparse.Namespace) -> int:
+    """Per-stage timing breakdown for one block (spends no quota, pure reading)."""
+    from . import journal
+
+    events = journal.read_stage_events(journal.stage_path(".", args.cycle))
+    print(journal.render_stage_breakdown(args.cycle, events))
+    return 0 if events else 1
 
 
 def cmd_synthesize(args: argparse.Namespace) -> int:
@@ -249,6 +259,12 @@ def build_parser() -> argparse.ArgumentParser:
     cy.add_argument("--dry-run", action="store_true",
                     help="no GitHub writes and no agent quota spend; journals separately")
     cy.set_defaults(func=cmd_cycle)
+
+    jn = sub.add_parser(
+        "journal", help="per-stage timing breakdown for a cycle (spends no quota)"
+    )
+    jn.add_argument("cycle", type=int, help="cycle/block index")
+    jn.set_defaults(func=cmd_journal)
 
     sy = sub.add_parser("synthesize", help="heavy-model synthesis: file substantial tickets")
     sy.add_argument("--index", type=int, default=0, help="rotation index for reference subset")

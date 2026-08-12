@@ -101,6 +101,7 @@ hsai loop --max-parallel 3 -n 1   # ramp to the swarm (after proving one iterati
 hsai traj 12       # print what agent run (iteration) 12 did (spends no quota)
 hsai recall "knowledge-only diff on a code ticket"   # rank prior lessons for a task
 hsai cycle --resume   # finish an interrupted governance block, replaying what completed
+hsai journal 41353    # per-stage timing breakdown for a block (spends no quota)
 ```
 
 Every agent run persists a **trajectory** - prompt, step stream, exit status,
@@ -141,7 +142,12 @@ The loop is governed, not just autonomous - see [docs/SDLC.md](docs/SDLC.md) and
    Every block step is journaled to `.hsai/cycles/<index>/journal.jsonl` as it
    completes, so a crash or a machine sleep is recoverable: `hsai cycle --resume`
    replays what already finished (no re-filed tickets, no second review issue,
-   no quota spent twice) and only re-runs what did not.
+   no quota spent twice) and only re-runs what did not. A second, independent
+   journal - one timing event per stage transition (agent run, guards, local
+   and remote CI, merge; and, per block, synthesis/implementation/whitepaper/
+   brief) - lands in `.hsai/journal/<index>.jsonl`; `hsai journal <index>`
+   renders the per-stage breakdown, and the review brief's own slowest-stage
+   line is folded from the same events.
 
 Whitepapers are ingested by [agentic-atlas](https://github.com/hyperscaleailabs/agentic-atlas)
 via its own pipeline (pull-based publishing).

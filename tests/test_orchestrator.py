@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from hsai import ledger, orchestrator, recall, review, trajectory
+from hsai import journal, ledger, orchestrator, recall, review, trajectory
 from hsai.config import load_config
 from hsai.models import ModelChoice
 from hsai.orchestrator import (
@@ -568,6 +568,76 @@ def test_run_once_recovers_when_remote_ci_fails(tmp_path):
     )
     # retry counter bumped (attempts:1, below max_ticket_attempts=2)
     assert any("attempts:1" in c for c in runner.calls)
+
+
+# --- per-stage journal ------------------------------------------------------
+# `run_once` journals a timing event at every guard boundary. `block =
+# iteration // 100`, so `iteration=1` journals into cycle index 0.
+
+
+def test_run_once_records_a_stage_journal_event_at_every_guard_boundary(tmp_path):
+    cfg = load_config()
+    open_issues = [
+        {
+            "number": 7,
+            "title": "feat: add widget",
+            "labels": [{"name": "priority:P2"}],
+            "assignees": [],
+            "body": WELL_FORMED_BODY,
+        }
+    ]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+        worktree_status=" M src/hsai/widget.py\n?? tests/test_widget.py\n",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.merged is True
+    events = journal.read_stage_events(journal.stage_path(tmp_path, 0))
+    stages = [e.stage for e in events]
+    for expected in (
+        "agent_run", "workflow_revert", "completeness_guard",
+        "ci_local", "remote_ci", "merge",
+    ):
+        assert expected in stages, f"{expected!r} missing from {stages!r}"
+    # Every event carries the ticket and iteration it belongs to.
+    assert all(e.iteration == 1 and e.ticket == 7 for e in events)
+    assert not any("journal:" in n for n in result.notes)  # no write failures
+
+
+def test_stage_journal_write_failure_never_fails_the_iteration(tmp_path):
+    # Block the stage-journal directory so every `record_stage` call fails.
+    blocker = tmp_path / journal.STAGE_DIR
+    blocker.parent.mkdir(parents=True, exist_ok=True)
+    blocker.write_text("not a directory")
+
+    cfg = load_config()
+    open_issues = [
+        {
+            "number": 7,
+            "title": "add widget",
+            "labels": [{"name": "priority:P2"}],
+            "assignees": [],
+            "body": WELL_FORMED_BODY,
+        }
+    ]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    # The run completed normally - a broken journal path degrades to a note,
+    # never an aborted iteration.
+    assert result.merged is True
+    assert any("journal:" in n for n in result.notes)
 
 
 def test_workflow_edits_are_reverted(tmp_path):

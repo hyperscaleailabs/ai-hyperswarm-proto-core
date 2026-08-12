@@ -130,6 +130,88 @@ def test_dry_run_journals_into_a_separate_file(tmp_path):
     assert journal.latest_resumable(tmp_path, dry_run=True) == 9
 
 
+# --- stage timing journal ----------------------------------------------------
+# A second, independent record from the step journal above: not for
+# idempotency, but for "where did the time go" - what `hsai journal <cycle>`
+# and the block review's slowest-stage line both read.
+
+
+def test_record_stage_round_trips_through_read_stage_events(tmp_path):
+    err = journal.record_stage(
+        tmp_path, 3, "agent_run", iteration=301, ticket=42,
+        started=1000.0, duration=12.5, outcome="ok", note="",
+    )
+    assert err == ""
+
+    events = journal.read_stage_events(journal.stage_path(tmp_path, 3))
+    assert len(events) == 1
+    e = events[0]
+    assert (e.stage, e.iteration, e.ticket, e.duration, e.outcome) == (
+        "agent_run", 301, 42, 12.5, "ok",
+    )
+    assert e.created  # every event is stamped
+
+
+def test_record_stage_never_raises_on_an_unwritable_path(tmp_path):
+    # Put a plain file where the stage-journal directory needs to be created,
+    # so `mkdir(parents=True)` fails with an OSError instead of succeeding.
+    blocker = tmp_path / journal.STAGE_DIR
+    blocker.parent.mkdir(parents=True, exist_ok=True)
+    blocker.write_text("not a directory")
+
+    err = journal.record_stage(
+        tmp_path, 1, "agent_run", started=0.0, duration=1.0, outcome="ok",
+    )
+
+    assert err  # the failure is reported...
+    assert "agent_run" in err
+    # ...but nothing was written, and nothing raised.
+    assert journal.read_stage_events(journal.stage_path(tmp_path, 1)) == []
+
+
+def test_stage_breakdown_folds_by_stage_slowest_total_first(tmp_path):
+    events = [
+        journal.StageEvent(stage="agent_run", iteration=1, ticket=None,
+                            started=0.0, duration=10.0, outcome="ok"),
+        journal.StageEvent(stage="agent_run", iteration=2, ticket=None,
+                            started=0.0, duration=5.0, outcome="ok"),
+        journal.StageEvent(stage="ci_local", iteration=1, ticket=None,
+                            started=0.0, duration=2.0, outcome="ok"),
+    ]
+    rows = journal.stage_breakdown(events)
+    assert [r.stage for r in rows] == ["agent_run", "ci_local"]
+    assert rows[0].count == 2 and rows[0].total_seconds == 15.0 and rows[0].max_seconds == 10.0
+    assert rows[1].total_seconds == 2.0
+
+    slowest = journal.slowest_stage(events)
+    assert slowest.stage == "agent_run"
+    assert journal.slowest_stage([]) is None
+
+
+def test_render_stage_breakdown_reports_no_events_without_crashing():
+    assert "no stage events" in journal.render_stage_breakdown(9, [])
+
+
+def test_render_stage_breakdown_lists_every_stage(tmp_path):
+    journal.record_stage(tmp_path, 5, "agent_run", started=0.0, duration=3.0, outcome="ok")
+    journal.record_stage(tmp_path, 5, "merge", started=0.0, duration=1.0, outcome="merged")
+    events = journal.read_stage_events(journal.stage_path(tmp_path, 5))
+    text = journal.render_stage_breakdown(5, events)
+    assert "cycle 5: 2 stage event(s), 2 distinct stage(s)" in text
+    assert "agent_run" in text and "merge" in text
+
+
+def test_slowest_stage_line_names_the_stage_and_total():
+    events = [
+        journal.StageEvent(stage="remote_ci", iteration=1, ticket=None,
+                            started=0.0, duration=42.0, outcome="SUCCESS"),
+    ]
+    line = journal.slowest_stage_line(2, events)
+    assert line.startswith("slowest stage: `remote_ci`")
+    assert "42.0s total across 1 run(s)" in line
+    assert journal.slowest_stage_line(2, []) == ""
+
+
 def test_summary_is_one_line_naming_the_replayed_steps(tmp_path):
     jr = journal.open_journal(tmp_path, 12)
     for step in ("synthesis", "iteration", "whitepaper"):

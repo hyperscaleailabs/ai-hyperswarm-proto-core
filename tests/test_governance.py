@@ -99,3 +99,16 @@ def test_brief_says_when_tokens_per_merged_pr_is_unavailable():
     cost = BlockAggregate(block=7, iterations=2, total_seconds=10.0)
     body = render_brief(cfg, BlockReport(cycle_index=7, cost=cost))
     assert "tokens per merged PR: _not available_" in body
+
+
+def test_brief_shows_the_slowest_stage_line():
+    cfg = load_config()
+    line = "slowest stage: `agent_run` - 42.0s total across 3 run(s) (max 20.0s)"
+    body = render_brief(cfg, BlockReport(cycle_index=7, slowest_stage=line))
+    assert line in body
+
+
+def test_brief_notes_when_no_stage_timing_was_recorded():
+    cfg = load_config()
+    body = render_brief(cfg, BlockReport(cycle_index=7))
+    assert "no stage timing recorded for this block" in body
