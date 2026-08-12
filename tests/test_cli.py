@@ -1,7 +1,7 @@
 import json
 
 from hsai import cli as cli_module
-from hsai import trajectory
+from hsai import ledger, trajectory
 from hsai.cli import build_parser, main
 from hsai.repro import ReproResult
 from hsai.trajectory import Step, Trajectory
@@ -106,6 +106,77 @@ def test_recall_command_reports_a_miss(tmp_path, capsys):
     lessons.mkdir(parents=True)
     (lessons / "n.md").write_text("# A note\n\n## Lesson learned\nSomething.\n")
     rc = main(["recall", "zzzznomatch", "--root", str(tmp_path)])
+    assert rc == 1
+    assert "no match" in capsys.readouterr().err
+
+
+def test_parser_memory_defaults():
+    parser = build_parser()
+    args = parser.parse_args(["memory", "remote CI gate"])
+    assert args.command == "memory"
+    assert args.query == "remote CI gate"
+    assert args.k == 5 and args.prefer == "" and args.root == "."
+
+
+def _seed_memory_vault(tmp_path):
+    lessons = tmp_path / "knowledge" / "lessons"
+    lessons.mkdir(parents=True)
+    (lessons / "2026-01-01-remote-rollup-gate.md").write_text(
+        "---\ntags:\n  - lesson\n  - outcome/fail\n  - kind/implement\n---\n\n"
+        "# Remote rollup gate\n\n"
+        "| field | value |\n| --- | --- |\n| ticket | #42 |\n\n"
+        "## Lesson learned\nPoll the rollup before merging.\n"
+    )
+    (lessons / "2026-01-02-unrelated.md").write_text(
+        "---\ntags:\n  - lesson\n  - outcome/pass\n  - kind/improve\n---\n\n"
+        "# Obsidian layout\n\n## Lesson learned\nWikilinks make a graph.\n"
+    )
+    ledger.append_record(
+        tmp_path / "knowledge" / "ledger" / "iterations.jsonl",
+        ledger.LedgerRecord(
+            iteration=1, block=1, ticket=42, kind="implement", tier="heavy",
+            model="opus", wall_clock_seconds=900.0, attempts=2, outcome="recovered",
+        ),
+    )
+
+
+def test_memory_command_prints_recalled_lessons_with_outcome_and_score(tmp_path, capsys):
+    _seed_memory_vault(tmp_path)
+
+    rc = main(["memory", "remote rollup gate", "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    first = out.splitlines()[0].split()
+    assert float(first[0]) > 0 and first[1] == "2026-01-01-remote-rollup-gate"
+    assert "(fail/implement, #42, 2 attempt(s), 900s, `opus`)" in out
+    assert "Poll the rollup before merging." in out
+    assert "2026-01-02-unrelated" not in out       # no shared vocabulary, no recall
+
+
+def test_memory_command_can_prefer_an_outcome(tmp_path, capsys):
+    _seed_memory_vault(tmp_path)
+
+    plain = main(["memory", "remote rollup gate", "--root", str(tmp_path)])
+    unweighted = float(capsys.readouterr().out.splitlines()[0].split()[0])
+    preferred = main(
+        ["memory", "remote rollup gate", "--root", str(tmp_path), "--prefer", "fail"]
+    )
+    weighted = float(capsys.readouterr().out.splitlines()[0].split()[0])
+
+    assert plain == preferred == 0
+    assert weighted > unweighted
+
+
+def test_memory_command_reports_an_empty_vault_without_crashing(tmp_path, capsys):
+    rc = main(["memory", "anything", "--root", str(tmp_path)])
+    assert rc == 1
+    assert "no lessons under" in capsys.readouterr().err
+
+
+def test_memory_command_reports_a_miss(tmp_path, capsys):
+    _seed_memory_vault(tmp_path)
+    rc = main(["memory", "zzzznomatch", "--root", str(tmp_path)])
     assert rc == 1
     assert "no match" in capsys.readouterr().err
 

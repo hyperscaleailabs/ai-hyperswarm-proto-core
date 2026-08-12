@@ -206,6 +206,16 @@ knowledge:
     max_chars: 1200                  # hard ceiling on the injected text
     fail_weight: 1.6                 # score multiplier for outcome/fail notes
     kind_weight: 1.25                # score multiplier when kind/ matches the task
+  # Retrieval memory (see src/hsai/memory.py). Where `recall` answers "which
+  # notes are relevant", this answers "how did attempts like this one END, and
+  # what did they COST" - lessons joined with knowledge/ledger by ticket number.
+  # Failures render as AVOID warnings, merged work as precedent. Inspect it with
+  # `hsai memory "<query>"`.
+  memory:
+    enabled: true                    # inject 'Prior outcomes for similar work'
+    k: 3                             # max memories shown per prompt
+    max_prompt_chars: 2000           # hard ceiling: ticket text is never crowded out
+    practices_file: knowledge/registry/practices.jsonl  # append-only provenance
 
 # Ranked snapshot pinned on 2026-07-25. Criteria: >= 10k stars, permissive
 # license (MIT or Apache-2.0), quality README, relevance to swarm / multi-agent.

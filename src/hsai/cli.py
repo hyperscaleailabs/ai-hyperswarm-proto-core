@@ -7,6 +7,7 @@ Commands:
   hsai cycle [--cycle-index N] [--resume] [--dry-run]          one governance block
   hsai reindex                                                 rebuild knowledge MOCs
   hsai recall "<query>" [--k N] [--kind K]                     rank prior lessons/ADRs
+  hsai memory "<query>" [--k N] [--prefer pass|fail]           recall lessons + what they cost
   hsai doctor                                                  verify environment + invariants
   hsai traj <iteration> [--json]                               print a stored agent run
   hsai replay <iteration> [--json]                             alias of `hsai traj`
@@ -17,7 +18,7 @@ import argparse
 import os
 import sys
 
-from . import __version__, ai, recall, repro, trajectory
+from . import __version__, ai, memory, recall, repro, trajectory
 from .config import CoreConfig, load_config, validate
 from .knowledge import KnowledgeBase
 from .orchestrator import run_loop
@@ -97,6 +98,27 @@ def cmd_recall(args: argparse.Namespace) -> int:
         return 1
     for note in notes:
         print(f"{note.score:8.3f}  {note.note_name}  ({note.label()})")
+    return 0
+
+
+def cmd_memory(args: argparse.Namespace) -> int:
+    """Inspect what the loop would remember for a ticket, and what it cost.
+
+    Pure reading: builds the TF-IDF index over knowledge/lessons, joins it with
+    the quota ledger, and prints the ranking. No model call, no network.
+    """
+    cfg = _load(args)
+    corpus = memory.Corpus.load(args.root, cfg)
+    if not len(corpus):
+        print(f"memory: no lessons under {args.root}", file=sys.stderr)
+        return 1
+    hits = corpus.retrieve(args.query, args.k, prefer_outcome=args.prefer or None)
+    if not hits:
+        print(f"memory: no match for {args.query!r} in {len(corpus)} lesson(s)", file=sys.stderr)
+        return 1
+    for hit in hits:
+        print(f"{hit.score:8.3f}  {hit.record.note_name}  ({hit.record.label()})")
+        print(f"          {hit.record.summary()}")
     return 0
 
 
@@ -239,6 +261,14 @@ def build_parser() -> argparse.ArgumentParser:
     rl.add_argument("--kind", default="", help="bias toward this task kind (heal/implement/improve)")
     rl.add_argument("--root", default=".", help="repo root holding knowledge/ and docs/adr")
     rl.set_defaults(func=cmd_recall)
+
+    mem = sub.add_parser("memory", help="recall prior lessons joined with what they cost")
+    mem.add_argument("query", help="what the task is about, in plain words")
+    mem.add_argument("--k", type=int, default=5, help="how many memories to print")
+    mem.add_argument("--prefer", default="", choices=["", "pass", "fail"],
+                     help="up-weight this outcome (workers use 'fail')")
+    mem.add_argument("--root", default=".", help="repo root holding knowledge/")
+    mem.set_defaults(func=cmd_memory)
 
     cy = sub.add_parser("cycle", help="run one half-day governance block")
     cy.add_argument("--index", "--cycle-index", dest="index", type=int, default=None,

@@ -5,8 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from hsai import ledger, orchestrator, recall, review, trajectory
+from hsai import ledger, memory, orchestrator, recall, review, trajectory
 from hsai.config import load_config
+from hsai.knowledge import KnowledgeBase, Lesson
 from hsai.models import ModelChoice
 from hsai.orchestrator import (
     HEAL,
@@ -1169,10 +1170,10 @@ def _seed_recall_corpus(root: Path) -> None:
     )
 
 
-def _implement_run(cfg, tmp_path, monkeypatch, iteration: int):
+def _implement_run(cfg, tmp_path, monkeypatch, iteration: int, seed=_seed_recall_corpus):
     """One fake-runner implement iteration; returns (prompt, pr_body, result)."""
     wt = _pin_worktree_path(monkeypatch, tmp_path, cfg, iteration)
-    _seed_recall_corpus(wt)
+    seed(wt)
     open_issues = [
         {
             "number": 7,
@@ -1199,6 +1200,13 @@ def _with_recall(**overrides):
     cfg = load_config()
     knowledge = dict(cfg.knowledge)
     knowledge["recall"] = {**(knowledge.get("recall") or {}), **overrides}
+    return replace(cfg, knowledge=knowledge)
+
+
+def _with_memory(*, cfg=None, **overrides):
+    cfg = cfg or load_config()
+    knowledge = dict(cfg.knowledge)
+    knowledge["memory"] = {**(knowledge.get("memory") or {}), **overrides}
     return replace(cfg, knowledge=knowledge)
 
 
@@ -1268,15 +1276,17 @@ def test_recalled_lessons_reach_the_prompt_the_lesson_and_the_pr_body(
         assert f"- [[{name}]]" in pr_body
 
 
-def test_disabling_recall_restores_the_pre_change_prompt_and_pr_body(
+def test_disabling_retrieval_restores_the_pre_change_prompt_and_pr_body(
     tmp_path, monkeypatch
 ):
-    off = _with_recall(enabled=False)
+    """Both retrievers read the same vault, so the off switch has to cover both."""
+    off = _with_memory(enabled=False, cfg=_with_recall(enabled=False))
     prompt, pr_body, result = _implement_run(off, tmp_path, monkeypatch, 2)
 
-    # byte-identical to what _task_prompt produced before recall existed
+    # byte-identical to what _task_prompt produced before retrieval existed
     assert prompt == _task_prompt(IMPLEMENT, off, RECALL_TICKET_TITLE, WELL_FORMED_BODY)
     assert recall.HEADING not in prompt
+    assert memory.HEADING not in prompt
     assert "## Prior lessons consulted" not in pr_body
     assert result.recalled == []
     assert "recalled:" not in Path(result.lesson_path).read_text().split("---\n")[1]
@@ -1291,3 +1301,127 @@ def test_dry_run_still_records_what_it_recalled(tmp_path):
     assert result.kind == IMPROVE
     assert result.recalled                       # retrieval runs without an agent
     assert "recalled:" in Path(result.lesson_path).read_text().split("---\n")[1]
+
+
+# --- retrieval memory: prior OUTCOMES, and what they cost --------------------
+
+
+def _seed_memory_corpus(root: Path) -> None:
+    """A vault plus the cost ledger that memory joins it against."""
+    kb = KnowledgeBase(root)
+    kb.write_lesson(
+        Lesson(
+            title="Gate merges on the remote rollup",
+            outcome="fail", kind="implement", created="2026-01-01", ticket=7,
+            context="ctx",
+            what_happened="Auto-merge raced the rollup and merged a red branch.",
+            lesson="Local green is not remote green; gate merges on the rollup.",
+        )
+    )
+    kb.write_lesson(
+        Lesson(
+            title="Obsidian vault wikilinks",
+            outcome="pass", kind="improve", created="2026-01-02", ticket=8,
+            context="ctx", what_happened="Notes were linked upward.",
+            lesson="Wikilinks connect notes inside the graph view.",
+        )
+    )
+    ledger.append_record(
+        root / "knowledge" / "ledger" / "iterations.jsonl",
+        ledger.LedgerRecord(
+            iteration=1, block=1, ticket=7, kind="implement", tier="heavy",
+            model="opus", wall_clock_seconds=1022.8, attempts=2, outcome="recovered",
+        ),
+    )
+
+
+def test_a_failed_prior_outcome_reaches_the_worker_as_an_explicit_warning(
+    tmp_path, monkeypatch
+):
+    # recall off, so this proves the MEMORY path end to end rather than
+    # accidentally re-observing the other retriever.
+    cfg = _with_recall(enabled=False)
+    prompt, _, result = _implement_run(
+        cfg, tmp_path, monkeypatch, 3, seed=_seed_memory_corpus
+    )
+
+    assert memory.HEADING in prompt
+    injected = prompt[prompt.index(memory.HEADING):]
+    # the failure is a warning, not a neutral suggestion...
+    assert "- AVOID [[2026-01-01-gate-merges-on-the-remote-rollup]]" in injected
+    assert "- PRECEDENT" not in injected          # the unrelated pass note did not match
+    # ...and it carries what the attempt cost, joined in from the ledger
+    assert "#7" in injected and "2 attempt(s)" in injected and "`opus`" in injected
+    assert "remembered 1 prior outcome(s)" in result.notes
+
+
+def test_task_prompt_clamps_oversized_retrieval_memory_to_the_configured_budget():
+    """The ticket is the instruction; retrieval can never crowd it out."""
+    cfg = load_config()
+    budget = memory.MemoryConfig.from_core(cfg).max_prompt_chars
+    oversized = "\n".join(
+        f"- AVOID [[note-{i}]] (fail/implement): {'padding ' * 40}" for i in range(200)
+    )
+    assert len(oversized) > 10 * budget
+
+    for kind in (HEAL, IMPLEMENT, IMPROVE):
+        bare = _task_prompt(kind, cfg, RECALL_TICKET_TITLE, WELL_FORMED_BODY)
+        prompt = _task_prompt(
+            kind, cfg, RECALL_TICKET_TITLE, WELL_FORMED_BODY, "", oversized
+        )
+        # every word of the ticket survives...
+        assert RECALL_TICKET_TITLE in prompt and WELL_FORMED_BODY in prompt
+        # ...and the injected text is inside the budget (+2 for the separator)
+        assert len(prompt) - len(bare) <= budget + 2
+        # truncation is deterministic: the highest-ranked memories are kept
+        assert "- AVOID [[note-0]]" in prompt
+        assert "- AVOID [[note-199]]" not in prompt
+        assert prompt == _task_prompt(
+            kind, cfg, RECALL_TICKET_TITLE, WELL_FORMED_BODY, "", oversized
+        )
+
+
+def test_an_empty_memory_leaves_the_prompt_byte_for_byte_unchanged():
+    cfg = load_config()
+    for kind in (HEAL, IMPLEMENT, IMPROVE):
+        bare = _task_prompt(kind, cfg, "t", "b")
+        assert _task_prompt(kind, cfg, "t", "b", "", "") == bare
+        assert memory.HEADING not in bare
+
+
+def test_a_merged_iteration_appends_one_provenance_record(tmp_path, monkeypatch):
+    cfg = load_config()
+    _, _, result = _implement_run(cfg, tmp_path, monkeypatch, 4)
+    assert result.merged is True
+
+    practices = memory.read_practices(memory.practices_path(cfg, tmp_path))
+    assert len(practices) == 1
+    record = practices[0]
+    assert record.ticket == 7 and record.pr == result.pr
+    assert record.title == RECALL_TICKET_TITLE
+    # the reference repos the lesson cited - the citation that makes G1 checkable
+    assert record.reference_repos == tuple(r.repo for r in cfg.reference_top10[:3])
+    assert record.lesson_note and record.note
+
+
+def test_a_recovered_iteration_records_no_practice(tmp_path, monkeypatch):
+    """Only MERGED work is a practice; a red PR must not claim provenance."""
+    cfg = load_config()
+    wt = _pin_worktree_path(monkeypatch, tmp_path, cfg, 5)
+    _seed_recall_corpus(wt)
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], remote_ci="FAILURE",
+        worktree_status="?? src/hsai/gate.py\n",
+        open_issues=[{
+            "number": 7, "title": RECALL_TICKET_TITLE,
+            "labels": [{"name": "priority:P2"}], "assignees": [],
+            "body": WELL_FORMED_BODY,
+        }],
+    )
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=5,
+    )
+
+    assert result.merged is False
+    assert memory.read_practices(memory.practices_path(cfg, tmp_path)) == []

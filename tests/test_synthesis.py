@@ -1,12 +1,15 @@
 import json
 
-from hsai import ai
+from hsai import ai, memory
 from hsai.config import load_config
 from hsai.models import ModelChoice
 from hsai.proc import Proc
 from hsai.synthesis import (
+    ADOPTED_HEADING,
     TRIED_HEADING,
     ContextPack,
+    build_adopted_digest,
+    build_context_pack,
     build_prompt,
     build_tried_digest,
     parse_ticket_specs,
@@ -186,3 +189,108 @@ def test_synthesize_feeds_the_tried_digest_to_the_model():
     synthesize(cfg, cycle_index=0, root=".", runner=runner, ai_runner=runner)
     claude_call = next(c for c in runner.calls if c[:1] == ["claude"])
     assert TRIED_HEADING in claude_call[2]
+
+
+# --- "already adopted": the provenance registry feeds the planner ------------
+
+
+def _adopt(root, **kwargs):
+    memory.append_practice(
+        memory.practices_path(_cfg(), root), memory.PracticeRecord(**kwargs)
+    )
+
+
+def test_prompt_lists_the_practices_this_repo_already_adopted(tmp_path):
+    cfg = _cfg()
+    pack = ContextPack(repos=["a/b"], sections={"a/b": "digest"})
+    _adopt(tmp_path, ticket=1, pr=2, title="feat: quota ledger",
+           reference_repos=("assafelovic/gpt-researcher",))
+
+    adopted = build_adopted_digest(cfg, root=str(tmp_path))
+    prompt = build_prompt(cfg, pack, "", adopted)
+
+    assert ADOPTED_HEADING in prompt
+    assert "feat: quota ledger" in prompt
+    assert "`assafelovic/gpt-researcher`" in prompt   # the citation, not just the title
+    assert "Do NOT re-propose any of them" in prompt  # an instruction, not a hint
+
+    # the heading survives with nothing adopted, so the planner always knows the
+    # section exists rather than inferring its absence means "nothing shipped"
+    empty = build_prompt(cfg, pack)
+    assert ADOPTED_HEADING in empty
+    assert "no practices recorded in the provenance registry yet" in empty
+
+
+def test_synthesize_feeds_the_adopted_digest_to_the_model(tmp_path):
+    cfg = _cfg()
+    _adopt(tmp_path, ticket=1, pr=2, title="feat: quota ledger",
+           reference_repos=("assafelovic/gpt-researcher",))
+    runner = _plain_text_runner()
+
+    synthesize(cfg, cycle_index=0, root=str(tmp_path), runner=runner, ai_runner=runner)
+
+    claude_call = next(c for c in runner.calls if c[:1] == ["claude"])
+    assert ADOPTED_HEADING in claude_call[2]
+    assert "feat: quota ledger" in claude_call[2]
+
+
+# --- the context pack must match what core.yaml promises to learn from -------
+
+
+def _pack_runner(*, fail: tuple[str, ...] = ()):
+    """A `gh api` stand-in; any path containing an entry of `fail` returns red."""
+
+    def runner(cmd, *, cwd=None, env=None, timeout=None, input_text=None):
+        path = cmd[2] if len(cmd) > 2 else ""
+        if any(f in path for f in fail):
+            return Proc(cmd, 1, "", "gh: HTTP 404")
+        if path.endswith("/readme"):
+            return Proc(cmd, 0, "# a/b\nA reference project.", "")
+        if "/commits" in path:
+            return Proc(cmd, 0, "feat: add a thing\nfix: repair a thing", "")
+        if path.endswith("/contents/.github/workflows"):
+            return Proc(cmd, 0, "label-issues.yml\nci.yml", "")
+        if "/contents/.github/workflows/" in path:
+            return Proc(cmd, 0, "name: CI\non: [push]\njobs:\n  test:\n    runs-on: ubuntu-latest", "")
+        if "issues?state=closed" in path:
+            return Proc(cmd, 0, "- Bug: the thing broke  [bug, resolved]", "")
+        return Proc(cmd, 0, "", "")
+
+    return runner
+
+
+def test_context_pack_fetches_closed_issues_and_one_workflow_body():
+    digest = build_context_pack(["a/b"], runner=_pack_runner()).sections["a/b"]
+
+    assert "README (truncated):" in digest
+    assert "Recent commit subjects:" in digest
+    assert "CI workflows:" in digest
+    # a filename teaches nothing reusable - the CONTENTS do
+    assert "Workflow `ci.yml` (truncated):" in digest   # deterministic pick: sorted first
+    assert "runs-on: ubuntu-latest" in digest
+    # issue_history is declared in core.yaml's learn_from and was never fetched
+    assert "Recently closed issues (title [labels]):" in digest
+    assert "Bug: the thing broke" in digest
+
+
+def test_context_pack_degrades_to_the_pre_existing_sections_when_the_new_calls_fail():
+    runner = _pack_runner(fail=("issues?state=closed", "/contents/.github/workflows/"))
+
+    digest = build_context_pack(["a/b"], runner=runner).sections["a/b"]
+
+    assert "README (truncated):" in digest
+    assert "Recent commit subjects:" in digest
+    assert "CI workflows:" in digest              # the filename listing still lands
+    assert "Workflow `ci.yml`" not in digest
+    assert "Recently closed issues" not in digest
+
+
+def test_context_pack_survives_every_gh_call_failing():
+    def dead(cmd, *, cwd=None, env=None, timeout=None, input_text=None):
+        return Proc(cmd, 1, "", "gh: API rate limit exceeded")
+
+    pack = build_context_pack(["a/b", "c/d"], runner=dead)
+
+    assert pack.repos == ["a/b", "c/d"]
+    assert pack.sections == {"a/b": "(no data fetched)", "c/d": "(no data fetched)"}
+    assert "### a/b" in pack.render()

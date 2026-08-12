@@ -84,17 +84,41 @@ closes the loop.
   repo* section of at most `k` wikilinked notes, hard-capped at `max_chars`;
   whole notes are dropped to fit, never truncated mid-line. An empty corpus or
   `enabled: false` renders nothing at all.
+- **Remember the cost.** `hsai.memory` runs a second, cheaper index over the
+  same lessons, joined with `knowledge/ledger/iterations.jsonl` by ticket
+  number, so each memory carries what the attempt cost as well as what it
+  concluded. It renders ahead of the recall section as *Prior outcomes for
+  similar work* - `outcome/fail` as an **AVOID** warning, `outcome/pass` as
+  precedent - clamped to `memory.max_prompt_chars` in `_task_prompt` itself, so
+  no corpus size can crowd out the ticket. Notes recall already showed are
+  excluded, so the worker is never told the same thing twice.
 - **Plan.** `synthesis.build_prompt` carries an *Already tried in this repo*
   digest - prior lesson titles with pass/fail outcomes plus the titles of
   synthesis tickets still open - so the planner stops re-proposing dead ideas.
+  Alongside it, *Already adopted in this repo* lists what actually **merged**,
+  each with the reference repos it cited, read off
+  `knowledge/registry/practices.jsonl`.
+- **Cite.** Every merged iteration appends one append-only, lock-protected line
+  to that registry (ticket, PR, reference repos, lesson note), in the style of
+  `ledger.append_record`. G1's claim that each improvement traces back to a
+  field observation is therefore a query, not a promise.
 - **Audit.** What was retrieved is recorded three times: on `IterationResult`,
   as a `recalled:` list in the lesson's frontmatter, and as a
-  *Prior lessons consulted* section on the PR. `hsai recall "<query>"` prints
-  the same ranking by hand.
+  *Prior lessons consulted* section on the PR. `hsai recall "<query>"` and
+  `hsai memory "<query>"` print the same rankings by hand.
 
-Reference-set lineage: retrieval-before-planning from `assafelovic/gpt-researcher`,
-index-then-retrieve with metadata preserved from `run-llama/llama_index`, and
-scoped agent memory from `OpenBMB/ChatDev`.
+The synthesis context pack is fed to match what `core.yaml` declares under
+`learn_from`: README, recent commit subjects, the CI workflow inventory *and the
+contents of one workflow file*, plus recently closed issue titles with their
+labels. Each fetch is independent - any failing `gh` call contributes nothing
+and the digest degrades to whatever did succeed.
+
+Reference-set lineage: retrieval-before-planning and citation discipline from
+`assafelovic/gpt-researcher`, index-then-retrieve with metadata preserved from
+`run-llama/llama_index`, SOP memory carried into the next agent's context from
+`FoundationAgents/MetaGPT`, scoped agent memory from `OpenBMB/ChatDev`, and the
+issue-handling surface (`label-issues`, `close-inactive-issues`) from
+`microsoft/semantic-kernel` that made issue history worth fetching.
 
 ## Testability
 
