@@ -139,6 +139,41 @@ def list_open_issues(repo: str, *, runner: Runner = run) -> list[Issue]:
     return issues
 
 
+def list_closed_issues(repo: str, *, limit: int = 20, runner: Runner = run) -> list[Issue]:
+    """List recently closed issues, most recently closed first (capped at `limit`).
+
+    Used by synthesis memory: a duplicate check must also see work that is
+    already *done*, not just what is still open.
+    """
+    p = _gh(
+        [
+            "issue", "list", "--repo", repo, "--state", "closed",
+            "--limit", str(limit),
+            "--json", "number,title,labels,assignees,body,closedAt",
+        ],
+        runner=runner,
+    )
+    try:
+        data = json.loads(p.stdout or "[]")
+    except json.JSONDecodeError:
+        return []
+    issues = [
+        Issue(
+            number=item["number"],
+            title=item.get("title", ""),
+            labels=tuple(lb["name"] for lb in item.get("labels", [])),
+            assignees=tuple(a["login"] for a in item.get("assignees", [])),
+            body=item.get("body", "") or "",
+        )
+        for item in data
+    ]
+    closed_at = {item["number"]: item.get("closedAt", "") or "" for item in data}
+    # Sort ourselves (ISO-8601 strings compare correctly lexically) rather than
+    # trust `gh`'s default order, which is not documented to be closedAt desc.
+    issues.sort(key=lambda i: closed_at.get(i.number, ""), reverse=True)
+    return issues
+
+
 def next_ticket(repo: str, *, runner: Runner = run) -> Issue | None:
     issues = list_open_issues(repo, runner=runner)
     return issues[0] if issues else None

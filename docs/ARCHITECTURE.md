@@ -84,9 +84,15 @@ closes the loop.
   repo* section of at most `k` wikilinked notes, hard-capped at `max_chars`;
   whole notes are dropped to fit, never truncated mid-line. An empty corpus or
   `enabled: false` renders nothing at all.
-- **Plan.** `synthesis.build_prompt` carries an *Already tried in this repo*
-  digest - prior lesson titles with pass/fail outcomes plus the titles of
-  synthesis tickets still open - so the planner stops re-proposing dead ideas.
+- **Plan.** `synthesis.build_prompt` carries a *What this loop has already
+  tried* section (`synthesis.MemoryPack`) - open tickets, recently closed
+  tickets, and lesson outcomes, titles only and hard-capped - ahead of the
+  reference-project digest, so the planner stops re-proposing dead ideas.
+  `synthesis.is_duplicate` then filters the model's own output before filing:
+  a candidate whose title exactly matches, or whose normalized-token overlap
+  with a prior title clears the configured Jaccard threshold, is dropped and
+  its slot is never back-filled - `SynthesisResult.rejected` and
+  `.rejected_titles` carry the count and matches into `BlockReport.notes`.
 - **Audit.** What was retrieved is recorded three times: on `IterationResult`,
   as a `recalled:` list in the lesson's frontmatter, and as a
   *Prior lessons consulted* section on the PR. `hsai recall "<query>"` prints
