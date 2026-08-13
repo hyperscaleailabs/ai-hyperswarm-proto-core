@@ -141,6 +141,7 @@ class BlockAggregate:
     heavy_iterations: int = 0
     merged_iterations: int = 0
     review_iterations: int = 0  # kind='review': second opinions, not authored work
+    repair_iterations: int = 0  # kind='repair': extra passes over a red local build
     total_seconds: float = 0.0
     total_attempts: int = 0
     input_tokens: int = 0
@@ -172,6 +173,10 @@ class BlockAggregate:
                 f", {self.review_iterations} independent review(s)"
                 if self.review_iterations else ""
             )
+            + (
+                f", {self.repair_iterations} repair pass(es)"
+                if self.repair_iterations else ""
+            )
             + (f", tiers[{tiers}]" if tiers else "")
             + (f", {toks} tokens" if toks else "")
             + (f", {per_pr:.0f} tokens/merged PR" if per_pr else "")
@@ -194,6 +199,8 @@ def aggregate_block(records: list[LedgerRecord], block: int) -> BlockAggregate:
             agg.merged_iterations += 1
         if r.kind == "review":
             agg.review_iterations += 1
+        if r.kind == "repair":
+            agg.repair_iterations += 1
         agg.input_tokens += r.input_tokens or 0
         agg.output_tokens += r.output_tokens or 0
     agg.total_seconds = round(agg.total_seconds, 3)

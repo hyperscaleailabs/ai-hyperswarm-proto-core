@@ -76,6 +76,21 @@ auditable. Tune it under `knowledge.recall` in `.ai-swarm/core.yaml`
 hsai recall "remote CI gate"       # what would a worker be shown for this task?
 ```
 
+**A red build gets a second chance, not a second attempt.** Loop workers are
+sandboxed without permission to run `ruff` or `pytest`, so an agent cannot
+verify its own change - only the orchestrator can. When local CI comes back red
+after the agent stops, `hsai.repair` renders the failing step names and a
+bounded tail of the CI output (pytest's short-summary lines kept, not truncated
+away) into a fix-only prompt, and the *same* model is called again in the *same*
+worktree, up to `repair.max_attempts` times. Every post-agent guard is re-run
+after each pass - workflow revert, completeness, reproduce-before-fix - so a
+repair cannot smuggle in a CI edit or erase the reproduction evidence. Each pass
+is metered on the ledger as `outcome='repair'`, a soft budget breach skips
+repair entirely, and the transition (`repair 1/1: ruff FAIL -> pass`) lands in
+the lesson. Nothing about merging changes: remote CI is still the only thing
+that authorizes one. Tune it under `repair` in `.ai-swarm/core.yaml`
+(`enabled`, `max_attempts`, `max_log_chars`).
+
 **Nothing merges on the author's word alone.** Once local CI is green and the
 work is committed, `hsai.review` hands the branch diff, the ticket and its
 parsed acceptance criteria to a model on a *different tier* than the one that

@@ -2,8 +2,8 @@
 
 One iteration = sync main -> CI check -> choose work (heal / implement /
 self-improve) -> ensure a ticket exists -> run a model -> re-check CI ->
-independent review by a different model -> record a lesson -> open a linked PR
--> merge on green.
+repair while red (bounded budget) -> independent review by a different model ->
+record a lesson -> open a linked PR -> merge on green.
 
 Decision logic (:func:`decide_path`) and PR-body assembly
 (:func:`build_pr_body`) are pure and unit-tested; the orchestration around them
@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from uuid import uuid4
 
-from . import ai, ci, github, gitops, ledger, recall, repro, review, trajectory
+from . import ai, ci, github, gitops, ledger, recall, repair, repro, review, trajectory
 from .config import CoreConfig
 from .knowledge import KnowledgeBase, Lesson
 from .models import ModelChoice, Task, select
@@ -162,6 +162,7 @@ class IterationResult:
     remote: str = ""
     recovered: bool = False
     review: str = ""  # approve | blocked | skipped (independent review gate)
+    repairs: int = 0  # extra agent passes spent turning a red local build green
     lesson_path: str = ""
     recalled: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -173,6 +174,7 @@ class IterationResult:
             f"pr={self.pr}",
             f"model={self.model}",
             f"ci:{self.ci_before}->{self.ci_after}",
+            f"repairs={self.repairs}",
             f"review={self.review or '-'}",
             f"remote={self.remote or '-'}",
             f"merged={self.merged}",
@@ -239,6 +241,84 @@ def _improvement_idea(cfg: CoreConfig) -> tuple[str, str]:
         + ", ".join(r.repo for r in cfg.reference_top10)
     )
     return title, body
+
+
+@dataclass
+class _GuardOutcome:
+    """What the post-agent guards found on one pass over the worktree."""
+
+    notes: list[str] = field(default_factory=list)
+    reverted_workflows: list[str] = field(default_factory=list)
+    repro_result: repro.ReproResult | None = None
+    abort_remote: str = ""   # "" => the change may proceed
+    abort_outcome: str = ""  # ledger outcome to record when it may not
+
+    @property
+    def ok(self) -> bool:
+        return not self.abort_remote
+
+
+def _run_post_agent_guards(
+    cfg: CoreConfig,
+    *,
+    repo_dir: str,
+    wt: str,
+    kind: str,
+    ticket_title: str,
+    runner: Runner,
+) -> _GuardOutcome:
+    """Shape checks over the worktree, run after EVERY agent call.
+
+    They are re-evaluated after each repair pass, not only after the first
+    agent run: a repair is a full agent invocation with the same freedom as the
+    original, so without re-checking it could smuggle in a `.github/workflows/`
+    edit, reduce the diff to knowledge-only, or delete the regression test whose
+    failing-then-passing transition an earlier pass had already proven.
+    """
+    out = _GuardOutcome()
+
+    # Guard: a task must not change the CI checks, or local and remote CI would
+    # diverge (as happened once when a worker added mypy). Revert any workflow
+    # edits before they are committed and note it in the lesson.
+    out.reverted_workflows = [
+        p for p in gitops.changed_paths(cwd=wt, runner=runner)
+        if p.startswith(".github/workflows/")
+    ]
+    if out.reverted_workflows:
+        gitops.restore_pathspec(".github/workflows", cwd=wt, runner=runner)
+        out.notes.append(f"reverted workflow edits: {out.reverted_workflows}")
+
+    # Completeness guard: a code ticket (feat/skill/refactor/fix) cannot be
+    # satisfied by a knowledge-only diff. PR #17 once "closed" a feature ticket
+    # by committing nothing but its own lesson file - never again.
+    if _requires_code(ticket_title):
+        touched = gitops.changed_paths(cwd=wt, runner=runner)
+        code_files = [p for p in touched if not p.startswith("knowledge/")]
+        if not code_files:
+            out.notes.append("completeness guard: knowledge-only diff on a code ticket")
+            out.abort_remote, out.abort_outcome = "INCOMPLETE", "incomplete"
+            return out
+
+    # Reproduce-before-fix guard: heal/bugfix tickets must add or modify a test
+    # that FAILS on the pre-fix (parent) tree and PASSES on the fix branch,
+    # proving the bug was real (llama_index's fix-stream discipline).
+    # Docs/chore tickets are exempt.
+    if repro.requires_repro_guard(kind, ticket_title):
+        base_ref = gitops.merge_base(
+            "HEAD", f"origin/{cfg.default_branch}", cwd=wt, runner=runner,
+        ) or f"origin/{cfg.default_branch}"
+        test_files = repro.changed_test_files(
+            gitops.changed_paths(cwd=wt, runner=runner)
+        )
+        out.repro_result = repro.check_repro(
+            repo_root=repo_dir, wt=wt, base_ref=base_ref,
+            test_files=test_files, worktrees_dir=cfg.worktrees_dir, runner=runner,
+        )
+        out.notes.append(f"repro guard: {out.repro_result.reason}")
+        if not out.repro_result.ok:
+            out.abort_remote, out.abort_outcome = "NO_REPRO", "no_repro"
+
+    return out
 
 
 def run_once(
@@ -408,6 +488,26 @@ def run_once(
             ),
         )
 
+    def _record_repair_cost(ares: ai.AIResult, seconds: float) -> None:
+        """One ledger line per repair pass, so repair spend is never invisible."""
+        toks = ledger.parse_tokens(ares.payload)
+        ledger.append_record(
+            ledger.ledger_path(cfg, repo_dir),
+            ledger.LedgerRecord(
+                iteration=iteration,
+                block=block,
+                ticket=ticket_num,
+                kind=repair.LEDGER_KIND,
+                tier=choice.tier,
+                model=choice.model,
+                wall_clock_seconds=round(max(0.0, seconds), 3),
+                attempts=attempts,
+                outcome=repair.LEDGER_OUTCOME,
+                input_tokens=toks[0] if toks else None,
+                output_tokens=toks[1] if toks else None,
+            ),
+        )
+
     # 5. run the agent (subscription-only)
     agent_ok = True
     agent_err = ""
@@ -437,64 +537,83 @@ def run_once(
         if agent_err:
             agent_err = _format_error_with_context(agent_err, kind, ticket_num)
 
-        # Guard: a task must not change the CI checks, or local and remote CI
-        # would diverge (as happened once when a worker added mypy). Revert any
-        # workflow edits before they are committed and note it in the lesson.
-        reverted_workflows = [
-            p for p in gitops.changed_paths(cwd=wt, runner=runner)
-            if p.startswith(".github/workflows/")
-        ]
-        if reverted_workflows:
-            gitops.restore_pathspec(".github/workflows", cwd=wt, runner=runner)
-            result.notes.append(f"reverted workflow edits: {reverted_workflows}")
+    def _absorb_guards(g: _GuardOutcome) -> None:
+        """Fold one guard pass into the iteration's record."""
+        nonlocal reverted_workflows, repro_result
+        result.notes.extend(g.notes)
+        if g.reverted_workflows:
+            reverted_workflows = g.reverted_workflows
+        if g.repro_result is not None:
+            repro_result = g.repro_result
 
-        # Completeness guard: a code ticket (feat/skill/refactor/fix) cannot be
-        # satisfied by a knowledge-only diff. PR #17 once "closed" a feature
-        # ticket by committing nothing but its own lesson file - never again.
-        if _requires_code(ticket_title):
-            touched = gitops.changed_paths(cwd=wt, runner=runner)
-            code_files = [p for p in touched if not p.startswith("knowledge/")]
-            if not code_files:
-                result.notes.append("completeness guard: knowledge-only diff on a code ticket")
-                _recover_failed(
-                    cfg, repo, 0, kind=kind, ticket_num=ticket_num,
-                    claimed_issue=claimed_issue, login=login,
-                    remote="INCOMPLETE", runner=runner,
-                )
-                result.recovered = True
-                _record_cost("incomplete")
-                gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
-                return result
+    def _abort_on_guard(g: _GuardOutcome) -> None:
+        """A guard refused the worktree: recover the ticket and tear down."""
+        _recover_failed(
+            cfg, repo, 0, kind=kind, ticket_num=ticket_num,
+            claimed_issue=claimed_issue, login=login,
+            remote=g.abort_remote, runner=runner,
+        )
+        result.recovered = True
+        _record_cost(g.abort_outcome)
+        gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
 
-        # Reproduce-before-fix guard: heal/bugfix tickets must add or modify a
-        # test that FAILS on the pre-fix (parent) tree and PASSES on the fix
-        # branch, proving the bug was real (llama_index's fix-stream
-        # discipline). Docs/chore tickets are exempt.
-        if repro.requires_repro_guard(kind, ticket_title):
-            base_ref = gitops.merge_base(
-                "HEAD", f"origin/{cfg.default_branch}", cwd=wt, runner=runner,
-            ) or f"origin/{cfg.default_branch}"
-            test_files = repro.changed_test_files(
-                gitops.changed_paths(cwd=wt, runner=runner)
-            )
-            repro_result = repro.check_repro(
-                repo_root=repo_dir, wt=wt, base_ref=base_ref,
-                test_files=test_files, worktrees_dir=cfg.worktrees_dir, runner=runner,
-            )
-            result.notes.append(f"repro guard: {repro_result.reason}")
-            if not repro_result.ok:
-                _recover_failed(
-                    cfg, repo, 0, kind=kind, ticket_num=ticket_num,
-                    claimed_issue=claimed_issue, login=login,
-                    remote="NO_REPRO", runner=runner,
-                )
-                result.recovered = True
-                _record_cost("no_repro")
-                gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
-                return result
+    if not dry_run:
+        guards = _run_post_agent_guards(
+            cfg, repo_dir=repo_dir, wt=wt, kind=kind,
+            ticket_title=ticket_title, runner=runner,
+        )
+        _absorb_guards(guards)
+        if not guards.ok:
+            _abort_on_guard(guards)
+            return result
 
     # 6. re-check CI
     ci_after = ci.run_local(cwd=wt, runner=runner) if not dry_run else ci_before
+
+    # 6a. Verify-and-repair. Local CI is the one signal a sandboxed worker cannot
+    # get for itself - it may not run ruff or pytest - so an iteration that stops
+    # here discards a nearly-finished change over a lint error AND burns one of
+    # only `max_ticket_attempts` attempts. Instead, hand the failing output back
+    # to the SAME model in the SAME worktree, re-run every guard, and re-run CI.
+    # Nothing about the merge gate changes: remote CI still decides.
+    repair_notes: list[str] = []
+    if not dry_run and not ci_after.ok:
+        skipped = repair.skip_reason(cfg, demote_tier=demote_tier)
+        if skipped:
+            result.notes.append(f"repair skipped: {skipped}")
+        allowed = 0 if skipped else repair.max_attempts(cfg)
+        while not ci_after.ok and result.repairs < allowed:
+            result.repairs += 1
+            before = ci_after
+            repair_started = time.time()
+            rres = ai.run_agent(
+                repair.build_repair_prompt(
+                    ticket_title, before, result.repairs,
+                    max_attempts=allowed, max_log_chars=repair.max_log_chars(cfg),
+                ),
+                choice, cfg, cwd=wt, runner=ai_runner, timeout=cfg.agent_timeout,
+            )
+            _record_repair_cost(rres, time.time() - repair_started)
+            if not rres.ok and rres.error:
+                result.notes.append(
+                    f"repair {result.repairs} agent error: {rres.error[:200]}"
+                )
+            guards = _run_post_agent_guards(
+                cfg, repo_dir=repo_dir, wt=wt, kind=kind,
+                ticket_title=ticket_title, runner=runner,
+            )
+            _absorb_guards(guards)
+            if not guards.ok:
+                _abort_on_guard(guards)
+                return result
+            ci_after = ci.run_local(cwd=wt, runner=runner)
+            note = (
+                f"repair {result.repairs}/{allowed}: "
+                f"{repair.describe_transition(before, ci_after)}"
+            )
+            repair_notes.append(note)
+            result.notes.append(note)
+
     result.ci_after = ci_after.ok
 
     # 6b. Independent review gate: a SECOND opinion, from a different tier than
@@ -544,6 +663,14 @@ def run_once(
             + (
                 f"\n\nReverted off-spec workflow edits: {reverted_workflows}."
                 if reverted_workflows else ""
+            )
+            # What the bounded repair budget bought (or failed to buy): the
+            # transition per pass, so the vault records that local CI went red
+            # first and how it was closed.
+            + (
+                "\n\nVerify-and-repair passes:\n"
+                + "\n".join(f"- {n}" for n in repair_notes)
+                if repair_notes else ""
             )
             + (f"\n\nAgent error:\n```\n{agent_err[:800]}\n```" if agent_err else "")
             # Only a digest line plus a redacted tail of the trajectory is
