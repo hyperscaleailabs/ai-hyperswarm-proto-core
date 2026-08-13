@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from . import github
 from .ai import run_agent
 from .config import CoreConfig
-from .knowledge import KnowledgeBase
+from .knowledge import KnowledgeBase, Practice, slugify
 from .models import ModelChoice
 from .proc import Runner, run
 from .tickets import TicketSpec
@@ -169,9 +169,54 @@ block: a JSON array where each element has exactly these keys:
   "verification_plan" (array of 2-4 concrete check strings),
   "size" ("M" or "L" - substantial work, never "S"),
   "goal_ids" (array like ["G1","G4"]),
-  "synthesis_rationale" (string naming the >= {combine} projects combined and how).
+  "synthesis_rationale" (string naming the >= {combine} projects combined and how),
+  "practices" (array of >= {combine} objects, one per project you combined, each
+    with "id" (kebab slug of >= 2 words, e.g. "metagpt-phase-artifacts"),
+    "source_repo" (owner/name from the digest above), "artifact" (a file path,
+    workflow name, PR or commit URL a reader can OPEN - never a vague claim),
+    "observation" (what that project actually does) and "adaptation" (what this
+    repo should do instead)).
+
+Each practice becomes a note in knowledge/practices/ and is the ONLY evidence the
+ticket may cite, so an entry whose artifact cannot be opened is worse than none.
 
 The JSON block must be the LAST fenced block in your reply."""
+
+
+def parse_practices(raw: object, rationale: str = "") -> tuple[Practice, ...]:
+    """Turn one ticket's ``practices`` array into registry records.
+
+    An entry missing what makes a practice checkable - an id, the project it came
+    from, and the artifact where it can be seen - is dropped rather than filed as
+    half-evidence: the whole point of the registry is that a citation resolves.
+    ``rationale`` (the planner's own account of what it combined) stands in as
+    the observation when the entry did not spell one out.
+    """
+    if not isinstance(raw, list):
+        return ()
+    practices: list[Practice] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        pid = slugify(str(item.get("id", "")))
+        source = str(item.get("source_repo", "")).strip()
+        artifact = str(item.get("artifact", "")).strip()
+        # "-" in pid: a single-segment id could not be told apart from ordinary
+        # inline code when the orchestrator reads citations back out of a body.
+        if not (source and artifact) or "-" not in pid or pid in seen:
+            continue
+        seen.add(pid)
+        practices.append(
+            Practice(
+                id=pid,
+                source_repo=source,
+                artifact=artifact,
+                observation=str(item.get("observation", "")).strip() or rationale,
+                adaptation=str(item.get("adaptation", "")).strip(),
+            )
+        )
+    return tuple(practices)
 
 
 def parse_ticket_specs(output: str) -> list[TicketSpec]:
@@ -186,6 +231,7 @@ def parse_ticket_specs(output: str) -> list[TicketSpec]:
     specs: list[TicketSpec] = []
     for item in raw:
         try:
+            rationale = str(item.get("synthesis_rationale", ""))
             specs.append(
                 TicketSpec(
                     title=str(item["title"])[:150],
@@ -195,11 +241,12 @@ def parse_ticket_specs(output: str) -> list[TicketSpec]:
                     verification_plan=tuple(str(v) for v in item["verification_plan"]),
                     size=str(item.get("size", "M")),
                     goal_ids=tuple(str(g) for g in item.get("goal_ids", [])),
-                    synthesis_rationale=str(item.get("synthesis_rationale", "")),
+                    synthesis_rationale=rationale,
+                    practices=parse_practices(item.get("practices"), rationale),
                     labels=("self-improve", "hsai", "priority:P2"),
                 )
             )
-        except (KeyError, TypeError):
+        except (KeyError, TypeError, AttributeError):
             continue
     return specs
 
@@ -210,6 +257,7 @@ class SynthesisResult:
     studied: list[str]
     filed: list[int]
     error: str = ""
+    practices: tuple[str, ...] = ()  # registry ids written by this pass
 
 
 def synthesize(
@@ -240,12 +288,26 @@ def synthesize(
         return SynthesisResult(ok=False, studied=repos, filed=[], error=ares.error[:500])
 
     specs = parse_ticket_specs(ares.output)
+    kb = KnowledgeBase.from_config(cfg, root)
     filed: list[int] = []
+    written: list[str] = []
     for spec in specs:
+        # The registry note is written BEFORE the ticket that cites it exists:
+        # a ticket whose practice ids do not resolve is stopped by the
+        # orchestrator's evidence guard, so filing first would file a dud.
+        for practice in spec.practices:
+            kb.write_practice(practice)
+            written.append(practice.id)
         num = github.create_issue(
             cfg.repo_slug, spec.title, spec.render(), spec.all_labels(), runner=runner
         )
-        if num:
-            filed.append(num)
+        if not num:
+            continue
+        filed.append(num)
+        # Now that the ticket has a number, close the loop the other way.
+        for practice in spec.practices:
+            practice.adopted_by = (f"ticket #{num}",)
+            kb.write_practice(practice)
     return SynthesisResult(ok=bool(filed), studied=repos, filed=filed,
-                           error="" if specs else "no parseable ticket specs in output")
+                           error="" if specs else "no parseable ticket specs in output",
+                           practices=tuple(written))

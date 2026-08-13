@@ -127,9 +127,14 @@ def _synthesis_step(
     """Synthesize tickets when the well-formed backlog is thin (journaled once)."""
     low_water = int(cfg.cycle.get("backlog_low_watermark", 4))
     if dry_run or _well_formed_backlog(cfg, runner=runner) >= low_water:
-        return {"ran": False, "filed": [], "error": ""}
+        return {"ran": False, "filed": [], "practices": [], "error": ""}
     sres = synthesize(cfg, cycle_index=idx, runner=runner, ai_runner=ai_runner)
-    return {"ran": True, "filed": list(sres.filed), "error": sres.error}
+    # The practice ids are journaled too: the block's audit trail should say what
+    # evidence was registered, not only which tickets came out of it.
+    return {
+        "ran": True, "filed": list(sres.filed),
+        "practices": list(sres.practices), "error": sres.error,
+    }
 
 
 def _grade_budget(ledger_file: Path, idx: int, budget: dict) -> dict:
@@ -235,6 +240,9 @@ def run_cycle(
     report.synthesized = list(synth["filed"])
     if synth["ran"] and not report.synthesized:
         report.notes.append(f"synthesis produced no tickets: {synth['error']}")
+    # `.get`: a journal written before the registry existed has no such key.
+    if synth.get("practices"):
+        report.notes.append(f"practices registered: {', '.join(synth['practices'])}")
 
     # 2. Sequential implementation block, under the quota budget gate.
     ledger_file = ledger.ledger_path(cfg, repo_root)

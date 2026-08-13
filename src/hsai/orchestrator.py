@@ -18,7 +18,7 @@ from uuid import uuid4
 
 from . import ai, ci, github, gitops, ledger, recall, repro, review, trajectory
 from .config import CoreConfig
-from .knowledge import KnowledgeBase, Lesson
+from .knowledge import KnowledgeBase, Lesson, cited_practice_ids
 from .models import ModelChoice, Task, select
 from .proc import Runner, run
 from .tickets import NEEDS_REFINEMENT, issue_well_formed
@@ -108,7 +108,10 @@ def build_pr_body(
     """
     if not ticket:
         raise ValueError("Every PR must be linked to a ticket (traceability invariant).")
-    refs = ", ".join(f"`{r}`" for r in references) or "_(none)_"
+    # Practice ids lifted from the ticket, each resolving to a note in
+    # knowledge/practices/. "(none cited)" is a legitimate answer; a stock list
+    # of reference repos that had nothing to do with the change is not.
+    refs = ", ".join(f"`{r}`" for r in references) or "_(none cited)_"
     artifacts = _phase_artifacts(kind) if kind else ""
     artifacts_section = f"\n## Phase artifacts\n{artifacts}\n" if artifacts else ""
     # Which prior notes the worker was shown - retrieval is only trustworthy if
@@ -221,6 +224,16 @@ def _requires_code(ticket_title: str) -> bool:
     """Tickets whose titles promise code must produce code."""
     lowered = ticket_title.strip().lower()
     return lowered.startswith(("feat:", "fix:", "skill:", "refactor:", "perf:", "test:"))
+
+
+def _claims_reference_evidence(kind: str, issue: github.Issue | None) -> bool:
+    """Tickets that promise reference-set provenance, and so must prove it.
+
+    Self-improvement work (whether the loop invented it or the synthesizer filed
+    it) is justified by "another project does this"; every other kind is
+    justified by the repo's own backlog and cites nothing.
+    """
+    return kind == IMPROVE or bool(issue and "self-improve" in issue.labels)
 
 
 def _improvement_idea(cfg: CoreConfig) -> tuple[str, str]:
@@ -362,6 +375,13 @@ def run_once(
     ))
     choice = select(task, cfg, demote=demote_tier)
 
+    # This iteration's reference-set evidence: the practice ids the TICKET
+    # cites, so the PR and the lesson carry the provenance of THIS change. It
+    # used to be a static top-3 slice of core.yaml - the same three repo names
+    # stamped on every PR regardless of what informed it, which is a fabricated
+    # audit trail. An empty tuple renders as "(none cited)".
+    references = cited_practice_ids(ticket_body)
+
     # Read side of the knowledge base: pull the most relevant prior notes for
     # this ticket out of the vault in the worktree. Computed before the agent
     # runs (and regardless of dry-run) so the lesson can record what was shown.
@@ -466,6 +486,27 @@ def run_once(
                 gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
                 return result
 
+        # Evidence guard: a ticket that justifies itself with "another project
+        # does this" must cite practices that actually exist. An id with no note
+        # under knowledge/practices/ is a citation to nothing - the same class of
+        # failure as a knowledge-only diff, so it is recovered the same way. The
+        # registry is read from the WORKTREE, so a worker that adds the missing
+        # practice note as part of its change satisfies the guard.
+        if _claims_reference_evidence(kind, claimed_issue):
+            known = KnowledgeBase.from_config(cfg, wt).practice_ids()
+            unknown = [p for p in references if p not in known]
+            if unknown:
+                result.notes.append(f"evidence guard: unknown practice id(s) {unknown}")
+                _recover_failed(
+                    cfg, repo, 0, kind=kind, ticket_num=ticket_num,
+                    claimed_issue=claimed_issue, login=login,
+                    remote="NO_EVIDENCE", runner=runner,
+                )
+                result.recovered = True
+                _record_cost("no_evidence")
+                gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
+                return result
+
         # Reproduce-before-fix guard: heal/bugfix tickets must add or modify a
         # test that FAILS on the pre-fix (parent) tree and PASSES on the fix
         # branch, proving the bug was real (llama_index's fix-stream
@@ -532,7 +573,6 @@ def run_once(
         # refines it to the merge outcome once that is settled.
         traj.outcome = outcome
     kb = KnowledgeBase.from_config(cfg, wt)
-    references = tuple(r.repo for r in cfg.reference_top10[:3])
     lesson = Lesson(
         title=f"{kind}: {ticket_title}"[:120],
         outcome=outcome,

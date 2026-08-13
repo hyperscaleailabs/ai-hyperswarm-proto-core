@@ -1,9 +1,17 @@
-"""The knowledge base: lessons, whitepapers, and Maps of Content (MOCs).
+"""The knowledge base: practices, lessons, whitepapers, and Maps of Content.
 
 Everything written here is Obsidian-ready:
 - YAML frontmatter with tags,
 - ``[[wikilinks]]`` between notes and up to their MOCs,
 so that cloning the repo and opening it as a vault yields a connected graph.
+
+The *practice registry* (:class:`Practice`, ``knowledge/practices/``) is the
+evidence half of goal G1. A practice note records one thing a reference project
+actually does - naming the artifact where it can be seen - and what this repo did
+instead. Tickets, PRs and lessons cite practices by id, and a citation that does
+not resolve to a note here is caught by the orchestrator's evidence guard, so
+"which practice came from where" has a machine-checkable answer rather than a
+plausible-looking list of repo names.
 """
 from __future__ import annotations
 
@@ -17,6 +25,13 @@ from .config import CoreConfig
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _TAG_RE = re.compile(r"^\s*-\s+(\S.*)$", re.MULTILINE)
+# A practice id is a kebab slug of >= 2 segments, cited either as an inline
+# `code` span (GitHub, which does not render wikilinks) or as a [[wikilink]]
+# (the vault, where the link is the graph edge). The >= 2 requirement is what
+# keeps ordinary inline code in the same section (`gh`, `pytest`, a repo slug
+# like `openai/swarm`) out of the evidence trail.
+_SLUG_ID = r"[a-z0-9]+(?:-[a-z0-9]+)+"
+_PRACTICE_ID_RE = re.compile(rf"`({_SLUG_ID})`|\[\[({_SLUG_ID})\]\]")
 _FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
 _TITLE_RE = re.compile(r"^# (.+)$", re.MULTILINE)
 _SECTION_RE = re.compile(r"^## (.+)$", re.MULTILINE)
@@ -54,7 +69,7 @@ class Lesson:
     ticket: int | None = None
     pr: int | None = None
     model: str = ""
-    references: tuple[str, ...] = ()  # reference-set repos that informed the work
+    references: tuple[str, ...] = ()  # practice ids (see Practice) that informed the work
     tags: tuple[str, ...] = ()
     created: str = field(default_factory=_today)
     remote_ci: str = ""  # SUCCESS | FAILURE | TIMEOUT, filled in once gh checks conclude
@@ -92,22 +107,35 @@ def split_sections(text: str) -> dict[str, str]:
     return sections
 
 
-def _frontmatter_tags(fm: str) -> tuple[str, ...]:
-    """List items under the ``tags:`` key only.
+def _frontmatter_list(fm: str, key: str) -> tuple[str, ...]:
+    """List items under one frontmatter key only.
 
-    Frontmatter now holds a second list (``recalled:``), so a blanket "every
-    ``- item`` line is a tag" scan would file recalled note names as tags.
+    Frontmatter holds several lists (``tags:``, ``recalled:``, ``adopted_by:``),
+    so a blanket "every ``- item`` line belongs to me" scan would file recalled
+    note names as tags.
     """
-    tags: list[str] = []
-    in_tags = False
+    items: list[str] = []
+    in_key = False
     for line in fm.splitlines():
         if line.strip() and not line.startswith((" ", "\t", "-")):
-            in_tags = line.strip() == "tags:"
+            in_key = line.strip() == f"{key}:"
             continue
         match = _TAG_RE.match(line)
-        if in_tags and match:
-            tags.append(match.group(1).strip())
-    return tuple(tags)
+        if in_key and match:
+            items.append(match.group(1).strip())
+    return tuple(items)
+
+
+def _frontmatter_scalar(fm: str, key: str) -> str:
+    """The value of a single-line ``key: value`` frontmatter entry ("" if absent)."""
+    for line in fm.splitlines():
+        if line.startswith(f"{key}:"):
+            return line.split(":", 1)[1].strip().strip("'\"")
+    return ""
+
+
+def _frontmatter_tags(fm: str) -> tuple[str, ...]:
+    return _frontmatter_list(fm, "tags")
 
 
 def parse_note(path: str | Path) -> LessonRecord:
@@ -141,12 +169,85 @@ def parse_note(path: str | Path) -> LessonRecord:
     )
 
 
+# Where a ticket lists the practices it is built on, and where a lesson lists
+# the ones that informed it. Both are read by :func:`cited_practice_ids`.
+PRACTICES_HEADING = "Practices cited"
+LESSON_REFERENCES_HEADING = "References (reference-set evidence)"
+
+
+@dataclass
+class Practice:
+    """One practice observed in a reference project, and what hsai did with it.
+
+    The unit of G1 evidence. ``artifact`` must point at something a reader can
+    open - a file path, a workflow name, a PR or commit URL - because "MetaGPT
+    does roles well" is an impression, while ``metagpt/roles/engineer.py`` is a
+    citation.
+    """
+
+    id: str  # kebab slug, >= 2 segments; also the note name
+    source_repo: str  # e.g. "FoundationAgents/MetaGPT"
+    artifact: str  # file path, workflow name, PR or commit URL
+    observation: str  # what that project actually does
+    adaptation: str  # what hsai did instead
+    adopted_by: tuple[str, ...] = ()  # e.g. ("ticket #203", "PR #204")
+    tags: tuple[str, ...] = ()
+    created: str = field(default_factory=_today)
+
+    def note_name(self) -> str:
+        return self.id
+
+
+def parse_practice(path: str | Path) -> Practice:
+    """Read a practice note back off disk - the read side of :class:`Practice`."""
+    path = Path(path)
+    text = path.read_text()
+    fm_match = _FRONTMATTER_RE.match(text)
+    fm = fm_match.group(1) if fm_match else ""
+    sections = split_sections(text)
+    return Practice(
+        id=path.stem,
+        source_repo=_frontmatter_scalar(fm, "source_repo"),
+        artifact=_frontmatter_scalar(fm, "artifact"),
+        observation=sections.get("observation", ""),
+        adaptation=sections.get("adaptation", ""),
+        adopted_by=_frontmatter_list(fm, "adopted_by"),
+        # The generated tags are dropped so a note round-trips through
+        # parse -> write unchanged instead of accumulating duplicates.
+        tags=tuple(
+            t for t in _frontmatter_tags(fm)
+            if t != "practice" and not t.startswith("source/")
+        ),
+        created=_frontmatter_scalar(fm, "created"),
+    )
+
+
+def cited_practice_ids(text: str) -> tuple[str, ...]:
+    """Practice ids cited by a ticket body or a lesson note, in order of appearance.
+
+    One reader serves both because both list ids the same way: as inline `code`
+    spans under a heading that says they are evidence (``## Practices cited`` on
+    a ticket, ``## References ...`` on a lesson). Prose elsewhere in the note is
+    ignored - a citation only counts where the note claims to be citing.
+    """
+    ids: list[str] = []
+    for heading, body in split_sections(text).items():
+        if heading != PRACTICES_HEADING.lower() and not heading.startswith("references"):
+            continue
+        for match in _PRACTICE_ID_RE.finditer(body):
+            pid = match.group(1) or match.group(2)
+            if pid not in ids:
+                ids.append(pid)
+    return tuple(ids)
+
+
 @dataclass
 class Whitepaper:
     title: str
     summary: str
     body: str
     covers_lessons: tuple[str, ...] = ()  # note names
+    cites_practices: tuple[str, ...] = ()  # practice ids adopted in this window
     tags: tuple[str, ...] = ()
     created: str = field(default_factory=_today)
 
@@ -163,15 +264,17 @@ class KnowledgeBase:
         *,
         lessons_dir: str = "knowledge/lessons",
         whitepapers_dir: str = "knowledge/whitepapers",
+        practices_dir: str = "knowledge/practices",
         mocs_dir: str = "knowledge/MOCs",
         whitepaper_every: int = 10,
     ) -> None:
         self.root = Path(root)
         self.lessons_dir = self.root / lessons_dir
         self.whitepapers_dir = self.root / whitepapers_dir
+        self.practices_dir = self.root / practices_dir
         self.mocs_dir = self.root / mocs_dir
         self.whitepaper_every = whitepaper_every
-        for d in (self.lessons_dir, self.whitepapers_dir, self.mocs_dir):
+        for d in (self.lessons_dir, self.whitepapers_dir, self.practices_dir, self.mocs_dir):
             d.mkdir(parents=True, exist_ok=True)
 
     @classmethod
@@ -181,6 +284,7 @@ class KnowledgeBase:
             root,
             lessons_dir=k.get("lessons_dir", "knowledge/lessons"),
             whitepapers_dir=k.get("whitepapers_dir", "knowledge/whitepapers"),
+            practices_dir=k.get("practices_dir", "knowledge/practices"),
             mocs_dir=k.get("mocs_dir", "knowledge/MOCs"),
             whitepaper_every=int(k.get("whitepaper_every_lessons", 10)),
         )
@@ -196,12 +300,24 @@ class KnowledgeBase:
         path.write_text(self._render_whitepaper(paper))
         return path
 
+    def write_practice(self, practice: Practice) -> Path:
+        path = self.practices_dir / f"{practice.note_name()}.md"
+        path.write_text(self._render_practice(practice))
+        return path
+
     # --- counting -------------------------------------------------------------
     def lesson_notes(self) -> list[str]:
         return sorted(p.stem for p in self.lessons_dir.glob("*.md"))
 
     def whitepaper_notes(self) -> list[str]:
         return sorted(p.stem for p in self.whitepapers_dir.glob("*.md"))
+
+    def practice_notes(self) -> list[str]:
+        return sorted(p.stem for p in self.practices_dir.glob("*.md"))
+
+    def practice_ids(self) -> set[str]:
+        """Every id a PR, ticket or lesson is allowed to cite as evidence."""
+        return set(self.practice_notes())
 
     def should_write_whitepaper(self) -> bool:
         n = len(self.lesson_notes())
@@ -214,6 +330,13 @@ class KnowledgeBase:
 
     def _parse_lesson(self, note_name: str) -> LessonRecord:
         return parse_note(self.lessons_dir / f"{note_name}.md")
+
+    def read_practices(self) -> list[Practice]:
+        """Parse the whole practice registry back off disk, ordered by id."""
+        return [
+            parse_practice(self.practices_dir / f"{name}.md")
+            for name in self.practice_notes()
+        ]
 
     def synthesize_whitepaper(self, n: int | None = None) -> Whitepaper:
         """Synthesize a whitepaper by grouping the last `n` lessons by outcome/kind
@@ -282,7 +405,24 @@ class KnowledgeBase:
             summary=summary,
             body=body,
             covers_lessons=tuple(r.note_name for r in covered),
+            cites_practices=self._practices_cited_by(covered),
         )
+
+    def _practices_cited_by(self, records: list[LessonRecord]) -> tuple[str, ...]:
+        """Which registry practices the lessons in a window actually cited.
+
+        Only ids that resolve to a note are kept: a whitepaper that linked to a
+        practice which does not exist would break the very lesson -> practice ->
+        MOC path it is meant to demonstrate.
+        """
+        known = self.practice_ids()
+        cited = {
+            pid
+            for record in records
+            for pid in cited_practice_ids(record.body)
+            if pid in known
+        }
+        return tuple(sorted(cited))
 
     # --- indexing -------------------------------------------------------------
     def reindex_mocs(self) -> list[Path]:
@@ -290,6 +430,7 @@ class KnowledgeBase:
         written = [
             self._write_lessons_moc(),
             self._write_whitepapers_moc(),
+            self._write_practices_moc(),
             self._write_root_moc(),
         ]
         return written
@@ -322,7 +463,10 @@ class KnowledgeBase:
         if lesson.recalled:
             extra["recalled"] = lesson.recalled
         fm = self._frontmatter(tags, extra)
-        refs = "\n".join(f"- `{r}`" for r in lesson.references) or "- _(none cited)_"
+        # Practice ids, wikilinked so lesson -> practice -> [[Practices MOC]] is
+        # a real edge in the graph. Nothing cited stays nothing cited: an
+        # invented list of repo names is worse than an honest blank.
+        refs = "\n".join(f"- [[{r}]]" for r in lesson.references) or "- _(none cited)_"
         ticket = f"#{lesson.ticket}" if lesson.ticket else "_(none)_"
         pr = f"#{lesson.pr}" if lesson.pr else "_(none)_"
         repro = lesson.repro_evidence or "_(not applicable: not a heal/bugfix ticket)_"
@@ -359,14 +503,53 @@ class KnowledgeBase:
 ## Reproduction evidence
 {repro}
 
-## References (reference-set evidence)
+## {LESSON_REFERENCES_HEADING}
 {refs}
+"""
+
+    def _render_practice(self, practice: Practice) -> str:
+        tags = ("practice", f"source/{slugify(practice.source_repo)}", *practice.tags)
+        extra: dict[str, str | tuple[str, ...]] = {
+            "created": practice.created,
+            "source_repo": practice.source_repo,
+            "artifact": practice.artifact,
+        }
+        if practice.adopted_by:
+            extra["adopted_by"] = practice.adopted_by
+        fm = self._frontmatter(tags, extra)
+        adopted = "\n".join(f"- {a}" for a in practice.adopted_by) or "- _(not yet adopted)_"
+        return f"""{fm}
+
+# {practice.id}
+
+> Part of [[Practices MOC]] - [[Knowledge Base MOC]]
+
+| field | value |
+| --- | --- |
+| source repo | `{practice.source_repo}` |
+| artifact | `{practice.artifact}` |
+
+## Observation
+{practice.observation}
+
+## Adaptation
+{practice.adaptation}
+
+## Adopted by
+{adopted}
 """
 
     def _render_whitepaper(self, paper: Whitepaper) -> str:
         tags = ("whitepaper", *paper.tags)
         fm = self._frontmatter(tags, {"created": paper.created})
         covered = "\n".join(f"- [[{n}]]" for n in paper.covers_lessons) or "- _(none)_"
+        # Registry lookup, so the whitepaper says which PROJECT each adopted
+        # practice came from rather than only its id.
+        index = {p.id: p for p in self.read_practices()}
+        adopted = "\n".join(
+            f"- [[{pid}]] - `{index[pid].source_repo}`" if pid in index else f"- [[{pid}]]"
+            for pid in paper.cites_practices
+        ) or "_No lesson in this window cited a practice from the registry._"
         return f"""{fm}
 
 # {paper.title}
@@ -377,6 +560,9 @@ class KnowledgeBase:
 {paper.summary}
 
 {paper.body}
+
+## Practices adopted in this window
+{adopted}
 
 ## Lessons synthesized
 {covered}
@@ -418,10 +604,48 @@ Periodic syntheses of accumulated lessons. Total: **{len(notes)}**.
         path.write_text(content)
         return path
 
+    def _write_practices_moc(self) -> Path:
+        """Index the registry by the project each practice was taken from.
+
+        Grouping by source repo is what turns the registry into an answer to
+        "what have we actually learned from MetaGPT?" - the question G1 exists
+        to make answerable.
+        """
+        practices = self.read_practices()
+        by_repo: dict[str, list[Practice]] = {}
+        for practice in practices:
+            by_repo.setdefault(practice.source_repo or "_(unattributed)_", []).append(practice)
+        groups: list[str] = []
+        for repo in sorted(by_repo):
+            links = "\n".join(
+                f"- [[{p.id}]] - `{p.artifact}`"
+                for p in sorted(by_repo[repo], key=lambda x: x.id)
+            )
+            groups.append(f"### {repo}\n{links}")
+        body = "\n\n".join(groups) or "_No practices recorded yet._"
+        fm = self._frontmatter(("moc", "practices"), {"updated": _today()})
+        content = f"""{fm}
+
+# Practices MOC
+
+Up: [[Knowledge Base MOC]]
+
+Every practice this repo adopted from the reference set, grouped by the project
+it came from. Tickets, PRs and lessons cite these by id; a citation that does not
+resolve to a note here is refused by the orchestrator's evidence guard.
+Total: **{len(practices)}** across {len(by_repo)} project(s).
+
+{body}
+"""
+        path = self.mocs_dir / "Practices MOC.md"
+        path.write_text(content)
+        return path
+
     def _write_root_moc(self) -> Path:
         fm = self._frontmatter(("moc", "index"), {"updated": _today()})
         n_lessons = len(self.lesson_notes())
         n_papers = len(self.whitepaper_notes())
+        n_practices = len(self.practice_notes())
         content = f"""{fm}
 
 # Knowledge Base MOC
@@ -432,9 +656,12 @@ vault and use the graph view to explore how lessons connect.
 ## Maps
 - [[Lessons MOC]] - {n_lessons} lesson(s)
 - [[Whitepapers MOC]] - {n_papers} whitepaper(s)
+- [[Practices MOC]] - {n_practices} practice(s) adopted from the reference set
 
 ## How this is maintained
 - Each PR the [[hsai]] loop opens contributes exactly one lesson.
+- Every improvement cites the practices it came from; each id resolves to a note
+  under `knowledge/practices/`.
 - Every {self.whitepaper_every} lessons, a whitepaper synthesizes the themes.
 - These MOCs are regenerated by `hsai reindex` after each iteration.
 """

@@ -2,6 +2,7 @@ import json
 
 from hsai import ai
 from hsai.config import load_config
+from hsai.knowledge import KnowledgeBase, cited_practice_ids
 from hsai.models import ModelChoice
 from hsai.proc import Proc
 from hsai.synthesis import (
@@ -9,6 +10,7 @@ from hsai.synthesis import (
     ContextPack,
     build_prompt,
     build_tried_digest,
+    parse_practices,
     parse_ticket_specs,
     pick_rotation,
     synthesize,
@@ -61,6 +63,104 @@ PHASE 3:
 def test_parse_handles_garbage():
     assert parse_ticket_specs("no json here") == []
     assert parse_ticket_specs("```json\nnot json\n```") == []
+    assert parse_ticket_specs('```json\n["a string, not a ticket"]\n```') == []
+
+
+# --- practices: the machine-checkable half of the synthesis rationale ---------
+
+RATIONALE = "combines gpt-researcher, MetaGPT and llama_index"
+PRACTICE_OUTPUT = """PHASE 3 - CONVERGE:
+```json
+[{"title": "feat: practice registry", "problem": "p", "proposal": "pp",
+  "acceptance_criteria": ["a", "b"], "verification_plan": ["v1", "v2"],
+  "size": "L", "goal_ids": ["G1"],
+  "synthesis_rationale": "combines gpt-researcher, MetaGPT and llama_index",
+  "practices": [
+    {"id": "MetaGPT Phase Artifacts", "source_repo": "FoundationAgents/MetaGPT",
+     "artifact": "metagpt/roles/", "observation": "each role emits a named document",
+     "adaptation": "render phase artifacts into every PR body"},
+    {"id": "swarm-error-context", "source_repo": "openai/swarm",
+     "artifact": "swarm/core.py", "adaptation": "prefix errors with phase and ticket"},
+    {"id": "nope", "source_repo": "openai/swarm", "artifact": "swarm/core.py"},
+    {"id": "no-artifact-given", "source_repo": "openai/swarm"}
+  ]}]
+```"""
+
+
+def test_parse_practices_keeps_only_entries_that_can_be_checked():
+    raw = [
+        {"id": "Swarm Error Context", "source_repo": "openai/swarm",
+         "artifact": "swarm/core.py", "observation": "o", "adaptation": "a"},
+        {"id": "single", "source_repo": "openai/swarm", "artifact": "swarm/core.py"},
+        {"id": "no-artifact", "source_repo": "openai/swarm"},
+        {"id": "no-source", "artifact": "swarm/core.py"},
+        {"id": "swarm-error-context", "source_repo": "openai/swarm",
+         "artifact": "swarm/core.py"},  # duplicate id
+        "not an object",
+    ]
+    practices = parse_practices(raw, "the rationale")
+    assert [p.id for p in practices] == ["swarm-error-context"]
+    assert parse_practices("not a list") == ()
+
+
+def test_parse_ticket_specs_captures_per_ticket_practices():
+    spec = parse_ticket_specs(PRACTICE_OUTPUT)[0]
+
+    assert [p.id for p in spec.practices] == [
+        "metagpt-phase-artifacts",  # slugified from prose
+        "swarm-error-context",
+    ]
+    assert spec.practices[0].source_repo == "FoundationAgents/MetaGPT"
+    # an entry that skipped its observation inherits the planner's own account
+    assert spec.practices[1].observation == RATIONALE
+
+    # the filed body cites them in a section the orchestrator can read back
+    body = spec.render()
+    assert "## Practices cited" in body
+    assert cited_practice_ids(body) == ("metagpt-phase-artifacts", "swarm-error-context")
+    # a ticket with no practices renders exactly as it did before the registry
+    assert "Practices cited" not in parse_ticket_specs(PLAIN_TEXT_OUTPUT)[0].render()
+
+
+def _practice_runner():
+    calls: list[list[str]] = []
+
+    def runner(cmd, *, cwd=None, env=None, timeout=None, input_text=None):
+        calls.append(list(cmd))
+        if cmd[:1] == ["claude"]:
+            return Proc(cmd, 0, PRACTICE_OUTPUT, "")
+        if cmd[:3] == ["gh", "issue", "create"]:
+            return Proc(cmd, 0, "https://github.com/o/r/issues/321\n", "")
+        return Proc(cmd, 0, "", "")
+
+    runner.calls = calls  # type: ignore[attr-defined]
+    return runner
+
+
+def test_synthesize_writes_the_registry_notes_the_filed_ticket_cites(tmp_path):
+    cfg = _cfg()
+    runner = _practice_runner()
+
+    res = synthesize(
+        cfg, cycle_index=0, root=str(tmp_path), runner=runner, ai_runner=runner
+    )
+
+    assert res.filed == [321]
+    assert res.practices == ("metagpt-phase-artifacts", "swarm-error-context")
+
+    kb = KnowledgeBase.from_config(cfg, tmp_path)
+    assert kb.practice_ids() == {"metagpt-phase-artifacts", "swarm-error-context"}
+
+    # every id the ticket cites resolves, which is exactly what the
+    # orchestrator's evidence guard will demand of it later
+    create = next(c for c in runner.calls if c[:3] == ["gh", "issue", "create"])
+    body = create[create.index("--body") + 1]
+    assert set(cited_practice_ids(body)) == kb.practice_ids()
+
+    # and each note points back at the ticket that adopted it
+    note = (kb.practices_dir / "swarm-error-context.md").read_text()
+    assert "source_repo: openai/swarm" in note
+    assert "- ticket #321" in note
 
 
 # --- plain-text (non-JSON) CLI output must never break synthesis -------------

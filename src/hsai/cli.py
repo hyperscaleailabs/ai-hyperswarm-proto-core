@@ -125,6 +125,7 @@ def cmd_synthesize(args: argparse.Namespace) -> int:
     cfg = _load(args)
     res = synthesize(cfg, cycle_index=args.index)
     print(f"studied: {', '.join(res.studied)}")
+    print(f"practices: {', '.join(res.practices) or 'none'}")
     print(f"filed tickets: {res.filed or 'none'}")
     if res.error:
         print(f"error: {res.error}")

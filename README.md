@@ -52,13 +52,24 @@ Clone the repo and **open the folder as an Obsidian vault** - the committed
 
 ```
 knowledge/
-├── MOCs/          # Maps of Content: Knowledge Base / Lessons / Whitepapers
+├── MOCs/          # Maps of Content: Knowledge Base / Lessons / Whitepapers / Practices
 ├── lessons/       # one article per iteration (pass or fail)
+├── practices/     # one note per practice adopted from the reference set
 ├── whitepapers/   # periodic syntheses (every N lessons)
 └── templates/     # note templates
 ```
 
 `hsai reindex` rebuilds the MOCs from what is on disk.
+
+**Evidence is a note, not a name.** Each practice this repo took from the
+reference set gets a note under `knowledge/practices/` recording the source
+repo, the *artifact* it was observed in (a file, a workflow, a PR), what that
+project does, and what hsai did instead. Tickets, PRs and lessons cite
+practices by id, and the orchestrator's **evidence guard** recovers a
+self-improvement change whose cited id does not resolve to a note - so
+`lesson -> practice -> [[Practices MOC]]` is a path you can actually walk,
+and "which practice came from where" has an answer that is checked rather
+than asserted.
 
 **The loop reads the vault back.** Before an agent starts, `hsai.recall` builds
 a BM25 index over `knowledge/lessons`, `knowledge/whitepapers` and `docs/adr`

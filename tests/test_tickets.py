@@ -1,3 +1,4 @@
+from hsai.knowledge import Practice, cited_practice_ids
 from hsai.tickets import TicketSpec, check_well_formed
 
 
@@ -21,6 +22,32 @@ def test_spec_renders_all_required_sections():
     assert "size:M" in spec.all_labels()
     wf = check_well_formed(spec.title, body)
     assert wf.ok, wf.reasons
+
+
+def test_cited_practices_render_as_a_readable_section_and_a_citable_one():
+    spec = TicketSpec(
+        title="feat: adaptive retry budget",
+        problem="Retries are fixed.",
+        proposal="Budget adapts to failure class.",
+        acceptance_criteria=("budget adapts", "tests cover classes"),
+        verification_plan=("pytest green", "manual failure injection"),
+        practices=(
+            Practice(
+                id="swarm-error-context",
+                source_repo="openai/swarm",
+                artifact="swarm/core.py",
+                observation="context travels with the run",
+                adaptation="errors carry phase and ticket",
+            ),
+        ),
+    )
+    body = spec.render()
+
+    # a human reads the repo and the artifact; the orchestrator reads the id
+    assert "## Practices cited" in body
+    assert "`openai/swarm`" in body and "swarm/core.py" in body
+    assert cited_practice_ids(body) == ("swarm-error-context",)
+    assert check_well_formed(spec.title, body).ok
 
 
 def test_vague_feature_ticket_is_malformed():

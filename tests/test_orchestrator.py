@@ -630,6 +630,138 @@ def test_completeness_guard_blocks_knowledge_only_diff_on_code_ticket(tmp_path):
     )
 
 
+# --- evidence guard: provenance that does not resolve is not provenance -------
+
+PRACTICE_NOTE = """---
+tags:
+  - practice
+  - source/openai-swarm
+created: 2026-07-26
+source_repo: openai/swarm
+artifact: swarm/core.py
+---
+
+# swarm-error-context
+
+> Part of [[Practices MOC]] - [[Knowledge Base MOC]]
+
+## Observation
+The run loop carries the active step, so failures name where they happened.
+
+## Adaptation
+Agent errors are prefixed with phase and ticket before anything records them.
+"""
+
+
+def _citing_issue(*practice_ids: str) -> dict:
+    """A synthesized (self-improve) ticket that cites its evidence by id."""
+    cited = "\n".join(
+        f"- `{pid}` - `openai/swarm` - swarm/core.py" for pid in practice_ids
+    )
+    return {
+        "number": 21,
+        "title": "feat: thread real provenance",
+        "labels": [{"name": "priority:P2"}, {"name": "self-improve"}],
+        "assignees": [],
+        "body": f"{WELL_FORMED_BODY}\n## Practices cited\n{cited}\n",
+    }
+
+
+def test_evidence_guard_recovers_a_pr_citing_an_unknown_practice_id(tmp_path, monkeypatch):
+    cfg = load_config()
+    _pin_worktree_path(monkeypatch, tmp_path, cfg)  # worktree registry stays empty
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[_citing_issue("not-a-real-practice")],
+        worktree_status="?? src/hsai/widget.py\n",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    # a citation to nothing never becomes a PR
+    assert result.recovered is True
+    assert result.pr is None and result.merged is False
+    assert any(
+        "evidence guard" in n and "not-a-real-practice" in n for n in result.notes
+    )
+    assert not any(c[:3] == ["gh", "pr", "create"] for c in runner.calls)
+    # ...and it is recovered by the same mechanism as a knowledge-only diff:
+    # ticket unassigned, attempt spent, one ledger record naming the outcome
+    assert any(
+        c[:3] == ["gh", "issue", "edit"] and "--remove-assignee" in c for c in runner.calls
+    )
+    assert [r.outcome for r in _iteration_records(cfg, str(tmp_path))] == ["no_evidence"]
+
+
+def test_evidence_guard_ignores_tickets_that_claim_no_reference_provenance(tmp_path):
+    """An ordinary backlog ticket cites nothing and is not asked to."""
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[{
+            "number": 9, "title": "feat: add widget",
+            "labels": [{"name": "priority:P2"}], "assignees": [],
+            "body": WELL_FORMED_BODY,
+        }],
+        worktree_status="?? src/hsai/widget.py\n",
+    )
+
+    result = run_once(
+        load_config(), repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.recovered is False and result.pr is not None
+    assert not any("evidence guard" in n for n in result.notes)
+
+
+def test_provenance_threaded_into_the_pr_and_lesson_comes_from_the_ticket(
+    tmp_path, monkeypatch
+):
+    """The reference-set evidence is what THIS ticket cited - never a static slice."""
+    cfg = load_config()
+    wt = _pin_worktree_path(monkeypatch, tmp_path, cfg)
+    registry = wt / "knowledge" / "practices"
+    registry.mkdir(parents=True)
+    (registry / "swarm-error-context.md").write_text(PRACTICE_NOTE)
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[_citing_issue("swarm-error-context")],
+        worktree_status="?? src/hsai/widget.py\n",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.recovered is False
+    assert result.pr is not None
+    pr_create = next(c for c in runner.calls if c[:3] == ["gh", "pr", "create"])
+    pr_body = pr_create[pr_create.index("--body") + 1]
+    lesson = Path(result.lesson_path).read_text()
+
+    assert "`swarm-error-context`" in pr_body
+    assert "- [[swarm-error-context]]" in lesson  # lesson -> practice, as a graph edge
+    # the old behaviour - the first three pinned repos stamped on everything -
+    # is gone from both artifacts
+    for repo in (r.repo for r in cfg.reference_top10[:3]):
+        assert repo not in pr_body
+        assert repo not in lesson
+
+
+def test_an_iteration_that_cited_nothing_says_none_cited(tmp_path):
+    """Empty is an honest answer; an invented list is not."""
+    choice = ModelChoice(tier="standard", model="sonnet", rationale="x")
+    body = build_pr_body(
+        ticket=42, choice=choice, lesson_note="2026-01-03-note",
+        lesson_summary="s", ci_summary="green",
+    )
+    assert "## Reference-set evidence\n_(none cited)_" in body
+
+
 # --- independent review gate (a second opinion before any PR opens) ---------
 
 CODE_ISSUE = {

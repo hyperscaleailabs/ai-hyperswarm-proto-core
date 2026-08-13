@@ -16,7 +16,7 @@ so the decision logic stays pure and unit-tested.
 | `hsai.ci` | local CI gate (ruff+pytest) + remote status | subprocess |
 | `hsai.trajectory` | one durable record per agent run; redaction, replay | write files |
 | `hsai.journal` | append-only per-block step journal; `once()` replay | write files |
-| `hsai.knowledge` | lessons, whitepapers, MOC reindex (Obsidian) | write files |
+| `hsai.knowledge` | practices, lessons, whitepapers, MOC reindex (Obsidian) | write files |
 | `hsai.recall` | BM25 index over the vault; retrieve prior notes | read files |
 | `hsai.review` | independent, different-tier review of the branch diff | subprocess |
 | `hsai.orchestrator` | one iteration; `decide_path`, `build_pr_body` (pure) | composes above |
@@ -45,6 +45,7 @@ sequenceDiagram
     O->>A: run_agent(prompt + prior lessons, model choice)
     A-->>O: ok / error + steps + usage (JSON envelope)
     O->>T: record (before any guard can abort)
+    O->>K: practice_ids (evidence guard: every cited id must resolve)
     O->>C: run_local (CI after)
     O->>G: commit_all (so the reviewer has a diff to read)
     O->>V: review_change (different tier than the author)

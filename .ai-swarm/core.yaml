@@ -192,6 +192,11 @@ knowledge:
   root: knowledge                    # Obsidian vault content lives under the repo root
   lessons_dir: knowledge/lessons
   whitepapers_dir: knowledge/whitepapers
+  # The practice registry: one note per practice adopted from the reference set,
+  # naming the artifact it was observed in. PRs, tickets and lessons cite these
+  # by id; the orchestrator's evidence guard refuses a citation that does not
+  # resolve to a note here (G1 evidence, G2 auditability).
+  practices_dir: knowledge/practices
   mocs_dir: knowledge/MOCs
   templates_dir: knowledge/templates
   whitepaper_every_lessons: 10       # synthesize a whitepaper every N new lessons
