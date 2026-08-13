@@ -133,6 +133,37 @@ def test_block_soft_biases_then_hard_halts_but_inflight_merges(tmp_path, monkeyp
         json.loads(line)
 
 
+# --- synthesis duplicate rejections reach the review brief -------------------
+
+def test_synthesis_duplicate_rejections_surface_in_block_notes(tmp_path, monkeypatch):
+    """`SynthesisResult.rejected` must reach `BlockReport.notes` (and the brief)."""
+    cfg = load_config()
+    cfg.budget.clear()
+    cfg.cycle["block_size"] = 0  # isolate: no implementation iterations needed
+
+    def fake_synthesize(cfg, *, cycle_index, runner, ai_runner):
+        return SynthesisResult(
+            ok=True, studied=["a/b"], filed=[901],
+            rejected=1, rejected_titles=["feat: already open ticket"],
+        )
+
+    runner = _Runner()
+    monkeypatch.setattr(cycle, "synthesize", fake_synthesize)
+    monkeypatch.setattr(cycle, "_well_formed_backlog", lambda cfg, *, runner: 0)
+    monkeypatch.setattr(cycle, "_governance_pr", lambda *a, **k: 0)
+
+    res = cycle.run_cycle(cfg, repo_dir=str(tmp_path), cycle_index=1, runner=runner)
+
+    assert res.report.synthesized == [901]
+    note = next(n for n in res.report.notes if n.startswith("synthesis:"))
+    assert "1 duplicate(s) rejected" in note
+    assert "feat: already open ticket" in note
+
+    # The review brief renders every note verbatim.
+    assert runner.review_bodies, "a review issue should have been opened"
+    assert note in runner.review_bodies[-1]
+
+
 # --- plain-text agent output must not break article generation --------------
 
 def test_persona_articles_survive_output_without_a_json_envelope(tmp_path):
