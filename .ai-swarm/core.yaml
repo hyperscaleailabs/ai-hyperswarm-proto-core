@@ -166,6 +166,23 @@ review:
   max_diff_chars: 20000        # hard ceiling on the diff handed to the reviewer
   timeout_seconds: 900         # cap per reviewer run so the gate cannot hang the loop
 
+# Verify-and-repair inner loop (see src/hsai/repair.py). Loop workers are
+# sandboxed WITHOUT permission to run ruff or pytest, so an agent cannot
+# self-verify from inside its own run - only the orchestrator can close that
+# feedback loop. When local CI is red after the agent stops, the SAME model is
+# called again in the SAME worktree with the failing step names and a truncated
+# CI log tail, then local CI is re-run. Every post-agent guard (workflow revert,
+# completeness, reproduce-before-fix) is re-applied after each pass, so a repair
+# cannot smuggle in a workflow edit or erase the reproduction evidence. Each
+# pass appends an outcome='repair' ledger record, and a soft budget breach skips
+# repair entirely. The merge gate is untouched: remote CI (ci.wait_remote)
+# remains the only thing that authorizes a merge. Set enabled: false (or
+# max_attempts: 0) to restore the one-shot flow.
+repair:
+  enabled: true
+  max_attempts: 1              # extra agent calls per iteration while local CI is red
+  max_log_chars: 4000          # ceiling on the CI output tail shown to the repair pass
+
 personas:                      # article targets generated from each whitepaper
   - id: cto
     audience: CTO level - business impact, risk posture, strategic direction

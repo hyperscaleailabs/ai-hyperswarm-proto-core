@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from hsai import ledger, orchestrator, recall, review, trajectory
+from hsai import ledger, orchestrator, recall, repair, review, trajectory
 from hsai.config import load_config
 from hsai.models import ModelChoice
 from hsai.orchestrator import (
@@ -75,17 +75,34 @@ REVIEW_BLOCK = _reviewer_envelope(
     }
 )
 
+# What a repair pass prints: a smaller envelope than the authoring run, so its
+# ledger line is distinguishable from the worker's.
+REPAIR_JSON = json.dumps(
+    {
+        "type": "result",
+        "result": "Dropped the unused import so ruff passes.",
+        "usage": {"input_tokens": 700, "output_tokens": 90},
+    }
+)
+
 
 def _claude_prompts(runner) -> list[str]:
     return [c[2] for c in runner.calls if c[:1] == ["claude"]]
 
 
 def _worker_prompts(runner) -> list[str]:
-    return [p for p in _claude_prompts(runner) if review.PROMPT_MARKER not in p]
+    return [
+        p for p in _claude_prompts(runner)
+        if review.PROMPT_MARKER not in p and repair.PROMPT_MARKER not in p
+    ]
 
 
 def _review_prompts(runner) -> list[str]:
     return [p for p in _claude_prompts(runner) if review.PROMPT_MARKER in p]
+
+
+def _repair_prompts(runner) -> list[str]:
+    return [p for p in _claude_prompts(runner) if repair.PROMPT_MARKER in p]
 
 
 def _iteration_records(cfg, root) -> list[ledger.LedgerRecord]:
@@ -117,10 +134,17 @@ class FakeRunner:
         repro_parent_ok: bool = False,
         agent_output: str = AGENT_JSON,
         review_output: str = REVIEW_APPROVE,
+        repair_output: str = REPAIR_JSON,
+        repair_worktree_status: str | None = None,
     ) -> None:
         self.repo_root = repo_root
         self.agent_output = agent_output
         self.review_output = review_output
+        self.repair_output = repair_output
+        # What the worktree looks like AFTER a repair pass has edited it; the
+        # post-agent guards must be re-evaluated against this, not the state
+        # they already approved.
+        self.repair_worktree_status = repair_worktree_status
         self.ci_sequence = ci_sequence
         self.open_issues = open_issues or []
         self.remote_ci = remote_ci
@@ -188,6 +212,10 @@ class FakeRunner:
             prompt = cmd[2] if len(cmd) > 2 else ""
             if review.PROMPT_MARKER in prompt:
                 return Proc(cmd, 0, self.review_output, "")
+            if repair.PROMPT_MARKER in prompt:
+                if self.repair_worktree_status is not None:
+                    self.worktree_status = self.repair_worktree_status
+                return Proc(cmd, 0, self.repair_output, "")
             return Proc(cmd, 0, self.agent_output, "")
         if cmd[:3] == ["gh", "pr", "create"]:
             self._pr_seq += 1
@@ -733,8 +761,9 @@ def test_the_reviewer_is_shown_the_criteria_and_the_branch_diff(tmp_path):
 
 def test_a_red_local_build_skips_the_review_and_says_so(tmp_path):
     cfg = load_config()
+    # Red after the agent, still red after the repair budget is spent.
     runner = FakeRunner(
-        repo_root=str(tmp_path), ci_sequence=[True, False],
+        repo_root=str(tmp_path), ci_sequence=[True, False, False],
         open_issues=[dict(CODE_ISSUE)], worktree_status="?? src/hsai/widget.py\n",
         remote_ci="FAILURE",
     )
@@ -804,6 +833,233 @@ def test_build_pr_body_always_carries_an_independent_review_section():
     plain = build_pr_body(**kwargs)
     assert "## Independent review" in plain
     assert "_(no independent review recorded)_" in plain
+
+
+# --- verify-and-repair (a bounded second chance at a red local build) -------
+
+
+def _model_of(runner, prompt: str) -> str:
+    """The `--model` the CLI was invoked with for a given prompt."""
+    call = next(c for c in runner.calls if c[:1] == ["claude"] and c[2] == prompt)
+    return call[call.index("--model") + 1]
+
+
+def _repair_records(cfg, root) -> list[ledger.LedgerRecord]:
+    return [
+        r for r in ledger.read_records(ledger.ledger_path(cfg, root))
+        if r.kind == repair.LEDGER_KIND
+    ]
+
+
+def test_a_red_local_build_is_repaired_in_place_and_the_pr_still_opens(tmp_path):
+    """The whole point: a lint error no longer costs the ticket an attempt."""
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, False, True],
+        open_issues=[dict(CODE_ISSUE)], worktree_status="?? src/hsai/widget.py\n",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    # One extra agent call, in the same worktree, and the branch went green.
+    assert result.repairs == 1
+    assert len(_worker_prompts(runner)) == 1
+    assert len(_repair_prompts(runner)) == 1
+    assert result.ci_after is True
+    assert result.review == "approve"
+    assert result.pr is not None and result.merged is True
+    assert result.recovered is False
+    assert "repairs=1" in result.describe()
+
+    # The repair pass was shown what actually failed - the output no agent can
+    # produce for itself inside the sandbox.
+    prompt = _repair_prompts(runner)[0]
+    assert "ruff: fake lint failure" in prompt
+    assert "pytest: fake test failure" in prompt
+    assert "Failing CI step(s): `ruff`, `pytest`" in prompt
+    assert CODE_ISSUE["title"] in prompt
+    # ...by the SAME model that wrote the change, not a fresh selection.
+    assert _model_of(runner, prompt) == result.model
+
+    # The transition is on the result and in the committed lesson.
+    assert "repair 1/1: ruff FAIL -> pass, pytest FAIL -> pass" in result.notes
+    lesson_text = Path(result.lesson_path).read_text()
+    assert "Verify-and-repair passes:" in lesson_text
+    assert "repair 1/1: ruff FAIL -> pass" in lesson_text
+
+    # And the spend is metered like any other model call.
+    records = ledger.read_records(ledger.ledger_path(cfg, tmp_path))
+    assert [r.kind for r in records] == [repair.LEDGER_KIND, "review", IMPLEMENT]
+    repaired = records[0]
+    assert repaired.outcome == "repair"
+    assert repaired.model == result.model and repaired.ticket == result.ticket
+    assert (repaired.input_tokens, repaired.output_tokens) == (700, 90)
+    assert ledger.aggregate_block(records, block=0).repair_iterations == 1
+    assert "1 repair pass(es)" in ledger.aggregate_block(records, block=0).summary()
+
+
+def test_a_green_local_build_never_spends_a_repair_pass(tmp_path):
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[dict(CODE_ISSUE)], worktree_status="?? src/hsai/widget.py\n",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.repairs == 0
+    assert _repair_prompts(runner) == []
+    assert _repair_records(cfg, tmp_path) == []
+    assert result.merged is True
+
+
+def test_an_exhausted_repair_budget_still_recovers_the_ticket_exactly_once(
+    tmp_path, monkeypatch
+):
+    cfg = load_config()
+    calls: list[str] = []
+    real = orchestrator._recover_failed
+
+    def counting(*args, **kwargs):
+        calls.append(kwargs["remote"])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "_recover_failed", counting)
+    # Red, repaired once, still red -> the ordinary red-PR path takes over.
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, False, False],
+        open_issues=[dict(CODE_ISSUE)], worktree_status="?? src/hsai/widget.py\n",
+        remote_ci="FAILURE",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.repairs == cfg.repair["max_attempts"] == 1
+    assert len(_repair_prompts(runner)) == 1        # budget is a hard ceiling
+    assert result.ci_after is False
+    assert "repair 1/1: ruff FAIL -> FAIL, pytest FAIL -> FAIL" in result.notes
+
+    # Exactly one recovery, through the existing retry policy - no new stall state.
+    assert calls == ["FAILURE"]
+    assert result.recovered is True and result.merged is False
+    assert len([c for c in runner.calls if c[:3] == ["gh", "pr", "close"]]) == 1
+    assert any("attempts:1" in c for c in runner.calls)
+    assert len(_repair_records(cfg, tmp_path)) == 1
+
+
+def test_a_soft_budget_breach_skips_repair_entirely(tmp_path):
+    """A block already burning quota must not spend more polishing one change."""
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, False],
+        open_issues=[dict(CODE_ISSUE)], worktree_status="?? src/hsai/widget.py\n",
+        remote_ci="FAILURE",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1, demote_tier=True,
+    )
+
+    assert result.repairs == 0
+    assert _repair_prompts(runner) == []
+    assert _repair_records(cfg, tmp_path) == []
+    assert any(
+        "repair skipped" in n and "soft budget breach" in n for n in result.notes
+    )
+    # The pre-repair behaviour is exactly what happens instead.
+    assert result.ci_after is False and result.recovered is True
+
+
+def test_disabling_repair_restores_the_one_shot_flow(tmp_path):
+    cfg = replace(load_config(), repair={"enabled": False})
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, False],
+        open_issues=[dict(CODE_ISSUE)], worktree_status="?? src/hsai/widget.py\n",
+        remote_ci="FAILURE",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.repairs == 0
+    assert _repair_prompts(runner) == []
+    assert any("repair skipped: disabled" in n for n in result.notes)
+
+
+def test_a_workflow_edit_smuggled_in_by_a_repair_is_reverted(tmp_path):
+    """The guards run after EVERY agent call, not only after the first one."""
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, False, True],
+        open_issues=[dict(CODE_ISSUE)], worktree_status="?? src/hsai/widget.py\n",
+        repair_worktree_status=" M .github/workflows/ci.yml\n?? src/hsai/widget.py\n",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    # The first guard pass had nothing to revert; the post-repair pass did.
+    assert result.repairs == 1
+    reverts = [c for c in runner.calls if c[:3] == ["git", "checkout", "HEAD"]]
+    assert len(reverts) == 1
+    assert ".github/workflows" in reverts[0]
+    assert any(
+        "reverted workflow edits" in n and "ci.yml" in n for n in result.notes
+    )
+    # The revert happened before the change was committed, so the PR is clean.
+    assert result.pr is not None and result.merged is True
+    lesson_text = Path(result.lesson_path).read_text()
+    assert "Reverted off-spec workflow edits" in lesson_text
+
+
+def test_a_repair_that_erases_the_code_diff_is_caught_by_the_completeness_guard(
+    tmp_path,
+):
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, False, True],
+        open_issues=[dict(CODE_ISSUE)], worktree_status="?? src/hsai/widget.py\n",
+        repair_worktree_status="?? knowledge/lessons/2026-08-13-fake.md\n",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    # The guard aborts the iteration mid-repair: no PR, ticket back in the queue.
+    assert result.repairs == 1
+    assert result.recovered is True and result.pr is None
+    assert any("completeness guard" in n for n in result.notes)
+    assert not any(c[:3] == ["gh", "pr", "create"] for c in runner.calls)
+    # The repair pass is still on the ledger - an abort spent quota too.
+    assert len(_repair_records(cfg, tmp_path)) == 1
+    assert ledger.read_records(ledger.ledger_path(cfg, tmp_path))[-1].outcome == (
+        "incomplete"
+    )
+
+
+def test_a_dry_run_never_invokes_a_repair_pass(tmp_path):
+    cfg = load_config()
+    result = run_once(cfg, repo_dir=str(tmp_path), dry_run=True, iteration=1)
+
+    assert result.repairs == 0
+    assert "repairs=0" in result.describe()
+    assert not any(n.startswith("repair") for n in result.notes)
 
 
 # --- trajectory store (one durable record per agent run) --------------------
