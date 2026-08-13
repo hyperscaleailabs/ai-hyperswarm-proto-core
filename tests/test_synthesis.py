@@ -2,6 +2,7 @@ import json
 
 from hsai import ai
 from hsai.config import load_config
+from hsai.knowledge import KnowledgeBase, extract_practice_ids
 from hsai.models import ModelChoice
 from hsai.proc import Proc
 from hsai.synthesis import (
@@ -186,3 +187,98 @@ def test_synthesize_feeds_the_tried_digest_to_the_model():
     synthesize(cfg, cycle_index=0, root=".", runner=runner, ai_runner=runner)
     claude_call = next(c for c in runner.calls if c[:1] == ["claude"])
     assert TRIED_HEADING in claude_call[2]
+
+
+# --- practices: the planner's provenance becomes registry notes --------------
+
+PRACTICE_OUTPUT = """PHASE 3 - CONVERGE:
+```json
+[{"title": "feat: evidence guard", "problem": "p", "proposal": "pp",
+  "acceptance_criteria": ["a", "b"], "verification_plan": ["v1", "v2"],
+  "size": "L", "goal_ids": ["G1"],
+  "synthesis_rationale": "Combines crewAI (mechanical PR gates) and openai/swarm (context).",
+  "practices": [
+    {"source_repo": "crewAIInc/crewAI", "artifact": ".github/workflows/pr-title.yml",
+     "observation": "PR metadata is checked by CI at intake, not by convention.",
+     "adaptation": "Resolve every cited practice id against the registry."},
+    {"id": "swarm-context-travels", "source_repo": "openai/swarm", "artifact": "",
+     "observation": "Context variables travel with every handoff.",
+     "adaptation": "Errors carry their phase and ticket."}
+  ]}]
+```"""
+
+
+def test_parse_ticket_specs_captures_per_ticket_practices():
+    cfg = _cfg()
+    spec = parse_ticket_specs(
+        PRACTICE_OUTPUT, known_repos=[r.repo for r in cfg.reference_top10]
+    )[0]
+
+    assert [p.id for p in spec.practices] == [
+        "crewai-evidence-guard", "swarm-context-travels",
+    ]
+    crewai, swarm = spec.practices
+    assert crewai.source_repo == "crewAIInc/crewAI"
+    assert crewai.artifact == ".github/workflows/pr-title.yml"
+    assert crewai.observation.startswith("PR metadata is checked")
+    assert crewai.adaptation.startswith("Resolve every cited")
+    # an artifact the planner could not point at is marked, never invented
+    assert "not recorded" in swarm.artifact
+
+    body = spec.render()
+    assert "## Practices cited" in body
+    for practice in spec.practices:
+        assert f"`{practice.citation()}`" in body
+        assert f"[[{practice.note_name()}]]" in body
+    assert extract_practice_ids(body) == ("crewai-evidence-guard", "swarm-context-travels")
+
+
+def test_practices_fall_back_to_the_projects_the_rationale_names():
+    cfg = _cfg()
+    output = """```json
+[{"title": "feat: practice registry", "problem": "p", "proposal": "pp",
+  "acceptance_criteria": ["a", "b"], "verification_plan": ["v1"],
+  "synthesis_rationale":
+    "Combines gpt-researcher (per-claim source attribution is what makes a report usable), \
+MetaGPT (each phase emits an auditable artifact) and NotAPinnedProject (irrelevant aside)."}]
+```"""
+    spec = parse_ticket_specs(
+        output, known_repos=[r.repo for r in cfg.reference_top10]
+    )[0]
+
+    # only projects pinned in the reference set count as a source
+    assert [p.source_repo for p in spec.practices] == [
+        "assafelovic/gpt-researcher", "FoundationAgents/MetaGPT",
+    ]
+    assert spec.practices[0].observation.startswith("per-claim source attribution")
+    assert all("not recorded" in p.artifact for p in spec.practices)
+    assert all(p.adaptation for p in spec.practices)
+
+
+def test_synthesize_writes_the_registry_notes_before_filing_the_ticket(tmp_path):
+    cfg = _cfg()
+    registry = tmp_path / "knowledge" / "practices"
+    filed_bodies: list[str] = []
+
+    def runner(cmd, *, cwd=None, env=None, timeout=None, input_text=None):
+        if cmd[:1] == ["claude"]:
+            return Proc(cmd, 0, PRACTICE_OUTPUT, "")
+        if cmd[:3] == ["gh", "issue", "create"]:
+            # the citation must already resolve at the moment the ticket is filed
+            assert (registry / "crewai-evidence-guard.md").exists()
+            filed_bodies.append(cmd[cmd.index("--body") + 1])
+            return Proc(cmd, 0, "https://github.com/o/r/issues/321\n", "")
+        return Proc(cmd, 0, "", "")
+
+    res = synthesize(
+        cfg, cycle_index=0, root=str(tmp_path), runner=runner, ai_runner=runner
+    )
+
+    assert res.filed == [321]
+    assert sorted(res.practices) == ["crewai-evidence-guard", "swarm-context-travels"]
+    kb = KnowledgeBase.from_config(cfg, tmp_path)
+    assert kb.practice_ids() == {"crewai-evidence-guard", "swarm-context-travels"}
+    # every cited id resolves - which is exactly what the evidence guard checks
+    assert set(extract_practice_ids(filed_bodies[0])) <= kb.practice_ids()
+    # and the registry records which ticket adopted it
+    assert {p.adopted_by for p in kb.read_practices()} == {("#321",)}

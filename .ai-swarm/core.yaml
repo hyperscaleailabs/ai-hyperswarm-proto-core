@@ -191,6 +191,7 @@ constraints:
 knowledge:
   root: knowledge                    # Obsidian vault content lives under the repo root
   lessons_dir: knowledge/lessons
+  practices_dir: knowledge/practices   # registry of practices adopted from the reference set
   whitepapers_dir: knowledge/whitepapers
   mocs_dir: knowledge/MOCs
   templates_dir: knowledge/templates

@@ -11,6 +11,7 @@ import re
 from dataclasses import dataclass, field
 
 from .github import Issue
+from .knowledge import Practice
 
 # Sections a substantial ticket must carry.
 ACCEPTANCE_HEADING = re.compile(r"^#{2,3}\s*acceptance criteria\s*$", re.IGNORECASE | re.MULTILINE)
@@ -39,6 +40,7 @@ class TicketSpec:
     size: str = "M"  # S | M | L
     goal_ids: tuple[str, ...] = ()
     synthesis_rationale: str = ""  # which reference projects were combined, and how
+    practices: tuple[Practice, ...] = ()  # registry entries this ticket draws on
     labels: tuple[str, ...] = ()
 
     def render(self) -> str:
@@ -50,6 +52,13 @@ class TicketSpec:
             if self.synthesis_rationale
             else ""
         )
+        # The citations the orchestrator threads onto the PR and the lesson, and
+        # that its evidence guard resolves against the practice registry.
+        cited = "\n".join(
+            f"- `{p.citation()}` - {p.source_repo} (`{p.artifact}`) - [[{p.note_name()}]]"
+            for p in self.practices
+        )
+        cites = f"\n## Practices cited\n{cited}\n" if self.practices else ""
         return f"""## Problem
 {self.problem}
 
@@ -61,7 +70,7 @@ class TicketSpec:
 
 ## Verification plan
 {vp}
-{synth}
+{synth}{cites}
 ## Meta
 - goals: {goals}
 - size: {self.size}

@@ -31,6 +31,7 @@ Every PR is held to three **traceability invariants**:
 | linked to a ticket | `build_pr_body` refuses to build a body without one |
 | records the model used | model + tier + selection rationale in the PR body |
 | carries a lesson learned (pass **or** fail) | written to `knowledge/lessons/` every iteration |
+| cites only evidence that resolves | practice ids come from the ticket and must exist in `knowledge/practices/` |
 
 ## Subscription-only, no metered API
 
@@ -52,13 +53,21 @@ Clone the repo and **open the folder as an Obsidian vault** - the committed
 
 ```
 knowledge/
-├── MOCs/          # Maps of Content: Knowledge Base / Lessons / Whitepapers
+├── MOCs/          # Maps of Content: Knowledge Base / Lessons / Practices / Whitepapers
 ├── lessons/       # one article per iteration (pass or fail)
+├── practices/     # one note per practice adopted from the reference set
 ├── whitepapers/   # periodic syntheses (every N lessons)
 └── templates/     # note templates
 ```
 
 `hsai reindex` rebuilds the MOCs from what is on disk.
+
+**Provenance is registered, not asserted.** Each `knowledge/practices/` note
+names the source repo and the *artifact* it was observed in (a file, a workflow,
+a PR), what that project does, and what we did instead. Tickets cite them as
+`practice:<id>`; the orchestrator threads exactly those ids onto the PR and into
+the lesson, renders `_(none cited)_` when a run cited nothing, and recovers a
+self-improve PR whose citation does not resolve.
 
 **The loop reads the vault back.** Before an agent starts, `hsai.recall` builds
 a BM25 index over `knowledge/lessons`, `knowledge/whitepapers` and `docs/adr`
