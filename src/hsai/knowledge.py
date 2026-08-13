@@ -61,6 +61,7 @@ class Lesson:
     repro_evidence: str = ""  # heal/bugfix only: failing-then-passing reproduction proof
     recalled: tuple[str, ...] = ()  # prior notes injected into this run's prompt
     review_verdict: str = ""  # the independent reviewer's verdict, verbatim
+    execution_trace: str = ""  # turns/tools/tokens/exit status; "" when no model ran
 
     def note_name(self) -> str:
         return f"{self.created}-{slugify(self.title)}"
@@ -328,6 +329,9 @@ class KnowledgeBase:
         repro = lesson.repro_evidence or "_(not applicable: not a heal/bugfix ticket)_"
         # Who checked the work, not just who wrote it (G2).
         review = lesson.review_verdict or "_(no independent review recorded)_"
+        # Real agent telemetry (G4's cost signal), quoted as a compact digest -
+        # never the raw transcript, which stays local and gitignored.
+        trace = lesson.execution_trace or "_(no agent run recorded)_"
         return f"""{fm}
 
 # {lesson.title}
@@ -349,6 +353,9 @@ class KnowledgeBase:
 
 ## What happened
 {lesson.what_happened}
+
+## Execution trace
+{trace}
 
 ## Lesson learned
 {lesson.lesson}

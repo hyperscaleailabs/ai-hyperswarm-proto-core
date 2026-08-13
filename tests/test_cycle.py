@@ -54,7 +54,8 @@ def _make_fake_run_once(ledger_file, *, tier: str, seconds: float):
     """
     state = {"demotes": [], "started_prs": [], "merged_prs": []}
 
-    def fake(cfg, *, repo_dir, runner, ai_runner, iteration, demote_tier=False, dry_run=False):
+    def fake(cfg, *, repo_dir, runner, ai_runner, iteration, block=0,
+             demote_tier=False, dry_run=False):
         state["demotes"].append(demote_tier)
         pr = 500 + len(state["demotes"])
         state["started_prs"].append(pr)
@@ -62,7 +63,7 @@ def _make_fake_run_once(ledger_file, *, tier: str, seconds: float):
         ledger.append_record(
             ledger_file,
             ledger.LedgerRecord(
-                iteration=iteration, block=iteration // 100, ticket=iteration,
+                iteration=iteration, block=block, ticket=iteration,
                 kind="implement", tier=recorded_tier, model=recorded_tier,
                 wall_clock_seconds=seconds, attempts=1, outcome="merged",
             ),
@@ -294,7 +295,8 @@ def _make_run_once(ledger_file, *, crash_at: int | None = None):
     """
     state: dict[str, list[int]] = {"iterations": []}
 
-    def fake(cfg, *, repo_dir, runner, ai_runner, iteration, demote_tier=False, dry_run=False):
+    def fake(cfg, *, repo_dir, runner, ai_runner, iteration, block=0,
+             demote_tier=False, dry_run=False):
         position = iteration % 100
         if crash_at is not None and position == crash_at:
             raise RuntimeError(f"worker died during iteration {iteration}")
@@ -302,7 +304,7 @@ def _make_run_once(ledger_file, *, crash_at: int | None = None):
         ledger.append_record(
             ledger_file,
             ledger.LedgerRecord(
-                iteration=iteration, block=iteration // 100, ticket=iteration,
+                iteration=iteration, block=block, ticket=iteration,
                 kind="implement", tier="standard", model="sonnet",
                 wall_clock_seconds=5.0, attempts=1, outcome="merged",
             ),

@@ -973,6 +973,60 @@ def test_token_counts_reach_the_ledger_and_the_block_aggregate(tmp_path):
     assert "2280 tokens/merged PR" in agg.summary()
 
 
+def test_run_loop_iterations_use_a_block_sentinel_distinct_from_cycle_blocks(tmp_path):
+    """Ad-hoc `hsai loop`/`run-once` iterations must never pollute a real
+    cycle's block aggregate - including cycle 0, a legitimate block index
+    (`iteration // 100` used to put every ad-hoc run there too)."""
+    cfg = load_config()
+    ledger_file = ledger.ledger_path(cfg, tmp_path)
+
+    # A cycle-driven iteration explicitly tagged block=0, exactly as
+    # `hsai cycle --index 0` would (cycle.py passes `block=idx` explicitly).
+    ledger.append_record(ledger_file, ledger.LedgerRecord(
+        iteration=1, block=0, ticket=1, kind="implement", tier="standard",
+        model="sonnet", wall_clock_seconds=10.0, attempts=1, outcome="merged",
+    ))
+
+    # An ad-hoc `hsai loop` run, through the real orchestrator entry point.
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[dict(WIDGET_ISSUE)],
+    )
+    orchestrator.run_loop(
+        cfg, repo_dir=str(tmp_path), max_iterations=1, runner=runner, ai_runner=runner,
+    )
+
+    records = ledger.read_records(ledger_file)
+    adhoc = [r for r in records if r.kind == IMPLEMENT and r.ticket == 7]
+    assert len(adhoc) == 1
+    assert adhoc[0].block == orchestrator.ADHOC_BLOCK
+    assert orchestrator.ADHOC_BLOCK != 0
+
+    # Cycle 0's aggregate reflects ONLY the cycle-tagged record.
+    agg0 = ledger.aggregate_block(records, block=0)
+    assert agg0.iterations == 1
+
+
+def test_cycle_passes_an_explicit_block_decoupled_from_the_iteration_encoding(tmp_path):
+    """`iteration = block * 100 + n` is a uniqueness convention for trajectory
+    file names, not how the block is derived: an explicit `block` overrides
+    whatever `iteration // 100` would have produced."""
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[dict(WIDGET_ISSUE)],
+    )
+
+    # An iteration number that would derive block=9 the old way, but the
+    # caller (as `hsai cycle` now does) explicitly says this is block 3.
+    run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=903, block=3,
+    )
+
+    records = [r for r in ledger.read_records(ledger.ledger_path(cfg, tmp_path))
+               if r.kind == IMPLEMENT]
+    assert records[0].block == 3
+
+
 def test_trajectory_digest_reaches_the_lesson_and_the_pr_body(tmp_path):
     """The audit trail is visible on the PR, not only on local disk."""
     cfg = load_config()
@@ -995,6 +1049,13 @@ def test_trajectory_digest_reaches_the_lesson_and_the_pr_body(tmp_path):
         assert "exit=ok" in text                  # how it ended
         assert "hsai traj 14" in text             # where the full record is
     assert "## Trajectory" in pr_body
+
+    # The lesson also carries a dedicated, machine-parseable execution trace -
+    # the compact digest of real agent telemetry G4's cost signal is built on.
+    assert "## Execution trace" in lesson_text
+    assert "1500 in / 320 out" in lesson_text
+    assert "exit status: ok" in lesson_text
+    assert "tools used: Read" in lesson_text
 
 
 def test_non_json_agent_output_still_produces_an_iteration_and_trajectory(tmp_path):
@@ -1021,6 +1082,12 @@ def test_non_json_agent_output_still_produces_an_iteration_and_trajectory(tmp_pa
     # The ledger record still exists; its token columns are simply null.
     authored = _iteration_records(cfg, tmp_path)[0]
     assert authored.input_tokens is None and authored.output_tokens is None
+
+    # The lesson honestly records that telemetry could not be captured, rather
+    # than silently omitting the section or claiming a false zero.
+    lesson_text = Path(result.lesson_path).read_text()
+    assert "## Execution trace" in lesson_text
+    assert "telemetry=unavailable" in lesson_text
 
 
 LOUD_AGENT_JSON = json.dumps(

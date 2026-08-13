@@ -69,7 +69,13 @@ def parse_output(stdout: str) -> tuple[dict[str, Any] | None, dict[str, Any] | N
 
 
 def _sanitized_env(cfg: CoreConfig) -> dict[str, str]:
-    """Return an env with forbidden (billing) variables removed."""
+    """Return the *complete* child env with forbidden (billing) variables removed.
+
+    This is the whole environment the ``claude`` subprocess will see, not a
+    patch to be merged onto one - :func:`hsai.proc.run` treats a supplied
+    ``env`` as authoritative (matching :class:`subprocess.Popen`'s own
+    convention), so a key popped here stays popped all the way to the child.
+    """
     env = dict(os.environ)
     for key in cfg.forbidden_env:
         env.pop(key, None)
@@ -79,6 +85,13 @@ def _sanitized_env(cfg: CoreConfig) -> dict[str, str]:
         # Signal to the CLI to prefer subscription auth where supported.
         env.setdefault("CLAUDE_CODE_SUBSCRIPTION_ONLY", "1")
     return env
+
+
+def child_env(cfg: CoreConfig) -> dict[str, str]:
+    """Public entrance to :func:`_sanitized_env`, for callers outside this
+    module that need to inspect (``hsai doctor``) or reuse the exact
+    environment a real agent invocation would run with."""
+    return _sanitized_env(cfg)
 
 
 def build_command(

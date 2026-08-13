@@ -195,7 +195,7 @@ def _implementation_block(
             jr, "iteration", str(i),
             lambda i=i, decision=decision: _iteration_payload(run_once(
                 cfg, repo_dir=str(repo_root), runner=runner, ai_runner=ai_runner,
-                iteration=idx * 100 + i + 1, demote_tier=decision.demote,
+                iteration=idx * 100 + i + 1, block=idx, demote_tier=decision.demote,
                 dry_run=dry_run,
             )),
         )

@@ -1,5 +1,6 @@
 import json
 
+from hsai import orchestrator
 from hsai.ai import run_agent
 from hsai.config import load_config
 from hsai.ledger import (
@@ -98,6 +99,19 @@ def test_parse_tokens_none_when_absent_or_plain_text():
 
 
 # --- block aggregation ------------------------------------------------------
+
+def test_adhoc_block_sentinel_never_aggregates_into_cycle_block_zero():
+    """Cycle block 0 is a legitimate index; ad-hoc `hsai loop` iterations must
+    never fold into it (the collision `iteration // 100` used to cause)."""
+    assert orchestrator.ADHOC_BLOCK != 0
+    records = [
+        _rec(block=0, seconds=10.0),                       # a real cycle-0 iteration
+        _rec(block=orchestrator.ADHOC_BLOCK, seconds=999.0),  # an ad-hoc `hsai loop` run
+    ]
+    agg0 = aggregate_block(records, block=0)
+    assert agg0.iterations == 1
+    assert agg0.total_seconds == 10.0
+
 
 def test_aggregate_block_folds_only_matching_block():
     records = [

@@ -10,7 +10,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .config import CoreConfig
-from .orchestrator import IterationResult, run_once
+from .orchestrator import ADHOC_BLOCK, IterationResult, run_once
 from .proc import Runner, run
 
 
@@ -38,6 +38,7 @@ def run_parallel(
                     runner=runner,
                     ai_runner=ai_runner,
                     iteration=r * workers + w + 1,
+                    block=ADHOC_BLOCK,
                 )
                 for w in range(workers)
             ]

@@ -1,8 +1,10 @@
 import json
+from dataclasses import replace
 
 from hsai import cli as cli_module
 from hsai import trajectory
 from hsai.cli import build_parser, main
+from hsai.config import load_config
 from hsai.repro import ReproResult
 from hsai.trajectory import Step, Trajectory
 
@@ -62,6 +64,43 @@ def test_cycle_command_passes_resume_through(monkeypatch, capsys):
     assert rc == 0
     assert seen["resume"] is True and seen["cycle_index"] == 42 and seen["dry_run"] is False
     assert "block 42 (resumed)" in out and "/tmp/j.jsonl" in out
+
+
+# --- doctor: a LIVE child-environment check, not just config inspection -----
+
+def test_doctor_reports_the_live_child_env_check_as_pass(monkeypatch, capsys):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-should-be-stripped")
+
+    rc = main(["doctor"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "child env check: PASS" in out
+    assert "absent from the real child environment" in out
+
+
+def test_doctor_fails_and_exits_nonzero_when_the_key_would_actually_leak(
+    monkeypatch, capsys
+):
+    """Config-only checks (subscription guard, `validate`) cannot catch a bug
+    in how the environment is actually assembled - only spawning a real child
+    and inspecting it can. Here `subscription_only=False` disables the
+    belt-and-suspenders strip too, so ANTHROPIC_API_KEY genuinely reaches the
+    probed child unless the live check is really live.
+    """
+    leaky_cfg = replace(
+        load_config(),
+        constraints={"subscription_only": False, "forbid_env": []},
+    )
+    monkeypatch.setattr(cli_module, "_load", lambda args: leaky_cfg)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-should-leak")
+
+    rc = main(["doctor"])
+    out = capsys.readouterr().out
+
+    assert rc == 1
+    assert "child env check: FAIL" in out
+    assert "IS present" in out
 
 
 def test_parser_recall_defaults():

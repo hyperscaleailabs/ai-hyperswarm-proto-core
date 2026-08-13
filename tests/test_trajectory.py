@@ -219,6 +219,50 @@ def test_digest_without_usage_says_so():
     assert "tokens=unreported" in _traj(usage=None).digest()
 
 
+# --- execution trace (the lesson's '## Execution trace' section) ------------
+
+def test_tools_used_lists_distinct_names_in_first_use_order():
+    traj = _traj(steps=[
+        Step(index=1, kind="tool_use", name="Read", text="{}"),
+        Step(index=2, kind="tool_result", text="ok"),
+        Step(index=3, kind="tool_use", name="Write", text="{}"),
+        Step(index=4, kind="tool_use", name="Read", text="{}"),  # repeat, not re-listed
+    ])
+    assert traj.tools_used() == ["Read", "Write"]
+
+
+def test_tools_used_is_empty_for_a_plain_text_run():
+    assert _traj(steps=[Step(index=1, kind="output", text="plain")]).tools_used() == []
+
+
+def test_execution_trace_reports_turns_tools_tokens_and_exit_status():
+    traj = _traj(
+        num_turns=3,
+        usage={"input_tokens": 1500, "output_tokens": 320},
+        exit_status="ok", outcome="merged", duration_seconds=12.3,
+        steps=[
+            Step(index=1, kind="tool_use", name="Read", text="{}"),
+            Step(index=2, kind="tool_result", text="ok"),
+            Step(index=3, kind="result", text="done"),
+        ],
+    )
+    trace = traj.execution_trace()
+    assert "turns: 3" in trace
+    assert "tools used: Read" in trace
+    assert "1500 in / 320 out" in trace
+    assert "exit status: ok" in trace
+    assert "duration: 12.3s" in trace
+    assert "outcome: merged" in trace
+    assert "hsai traj 12" in trace
+
+
+def test_execution_trace_reports_telemetry_unavailable_without_usage():
+    trace = _traj(usage=None, num_turns=None, steps=[]).execution_trace()
+    assert "telemetry=unavailable" in trace
+    assert "turns: (unknown)" in trace
+    assert "tools used: (none)" in trace
+
+
 def test_digest_points_at_the_first_failing_step():
     traj = _traj(steps=[
         Step(index=1, kind="assistant", text="reading the file"),
@@ -247,6 +291,26 @@ def test_record_builds_from_an_ai_result(tmp_path):
     assert "ghp_0123456789abcdefghij" not in traj.error  # errors are scrubbed too
     assert traj.prompt_digest == trajectory.prompt_digest("fix it")
     assert trajectory.path_for(tmp_path, "3", 0).is_file()
+
+
+def test_record_captures_num_turns_when_the_envelope_reports_it(tmp_path):
+    payload = dict(MESSAGES_PAYLOAD, num_turns=5)
+    ares = AIResult(
+        ok=True, model="sonnet", output=json.dumps(payload), error="",
+        cmd=["claude"], usage=payload["usage"], payload=payload,
+    )
+    traj = trajectory.record(
+        tmp_path, iteration=6, ticket=1, kind="implement", tier="standard",
+        model="sonnet", prompt="do it", result=ares, block=0,
+    )
+    assert traj.num_turns == 5
+
+    # A plain-text run (no envelope) reports no turn count - not a crash.
+    plain = AIResult(ok=True, model="sonnet", output="done", error="", cmd=["claude"])
+    assert trajectory.record(
+        tmp_path, iteration=7, ticket=1, kind="implement", tier="standard",
+        model="sonnet", prompt="do it", result=plain, block=0,
+    ).num_turns is None
 
 
 def test_record_captures_the_session_id_when_exposed(tmp_path):

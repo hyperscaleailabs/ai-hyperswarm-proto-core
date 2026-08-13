@@ -1,10 +1,11 @@
 import json
+import subprocess
 from dataclasses import replace
 
 from hsai import ai
 from hsai.config import load_config
 from hsai.models import ModelChoice
-from hsai.proc import Proc
+from hsai.proc import Proc, run as real_run
 
 CHOICE = ModelChoice(tier="standard", model="sonnet", rationale="test")
 
@@ -129,3 +130,33 @@ def test_run_agent_strips_billing_env(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-should-be-stripped")
     ai.run_agent("prompt", CHOICE, cfg, runner=runner)
     assert "ANTHROPIC_API_KEY" not in seen["env"]
+
+
+def test_child_env_is_the_public_entrance_to_the_sanitized_env(monkeypatch):
+    cfg = load_config()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-should-be-stripped")
+    env = ai.child_env(cfg)
+    assert "ANTHROPIC_API_KEY" not in env
+
+
+def test_run_agent_env_leak_is_fixed_end_to_end(monkeypatch):
+    """The regression test for the real defect: drive `ai.run_agent` through
+    the REAL `proc.run` (not a fake) and inspect the env at the actual
+    subprocess boundary. This is what proves the leak is gone all the way to
+    the process `claude -p` would run as - a fake runner can never prove this,
+    since it never touches proc.run's (previously buggy) merge logic.
+    """
+    cfg = load_config()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-should-be-stripped")
+    captured: dict = {}
+
+    def fake_subprocess_run(cmd, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return subprocess.CompletedProcess(cmd, 0, CLAUDE_JSON_PAYLOAD, "")
+
+    monkeypatch.setattr(subprocess, "run", fake_subprocess_run)
+
+    result = ai.run_agent("prompt", CHOICE, cfg, runner=real_run)
+
+    assert result.ok is True
+    assert "ANTHROPIC_API_KEY" not in captured["env"]

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 import subprocess
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 
@@ -31,13 +31,27 @@ def run(
     *,
     cwd: str | None = None,
     env: Mapping[str, str] | None = None,
+    env_remove: Iterable[str] | None = None,
     timeout: float | None = None,
     input_text: str | None = None,
 ) -> Proc:
-    """Run ``cmd`` and capture output. Never raises on non-zero exit."""
-    full_env = dict(os.environ)
-    if env is not None:
-        full_env.update(env)
+    """Run ``cmd`` and capture output. Never raises on non-zero exit.
+
+    ``env``, when given, is the complete child environment (matching
+    :class:`subprocess.Popen`'s own convention) rather than a patch merged onto
+    a fresh copy of ``os.environ`` - the previous merge-only behavior could add
+    or override a variable but could never make one absent, which is exactly
+    the shape of bug that let a stripped ``ANTHROPIC_API_KEY`` reappear from
+    ``os.environ`` on its way to the child. ``env_remove`` covers the common
+    case of "inherit everything except these": it applies on top of whatever
+    ``env`` resolves to (the given mapping, or ``os.environ`` when ``env`` is
+    ``None``), so a caller never has to hand-copy the whole environment just to
+    guarantee one variable's absence.
+    """
+    full_env = dict(env) if env is not None else dict(os.environ)
+    if env_remove:
+        for key in env_remove:
+            full_env.pop(key, None)
     try:
         completed = subprocess.run(  # noqa: S603 - cmd is a list, never shell=True
             list(cmd),

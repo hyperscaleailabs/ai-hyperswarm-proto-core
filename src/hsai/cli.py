@@ -21,7 +21,32 @@ from . import __version__, ai, recall, repro, trajectory
 from .config import CoreConfig, load_config, validate
 from .knowledge import KnowledgeBase
 from .orchestrator import run_loop
+from .proc import run as proc_run
 from .swarm import run_parallel
+
+# Child processes spawned to PROBE the environment (never a `claude` call, and
+# never metered) are told apart from real agent runs by this marker.
+_LEAK_PROBE_CMD = [
+    sys.executable, "-c",
+    "import os, sys; sys.stdout.write('LEAK' if 'ANTHROPIC_API_KEY' in os.environ else 'CLEAN')",
+]
+
+
+def _live_child_env_check(cfg: CoreConfig) -> tuple[bool, str]:
+    """Actually spawn a child with the real sanitized env and inspect it.
+
+    `ai.preflight`/`validate` only read *config* - they cannot catch a runtime
+    bug in how the environment is actually assembled (exactly the defect that
+    let a stripped ``ANTHROPIC_API_KEY`` reappear via ``os.environ`` on its way
+    to the child; see :func:`hsai.proc.run`). This spends no quota: the probe
+    is a one-line Python subprocess, never ``claude``.
+    """
+    proc = proc_run(_LEAK_PROBE_CMD, env=ai.child_env(cfg), timeout=10)
+    if not proc.ok:
+        return False, f"could not probe the child environment: {proc.stderr.strip()}"
+    if proc.stdout.strip() == "LEAK":
+        return False, "ANTHROPIC_API_KEY IS present in the real child environment"
+    return True, "ANTHROPIC_API_KEY is absent from the real child environment"
 
 
 def _load(args: argparse.Namespace) -> CoreConfig:
@@ -52,12 +77,21 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     for e in v.errors:
         print(f"  config ERR: {e}")
         ok = False
-    # Subscription-only guard
+    # Subscription-only guard (static: config only)
     try:
         ai.preflight(cfg)
         print("  subscription guard: OK (no metered API path)")
     except ai.SubscriptionGuardError as exc:
         print(f"  subscription guard: FAIL - {exc}")
+        ok = False
+    # Live child-environment check (dynamic: an actual subprocess, not just
+    # config inspection) - the only thing that can catch a bug in how the
+    # environment is assembled rather than in what the config says it should be.
+    leak_ok, leak_msg = _live_child_env_check(cfg)
+    if leak_ok:
+        print(f"  child env check: PASS - {leak_msg}")
+    else:
+        print(f"  child env check: FAIL - {leak_msg}")
         ok = False
     print(f"  constraints: subscription_only={cfg.subscription_only}, "
           f"require_ticket_per_pr={cfg.constraints.get('require_ticket_per_pr')}")
