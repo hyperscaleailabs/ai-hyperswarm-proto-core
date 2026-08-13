@@ -153,9 +153,11 @@ via its own pipeline (pull-based publishing).
 ## Development
 
 ```bash
-ruff check .
-pytest
+hsai ci --scope local     # the CI contract declared in .ai-swarm/core.yaml
 ```
+
+The same steps run on GitHub via `hsai ci --scope remote`; see
+[CONTRIBUTING.md](CONTRIBUTING.md#the-ci-contract) for how to change them.
 
 ## License
 
