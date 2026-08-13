@@ -136,6 +136,10 @@ synthesis:
   ideas_target: 10             # candidate ideas generated before reflection
   file_top: 3                  # tickets actually filed after critique + prioritization
   min_projects_combined: 3     # an idea must combine practices from >= N reference projects
+  memory_max_chars: 3000       # hard cap on the rendered "already tried" prompt section
+  memory_max_lessons: 25       # most-recent lessons folded into that section
+  memory_closed_tickets: 15    # most-recently-closed tickets folded into that section
+  duplicate_threshold: 0.6     # Jaccard overlap (normalized title tokens) => reject as duplicate
 
 # Quota/cost budget for one half-day block (subscription-only: purely local
 # measurement, never a metered API call). The ledger aggregates each block's

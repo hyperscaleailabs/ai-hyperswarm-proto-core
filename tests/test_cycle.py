@@ -184,6 +184,40 @@ def test_cycle_prunes_trajectory_blocks_beyond_retention(tmp_path, monkeypatch):
     assert any("pruned trajectories" in n for n in res.report.notes)
 
 
+def test_run_cycle_surfaces_duplicate_rejections_in_the_brief(tmp_path, monkeypatch):
+    cfg = load_config()
+    cfg.cycle["block_size"] = 0            # no iterations; isolate synthesis
+
+    def fake_synthesize(cfg, *, cycle_index, runner, ai_runner) -> SynthesisResult:
+        num = github.create_issue(
+            cfg.repo_slug, "feat: synthesized novel idea", "problem/proposal", ["hsai"],
+            runner=runner,
+        )
+        return SynthesisResult(
+            ok=True, studied=["a/b"], filed=[num], error="only 1/3 candidate(s) were novel",
+            duplicates_rejected=2,
+            rejected_titles=("feat: already open thing", "feat: another duplicate"),
+        )
+
+    runner = _Runner()
+    monkeypatch.setattr(cycle, "synthesize", fake_synthesize)
+    monkeypatch.setattr(cycle, "_well_formed_backlog", lambda cfg, *, runner: 0)
+    monkeypatch.setattr(cycle, "_governance_pr", lambda *a, **k: 0)
+
+    res = cycle.run_cycle(cfg, repo_dir=str(tmp_path), cycle_index=1, runner=runner)
+
+    assert any(
+        "2 duplicate(s) rejected" in n
+        and "feat: already open thing" in n
+        and "feat: another duplicate" in n
+        for n in res.report.notes
+    )
+    assert any("only 1/3 candidate(s) were novel" in n for n in res.report.notes)
+    assert runner.review_bodies
+    brief = runner.review_bodies[-1]
+    assert "duplicate(s) rejected" in brief
+
+
 # --- crash + resume: the cycle journal --------------------------------------
 #
 # A block is a long chain of expensive, side-effecting steps. These tests kill

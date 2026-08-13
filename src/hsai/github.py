@@ -139,6 +139,36 @@ def list_open_issues(repo: str, *, runner: Runner = run) -> list[Issue]:
     return issues
 
 
+def list_closed_issues(repo: str, *, limit: int = 15, runner: Runner = run) -> list[Issue]:
+    """Most recently closed issues, newest-closed first (capped).
+
+    Read by synthesis memory only - never assigned/claimed like open issues,
+    so `assignees` is always empty here.
+    """
+    p = _gh(
+        [
+            "issue", "list", "--repo", repo, "--state", "closed",
+            "--limit", str(limit),
+            "--json", "number,title,labels,closedAt",
+        ],
+        runner=runner,
+    )
+    try:
+        data = json.loads(p.stdout or "[]")
+    except json.JSONDecodeError:
+        return []
+    data.sort(key=lambda item: item.get("closedAt") or "", reverse=True)
+    return [
+        Issue(
+            number=item["number"],
+            title=item.get("title", ""),
+            labels=tuple(lb["name"] for lb in item.get("labels", [])),
+            assignees=(),
+        )
+        for item in data
+    ]
+
+
 def next_ticket(repo: str, *, runner: Runner = run) -> Issue | None:
     issues = list_open_issues(repo, runner=runner)
     return issues[0] if issues else None

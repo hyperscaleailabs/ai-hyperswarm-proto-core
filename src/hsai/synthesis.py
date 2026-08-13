@@ -87,53 +87,177 @@ def build_context_pack(
     return ContextPack(repos=repos, sections=sections)
 
 
-TRIED_HEADING = "Already tried in this repo"
+TRIED_HEADING = "What this loop has already tried"
+
+# Threshold for is_duplicate(): the fraction of normalized title tokens two
+# candidates must share (Jaccard over the union) before the newer one is
+# treated as a re-proposal rather than a genuinely new idea. Tuned so a
+# prefix-only rename (feat: -> refactor:) always matches (union == overlap =>
+# 1.0) while two candidates that merely share a couple of common words do not.
+DUPLICATE_JACCARD_THRESHOLD = 0.6
 
 
-def build_tried_digest(
+@dataclass(frozen=True)
+class TicketRef:
+    number: int
+    title: str
+    blocked: bool = False
+
+
+@dataclass
+class MemoryPack:
+    """What this loop has already tried, queued, or finished with.
+
+    Three sources, each capped and newest-first: open tickets (still queued or
+    in flight), recently closed tickets (finished, one way or another), and
+    knowledge-base lesson outcomes (pass/fail on ideas actually attempted).
+
+    Kept separate from :class:`ContextPack` - that studies OTHER projects;
+    this is our OWN history - so it can never be silently displaced by the
+    rotating reference digest, and so :func:`is_duplicate` has one place to
+    read prior titles from.
+    """
+
+    open_tickets: tuple[TicketRef, ...] = ()
+    closed_tickets: tuple[TicketRef, ...] = ()
+    lesson_lines: tuple[str, ...] = ()  # "**outcome** - title", failures first
+
+    def prior_titles(self) -> tuple[str, ...]:
+        """Every title a new candidate could duplicate, order preserved, deduped."""
+        lesson_titles = (
+            line.split(" - ", 1)[1] for line in self.lesson_lines if " - " in line
+        )
+        titles = (
+            [t.title for t in self.open_tickets]
+            + [t.title for t in self.closed_tickets]
+            + list(lesson_titles)
+        )
+        return tuple(dict.fromkeys(titles))
+
+    def render(self, max_chars: int = 3000) -> str:
+        """Titles-only digest for the prompt, hard-capped so it can never
+        crowd out the reference-project study material."""
+        lines: list[str] = []
+        if self.lesson_lines:
+            lines.append("Lessons already recorded (outcome - title):")
+            lines.extend(f"- {line}" for line in self.lesson_lines)
+        if self.open_tickets:
+            lines.append("")
+            lines.append("Tickets already filed and still open:")
+            lines.extend(
+                f"- #{t.number} {t.title}" + (" (blocked)" if t.blocked else "")
+                for t in self.open_tickets
+            )
+        if self.closed_tickets:
+            lines.append("")
+            lines.append("Recently closed tickets:")
+            lines.extend(f"- #{t.number} {t.title}" for t in self.closed_tickets)
+        text = "\n".join(lines).strip()
+        if not text:
+            return "_(nothing recorded yet - this is an early cycle)_"
+        if len(text) > max_chars:
+            text = text[: max_chars - 1].rstrip() + "…"
+        return text
+
+
+def build_memory_pack(
     cfg: CoreConfig,
     *,
     root: str = ".",
     runner: Runner = run,
     max_lessons: int = 25,
-) -> str:
-    """What this repo has already attempted: lessons (with outcomes) + open tickets.
+) -> MemoryPack:
+    """Gather what this loop has already tried: open tickets, recently closed
+    tickets, and knowledge-base lesson outcomes.
 
-    Without it the planner keeps re-proposing ideas that were tried and failed,
-    because its only context is a freshly fetched digest of OTHER projects.
-    Failures are listed first - they are the ones worth not repeating.
+    Without it the planner keeps re-proposing ideas that were tried and failed
+    or are already queued, because its only context is a freshly fetched
+    digest of OTHER projects. Every source degrades independently to empty
+    (unreachable `gh`, unreadable/empty knowledge base) rather than aborting
+    synthesis - a planner with partial memory is still far better than one
+    that never runs.
     """
-    lines: list[str] = []
+    open_issues = github.list_open_issues(cfg.repo_slug, runner=runner)
+    open_refs = tuple(
+        TicketRef(i.number, i.title, blocked=i.is_blocked)
+        for i in sorted(open_issues, key=lambda i: i.number, reverse=True)
+    )
+
+    closed_cap = int(cfg.synthesis.get("memory_closed_tickets", 15))
+    closed_issues = github.list_closed_issues(cfg.repo_slug, limit=closed_cap, runner=runner)
+    closed_refs = tuple(TicketRef(i.number, i.title) for i in closed_issues)
+
+    max_lessons = int(cfg.synthesis.get("memory_max_lessons", max_lessons))
     try:
         records = KnowledgeBase.from_config(cfg, root).read_lessons()
     except OSError:
         records = []
+    lesson_lines: tuple[str, ...] = ()
     if records:
         # Failures first, then by note name: a total, reproducible order.
         window = sorted(
             records[-max_lessons:], key=lambda r: (r.outcome != "fail", r.note_name)
         )
-        lines.append("Lessons already recorded (outcome - title):")
-        lines.extend(f"- **{r.outcome}** - {r.title}" for r in window)
+        lesson_lines = tuple(f"**{r.outcome}** - {r.title}" for r in window)
 
-    filed = [
-        i.title for i in github.list_open_issues(cfg.repo_slug, runner=runner)
-        if "self-improve" in i.labels
-    ]
-    if filed:
-        lines.append("")
-        lines.append("Synthesis tickets already filed and still open:")
-        lines.extend(f"- {t}" for t in sorted(set(filed)))
-
-    return "\n".join(lines) or "_(nothing recorded yet - this is an early cycle)_"
+    return MemoryPack(open_tickets=open_refs, closed_tickets=closed_refs, lesson_lines=lesson_lines)
 
 
-def build_prompt(cfg: CoreConfig, pack: ContextPack, tried: str = "") -> str:
+_CONVENTIONAL_PREFIX_RE = re.compile(
+    r"^(feat|fix|refactor|chore|docs|test|perf|build|ci|skill)(\([^)]*\))?:\s*",
+    re.IGNORECASE,
+)
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+_TITLE_STOPWORDS = {
+    "a", "an", "the", "and", "or", "for", "to", "of", "in", "on", "with", "by",
+    "is", "are", "be", "as", "at", "it", "its", "this", "that", "via",
+    "add", "adds", "adding", "new", "into", "from", "so", "not", "no",
+}
+
+
+def _normalize_title(title: str) -> set[str]:
+    """Strip a conventional-commit prefix and stopwords, tokenize the rest."""
+    stripped = _CONVENTIONAL_PREFIX_RE.sub("", title.strip())
+    tokens = _TOKEN_RE.findall(stripped.lower())
+    return {t for t in tokens if t not in _TITLE_STOPWORDS and len(t) > 2}
+
+
+def is_duplicate(
+    spec: TicketSpec,
+    memory: MemoryPack,
+    *,
+    threshold: float = DUPLICATE_JACCARD_THRESHOLD,
+) -> str | None:
+    """Is this candidate substantially the same as something already tried?
+
+    Pure and side-effect-free: an exact-title check (case-insensitive), then
+    normalized-token Jaccard overlap against every prior title in `memory`
+    (open tickets, closed tickets, lesson titles). Returns the matched prior
+    title so the caller can log/report it, or ``None`` when the candidate is
+    genuinely new.
+    """
+    candidate_lower = spec.title.strip().lower()
+    candidate_norm = _normalize_title(spec.title)
+    for prior_title in memory.prior_titles():
+        if candidate_lower == prior_title.strip().lower():
+            return prior_title
+        prior_norm = _normalize_title(prior_title)
+        if not candidate_norm or not prior_norm:
+            continue
+        overlap = len(candidate_norm & prior_norm) / len(candidate_norm | prior_norm)
+        if overlap >= threshold:
+            return prior_title
+    return None
+
+
+def build_prompt(cfg: CoreConfig, pack: ContextPack, memory: MemoryPack | None = None) -> str:
     goals = "\n".join(f"- {g.get('id')}: {g.get('title')} - {g.get('description', '')}"
                       for g in cfg.goals)
     ideas = int(cfg.synthesis.get("ideas_target", 10))
     top = int(cfg.synthesis.get("file_top", 3))
     combine = int(cfg.synthesis.get("min_projects_combined", 3))
+    max_chars = int(cfg.synthesis.get("memory_max_chars", 3000))
+    mem_text = (memory or MemoryPack()).render(max_chars)
     return f"""You are the SYNTHESIS planner for ai-hyperswarm-proto-core, an
 autonomous self-improving AI-swarm harness. Your job is NOT to copy one idea
 from one project, but to COMBINE practices across projects into substantial,
@@ -143,13 +267,13 @@ gh tickets, claude -p workers, CI gates, Obsidian knowledge base).
 Project goals:
 {goals}
 
-Study digest of reference projects for this cycle:
-{pack.render()}
-
 {TRIED_HEADING} - this is our OWN history, not another project's. Do NOT
 re-propose an idea whose lesson is listed here, and never duplicate the title of
-a ticket that is still open; build on them instead:
-{tried or "_(nothing recorded yet - this is an early cycle)_"}
+a ticket that is still open or was recently closed; build on them instead:
+{mem_text}
+
+Study digest of reference projects for this cycle:
+{pack.render()}
 
 Work in three explicit phases and show them all in your output:
 
@@ -159,7 +283,10 @@ implementable inside this repo, and advance a named goal.
 
 PHASE 2 - REFLECT: critique every candidate honestly - feasibility in a small
 codebase, real value vs novelty theater, risk to the loop's invariants
-(ticket-linked PRs, green-gated merges, subscription-only models).
+(ticket-linked PRs, green-gated merges, subscription-only models). A candidate
+that substantially overlaps anything in "{TRIED_HEADING}" above MUST be
+dropped here and its slot refilled with a genuinely new one - do not carry a
+re-proposal into PHASE 3.
 
 PHASE 3 - CONVERGE: pick the best {top} and emit them as a fenced ```json code
 block: a JSON array where each element has exactly these keys:
@@ -210,6 +337,8 @@ class SynthesisResult:
     studied: list[str]
     filed: list[int]
     error: str = ""
+    duplicates_rejected: int = 0
+    rejected_titles: tuple[str, ...] = ()
 
 
 def synthesize(
@@ -220,10 +349,16 @@ def synthesize(
     runner: Runner = run,
     ai_runner: Runner = run,
 ) -> SynthesisResult:
-    """Run one synthesis pass and file the resulting tickets."""
+    """Run one synthesis pass, drop duplicates of prior work, and file the rest.
+
+    A candidate that duplicates something already open, recently closed, or
+    recorded as a lesson is dropped rather than filed - see :func:`is_duplicate`.
+    Filtering never back-fills: if fewer than ``file_top`` candidates survive,
+    only the survivors are filed. An honest thin block beats a padded one.
+    """
     repos = pick_rotation(cfg, cycle_index)
     pack = build_context_pack(repos, runner=runner)
-    tried = build_tried_digest(cfg, root=root, runner=runner)
+    memory = build_memory_pack(cfg, root=root, runner=runner)
     tier = cfg.synthesis.get("tier", "heavy")
     model = cfg.tiers[tier].model if tier in cfg.tiers else cfg.tiers[cfg.default_tier].model
     choice = ModelChoice(
@@ -232,7 +367,7 @@ def synthesize(
         strategy="synthesis-v1",
     )
     ares = run_agent(
-        build_prompt(cfg, pack, tried), choice, cfg,
+        build_prompt(cfg, pack, memory), choice, cfg,
         timeout=float(cfg.synthesis.get("timeout_seconds", 2400)),
         runner=ai_runner,
     )
@@ -240,12 +375,39 @@ def synthesize(
         return SynthesisResult(ok=False, studied=repos, filed=[], error=ares.error[:500])
 
     specs = parse_ticket_specs(ares.output)
-    filed: list[int] = []
+    threshold = float(cfg.synthesis.get("duplicate_threshold", DUPLICATE_JACCARD_THRESHOLD))
+    file_top = int(cfg.synthesis.get("file_top", 3))
+
+    survivors: list[TicketSpec] = []
+    rejected_titles: list[str] = []
     for spec in specs:
+        matched = is_duplicate(spec, memory, threshold=threshold)
+        if matched:
+            rejected_titles.append(matched)
+        else:
+            survivors.append(spec)
+
+    filed: list[int] = []
+    for spec in survivors:
         num = github.create_issue(
             cfg.repo_slug, spec.title, spec.render(), spec.all_labels(), runner=runner
         )
         if num:
             filed.append(num)
-    return SynthesisResult(ok=bool(filed), studied=repos, filed=filed,
-                           error="" if specs else "no parseable ticket specs in output")
+
+    if not specs:
+        error = "no parseable ticket specs in output"
+    elif not survivors:
+        error = f"all {len(specs)} candidate(s) were duplicates of prior work"
+    elif len(survivors) < file_top:
+        error = (
+            f"only {len(survivors)}/{file_top} candidate(s) were novel - "
+            f"{len(rejected_titles)} rejected as duplicates; filing survivors only, no backfill"
+        )
+    else:
+        error = ""
+
+    return SynthesisResult(
+        ok=bool(filed), studied=repos, filed=filed, error=error,
+        duplicates_rejected=len(rejected_titles), rejected_titles=tuple(rejected_titles),
+    )
