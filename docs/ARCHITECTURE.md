@@ -96,6 +96,34 @@ Reference-set lineage: retrieval-before-planning from `assafelovic/gpt-researche
 index-then-retrieve with metadata preserved from `run-llama/llama_index`, and
 scoped agent memory from `OpenBMB/ChatDev`.
 
+## Provenance is registered, not asserted
+
+Goal G1 promises every improvement traces back to something observed in the
+field. That claim used to be stamped on, not earned: every PR body and every
+lesson carried the same three repo names, sliced off `reference_top10`.
+
+- **Registry.** `knowledge/practices/` holds one note per adopted practice -
+  `source_repo`, `artifact` (the file, workflow, PR or commit actually looked
+  at), `observation`, `adaptation`, and the tickets that adopted it.
+- **Citation.** A ticket cites practices as `practice:<id>`. `synthesis` writes
+  the registry notes *before* filing the ticket that cites them, so a citation
+  resolves from the moment it exists.
+- **Thread.** `orchestrator.run_once` reads the cited ids off the claimed
+  ticket body and passes exactly those into the PR body and `Lesson.references`.
+  Work that cited nothing renders `_(none cited)_` - never a borrowed list.
+- **Guard.** Next to the completeness guard, a self-improve or synthesized
+  ticket whose citation does not resolve in the registry is recovered
+  (`NO_EVIDENCE`), the same mechanism that catches knowledge-only diffs.
+- **Index.** `hsai reindex` builds a *Practices MOC* grouped by source repo, and
+  each whitepaper lists the practices cited by the lessons in its window - so
+  lesson -> practice -> MOC is a walkable path in the vault.
+
+Reference-set lineage: per-claim source attribution from
+`assafelovic/gpt-researcher`, per-phase auditable artifacts from
+`FoundationAgents/MetaGPT`, structural CI gates over conventions from
+`run-llama/llama_index`, and mechanical PR-metadata enforcement at intake from
+`crewAIInc/crewAI`.
+
 ## Testability
 
 Every wrapper takes an injectable `runner` (default: real subprocess). Tests

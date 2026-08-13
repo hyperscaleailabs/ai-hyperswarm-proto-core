@@ -7,6 +7,7 @@ import pytest
 
 from hsai import ledger, orchestrator, recall, review, trajectory
 from hsai.config import load_config
+from hsai.knowledge import PRACTICE_SECTION
 from hsai.models import ModelChoice
 from hsai.orchestrator import (
     HEAL,
@@ -266,13 +267,13 @@ def test_build_pr_body_contains_traceability():
     body = build_pr_body(
         ticket=42, choice=choice, lesson_note="2026-07-25-do-thing",
         lesson_summary="kept it small", ci_summary="CI green (ruff=pass, pytest=pass)",
-        references=("openai/swarm", "SWE-agent/SWE-agent"),
+        references=("swarm-error-execution-context",),
     )
     assert "Closes #42" in body          # ticket linkage
     assert "`opus`" in body              # model recorded
     assert "kept it small" in body       # lesson present
     assert "[[2026-07-25-do-thing]]" in body
-    assert "openai/swarm" in body
+    assert "[[swarm-error-execution-context]]" in body
 
 
 def test_build_pr_body_includes_phase_artifacts():
@@ -1232,7 +1233,7 @@ def test_build_pr_body_renders_prior_lessons_consulted():
     assert "## Prior lessons consulted" not in plain
     assert plain == build_pr_body(**kwargs, recalled=())
     assert (
-        "See [[2026-01-03-note]] in the knowledge base.\n\n## Reference-set evidence"
+        f"See [[2026-01-03-note]] in the knowledge base.\n\n## {PRACTICE_SECTION}"
         in plain
     )
 
@@ -1291,3 +1292,151 @@ def test_dry_run_still_records_what_it_recalled(tmp_path):
     assert result.kind == IMPROVE
     assert result.recalled                       # retrieval runs without an agent
     assert "recalled:" in Path(result.lesson_path).read_text().split("---\n")[1]
+
+
+# --- practice provenance: cited evidence, or none at all ---------------------
+
+PRACTICE_ID = "swarm-error-execution-context"
+CITING_BODY = (
+    WELL_FORMED_BODY
+    + f"\n## Practices cited\n- `practice:{PRACTICE_ID}` - openai/swarm (`README.md`)\n"
+)
+
+
+def _seed_practice(root: Path, practice_id: str = PRACTICE_ID) -> None:
+    """Plant a registry note in the tree the evidence guard will read."""
+    practices = root / "knowledge" / "practices"
+    practices.mkdir(parents=True, exist_ok=True)
+    (practices / f"{practice_id}.md").write_text(
+        "---\ntags:\n  - practice\n  - source/openai-swarm\n"
+        f"id: {practice_id}\nsource_repo: openai/swarm\n"
+        "artifact: README.md - handoffs carry context\ncreated: 2026-01-01\n---\n\n"
+        f"# {practice_id}\n\n## Observation\nContext travels with the work.\n\n"
+        "## Adaptation\nErrors name their phase.\n"
+    )
+
+
+def _improve_issue(body: str, number: int = 21) -> dict:
+    return {
+        "number": number,
+        "title": "feat: adopt one practice from the reference set",
+        "labels": [{"name": "priority:P2"}, {"name": "self-improve"}],
+        "assignees": [],
+        "body": body,
+    }
+
+
+def test_no_pr_or_lesson_ever_gets_the_reference_set_as_evidence(tmp_path):
+    """The old behaviour stamped `cfg.reference_top10[:3]` on every run."""
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[{
+            "number": 7, "title": "feat: add widget",
+            "labels": [{"name": "priority:P2"}], "assignees": [],
+            "body": WELL_FORMED_BODY,          # cites no practice at all
+        }],
+        worktree_status="?? src/hsai/widget.py\n",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    pr_create = next(c for c in runner.calls if c[:3] == ["gh", "pr", "create"])
+    pr_body = pr_create[pr_create.index("--body") + 1]
+    lesson_text = Path(result.lesson_path).read_text()
+
+    assert "_(none cited)_" in pr_body and "_(none cited)_" in lesson_text
+    for repo in [r.repo for r in cfg.reference_top10]:
+        assert repo not in pr_body
+        assert repo not in lesson_text
+
+
+def test_the_practice_the_ticket_cites_reaches_the_pr_and_the_lesson(tmp_path, monkeypatch):
+    cfg = load_config()
+    wt = _pin_worktree_path(monkeypatch, tmp_path, cfg, 1)
+    _seed_practice(wt)
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[_improve_issue(CITING_BODY)],
+        worktree_status="?? src/hsai/widget.py\n",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.recovered is False
+    assert result.pr is not None
+    pr_create = next(c for c in runner.calls if c[:3] == ["gh", "pr", "create"])
+    pr_body = pr_create[pr_create.index("--body") + 1]
+    assert f"[[{PRACTICE_ID}]]" in pr_body
+    assert f"[[{PRACTICE_ID}]]" in Path(result.lesson_path).read_text()
+
+
+def test_the_evidence_guard_recovers_a_pr_citing_an_unknown_practice(tmp_path):
+    cfg = load_config()
+    unknown_body = (
+        WELL_FORMED_BODY + "\n## Practices cited\n- `practice:never-registered`\n"
+    )
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[_improve_issue(unknown_body)],
+        worktree_status="?? src/hsai/widget.py\n",     # real code, so not a completeness miss
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.recovered is True
+    assert result.pr is None
+    assert any("evidence guard" in n for n in result.notes)
+    assert any("never-registered" in n for n in result.notes)
+    assert not any(c[:3] == ["gh", "pr", "create"] for c in runner.calls)
+    # recovered by the same mechanism as the completeness guard: ticket back in
+    # the backlog with one attempt spent
+    assert any(
+        c[:3] == ["gh", "issue", "edit"] and "--remove-assignee" in c for c in runner.calls
+    )
+    assert any("attempts:1" in c for c in runner.calls)
+    assert [r.outcome for r in _iteration_records(cfg, str(tmp_path))] == ["no_evidence"]
+
+
+def test_an_ordinary_implement_ticket_is_not_asked_for_reference_set_evidence(tmp_path):
+    """The guard applies to work that claims field provenance, not to the backlog."""
+    cfg = load_config()
+    body = WELL_FORMED_BODY + "\n## Practices cited\n- `practice:never-registered`\n"
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[{
+            "number": 7, "title": "feat: add widget",
+            "labels": [{"name": "priority:P2"}], "assignees": [], "body": body,
+        }],
+        worktree_status="?? src/hsai/widget.py\n",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.recovered is False
+    assert result.pr is not None
+
+
+def test_build_pr_body_renders_practice_citations_or_says_none():
+    choice = ModelChoice(tier="standard", model="sonnet", rationale="x")
+    kwargs = dict(
+        ticket=42, choice=choice, lesson_note="2026-01-03-note",
+        lesson_summary="s", ci_summary="green", kind=IMPLEMENT,
+    )
+    cited = build_pr_body(**kwargs, references=(PRACTICE_ID,))
+    assert f"## {PRACTICE_SECTION}" in cited
+    assert f"- [[{PRACTICE_ID}]] (`practice:{PRACTICE_ID}`)" in cited
+
+    assert "_(none cited)_" in build_pr_body(**kwargs)

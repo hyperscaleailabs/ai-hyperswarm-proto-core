@@ -19,17 +19,25 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from collections.abc import Iterable
+from dataclasses import dataclass, field, replace
 
 from . import github
 from .ai import run_agent
 from .config import CoreConfig
-from .knowledge import KnowledgeBase
+from .knowledge import KnowledgeBase, Practice, slugify
 from .models import ModelChoice
 from .proc import Runner, run
 from .tickets import TicketSpec
 
 _JSON_BLOCK = re.compile(r"```(?:json)?\s*(\[.*?\])\s*```", re.DOTALL)
+# "gpt-researcher (per-claim source attribution ...)" - how the planner already
+# writes its rationale, and the fallback when it omits the `practices` array.
+_RATIONALE_CLAUSE = re.compile(r"([A-Za-z0-9][\w./-]*)\s*\(([^()]{10,})\)")
+# Two flavours of missing evidence, kept distinct so a note never overstates
+# where it came from.
+_NO_ARTIFACT = "(not recorded by the planner)"
+_RATIONALE_ARTIFACT = "(not recorded: derived from the synthesis rationale)"
 
 
 @dataclass
@@ -169,13 +177,104 @@ block: a JSON array where each element has exactly these keys:
   "verification_plan" (array of 2-4 concrete check strings),
   "size" ("M" or "L" - substantial work, never "S"),
   "goal_ids" (array like ["G1","G4"]),
-  "synthesis_rationale" (string naming the >= {combine} projects combined and how).
+  "synthesis_rationale" (string naming the >= {combine} projects combined and how),
+  "practices" (array of >= {combine} objects, one per project you actually drew
+    on, each with "source_repo" (owner/name from the reference set), "artifact"
+    (the concrete thing you looked at: a file path, a workflow filename, a PR or
+    commit URL), "observation" (what that project really does), and "adaptation"
+    (what we should do here instead)).
+
+Every practice becomes a registry note cited by the ticket, so an artifact you
+did not actually see in the digest above must be left as an empty string rather
+than guessed.
 
 The JSON block must be the LAST fenced block in your reply."""
 
 
-def parse_ticket_specs(output: str) -> list[TicketSpec]:
-    """Extract the final JSON block and convert it into TicketSpecs."""
+def _practice_id(source_repo: str, title: str) -> str:
+    """A stable, readable id: which project, for which ticket."""
+    project = slugify(source_repo.split("/")[-1])
+    subject = slugify(title.split(":", 1)[-1])[:48].rstrip("-")
+    return f"{project}-{subject}".strip("-") or "unnamed-practice"
+
+
+def _match_repo(name: str, known_repos: Iterable[str]) -> str:
+    """Resolve a bare project name from prose to its pinned ``owner/name`` slug."""
+    lowered = name.lower()
+    for repo in known_repos:
+        if lowered in (repo.lower(), repo.split("/")[-1].lower()):
+            return repo
+    return ""
+
+
+def practices_from_rationale(
+    rationale: str, title: str, known_repos: Iterable[str]
+) -> list[Practice]:
+    """Fallback provenance: the projects the rationale itself names.
+
+    Weaker evidence than an explicit ``practices`` entry - there is no artifact
+    to point at - so the note says so out loud instead of inventing a file path.
+    """
+    known = list(known_repos)
+    practices: list[Practice] = []
+    seen: set[str] = set()
+    for name, observation in _RATIONALE_CLAUSE.findall(rationale or ""):
+        repo = _match_repo(name, known)
+        if not repo or repo in seen:
+            continue
+        seen.add(repo)
+        practices.append(
+            Practice(
+                id=_practice_id(repo, title),
+                source_repo=repo,
+                artifact=_RATIONALE_ARTIFACT,
+                observation=" ".join(observation.split()),
+                adaptation=f"Adapted here by the ticket \"{title}\".",
+            )
+        )
+    return practices
+
+
+def _parse_practices(item: dict, title: str, known_repos: Iterable[str]) -> list[Practice]:
+    """Practice records for one ticket: explicit entries first, rationale second."""
+    practices: list[Practice] = []
+    seen: set[str] = set()
+    for entry in item.get("practices") or []:
+        if not isinstance(entry, dict):
+            continue
+        source_repo = str(entry.get("source_repo", "")).strip()
+        observation = str(entry.get("observation", "")).strip()
+        if not source_repo or not observation:
+            continue  # a practice without a source or an observation is not evidence
+        pid = slugify(str(entry.get("id", "")) or _practice_id(source_repo, title))
+        if pid in seen:
+            continue
+        seen.add(pid)
+        practices.append(
+            Practice(
+                id=pid,
+                source_repo=source_repo,
+                artifact=str(entry.get("artifact", "")).strip() or _NO_ARTIFACT,
+                observation=observation,
+                adaptation=str(entry.get("adaptation", "")).strip()
+                or f"Adapted here by the ticket \"{title}\".",
+            )
+        )
+    if practices:
+        return practices
+    return practices_from_rationale(
+        str(item.get("synthesis_rationale", "")), title, known_repos
+    )
+
+
+def parse_ticket_specs(
+    output: str, *, known_repos: Iterable[str] = ()
+) -> list[TicketSpec]:
+    """Extract the final JSON block and convert it into TicketSpecs.
+
+    ``known_repos`` (the pinned reference set) bounds the rationale fallback: a
+    project we never pinned is not accepted as a source.
+    """
     blocks = _JSON_BLOCK.findall(output)
     if not blocks:
         return []
@@ -183,12 +282,14 @@ def parse_ticket_specs(output: str) -> list[TicketSpec]:
         raw = json.loads(blocks[-1])
     except json.JSONDecodeError:
         return []
+    known = list(known_repos)
     specs: list[TicketSpec] = []
     for item in raw:
         try:
+            title = str(item["title"])[:150]
             specs.append(
                 TicketSpec(
-                    title=str(item["title"])[:150],
+                    title=title,
                     problem=str(item["problem"]),
                     proposal=str(item["proposal"]),
                     acceptance_criteria=tuple(str(c) for c in item["acceptance_criteria"]),
@@ -196,6 +297,7 @@ def parse_ticket_specs(output: str) -> list[TicketSpec]:
                     size=str(item.get("size", "M")),
                     goal_ids=tuple(str(g) for g in item.get("goal_ids", [])),
                     synthesis_rationale=str(item.get("synthesis_rationale", "")),
+                    practices=tuple(_parse_practices(item, title, known)),
                     labels=("self-improve", "hsai", "priority:P2"),
                 )
             )
@@ -210,6 +312,7 @@ class SynthesisResult:
     studied: list[str]
     filed: list[int]
     error: str = ""
+    practices: list[str] = field(default_factory=list)  # registry ids written
 
 
 def synthesize(
@@ -239,13 +342,28 @@ def synthesize(
     if not ares.ok:
         return SynthesisResult(ok=False, studied=repos, filed=[], error=ares.error[:500])
 
-    specs = parse_ticket_specs(ares.output)
+    specs = parse_ticket_specs(
+        ares.output, known_repos=[r.repo for r in cfg.reference_top10]
+    )
+    kb = KnowledgeBase.from_config(cfg, root)
     filed: list[int] = []
+    written: list[str] = []
     for spec in specs:
+        # The registry note has to exist before the ticket that cites it: the
+        # orchestrator's evidence guard resolves those citations later, and a
+        # dangling one is exactly what it is there to catch.
+        for practice in spec.practices:
+            kb.write_practice(practice)
+            written.append(practice.note_name())
         num = github.create_issue(
             cfg.repo_slug, spec.title, spec.render(), spec.all_labels(), runner=runner
         )
         if num:
             filed.append(num)
+            # Close the loop the other way too: the practice records which
+            # ticket adopted it, so the registry is navigable from either end.
+            for practice in spec.practices:
+                kb.write_practice(replace(practice, adopted_by=(f"#{num}",)))
     return SynthesisResult(ok=bool(filed), studied=repos, filed=filed,
-                           error="" if specs else "no parseable ticket specs in output")
+                           error="" if specs else "no parseable ticket specs in output",
+                           practices=written)
