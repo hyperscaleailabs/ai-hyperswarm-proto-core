@@ -2,7 +2,7 @@
 tags:
   - moc
   - index
-updated: 2026-08-12
+updated: 2026-08-13
 ---
 
 # Knowledge Base MOC
@@ -11,8 +11,8 @@ The living memory of **ai-hyperswarm-proto-core**. Open this repo as an Obsidian
 vault and use the graph view to explore how lessons connect.
 
 ## Maps
-- [[Lessons MOC]] - 26 lesson(s)
-- [[Whitepapers MOC]] - 7 whitepaper(s)
+- [[Lessons MOC]] - 28 lesson(s)
+- [[Whitepapers MOC]] - 8 whitepaper(s)
 
 ## How this is maintained
 - Each PR the [[hsai]] loop opens contributes exactly one lesson.
