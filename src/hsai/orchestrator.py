@@ -11,8 +11,10 @@ performs the real side effects through the wrapper modules.
 """
 from __future__ import annotations
 
+import re
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from uuid import uuid4
 
@@ -26,6 +28,16 @@ from .tickets import NEEDS_REFINEMENT, issue_well_formed
 HEAL = "heal"
 IMPLEMENT = "implement"
 IMPROVE = "improve"
+
+# Governed escape hatch from the workflow-revert guard: only a ticket carrying
+# this label may change .github/workflows/**, and then only by editing lines
+# that invoke the CI contract (`hsai ci` / `hsai repro-check`). Everything else
+# is still reverted, so a worker can never quietly move its own goalposts.
+CI_CHANGE_LABEL = "ci-change"
+WORKFLOW_PATH_PREFIX = ".github/workflows/"
+_ALLOWED_INVOCATION = re.compile(r"\bhsai\s+(ci|repro-check)\b")
+# Shell plumbing that could smuggle arbitrary work into an "invocation" line.
+_SMUGGLING = ("&&", "||", ";", "|", "`", "$(", ">", "<")
 
 # Serializes the short git-metadata prologue and the ticket claim so parallel
 # workers (threads) never race on git's index lock or grab the same ticket. The
@@ -80,6 +92,33 @@ def _phase_artifacts(kind: str) -> str:
         )
 
 
+def workflow_diff_allowed(diff: str) -> bool:
+    """May this ``.github/workflows`` diff be kept on a ``ci-change`` ticket?
+
+    Allowlist, not blocklist: every added or removed content line must invoke
+    `hsai ci` or `hsai repro-check` and carry no shell plumbing. An empty diff
+    (e.g. a new, untracked workflow file) is not an allowance.
+    """
+    changed = [
+        line for line in diff.splitlines()
+        if line[:1] in ("+", "-") and not line.startswith(("+++", "---"))
+    ]
+    if not changed:
+        return False
+    for line in changed:
+        content = line[1:].strip()
+        if not _ALLOWED_INVOCATION.search(content):
+            return False
+        if any(token in content for token in _SMUGGLING):
+            return False
+    return True
+
+
+def ci_change_allowed(labels: Iterable[str], diff: str) -> bool:
+    """The full gate: the ticket must be labelled AND the diff allowlisted."""
+    return CI_CHANGE_LABEL in {str(label) for label in labels} and workflow_diff_allowed(diff)
+
+
 def decide_path(ci_green: bool, has_tickets: bool) -> str:
     """Map current state to the branch of the loop to execute."""
     if not ci_green:
@@ -101,6 +140,7 @@ def build_pr_body(
     trajectory_digest: str = "",
     recalled: tuple[str, ...] = (),
     review_verdict: str = "",
+    ci_change_diff: str = "",
 ) -> str:
     """Assemble a PR body that satisfies the traceability invariants.
 
@@ -125,6 +165,16 @@ def build_pr_body(
     # Who checked the work, not just who wrote it: always rendered, so a PR that
     # skipped the gate says so out loud instead of staying silent about it.
     verdict = review_verdict or "_(no independent review recorded)_"
+    # The workflow-revert guard was waived for this PR: say so on the PR itself,
+    # with the exact diff that was kept, so a human can grade the allowance.
+    ci_change_section = (
+        f"\n## CI contract change (`{CI_CHANGE_LABEL}`)\n"
+        f"The workflow-revert guard was waived: this ticket carries the "
+        f"`{CI_CHANGE_LABEL}` label and the retained diff touches only allowlisted "
+        f"`hsai ci` / `hsai repro-check` invocation lines.\n"
+        f"```diff\n{ci_change_diff[:2000]}\n```\n"
+        if ci_change_diff else ""
+    )
     return f"""Closes #{ticket}
 
 ## Model used
@@ -136,7 +186,7 @@ def build_pr_body(
 
 ## Independent review
 {verdict}
-
+{ci_change_section}
 ## Lesson learned
 {lesson_summary}
 
@@ -412,6 +462,7 @@ def run_once(
     agent_ok = True
     agent_err = ""
     reverted_workflows: list[str] = []
+    retained_workflow_diff = ""
     repro_result: repro.ReproResult | None = None
     if not dry_run:
         prompt = _task_prompt(kind, cfg, ticket_title, ticket_body, recalled.section)
@@ -438,15 +489,31 @@ def run_once(
             agent_err = _format_error_with_context(agent_err, kind, ticket_num)
 
         # Guard: a task must not change the CI checks, or local and remote CI
-        # would diverge (as happened once when a worker added mypy). Revert any
-        # workflow edits before they are committed and note it in the lesson.
-        reverted_workflows = [
+        # would diverge (as happened once when a worker added mypy). Workflow
+        # edits are reverted by default; the ONE exception is a ticket labelled
+        # `ci-change` whose diff only touches allowlisted `hsai ci` /
+        # `hsai repro-check` invocation lines - and that allowance is recorded
+        # in the PR body and the lesson, never silent.
+        touched_workflows = [
             p for p in gitops.changed_paths(cwd=wt, runner=runner)
-            if p.startswith(".github/workflows/")
+            if p.startswith(WORKFLOW_PATH_PREFIX)
         ]
-        if reverted_workflows:
-            gitops.restore_pathspec(".github/workflows", cwd=wt, runner=runner)
-            result.notes.append(f"reverted workflow edits: {reverted_workflows}")
+        if touched_workflows:
+            workflow_diff = gitops.pathspec_diff(
+                WORKFLOW_PATH_PREFIX.rstrip("/"), cwd=wt, runner=runner
+            )
+            labels = tuple(claimed_issue.labels) if claimed_issue else ()
+            if ci_change_allowed(labels, workflow_diff):
+                retained_workflow_diff = workflow_diff
+                result.notes.append(
+                    f"ci-change: retained allowlisted workflow edits: {touched_workflows}"
+                )
+            else:
+                reverted_workflows = touched_workflows
+                gitops.restore_pathspec(
+                    WORKFLOW_PATH_PREFIX.rstrip("/"), cwd=wt, runner=runner
+                )
+                result.notes.append(f"reverted workflow edits: {reverted_workflows}")
 
         # Completeness guard: a code ticket (feat/skill/refactor/fix) cannot be
         # satisfied by a knowledge-only diff. PR #17 once "closed" a feature
@@ -545,6 +612,15 @@ def run_once(
                 f"\n\nReverted off-spec workflow edits: {reverted_workflows}."
                 if reverted_workflows else ""
             )
+            # A kept CI-contract change is the one case where a worker moved its
+            # own goalposts; the exact retained diff is written down for audit.
+            + (
+                f"\n\nRetained `{CI_CHANGE_LABEL}` workflow edit (ticket carries the "
+                f"`{CI_CHANGE_LABEL}` label and the diff is confined to allowlisted "
+                f"`hsai ci` / `hsai repro-check` invocation lines):\n"
+                f"```diff\n{retained_workflow_diff[:2000]}\n```"
+                if retained_workflow_diff else ""
+            )
             + (f"\n\nAgent error:\n```\n{agent_err[:800]}\n```" if agent_err else "")
             # Only a digest line plus a redacted tail of the trajectory is
             # committed; the full record stays in the (gitignored) local store,
@@ -617,6 +693,7 @@ def run_once(
         trajectory_digest=traj.digest() if traj else "",
         recalled=recalled.note_names,
         review_verdict=verdict.render(),
+        ci_change_diff=retained_workflow_diff,
     )
     pr_num = github.create_pr(
         repo, branch, f"{kind}: {ticket_title}"[:120], pr_body,

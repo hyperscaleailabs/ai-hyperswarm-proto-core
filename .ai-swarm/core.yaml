@@ -96,6 +96,37 @@ execution:
   ci_poll_interval_seconds: 10   # poll cadence while waiting for remote CI
   max_ticket_attempts: 2         # retries before a ticket is marked 'blocked' for humans
 
+# The CI contract: the ONE definition of "a green build". Executed by
+# `hsai ci --scope local` (and hsai.ci.run_local, the loop's pre-flight) and by
+# `hsai ci --scope remote` from .github/workflows/ci.yml, so the two can never
+# drift - tests/test_ci_parity.py fails the build if they do. Adopted from
+# MetaGPT's single pre-commit config (one file consumed by local hooks and CI)
+# and llama_index's CI-invokes-the-repo-CLI shape.
+#   scope:    local | remote | both  - where the step runs
+#   required: a red required step fails the build
+#   job:      steps sharing a job run in one `hsai ci` invocation; a step with
+#             its own job is invoked by its own workflow job (it needs setup
+#             `hsai ci` does not do, e.g. a fetched base ref).
+ci:
+  steps:
+    - id: ruff
+      command: [ruff, check, .]
+      scope: both
+      required: true
+    - id: pytest
+      command: [pytest]
+      scope: both
+      required: true
+    - id: sdlc-evidence          # PR body: ticket link + model + lesson (reads $PR_BODY)
+      command: [hsai, evidence-check]
+      scope: remote
+      required: true
+    - id: repro-check            # reproduce-before-fix gate for heal/bugfix PRs
+      command: [hsai, repro-check, --base-ref, origin/main]
+      scope: remote
+      required: true
+      job: repro
+
 # Model-size selection is a first-class, LEARNED capability (see backlog).
 # The orchestrator picks a tier per task; tiers map to `claude --model` aliases.
 models:

@@ -11,6 +11,37 @@ def test_core_yaml_loads_and_is_valid():
     assert v.ok, f"config invalid: {v.errors}"
 
 
+def test_ci_contract_is_declared_in_the_manifest():
+    """`ci.steps` is the one definition of a green build (see hsai.ci)."""
+    cfg = load_config()
+    steps = {s.id: s for s in cfg.ci_steps}
+    assert steps["ruff"].command == ("ruff", "check", ".")
+    assert steps["pytest"].command == ("pytest",)
+    assert steps["ruff"].scope == "both" and steps["ruff"].required
+    assert steps["sdlc-evidence"].scope == "remote"
+    # repro-check needs a fetched base ref, so it is its own workflow job
+    assert steps["repro-check"].job == "repro"
+    assert steps["repro-check"].in_scope("remote") and not steps["repro-check"].in_scope("local")
+
+
+def test_validate_rejects_a_malformed_ci_step(tmp_path):
+    core = tmp_path / ".ai-swarm" / "core.yaml"
+    core.parent.mkdir(parents=True)
+    core.write_text(
+        "identity:\n  name: t\n  owner: o\n"
+        "models:\n  tiers:\n    standard:\n      model: sonnet\n  default_tier: standard\n"
+        "ci:\n  steps:\n"
+        "    - id: ruff\n      command: [ruff, check, .]\n      scope: everywhere\n"
+        "    - id: ruff\n      command: [ruff]\n"
+        "    - id: nocommand\n      command: []\n"
+    )
+    v = validate(load_config(core))
+    assert not v.ok
+    assert any("scope" in e for e in v.errors)
+    assert any("duplicate id" in e for e in v.errors)
+    assert any("needs both an id and a command" in e for e in v.errors)
+
+
 def test_execution_telemetry_keys():
     """The agent-output format and trajectory retention are config, not code."""
     cfg = load_config()

@@ -110,6 +110,44 @@ def test_recall_command_reports_a_miss(tmp_path, capsys):
     assert "no match" in capsys.readouterr().err
 
 
+def test_parser_ci_defaults():
+    parser = build_parser()
+    args = parser.parse_args(["ci"])
+    assert args.command == "ci"
+    assert args.scope == "local" and args.job == "ci" and args.json is False
+    remote = parser.parse_args(["ci", "--scope", "remote", "--json"])
+    assert remote.scope == "remote" and remote.json is True
+
+
+def test_evidence_check_passes_a_compliant_body(capsys):
+    rc = main([
+        "evidence-check", "--body",
+        "Closes #42\n\n## Model used\nsonnet\n\n## Lesson learned\nsomething",
+    ])
+    assert rc == 0
+    assert "PASS" in capsys.readouterr().out
+
+
+def test_evidence_check_blocks_a_body_missing_evidence(capsys):
+    rc = main(["evidence-check", "--body", "just a change"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "Closes #N" in out and "Model used" in out and "Lesson learned" in out
+
+
+def test_evidence_check_skips_without_a_pr_context(monkeypatch, capsys):
+    monkeypatch.delenv("PR_BODY", raising=False)
+    assert main(["evidence-check"]) == 0
+    assert "skipped" in capsys.readouterr().out
+
+
+def test_evidence_check_reads_the_pr_body_from_the_environment(monkeypatch):
+    monkeypatch.setenv("PR_BODY", "Closes #1\n## Model used\nx\n## Lesson learned\ny")
+    assert main(["evidence-check"]) == 0
+    monkeypatch.setenv("PR_BODY", "no evidence here")
+    assert main(["evidence-check"]) == 1
+
+
 def test_parser_repro_check_defaults():
     parser = build_parser()
     args = parser.parse_args(["repro-check"])

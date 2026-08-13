@@ -1,6 +1,8 @@
 """`hsai` command-line entry point.
 
 Commands:
+  hsai ci --scope {local,remote} [--json]                      run the CI contract
+  hsai evidence-check [--body TEXT]                            PR-body SDLC evidence
   hsai loop [--iterations N] [--max-parallel M] [--dry-run]   run the auto loop
   hsai run-once [--dry-run]                                    a single iteration
   hsai status                                                  config + backlog snapshot
@@ -17,10 +19,11 @@ import argparse
 import os
 import sys
 
-from . import __version__, ai, recall, repro, trajectory
-from .config import CoreConfig, load_config, validate
+from . import __version__, ai, ci, recall, repro, trajectory
+from .config import DEFAULT_CI_JOB, LOCAL, REMOTE, CoreConfig, load_config, validate
 from .knowledge import KnowledgeBase
 from .orchestrator import run_loop
+from .proc import Runner, run
 from .swarm import run_parallel
 
 
@@ -131,6 +134,48 @@ def cmd_synthesize(args: argparse.Namespace) -> int:
     if res.error:
         print(f"error: {res.error}")
     return 0 if res.ok else 1
+
+
+def cmd_ci(args: argparse.Namespace, *, runner: Runner = run) -> int:
+    """Execute the CI contract declared in ``.ai-swarm/core.yaml``.
+
+    The one code path both a contributor and GitHub Actions use, so "green"
+    means the same thing in both places (llama_index's CI-invokes-the-repo-CLI
+    shape). Returns non-zero if any *required* step fails.
+    """
+    cfg = _load(args)
+    steps = ci.steps_for(cfg.ci_steps or ci.DEFAULT_STEPS, args.scope, job=args.job)
+    result = ci.run_steps(steps, cwd=args.cwd, runner=runner)
+    if args.json:
+        print(result.to_json())
+    elif not result.records:
+        print(f"ci: no steps declared for scope={args.scope} job={args.job}")
+    else:
+        # Output is captured per step, so echo it: a CI log that shows only a
+        # verdict is not a CI log.
+        print(result.log)
+        for record in result.records:
+            print(f"{'pass' if record.ok else 'FAIL'}  {record.id}: {' '.join(record.command)}")
+        print(result.summary())
+    return 0 if result.ok else 1
+
+
+def cmd_evidence_check(args: argparse.Namespace) -> int:
+    """SDLC-evidence gate: a PR body must link its ticket, model, and lesson.
+
+    Declared as the ``sdlc-evidence`` manifest step and run remotely by
+    ``hsai ci --scope remote``. With no PR context (push / workflow_dispatch)
+    there is nothing to check, so it passes.
+    """
+    body = args.body if args.body is not None else os.environ.get("PR_BODY", "")
+    if not body.strip():
+        print("evidence-check: no PR body in context (not a pull request) - skipped")
+        return 0
+    missing = ci.missing_pr_evidence(body)
+    for problem in missing:
+        print(f"::error::{problem}")
+    print(f"evidence-check: {'PASS' if not missing else 'BLOCKED'}")
+    return 0 if not missing else 1
 
 
 def cmd_repro_check(args: argparse.Namespace) -> int:
@@ -269,6 +314,21 @@ def build_parser() -> argparse.ArgumentParser:
         tp.add_argument("--root", default=".", help="repo root holding .hsai/traj")
         tp.add_argument("--json", action="store_true", help="print the raw trajectory JSON")
         tp.set_defaults(func=func)
+
+    cip = sub.add_parser("ci", help="run the CI contract declared in .ai-swarm/core.yaml")
+    cip.add_argument("--scope", choices=[LOCAL, REMOTE], default=LOCAL,
+                     help="which declared steps to run (default: local)")
+    cip.add_argument("--job", default=DEFAULT_CI_JOB,
+                     help="run the steps of this manifest job (default: ci)")
+    cip.add_argument("--cwd", default=None, help="directory to run the steps in")
+    cip.add_argument("--json", action="store_true", help="emit per-step results as JSON")
+    cip.set_defaults(func=cmd_ci)
+
+    ev = sub.add_parser(
+        "evidence-check", help="SDLC evidence in a PR body: ticket link, model, lesson"
+    )
+    ev.add_argument("--body", default=None, help="PR body text (default: $PR_BODY)")
+    ev.set_defaults(func=cmd_evidence_check)
 
     rc = sub.add_parser(
         "repro-check", help="reproduce-before-fix guard for heal/bugfix PRs (CI gate)"

@@ -9,6 +9,37 @@ import yaml
 
 CORE_PATH = ".ai-swarm/core.yaml"
 
+# CI contract vocabulary (see the `ci.steps` block in core.yaml).
+LOCAL = "local"
+REMOTE = "remote"
+BOTH = "both"
+CI_SCOPES = (LOCAL, REMOTE, BOTH)
+DEFAULT_CI_JOB = "ci"
+
+
+@dataclass(frozen=True)
+class CIStep:
+    """One declared step of "a green build".
+
+    Declared once in ``core.yaml`` and executed by both `hsai ci` and
+    :func:`hsai.ci.run_local`, so the local pre-flight and the GitHub workflow
+    cannot drift apart. ``job`` groups steps that a single `hsai ci` invocation
+    runs together; a step with its own job (e.g. ``repro-check``, which needs a
+    fetched base ref) is invoked by its own workflow job instead.
+    """
+
+    id: str
+    command: tuple[str, ...]
+    scope: str = BOTH
+    required: bool = True
+    job: str = DEFAULT_CI_JOB
+
+    def in_scope(self, scope: str) -> bool:
+        return self.scope == BOTH or self.scope == scope
+
+    def display(self) -> str:
+        return " ".join(self.command)
+
 
 @dataclass(frozen=True)
 class ModelTier:
@@ -47,6 +78,7 @@ class CoreConfig:
     ci_remote_timeout: float
     ci_poll_interval: float
     max_ticket_attempts: int
+    ci_steps: tuple[CIStep, ...]
     tiers: dict[str, ModelTier]
     default_tier: str
     constraints: dict[str, Any]
@@ -74,6 +106,25 @@ class CoreConfig:
 
     def goal_ids(self) -> list[str]:
         return [str(g.get("id")) for g in self.goals if g.get("id")]
+
+
+def _parse_ci_steps(data: dict[str, Any]) -> tuple[CIStep, ...]:
+    """Read the ``ci.steps`` manifest - the single definition of a green build."""
+    steps: list[CIStep] = []
+    for entry in (data.get("ci") or {}).get("steps", []) or []:
+        command = entry.get("command") or []
+        if isinstance(command, str):
+            command = command.split()
+        steps.append(
+            CIStep(
+                id=str(entry.get("id", "")),
+                command=tuple(str(c) for c in command),
+                scope=str(entry.get("scope", BOTH)),
+                required=bool(entry.get("required", True)),
+                job=str(entry.get("job", DEFAULT_CI_JOB)),
+            )
+        )
+    return tuple(steps)
 
 
 def _find_core(start: str | Path | None = None) -> Path:
@@ -139,6 +190,7 @@ def load_config(path: str | Path | None = None) -> CoreConfig:
         ci_remote_timeout=float(execution.get("ci_remote_timeout_seconds", 300)),
         ci_poll_interval=float(execution.get("ci_poll_interval_seconds", 10)),
         max_ticket_attempts=int(execution.get("max_ticket_attempts", 2)),
+        ci_steps=_parse_ci_steps(data),
         tiers=tiers,
         default_tier=models.get("default_tier", "standard"),
         constraints=data.get("constraints", {}),
@@ -173,6 +225,20 @@ def validate(cfg: CoreConfig) -> ValidationResult:
         errors.append("execution.max_parallel must be >= 1")
     if cfg.proven_at < 1:
         errors.append("execution.ramp.proven_at must be >= 1")
+    seen_step_ids: set[str] = set()
+    for step in cfg.ci_steps:
+        if not step.id or not step.command:
+            errors.append(f"ci.steps entry {step} needs both an id and a command")
+            continue
+        if step.id in seen_step_ids:
+            errors.append(f"ci.steps has a duplicate id '{step.id}'")
+        seen_step_ids.add(step.id)
+        if step.scope not in CI_SCOPES:
+            errors.append(
+                f"ci.steps['{step.id}'].scope '{step.scope}' is not one of {list(CI_SCOPES)}"
+            )
+    if not cfg.ci_steps:
+        warnings.append("ci.steps is empty; hsai ci falls back to the built-in ruff+pytest steps")
     if not cfg.subscription_only:
         warnings.append("constraints.subscription_only is false; API billing may occur")
     if "ANTHROPIC_API_KEY" not in cfg.forbidden_env:

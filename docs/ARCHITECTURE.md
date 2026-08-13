@@ -13,7 +13,7 @@ so the decision logic stays pure and unit-tested.
 | `hsai.ai` | drive `claude -p`; enforce subscription-only | subprocess, env |
 | `hsai.gitops` | worktrees, sync, branch, commit, push | git |
 | `hsai.github` | tickets, labels, PRs, merge | gh |
-| `hsai.ci` | local CI gate (ruff+pytest) + remote status | subprocess |
+| `hsai.ci` | run the declared CI contract + remote status; local/remote parity | subprocess |
 | `hsai.trajectory` | one durable record per agent run; redaction, replay | write files |
 | `hsai.journal` | append-only per-block step journal; `once()` replay | write files |
 | `hsai.knowledge` | lessons, whitepapers, MOC reindex (Obsidian) | write files |
@@ -232,10 +232,38 @@ and `main`; green-gated auto-merge serializes the actual integration.
   written back into the lesson (and pushed as a follow-up commit) so the
   knowledge base records the true CI outcome for every PR, not just the
   local approximation.
+- **One CI contract, two callers.** "A green build" is declared exactly once, in
+  `.ai-swarm/core.yaml` under `ci.steps`: each step has an `id`, a `command`
+  (argv list), a `scope` (`local` / `remote` / `both`), a `required` flag, and a
+  `job` (steps sharing a job run in one `hsai ci` invocation). Both entry points
+  execute that manifest through the same code path - `hsai ci --scope local`
+  and `ci.run_local` (the loop's pre-flight) - and
+  `.github/workflows/ci.yml` is a thin caller of `hsai ci --scope remote` plus a
+  `repro-check` job that fetches the base ref and runs `hsai repro-check`, so the
+  reproduce-before-fix contract is a real pre-merge gate on GitHub and not only
+  an in-loop guard. `tests/test_ci_parity.py` parses the workflow as YAML and
+  fails the build if a declared step stops being reachable from it, or if the
+  workflow reintroduces a bespoke inline lint/test command. This shape is
+  borrowed from llama_index (CI invokes a repo-local dev CLI, so contributors
+  and CI provably run the same code), crewAI (thin, delegating workflows), and
+  MetaGPT (one config consumed by both local hooks and CI). Where a checkout's
+  `ci.yml` has not yet been rewritten into a pure caller, the parity assertions
+  that presuppose it are strict `xfail`s that name what is missing rather than
+  silently passing - see CONTRIBUTING.md.
 - **Local == remote by construction.** A task must not change the CI checks, or
   local and remote would diverge. The orchestrator reverts any edits under
   `.github/workflows/**` before committing (and notes it in the lesson), so a
   worker cannot (accidentally or otherwise) move the goalposts it is judged by.
+- **The governed `ci-change` path.** A blanket revert also means the loop can
+  never sharpen its own CI signal, so there is exactly one hole in it, and it is
+  audited. An edit under `.github/workflows/**` is kept only when *both* hold:
+  the claimed ticket carries the `ci-change` label, **and** every added/removed
+  line of the diff invokes `hsai ci` or `hsai repro-check` with no shell plumbing
+  (`orchestrator.workflow_diff_allowed`, an allowlist - a new untracked workflow
+  file produces no diff and is therefore never waved through). When an edit is
+  kept, the allowance and the exact retained diff are written into the PR body
+  and the lesson. Everything else is still reverted. Contract *content* changes
+  belong in `ci.steps`, which needs no workflow edit at all.
 - **No ticket is stranded on failure.** If remote CI does not go green,
   `_recover_failed` closes the PR (deleting the branch) and returns the ticket
   to the backlog with an incremented `attempts:N` label. After

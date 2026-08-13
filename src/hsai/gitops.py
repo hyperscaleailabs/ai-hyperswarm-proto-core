@@ -114,6 +114,17 @@ def changed_paths(*, cwd: str, runner: Runner = run) -> list[str]:
     return paths
 
 
+def pathspec_diff(pathspec: str, *, cwd: str, runner: Runner = run) -> str:
+    """The uncommitted diff of tracked files under ``pathspec``.
+
+    What the orchestrator's ci-change allowlist inspects before deciding whether
+    a worker's workflow edit may be kept. A brand-new (untracked) file produces
+    no diff here, so it can never be waved through.
+    """
+    p = _git(["diff", "HEAD", "--", pathspec], cwd=cwd, runner=runner)
+    return p.stdout
+
+
 def restore_pathspec(pathspec: str, *, cwd: str, runner: Runner = run) -> None:
     """Discard both tracked edits and new files under ``pathspec``."""
     _git(["checkout", "HEAD", "--", pathspec], cwd=cwd, runner=runner)
