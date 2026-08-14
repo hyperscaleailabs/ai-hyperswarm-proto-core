@@ -1,7 +1,7 @@
 from dataclasses import replace
 
 from hsai.config import load_config
-from hsai.models import ModelChoice, Task, select, select_reviewer
+from hsai.models import ModelChoice, Task, escalate, select, select_reviewer
 
 
 def _cfg():
@@ -242,3 +242,91 @@ class TestReviewerSelection:
         author = ModelChoice(tier="light", model="haiku", rationale="x")
         reviewer = select_reviewer(author, cfg)
         assert reviewer.tier in cfg.tiers and reviewer.tier != "light"
+
+
+class TestEscalationLadder:
+    """A retried ticket climbs the tier ladder instead of repeating itself."""
+
+    def test_escalate_climbs_one_rung_per_attempt_saturating_at_heavy(self):
+        assert escalate("light", 1) == "light"     # a first try has nothing to escalate
+        assert escalate("light", 2) == "standard"
+        assert escalate("light", 3) == "heavy"
+        assert escalate("light", 4) == "heavy"      # saturates, does not overflow
+        assert escalate("standard", 2) == "heavy"
+        assert escalate("heavy", 2) == "heavy"       # already at the top
+
+    def test_escalate_ignores_an_unconfigured_tier(self):
+        assert escalate("nonexistent", 3) == "nonexistent"
+
+    def test_second_attempt_resolves_one_tier_heavier_than_the_first(self):
+        cfg = _cfg()
+        base = Task(kind="implement", title="add a status subcommand", est_files=2)
+        first = select(base, cfg)
+        second = select(replace(base, attempt=2), cfg)
+        assert first.tier == cfg.default_tier
+        assert second.tier == escalate(first.tier, 2)
+        assert second.tier != first.tier
+
+    def test_escalation_saturates_at_heavy_and_stays_there(self):
+        cfg = _cfg()
+        heavy_task = Task(
+            kind="improve", title="architecture: redesign the orchestrator",
+            body="large refactor of concurrency model", est_files=10, attempt=3,
+        )
+        choice = select(heavy_task, cfg)
+        assert choice.tier == "heavy"
+
+    def test_rationale_names_the_escalation(self):
+        cfg = _cfg()
+        task = Task(kind="implement", title="add a status subcommand", est_files=2, attempt=2)
+        choice = select(task, cfg)
+        assert f"escalated {cfg.default_tier}->{choice.tier} on attempt 2" in choice.rationale
+
+    def test_a_first_attempt_never_escalates(self):
+        cfg = _cfg()
+        task = Task(kind="implement", title="add a status subcommand", est_files=2, attempt=1)
+        choice = select(task, cfg)
+        assert "escalated" not in choice.rationale
+
+    def test_prior_failure_text_can_shift_the_score_toward_heavy(self):
+        cfg = _cfg()
+        task = Task(
+            kind="implement", title="add a status subcommand", est_files=2,
+            prior_failure=(
+                "a race condition and a concurrency bug in the security-sensitive "
+                "migration path caused the test to flake"
+            ),
+        )
+        choice = select(task, cfg)
+        assert choice.tier == "heavy"
+
+
+class TestBudgetGateWinsOverEscalation:
+    """A soft breach demotes even when a retry would otherwise escalate; a hard
+    breach means `select()` (and the model call it would drive) never runs at
+    all - proven at the `_implementation_block` level in test_cycle.py."""
+
+    def test_soft_breach_demotes_instead_of_escalating(self):
+        cfg = _cfg()
+        task = Task(kind="implement", title="add a status subcommand", est_files=2, attempt=2)
+        escalated = select(task, cfg, demote=False)
+        demoted = select(task, cfg, demote=True)
+
+        # Without the breach, attempt 2 escalates past the default tier.
+        assert escalated.tier == escalate(cfg.default_tier, 2)
+        # Under a soft breach, the demotion wins: the tier ends up CHEAPER than
+        # the (non-escalated) base tier, never heavier.
+        from hsai.ledger import demote_tier
+
+        assert demoted.tier == demote_tier(cfg.default_tier)
+        assert demoted.tier != escalated.tier
+        assert "demoted" in demoted.rationale and "wins over escalation" in demoted.rationale
+
+    def test_demote_wins_even_on_a_ticket_that_would_saturate_at_heavy(self):
+        cfg = _cfg()
+        task = Task(
+            kind="improve", title="architecture: redesign the orchestrator",
+            body="large refactor", est_files=10, attempt=3,
+        )
+        demoted = select(task, cfg, demote=True)
+        assert demoted.tier != "heavy"

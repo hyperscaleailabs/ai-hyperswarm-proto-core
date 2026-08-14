@@ -34,6 +34,13 @@ def test_diff_text_returns_the_branch_diff_verbatim():
     assert runner.calls[0][0] == ["git", "diff", "deadbeef...HEAD"]
 
 
+def test_diff_stat_returns_trimmed_stat_output():
+    stat = " src/hsai/widget.py | 12 ++++++++++++\n 1 file changed, 12 insertions(+)\n"
+    runner = _fake(stat)
+    assert gitops.diff_stat("origin/main", cwd="/repo", runner=runner) == stat.strip()
+    assert runner.calls[0][0] == ["git", "diff", "--stat", "origin/main"]
+
+
 def test_create_detached_worktree_builds_expected_path():
     def runner(cmd, **kwargs):
         cmd = list(cmd)

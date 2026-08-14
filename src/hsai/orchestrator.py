@@ -23,6 +23,11 @@ from .models import ModelChoice, Task, select
 from .proc import Runner, run
 from .tickets import NEEDS_REFINEMENT, issue_well_formed
 
+# Hidden marker prefixing every failure-dossier comment `_recover_failed` posts
+# on a ticket, so a claim on a retried ticket can find it back among (possibly
+# human) comments without guessing (see `_fetch_prior_failure`).
+DOSSIER_MARKER = "<!-- hsai:failure-dossier -->"
+
 HEAL = "heal"
 IMPLEMENT = "implement"
 IMPROVE = "improve"
@@ -86,6 +91,55 @@ def _phase_artifacts(kind: str) -> str:
             "- Lesson recorded with source citation\n"
             "- Tests passing, auditable change"
         )
+
+
+def _failing_steps(ci_result: ci.CIResult | None) -> list[str]:
+    """Local CI step names that failed, if any local CI ran before the guard."""
+    if not ci_result:
+        return []
+    return [name for name, ok in ci_result.steps.items() if not ok]
+
+
+def _build_failure_dossier(
+    *, remote: str, ci_result: ci.CIResult | None, guard: str, diffstat: str
+) -> str:
+    """A short, structured note on why an attempt failed.
+
+    Posted as a GitHub issue comment (see `_recover_failed`) so it survives the
+    worktree that recorded it being deleted, and fed back into the next
+    attempt's prompt under a `## Previous attempt failed` heading (see
+    `_task_prompt`) - the artifact MetaGPT-style roles hand off between
+    attempts, carrying context forward the way openai/swarm's `context_variables`
+    ride along a handoff.
+    """
+    failing = _failing_steps(ci_result)
+    lines = [
+        DOSSIER_MARKER,
+        "## Previous attempt failure dossier",
+        f"- remote CI conclusion: `{remote}`",
+        "- failing local CI steps: "
+        + (", ".join(f"`{s}`" for s in failing) if failing else "_(none - local CI was green)_"),
+        f"- guard fired: {guard or '_(none - remote CI decided this one)_'}",
+    ]
+    if diffstat:
+        lines.append(f"\nDiffstat of the closed branch:\n```\n{diffstat}\n```")
+    return "\n".join(lines)
+
+
+def _fetch_prior_failure(repo: str, ticket_num: int | None, *, runner: Runner) -> str:
+    """The most recent failure dossier comment on ``ticket_num``, if any.
+
+    Looked up fresh on claim (not carried on the `Issue`) precisely because the
+    worktree that recorded the failure is long gone - the comment is the only
+    place it survives (G2: auditable end to end).
+    """
+    if not ticket_num:
+        return ""
+    comments = github.list_issue_comments(repo, ticket_num, runner=runner)
+    for body in reversed(comments):
+        if DOSSIER_MARKER in body:
+            return body.split(DOSSIER_MARKER, 1)[1].strip()
+    return ""
 
 
 def decide_path(ci_green: bool, has_tickets: bool) -> str:
@@ -173,6 +227,9 @@ class IterationResult:
     lesson_path: str = ""
     recalled: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    # Non-empty iff model selection escalated this iteration's tier on a retry
+    # (see `models.escalate`); surfaced in the block review brief (G4).
+    escalation: str = ""
 
     def describe(self) -> str:
         parts = [
@@ -195,6 +252,7 @@ def _task_prompt(
     ticket_title: str,
     ticket_body: str,
     lessons: str = "",
+    prior_failure: str = "",
 ) -> str:
     goals = "; ".join(f"{g.get('id')}:{g.get('title')}" for g in cfg.goals)
     common = (
@@ -203,13 +261,22 @@ def _task_prompt(
         "code style consistent, and ensure `ruff check .` and `pytest` both pass. "
         f"Project goals: {goals}."
     )
+    # A prior attempt's failure dossier (see `_recover_failed`), if the claimed
+    # ticket carries one: rendered right after the ticket body, ahead of recall,
+    # so the agent addresses the recorded failure before anything else.
+    failure_section = (
+        f"\n\n## Previous attempt failed\n"
+        "Address this recorded failure FIRST, before anything else:\n\n"
+        f"{prior_failure}"
+        if prior_failure else ""
+    )
     # Retrieved prior notes, if any: appended last so the ticket stays the
     # instruction and the lessons stay context (empty string => nothing renders).
     recalled = f"\n\n{lessons}" if lessons else ""
     if kind == HEAL:
         return (
             f"{common}\nThe build is RED. Diagnose and fix it so CI is green. "
-            f"Ticket: {ticket_title}\n{ticket_body}{recalled}"
+            f"Ticket: {ticket_title}\n{ticket_body}{failure_section}{recalled}"
         )
     if kind == IMPLEMENT:
         return (
@@ -217,11 +284,12 @@ def _task_prompt(
             "its Acceptance criteria and execute its Verification plan, adding tests "
             "as evidence. A knowledge-only or docs-only diff on a feat/skill/refactor "
             "ticket is an automatic failure - real code must change.\n"
-            f"Ticket: {ticket_title}\n{ticket_body}{recalled}"
+            f"Ticket: {ticket_title}\n{ticket_body}{failure_section}{recalled}"
         )
     return (
         f"{common}\nImplement this self-improvement, learning from the reference set "
-        f"pinned in .ai-swarm/core.yaml.\nTicket: {ticket_title}\n{ticket_body}{recalled}"
+        f"pinned in .ai-swarm/core.yaml.\nTicket: {ticket_title}\n{ticket_body}"
+        f"{failure_section}{recalled}"
     )
 
 
@@ -373,11 +441,25 @@ def run_once(
         gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
         return res
 
+    # Retry context: how many times has this ticket already been tried, and
+    # (if at least once) what did the last attempt's failure dossier say? Fetched
+    # BEFORE model selection so a retried ticket both escalates its tier (see
+    # `models.escalate`) and re-shows the agent why it failed last time (see
+    # `_task_prompt`'s `## Previous attempt failed` section below).
+    attempts = (claimed_issue.attempts() if claimed_issue else 0) + 1
+    prior_failure = (
+        _fetch_prior_failure(repo, ticket_num, runner=runner)
+        if not dry_run and claimed_issue and claimed_issue.attempts() >= 1
+        else ""
+    )
+
     # 4. model selection (recorded for audit); a soft budget breach biases it
-    # one tier cheaper.
-    task = Task(kind=kind, title=ticket_title, body=ticket_body, labels=(
-        tuple(claimed_issue.labels) if claimed_issue else ()
-    ))
+    # one tier cheaper and always wins over a retry's tier escalation.
+    task = Task(
+        kind=kind, title=ticket_title, body=ticket_body,
+        labels=(tuple(claimed_issue.labels) if claimed_issue else ()),
+        attempt=attempts, prior_failure=prior_failure,
+    )
     choice = select(task, cfg, demote=demote_tier)
 
     # Read side of the knowledge base: pull the most relevant prior notes for
@@ -393,12 +475,14 @@ def run_once(
     )
     if recalled.notes:
         result.notes.append(f"recalled {len(recalled.notes)} prior note(s)")
+    if "escalated" in choice.rationale:
+        result.escalation = f"#{ticket_num}: {choice.rationale}"
+        result.notes.append(f"model selection: {choice.rationale}")
 
     # Quota ledger: every iteration that runs a model appends one cost record.
     # Written to the repo root (not the ephemeral worktree) so the block-level
     # aggregate and budget gate can read across iterations; the governance PR
     # later commits it so the economics stay auditable.
-    attempts = (claimed_issue.attempts() if claimed_issue else 0) + 1
     block = iteration // 100 if block is None else block
     tokens: tuple[int, int] | None = None
     traj: trajectory.Trajectory | None = None
@@ -432,7 +516,9 @@ def run_once(
     reverted_workflows: list[str] = []
     repro_result: repro.ReproResult | None = None
     if not dry_run:
-        prompt = _task_prompt(kind, cfg, ticket_title, ticket_body, recalled.section)
+        prompt = _task_prompt(
+            kind, cfg, ticket_title, ticket_body, recalled.section, task.prior_failure
+        )
         agent_started = time.time()
         ares = ai.run_agent(
             prompt, choice, cfg, cwd=wt, runner=ai_runner, timeout=cfg.agent_timeout
@@ -474,10 +560,15 @@ def run_once(
             code_files = [p for p in touched if not p.startswith("knowledge/")]
             if not code_files:
                 result.notes.append("completeness guard: knowledge-only diff on a code ticket")
+                guard_base_ref = gitops.merge_base(
+                    "HEAD", f"origin/{cfg.default_branch}", cwd=wt, runner=runner,
+                ) or f"origin/{cfg.default_branch}"
                 _recover_failed(
                     cfg, repo, 0, kind=kind, ticket_num=ticket_num,
                     claimed_issue=claimed_issue, login=login,
                     remote="INCOMPLETE", runner=runner,
+                    guard="completeness guard: knowledge-only diff on a code ticket",
+                    wt=wt, base_ref=guard_base_ref,
                 )
                 result.recovered = True
                 _record_cost("incomplete")
@@ -505,6 +596,8 @@ def run_once(
                     cfg, repo, 0, kind=kind, ticket_num=ticket_num,
                     claimed_issue=claimed_issue, login=login,
                     remote="NO_REPRO", runner=runner,
+                    guard=f"repro guard: {repro_result.reason}",
+                    wt=wt, base_ref=base_ref,
                 )
                 result.recovered = True
                 _record_cost("no_repro")
@@ -609,6 +702,8 @@ def run_once(
             cfg, repo, 0, kind=kind, ticket_num=ticket_num,
             claimed_issue=claimed_issue, login=login,
             remote="REVIEW_BLOCKED", runner=runner,
+            ci_result=ci_after, guard=f"independent review gate: {verdict.summary()}",
+            wt=wt, base_ref=base_ref,
         )
         result.recovered = True
         result.notes.append("recovered: independent review blocked the change")
@@ -669,9 +764,13 @@ def run_once(
         result.merged = True
     else:
         result.merged = False
+        final_base_ref = gitops.merge_base(
+            "HEAD", f"origin/{cfg.default_branch}", cwd=wt, runner=runner,
+        ) or f"origin/{cfg.default_branch}"
         _recover_failed(
             cfg, repo, pr_num, kind=kind, ticket_num=ticket_num,
             claimed_issue=claimed_issue, login=login, remote=remote, runner=runner,
+            ci_result=ci_after, wt=wt, base_ref=final_base_ref,
         )
         result.recovered = True
         result.notes.append("recovered: closed PR, returned ticket to backlog")
@@ -694,9 +793,21 @@ def _recover_failed(
     login: str,
     remote: str,
     runner: Runner,
+    ci_result: ci.CIResult | None = None,
+    guard: str = "",
+    wt: str = "",
+    base_ref: str = "",
 ) -> None:
-    """A PR did not go green (or never got one): close it, and either return the
-    ticket to the backlog for another attempt or mark it ``blocked``."""
+    """A PR did not go green (or never got one): close it, post a failure
+    dossier on the ticket, and either return it to the backlog for another
+    attempt or mark it ``blocked``.
+
+    The dossier (remote CI conclusion, failing local CI step names, and which
+    guard fired, if one did) is what the next claim reads back via
+    `_fetch_prior_failure` and feeds into the retry's prompt - it is the
+    artifact this Handoff carries forward (see the module-level constant
+    `DOSSIER_MARKER` and `_build_failure_dossier`).
+    """
     if pr_num:
         github.close_pr(
             repo, pr_num,
@@ -705,6 +816,12 @@ def _recover_failed(
         )
     if not ticket_num:
         return
+
+    diffstat = gitops.diff_stat(base_ref, cwd=wt, runner=runner) if wt else ""
+    dossier = _build_failure_dossier(
+        remote=remote, ci_result=ci_result, guard=guard, diffstat=diffstat
+    )
+    github.comment_issue(repo, ticket_num, dossier, runner=runner)
 
     # Determine how many attempts this ticket has already had.
     issue = claimed_issue or github.get_issue(repo, ticket_num, runner=runner)

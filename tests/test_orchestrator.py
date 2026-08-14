@@ -134,6 +134,11 @@ class FakeRunner:
         self._ci_round = 0
         self._issue_seq = 100
         self._pr_seq = 200
+        # Comments posted via `gh issue comment` (e.g. the failure dossier),
+        # keyed by issue number - so a later `gh issue view --json comments`
+        # in the SAME test (a second `run_once` claiming the same ticket) can
+        # read back what an earlier iteration posted.
+        self._comments: dict[int, list[str]] = {}
 
     def __call__(
         self, cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None
@@ -184,6 +189,11 @@ class FakeRunner:
             return Proc(cmd, 0, f"https://github.com/o/r/issues/{self._issue_seq}\n", "")
         if cmd[:3] == ["gh", "issue", "edit"]:
             return Proc(cmd, 0, "", "")
+        if cmd[:3] == ["gh", "issue", "comment"]:
+            num = int(cmd[3])
+            body = cmd[cmd.index("--body") + 1] if "--body" in cmd else ""
+            self._comments.setdefault(num, []).append(body)
+            return Proc(cmd, 0, "", "")
         if cmd[:1] == ["claude"]:
             prompt = cmd[2] if len(cmd) > 2 else ""
             if review.PROMPT_MARKER in prompt:
@@ -206,6 +216,10 @@ class FakeRunner:
             return Proc(cmd, 0, "", "")
         if cmd[:3] == ["gh", "issue", "view"]:
             num = int(cmd[3])
+            fields = cmd[cmd.index("--json") + 1].split(",") if "--json" in cmd else []
+            if "comments" in fields:
+                comments = [{"body": b} for b in self._comments.get(num, [])]
+                return Proc(cmd, 0, json.dumps({"comments": comments}), "")
             match = next((i for i in self.open_issues if i.get("number") == num), None)
             data = match or {
                 "number": num, "title": "", "labels": [], "assignees": [], "body": ""
@@ -568,6 +582,85 @@ def test_run_once_recovers_when_remote_ci_fails(tmp_path):
     )
     # retry counter bumped (attempts:1, below max_ticket_attempts=2)
     assert any("attempts:1" in c for c in runner.calls)
+
+    # a failure dossier was posted to the ticket, surviving the worktree the
+    # attempt ran in
+    comment = next(c for c in runner.calls if c[:3] == ["gh", "issue", "comment"])
+    dossier = comment[comment.index("--body") + 1]
+    assert "remote CI conclusion: `FAILURE`" in dossier
+    assert "guard fired: _(none - remote CI decided this one)_" in dossier
+
+
+# --- escalation ladder: a retried ticket carries its failure dossier forward
+# and is routed to a heavier tier (see models.escalate) ----------------------
+
+ESCALATION_ISSUE = {
+    "number": 7,
+    "title": "feat: add widget",
+    "labels": [{"name": "priority:P2"}],
+    "assignees": [],
+    "body": WELL_FORMED_BODY,
+}
+
+
+def test_a_second_claim_gets_the_first_attempts_dossier_and_a_heavier_tier(tmp_path):
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True, True, True],
+        open_issues=[dict(ESCALATION_ISSUE)],
+        worktree_status="?? src/hsai/widget.py\n",
+        remote_ci="FAILURE",
+    )
+
+    # --- attempt 1: fails remote CI, ticket returns to the backlog ------------
+    result1 = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+    assert result1.recovered is True and result1.merged is False
+    assert result1.model == cfg.tiers[cfg.default_tier].model  # first attempt: no escalation
+    prompt1 = _worker_prompts(runner)[-1]
+    assert "## Previous attempt failed" not in prompt1
+
+    # `_recover_failed` labeled the ticket `attempts:1` and unassigned it; the
+    # fake runner does not mutate `open_issues` from `gh issue edit`, so the
+    # test makes that state explicit for the second claim, exactly as a real
+    # `gh issue list` would report it.
+    runner.open_issues = [
+        dict(ESCALATION_ISSUE, labels=[{"name": "priority:P2"}, {"name": "attempts:1"}])
+    ]
+    runner.remote_ci = "SUCCESS"
+
+    # --- attempt 2: claims the same ticket, now carrying a dossier ------------
+    result2 = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=2,
+    )
+
+    assert result2.ticket == 7
+    assert result2.merged is True
+
+    # The prompt carries the FIRST attempt's failure text forward.
+    prompt2 = _worker_prompts(runner)[-1]
+    assert "## Previous attempt failed" in prompt2
+    assert "remote CI conclusion: `FAILURE`" in prompt2
+
+    # The tier moved up exactly one rung (standard -> heavy) on attempt 2.
+    assert result1.model == cfg.tiers["standard"].model
+    assert result2.model == cfg.tiers["heavy"].model
+    assert result2.escalation and "#7" in result2.escalation
+    assert "escalated standard->heavy on attempt 2" in result2.escalation
+
+    # ...and it is visible verbatim in the PR body's Model used section (#5).
+    pr_creates = [c for c in runner.calls if c[:3] == ["gh", "pr", "create"]]
+    pr_body_2 = pr_creates[-1][pr_creates[-1].index("--body") + 1]
+    assert "escalated standard->heavy on attempt 2" in pr_body_2
+
+    # The ledger counts the escalated iteration against the heavy-tier budget.
+    records = _iteration_records(cfg, tmp_path)
+    assert [r.tier for r in records] == ["standard", "heavy"]
+    agg = ledger.aggregate_block(records, block=0)
+    assert agg.heavy_iterations == 1
 
 
 def test_workflow_edits_are_reverted(tmp_path):
@@ -1281,6 +1374,32 @@ def test_task_prompt_renders_recalled_lessons_only_when_there_are_some():
         with_lessons = _task_prompt(kind, cfg, "t", "b", section)
         assert with_lessons == f"{bare}\n\n{section}"
         assert with_lessons.endswith(section)   # the ticket stays the instruction
+
+
+def test_task_prompt_includes_previous_attempt_failed_section_when_given_a_dossier():
+    cfg = load_config()
+    dossier = (
+        "## Previous attempt failure dossier\n"
+        "- remote CI conclusion: `FAILURE`\n"
+        "- failing local CI steps: `pytest`\n"
+        "- guard fired: _(none - remote CI decided this one)_"
+    )
+    for kind in (HEAL, IMPLEMENT, IMPROVE):
+        bare = _task_prompt(kind, cfg, "t", "b")
+        assert "## Previous attempt failed" not in bare
+        # an empty prior_failure changes nothing at all - byte-for-byte
+        assert _task_prompt(kind, cfg, "t", "b", "", "") == bare
+
+        with_dossier = _task_prompt(kind, cfg, "t", "b", "", dossier)
+        assert "## Previous attempt failed" in with_dossier
+        assert dossier in with_dossier
+        # the ticket instruction still comes before the failure section
+        assert with_dossier.index("Ticket: t") < with_dossier.index("## Previous attempt failed")
+
+    # it composes with recall: the failure section precedes the recalled notes
+    section = f"{recall.HEADING}:\n- [[a-note]] (fail/heal) - do not do that"
+    both = _task_prompt(IMPLEMENT, cfg, "t", "b", section, dossier)
+    assert both.index("## Previous attempt failed") < both.index(recall.HEADING)
 
 
 def test_build_pr_body_renders_prior_lessons_consulted():

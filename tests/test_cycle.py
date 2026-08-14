@@ -167,6 +167,37 @@ def test_synthesis_duplicate_rejections_surface_in_block_notes(tmp_path, monkeyp
     assert note in runner.review_bodies[-1]
 
 
+# --- escalated iterations reach the review brief -----------------------------
+
+def test_escalated_iterations_surface_in_the_review_brief(tmp_path, monkeypatch):
+    """`IterationResult.escalation` must reach `BlockReport.escalations` (and
+    the brief), so the architect sees which tickets needed a heavier model."""
+    cfg = load_config()
+    cfg.budget.clear()
+    cfg.cycle["block_size"] = 1
+
+    escalation_note = "#42: score=3 -> heavy (escalated standard->heavy on attempt 2)"
+
+    def fake_run_once(cfg, *, repo_dir, runner, ai_runner, iteration, block=None,
+                       demote_tier=False, dry_run=False):
+        return IterationResult(
+            kind="implement", ticket=42, pr=501, model="opus",
+            merged=True, escalation=escalation_note,
+        )
+
+    runner = _Runner()
+    monkeypatch.setattr(cycle, "run_once", fake_run_once)
+    monkeypatch.setattr(cycle, "_well_formed_backlog", lambda cfg, *, runner: 999)
+    monkeypatch.setattr(cycle, "_governance_pr", lambda *a, **k: 0)
+
+    res = cycle.run_cycle(cfg, repo_dir=str(tmp_path), cycle_index=1, runner=runner)
+
+    assert res.report.escalations == [escalation_note]
+    assert runner.review_bodies, "a review issue should have been opened"
+    assert "## Escalations (tier moved up on retry)" in runner.review_bodies[-1]
+    assert escalation_note in runner.review_bodies[-1]
+
+
 # --- plain-text agent output must not break article generation --------------
 
 def test_persona_articles_survive_output_without_a_json_envelope(tmp_path):

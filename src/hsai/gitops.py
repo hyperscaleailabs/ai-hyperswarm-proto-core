@@ -95,6 +95,18 @@ def diff_text(base_ref: str, *, cwd: str | None = None, runner: Runner = run) ->
     return p.stdout
 
 
+def diff_stat(base_ref: str, *, cwd: str | None = None, runner: Runner = run) -> str:
+    """Diffstat of the current tree against ``base_ref`` - best-effort.
+
+    Used by the failure dossier (:mod:`hsai.orchestrator`) to record how big a
+    closed branch was, without pulling in the full diff text. Compares the
+    working tree, not just HEAD, so it still reports something for a guard
+    that fires before the branch's fix is committed.
+    """
+    p = _git(["diff", "--stat", base_ref], cwd=cwd, runner=runner)
+    return p.stdout.strip()
+
+
 def has_changes(*, cwd: str, runner: Runner = run) -> bool:
     p = _git(["status", "--porcelain"], cwd=cwd, runner=runner)
     return bool(p.stdout.strip())
