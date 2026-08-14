@@ -1,0 +1,5 @@
+{
+  "min_aggregate_score": 1.0,
+  "min_scenarios": 14,
+  "note": "Committed gate for `hsai bench`. The scenario COUNT is part of the gate on purpose: deleting a failing scenario would otherwise raise the aggregate score and look like progress. Raise min_scenarios when adding scenarios; lowering either number needs an explicit, reviewed decision."
+}

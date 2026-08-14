@@ -1,0 +1,35 @@
+name: implement-a-size-l-ticket-selects-the-heavy-tier
+description: >
+  A size:L label set by the synthesis planner overrides keyword scoring: a
+  large synthesized change must never fall to a cheap tier. Paired with
+  budget-soft-breach-demotes-the-selected-tier, which is this same ticket run
+  under a soft budget breach.
+lesson: 2026-07-26-implement-skill-task-complexity-based-model-selection-learned
+
+issues:
+  - number: 18
+    title: "feat: add a widget helper"
+    labels: ["priority:P2", "size:L"]
+    body: |
+      ## Problem
+      The widget helper does not exist yet.
+
+      ## Proposal
+      Add a small widget helper and cover it with a test.
+
+      ## Acceptance criteria
+      - [ ] `widget()` returns a value
+      - [ ] a test covers the new helper
+
+      ## Verification plan
+      - [ ] `pytest` passes
+
+transcript:
+  - cmd: [git, status]
+    stdout: "?? src/hsai/widget.py\n"
+
+expect:
+  path: implement
+  tier: heavy
+  guards: []
+  outcome: merged

@@ -1,0 +1,18 @@
+name: improve-files-its-own-ticket-and-merges
+description: >
+  Green build, empty backlog: the loop picks a self-improvement, files a ticket
+  for it FIRST (no PR without a ticket) and implements it on the light tier -
+  a mechanical chore must not spend heavy quota.
+lesson: 2026-07-26-improve-chore-refresh-reference-set-snapshot-and-extract-one-practice
+
+remote_ci: SUCCESS
+
+transcript:
+  - cmd: [git, status]
+    stdout: "?? src/hsai/reference.py\n"
+
+expect:
+  path: improve
+  tier: light
+  guards: []
+  outcome: merged

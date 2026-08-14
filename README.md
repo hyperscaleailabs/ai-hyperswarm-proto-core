@@ -102,6 +102,7 @@ hsai doctor        # verify subscription-only guard + environment
 hsai loop --dry-run   # a full iteration with no side effects
 hsai loop          # one real iteration (opens & merges a PR on green)
 hsai loop --max-parallel 3 -n 1   # ramp to the swarm (after proving one iteration)
+hsai bench         # replay the frozen scenario suite; score the loop's decisions
 hsai traj 12       # print what agent run (iteration) 12 did (spends no quota)
 hsai recall "knowledge-only diff on a code ticket"   # rank prior lessons for a task
 hsai cycle --resume   # finish an interrupted governance block, replaying what completed

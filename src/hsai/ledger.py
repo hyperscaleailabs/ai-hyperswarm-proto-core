@@ -251,6 +251,20 @@ def evaluate_budget(agg: BlockAggregate, budget: dict) -> BudgetDecision:
     return BudgetDecision(OK, "within budget")
 
 
+def grade_block(
+    ledger_file: str | Path, block: int, budget: dict
+) -> tuple[BlockAggregate, BudgetDecision]:
+    """Read a block's spend off the ledger and grade it against ``budget``.
+
+    The single entry point for "may the loop start more work in this block?" -
+    used by `hsai cycle` before every iteration and replayed by `hsai bench`,
+    so the benchmark grades a budget breach through the same code the loop
+    runs rather than a copy of it that could drift.
+    """
+    spent = aggregate_block(read_records(ledger_file), block)
+    return spent, evaluate_budget(spent, budget)
+
+
 def demote_tier(tier: str) -> str:
     """Return the next cheaper tier (or ``tier`` itself if already cheapest)."""
     try:

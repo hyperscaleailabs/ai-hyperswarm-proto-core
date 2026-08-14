@@ -1,0 +1,36 @@
+name: implement-a-well-formed-ticket-merges-on-green
+description: >
+  The happy path: a green build plus one well-formed, unassigned ticket sends
+  the loop down the implement path, the reviewer approves, remote CI is green
+  and the PR merges. Every other scenario is a deviation from this one.
+lesson: 2026-07-26-implement-test-fake-runner-integration-tests-for-orchestrator-run-once-heal-implement-paths
+
+remote_ci: SUCCESS
+
+issues:
+  - number: 7
+    title: "feat: add a widget helper"
+    labels: ["priority:P2"]
+    body: |
+      ## Problem
+      The widget helper does not exist yet.
+
+      ## Proposal
+      Add a small widget helper and cover it with a test.
+
+      ## Acceptance criteria
+      - [ ] `widget()` returns a value
+      - [ ] a test covers the new helper
+
+      ## Verification plan
+      - [ ] `pytest` passes
+
+transcript:
+  - cmd: [git, status]
+    stdout: "?? src/hsai/widget.py\n?? tests/test_widget.py\n"
+
+expect:
+  path: implement
+  tier: standard
+  guards: []
+  outcome: merged

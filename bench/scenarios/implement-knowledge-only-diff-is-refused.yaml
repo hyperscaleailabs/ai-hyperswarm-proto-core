@@ -1,0 +1,35 @@
+name: implement-knowledge-only-diff-is-refused
+description: >
+  A feat: ticket answered with nothing but a lesson file is not implemented.
+  The completeness guard aborts the run before a PR opens - PR #17 once closed
+  a feature ticket with a knowledge-only diff, and that must stay impossible.
+lesson: 2026-07-26-architect-steering-quality-over-throughput
+
+issues:
+  - number: 9
+    title: "feat: add a widget helper"
+    labels: ["priority:P2"]
+    body: |
+      ## Problem
+      The widget helper does not exist yet.
+
+      ## Proposal
+      Add a small widget helper and cover it with a test.
+
+      ## Acceptance criteria
+      - [ ] `widget()` returns a value
+      - [ ] a test covers the new helper
+
+      ## Verification plan
+      - [ ] `pytest` passes
+
+transcript:
+  # The worker changed nothing but its own lesson note.
+  - cmd: [git, status]
+    stdout: "?? knowledge/lessons/2026-01-01-a-note.md\n"
+
+expect:
+  path: implement
+  tier: standard
+  guards: [completeness]
+  outcome: recovered

@@ -143,8 +143,7 @@ def _grade_budget(ledger_file: Path, idx: int, budget: dict) -> dict:
     from it on a replay would see the *whole* block's spend before iteration 0
     and halt immediately.
     """
-    spent = ledger.aggregate_block(ledger.read_records(ledger_file), idx)
-    decision = ledger.evaluate_budget(spent, budget)
+    spent, decision = ledger.grade_block(ledger_file, idx, budget)
     return {"status": decision.status, "reason": decision.reason, "spent": spent.summary()}
 
 

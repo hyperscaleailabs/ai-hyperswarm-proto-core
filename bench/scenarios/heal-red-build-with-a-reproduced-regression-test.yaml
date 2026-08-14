@@ -1,0 +1,36 @@
+name: heal-red-build-with-a-reproduced-regression-test
+description: >
+  A red build sends the loop down the heal path. The worker adds a regression
+  test that fails on the pre-fix tree and passes on the fix branch, so the
+  reproduce-before-fix guard approves and the change merges.
+lesson: 2026-07-26-implement-feat-reproduce-before-fix-regression-guard-for-heal-and-bugfix-tickets
+
+remote_ci: SUCCESS
+
+# The worker's diff, as the throwaway worktree would contain it.
+seed_files:
+  tests/test_regression.py: |
+    def test_regression():
+        assert True
+
+transcript:
+  # Local CI: red on the pre-flight check, green after the worker ran.
+  - cmd: [ruff, check]
+    responses:
+      - code: 1
+        stderr: "ruff: lint failure\n"
+      - code: 0
+  - cmd: [pytest]
+    exact: true
+    responses:
+      - code: 1
+        stderr: "pytest: failing test\n"
+      - code: 0
+  - cmd: [git, status]
+    stdout: "?? tests/test_regression.py\n"
+
+expect:
+  path: heal
+  tier: standard
+  guards: []
+  outcome: merged

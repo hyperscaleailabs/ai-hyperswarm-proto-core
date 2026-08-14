@@ -1,0 +1,29 @@
+name: heal-blocked-when-no-regression-test-is-added
+description: >
+  A heal run that touches no test file cannot have proven the bug was real. The
+  reproduce-before-fix guard blocks it before a PR is opened, and the ticket
+  goes back through the ordinary retry policy rather than into a new stall
+  state.
+lesson: 2026-07-26-implement-feat-reproduce-before-fix-regression-guard-for-heal-and-bugfix-tickets
+
+transcript:
+  - cmd: [ruff, check]
+    responses:
+      - code: 1
+        stderr: "ruff: lint failure\n"
+      - code: 0
+  - cmd: [pytest]
+    exact: true
+    responses:
+      - code: 1
+        stderr: "pytest: failing test\n"
+      - code: 0
+  # Nothing changed in the worktree: there is no regression test to run.
+  - cmd: [git, status]
+    stdout: ""
+
+expect:
+  path: heal
+  tier: standard
+  guards: [repro]
+  outcome: recovered

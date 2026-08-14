@@ -1,0 +1,36 @@
+name: heal-blocked-when-the-test-also-passes-on-the-pre-fix-tree
+description: >
+  A "regression" test that passes on the pre-fix tree proves nothing. The guard
+  blocks the change even though local CI went green and a test file really was
+  added - the failing-then-passing transition is the evidence, not the file.
+lesson: 2026-07-26-implement-feat-reproduce-before-fix-regression-guard-for-heal-and-bugfix-tickets
+
+seed_files:
+  tests/test_regression.py: |
+    def test_regression():
+        assert True
+
+transcript:
+  - cmd: [ruff, check]
+    responses:
+      - code: 1
+        stderr: "ruff: lint failure\n"
+      - code: 0
+  - cmd: [pytest]
+    exact: true
+    responses:
+      - code: 1
+        stderr: "pytest: failing test\n"
+      - code: 0
+  # The targeted run on the detached pre-fix worktree PASSES: no bug reproduced.
+  - cmd: [pytest]
+    cwd_contains: repro-check-
+    code: 0
+  - cmd: [git, status]
+    stdout: "?? tests/test_regression.py\n"
+
+expect:
+  path: heal
+  tier: standard
+  guards: [repro]
+  outcome: recovered
