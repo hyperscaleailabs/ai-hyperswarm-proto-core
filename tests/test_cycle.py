@@ -25,7 +25,7 @@ from hsai.config import load_config
 from hsai.knowledge import KnowledgeBase, Lesson
 from hsai.orchestrator import IterationResult
 from hsai.proc import Proc
-from hsai.synthesis import SynthesisResult
+from hsai.synthesis import Refusal, SynthesisResult
 
 
 class _Runner:
@@ -136,10 +136,14 @@ def test_block_soft_biases_then_hard_halts_but_inflight_merges(tmp_path, monkeyp
         json.loads(line)
 
 
-# --- synthesis duplicate rejections reach the review brief -------------------
+# --- dedupe-gate refusals reach the review brief -----------------------------
 
-def test_synthesis_duplicate_rejections_surface_in_block_notes(tmp_path, monkeypatch):
-    """`SynthesisResult.rejected` must reach `BlockReport.notes` (and the brief)."""
+def test_synthesis_refusals_surface_in_block_notes_and_brief(tmp_path, monkeypatch):
+    """`SynthesisResult.refused` must reach `BlockReport` (and the brief).
+
+    A refusal the architect cannot see is an unauditable filter on the loop's
+    own imagination, so the reason travels all the way to the review issue.
+    """
     cfg = load_config()
     cfg.budget.clear()
     cfg.cycle["block_size"] = 0  # isolate: no implementation iterations needed
@@ -147,7 +151,11 @@ def test_synthesis_duplicate_rejections_surface_in_block_notes(tmp_path, monkeyp
     def fake_synthesize(cfg, *, cycle_index, runner, ai_runner):
         return SynthesisResult(
             ok=True, studied=["a/b"], filed=[901],
-            rejected=1, rejected_titles=["feat: already open ticket"],
+            refused=[Refusal(
+                title="feat: lesson memory again",
+                reason="title duplicates open ticket #40: 'feat: already open ticket'",
+                matched="feat: already open ticket",
+            )],
         )
 
     runner = _Runner()
@@ -159,12 +167,20 @@ def test_synthesis_duplicate_rejections_surface_in_block_notes(tmp_path, monkeyp
 
     assert res.report.synthesized == [901]
     note = next(n for n in res.report.notes if n.startswith("synthesis:"))
-    assert "1 duplicate(s) rejected" in note
+    assert "1 idea(s) refused by the dedupe gate" in note
     assert "feat: already open ticket" in note
+    assert res.report.refused == [
+        "feat: lesson memory again - title duplicates open ticket #40: "
+        "'feat: already open ticket'"
+    ]
 
-    # The review brief renders every note verbatim.
+    # The review brief renders every note verbatim, and gives refusals their
+    # own section so a suppressed idea is never buried in the notes.
     assert runner.review_bodies, "a review issue should have been opened"
-    assert note in runner.review_bodies[-1]
+    body = runner.review_bodies[-1]
+    assert note in body
+    assert "## Ideas refused by the dedupe gate" in body
+    assert "feat: lesson memory again" in body
 
 
 # --- plain-text agent output must not break article generation --------------

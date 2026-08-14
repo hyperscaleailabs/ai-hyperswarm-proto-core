@@ -21,7 +21,7 @@ from .config import CoreConfig
 from .knowledge import KnowledgeBase, Lesson
 from .models import ModelChoice, Task, select
 from .proc import Runner, run
-from .tickets import NEEDS_REFINEMENT, issue_well_formed
+from .tickets import NEEDS_REFINEMENT, issue_well_formed, parse_practice_ids
 
 HEAL = "heal"
 IMPLEMENT = "implement"
@@ -106,6 +106,7 @@ def build_pr_body(
     ci_summary: str,
     kind: str = "",
     references: tuple[str, ...] = (),
+    practices: tuple[str, ...] = (),
     trajectory_digest: str = "",
     recalled: tuple[str, ...] = (),
     review_verdict: str = "",
@@ -117,6 +118,11 @@ def build_pr_body(
     if not ticket:
         raise ValueError("Every PR must be linked to a ticket (traceability invariant).")
     refs = ", ".join(f"`{r}`" for r in references) or "_(none)_"
+    # Named practices beat bare repo slugs: they say WHICH observed thing this
+    # change adopted, and they resolve in the reference field notes.
+    practice_line = (
+        "\n- practices adopted: " + ", ".join(f"`{p}`" for p in practices) if practices else ""
+    )
     artifacts = _phase_artifacts(kind) if kind else ""
     artifacts_section = f"\n## Phase artifacts\n{artifacts}\n" if artifacts else ""
     # Which prior notes the worker was shown - retrieval is only trustworthy if
@@ -151,7 +157,7 @@ def build_pr_body(
 See [[{lesson_note}]] in the knowledge base.
 {recalled_section}
 ## Reference-set evidence
-{refs}
+{refs}{practice_line}
 
 ---
 _Filed automatically by the `hsai` loop. Model usage is on the Claude subscription (no metered API)._
@@ -551,6 +557,10 @@ def run_once(
         traj.outcome = outcome
     kb = KnowledgeBase.from_config(cfg, wt)
     references = tuple(r.repo for r in cfg.reference_top10[:3])
+    # The ticket's own citations, carried through to the merged lesson: this is
+    # what turns "informed by crewAI" into "adopted crewAI's dated-snapshot
+    # discipline, recorded here as `crewaiinc-crewai--docs-freeze`".
+    practices = parse_practice_ids(ticket_body)
     lesson = Lesson(
         title=f"{kind}: {ticket_title}"[:120],
         outcome=outcome,
@@ -583,6 +593,7 @@ def run_once(
         ticket=ticket_num,
         model=choice.model,
         references=references,
+        practices=practices,
         repro_evidence=repro.render_evidence(repro_result) if repro_result else "",
         recalled=recalled.note_names,
         review_verdict=verdict.render(),
@@ -633,6 +644,7 @@ def run_once(
         ci_summary=ci_after.summary(),
         kind=kind,
         references=references,
+        practices=practices,
         trajectory_digest=traj.digest() if traj else "",
         recalled=recalled.note_names,
         review_verdict=verdict.render(),

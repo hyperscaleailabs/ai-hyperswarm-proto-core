@@ -22,6 +22,15 @@ CHECKBOX = re.compile(r"^\s*-\s*\[[ xX]?\]\s+\S", re.MULTILINE)
 NEEDS_REFINEMENT = "needs-refinement"
 SIZE_LABELS = ("size:S", "size:M", "size:L")
 
+# The machine-readable line that carries `practice_id`s through a filed issue.
+# Rendered by :meth:`TicketSpec.render`, read back by :func:`parse_practice_ids`
+# so a merged PR's lesson can name the practices it adopted (G1/G2).
+PRACTICE_IDS_PREFIX = "- practice_ids:"
+_PRACTICE_IDS_LINE = re.compile(
+    r"^\s*-\s*practice_ids\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE
+)
+_BACKTICKED = re.compile(r"`([^`]+)`")
+
 # Kinds of tickets exempt from the substantial-schema gate (docs and chores may
 # be legitimately small; heal tickets are filed by the loop itself mid-incident).
 _EXEMPT_PREFIXES = ("docs:", "chore:", "ci: main is red")
@@ -39,15 +48,25 @@ class TicketSpec:
     size: str = "M"  # S | M | L
     goal_ids: tuple[str, ...] = ()
     synthesis_rationale: str = ""  # which reference projects were combined, and how
+    practice_ids: tuple[str, ...] = ()  # observed practices this ticket adopts
     labels: tuple[str, ...] = ()
 
     def render(self) -> str:
         ac = "\n".join(f"- [ ] {c}" for c in self.acceptance_criteria)
         vp = "\n".join(f"- [ ] {v}" for v in self.verification_plan)
         goals = ", ".join(self.goal_ids) or "-"
+        # The evidence trail: named practices from the reference field notes,
+        # not bare repo slugs. Rendered under the rationale so a reader sees the
+        # claim and its citations together, and machine-readable so the merged
+        # PR's lesson can carry the same ids forward.
+        practices = (
+            f"\n{PRACTICE_IDS_PREFIX} " + ", ".join(f"`{p}`" for p in self.practice_ids)
+            if self.practice_ids
+            else ""
+        )
         synth = (
-            f"\n## Synthesis rationale\n{self.synthesis_rationale}\n"
-            if self.synthesis_rationale
+            f"\n## Synthesis rationale\n{self.synthesis_rationale}{practices}\n"
+            if self.synthesis_rationale or self.practice_ids
             else ""
         )
         return f"""## Problem
@@ -97,6 +116,22 @@ def check_well_formed(title: str, body: str) -> WellFormedness:
 
 def issue_well_formed(issue: Issue) -> WellFormedness:
     return check_well_formed(issue.title, issue.body)
+
+
+def parse_practice_ids(body: str) -> tuple[str, ...]:
+    """Read the ``practice_ids`` a filed ticket claims to adopt.
+
+    Backticked ids are preferred (that is how :meth:`TicketSpec.render` writes
+    them); a human-edited comma list without backticks still parses, because a
+    ticket refined by the architect must not silently lose its citations.
+    """
+    ids: list[str] = []
+    for raw in _PRACTICE_IDS_LINE.findall(body):
+        found = _BACKTICKED.findall(raw)
+        if not found:
+            found = [part.strip() for part in raw.split(",")]
+        ids.extend(i.strip().strip("`") for i in found if i.strip())
+    return tuple(dict.fromkeys(ids))
 
 
 def size_of(issue: Issue) -> str:

@@ -127,11 +127,13 @@ def _synthesis_step(
     """Synthesize tickets when the well-formed backlog is thin (journaled once)."""
     low_water = int(cfg.cycle.get("backlog_low_watermark", 4))
     if dry_run or _well_formed_backlog(cfg, runner=runner) >= low_water:
-        return {"ran": False, "filed": [], "error": "", "rejected": 0, "rejected_titles": []}
+        return {"ran": False, "filed": [], "error": "", "refused": []}
     sres = synthesize(cfg, cycle_index=idx, runner=runner, ai_runner=ai_runner)
     return {
         "ran": True, "filed": list(sres.filed), "error": sres.error,
-        "rejected": sres.rejected, "rejected_titles": list(sres.rejected_titles),
+        # Journaled as plain dicts so a resumed block replays the refusals
+        # verbatim instead of losing why an idea never reached the backlog.
+        "refused": [r.as_dict() for r in sres.refused],
     }
 
 
@@ -238,11 +240,15 @@ def run_cycle(
     report.synthesized = list(synth["filed"])
     if synth["ran"] and not report.synthesized:
         report.notes.append(f"synthesis produced no tickets: {synth['error']}")
-    if synth["rejected"]:
-        matched = "; ".join(f'"{t}"' for t in synth["rejected_titles"] if t) or "-"
+    # `.get` on purpose: a block journaled before refusals were recorded must
+    # still resume rather than KeyError on an older record shape.
+    refused = list(synth.get("refused", []))
+    if refused:
+        report.refused = [f"{r['title']} - {r['reason']}" for r in refused]
+        matched = "; ".join(f'"{r["matched"]}"' for r in refused if r.get("matched")) or "-"
         report.notes.append(
-            f"synthesis: {synth['rejected']} duplicate(s) rejected (matched: {matched}) - "
-            f"filed {len(report.synthesized)} survivor(s), no back-fill"
+            f"synthesis: {len(refused)} idea(s) refused by the dedupe gate "
+            f"(matched: {matched}) - filed {len(report.synthesized)} survivor(s), no back-fill"
         )
 
     # 2. Sequential implementation block, under the quota budget gate.

@@ -140,6 +140,7 @@ synthesis:
   memory_closed_limit: 15      # recently-closed tickets folded into synthesis memory
   memory_max_lessons: 25       # knowledge-base lessons folded into synthesis memory
   duplicate_threshold: 0.6     # Jaccard token overlap above which a candidate is a duplicate
+  adoption_max_chars: 2000     # hard cap on the "practices already acted on" prompt section
 
 # Quota/cost budget for one half-day block (subscription-only: purely local
 # measurement, never a metered API call). The ledger aggregates each block's
@@ -197,6 +198,10 @@ knowledge:
   lessons_dir: knowledge/lessons
   whitepapers_dir: knowledge/whitepapers
   mocs_dir: knowledge/MOCs
+  # Append-only field notes on the reference set (G1): one note per project,
+  # dated entries citing the artifact they came from, keyed by practice_id.
+  # Written by every synthesis pass; indexed as the Reference MOC.
+  reference_dir: knowledge/reference
   templates_dir: knowledge/templates
   whitepaper_every_lessons: 10       # synthesize a whitepaper every N new lessons
   obsidian_ready: true               # wikilinks + committed .obsidian config
