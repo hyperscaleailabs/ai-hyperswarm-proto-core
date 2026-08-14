@@ -1,22 +1,27 @@
 import json
 
-from hsai import ai
+from hsai import ai, github
 from hsai.config import load_config
+from hsai.knowledge import FieldNote, KnowledgeBase, Lesson, Observation
 from hsai.models import ModelChoice
 from hsai.proc import Proc
 from hsai.synthesis import (
+    ADOPTION_HEADING,
     DEFAULT_MEMORY_MAX_CHARS,
     DUPLICATE_JACCARD_THRESHOLD,
     MEMORY_HEADING,
+    AdoptionIndex,
     ContextPack,
     MemoryPack,
+    build_context_pack,
     build_prompt,
     is_duplicate,
     parse_ticket_specs,
     pick_rotation,
+    screen_specs,
     synthesize,
 )
-from hsai.tickets import TicketSpec
+from hsai.tickets import TicketSpec, parse_practice_ids
 
 
 def _cfg():
@@ -113,8 +118,8 @@ def test_synthesize_survives_output_without_a_json_envelope():
     assert res.ok is True
     assert res.filed == [321]
     assert res.error == ""
+    assert res.refused == []
     assert res.rejected == 0
-    assert res.rejected_titles == []
 
 
 # --- MemoryPack: what this loop already knows about its own state ------------
@@ -226,8 +231,7 @@ def test_memory_pack_gathering_degrades_gracefully_when_gh_is_unavailable(tmp_pa
     # it runs to completion (the model call still happens) rather than raising.
     res = synthesize(cfg, cycle_index=0, root=str(tmp_path), runner=broken_runner,
                       ai_runner=_plain_text_runner())
-    assert res.rejected == 0
-    assert res.rejected_titles == []
+    assert res.refused == []
 
 
 def test_prompt_puts_memory_section_before_the_study_digest():
@@ -367,6 +371,7 @@ def test_synthesize_drops_duplicates_and_files_only_the_survivors():
     assert len(res.filed) == 2
     assert res.rejected == 1
     assert res.rejected_titles == ["feat: lesson-retrieval memory"]
+    assert "open ticket #40" in res.refused[0].reason
 
     created_titles = [
         c[c.index("--title") + 1] for c in runner.calls if c[:3] == ["gh", "issue", "create"]
@@ -385,3 +390,306 @@ def test_synthesize_never_backfills_a_thin_block():
     res = synthesize(cfg, cycle_index=0, root=".", runner=runner, ai_runner=runner)
     assert len(res.filed) < int(cfg.synthesis.get("file_top", 3))
     assert len(res.filed) == 2
+
+
+# --- the deepened miner, and the field notes it persists ----------------------
+
+WORKFLOW_BODY = "name: Issue Classifier\non:\n  issues:\n    types: [opened]\n"
+CONTRIBUTING_BODY = "# Contributing\nSign the CLA, then open a draft PR.\n"
+
+
+def _mining_runner(*, calls: list[list[str]] | None = None):
+    """A fake `gh` that answers every endpoint the deepened miner reaches."""
+    seen = calls if calls is not None else []
+
+    def runner(cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None):
+        seen.append(list(cmd))
+        target = cmd[2] if len(cmd) > 2 else ""
+        if target.endswith("/readme"):
+            return Proc(cmd, 0, "# llama_index\nData framework for agents.\n", "")
+        if "/commits" in target:
+            return Proc(cmd, 0, "feat: add router\nfix: retry embeddings\n", "")
+        if target.endswith("/contents/.github/workflows"):
+            return Proc(cmd, 0, "issue_classifier.yml\nclose_new_integration_prs.yml\n", "")
+        if "/contents/.github/workflows/" in target:
+            return Proc(cmd, 0, WORKFLOW_BODY, "")
+        if "/pulls?state=closed" in target:
+            return Proc(cmd, 0, "fix: broken link [bug,triage]\nfeat: new tool [feature]\n", "")
+        if target.endswith("/contents/CONTRIBUTING.md"):
+            return Proc(cmd, 0, CONTRIBUTING_BODY, "")
+        if target.endswith("/contents/.github/ISSUE_TEMPLATE"):
+            return Proc(cmd, 0, "bug_report.yml\n", "")
+        return Proc(cmd, 1, "", "not found")
+
+    runner.calls = seen  # type: ignore[attr-defined]
+    return runner
+
+
+def test_context_pack_fetches_workflow_bodies_prs_and_contribution_policy():
+    """Names alone say a workflow exists; the body says what it does."""
+    calls: list[list[str]] = []
+    pack = build_context_pack(["run-llama/llama_index"], runner=_mining_runner(calls=calls))
+
+    section = pack.sections["run-llama/llama_index"]
+    assert "issue_classifier.yml" in section
+    assert "name: Issue Classifier" in section          # the BODY, not just the name
+    assert "fix: broken link [bug,triage]" in section   # closed PR titles WITH labels
+    assert "Sign the CLA" in section                    # CONTRIBUTING.md
+    assert "bug_report.yml" in section                  # issue templates
+    assert "feat: add router" in section                # and the pre-existing material
+
+    # every fetch is a `gh api` read; the miner never writes to GitHub
+    assert calls and all(c[:2] == ["gh", "api"] for c in calls)
+
+
+def test_context_pack_sections_stay_inside_their_character_budget():
+    """Three deep sections must not swamp the heavy prompt."""
+    def fat_runner(cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None):
+        return Proc(cmd, 0, "x" * 50000, "")
+
+    pack = build_context_pack(["a/b"], runner=fat_runner, max_section_chars=1000)
+    assert len(pack.sections["a/b"]) <= 1000
+    assert pack.sections["a/b"].endswith("...")
+
+
+def test_build_context_pack_appends_a_dated_entry_per_pass(tmp_path):
+    """Mining twice appends; it never rewrites what the first pass recorded."""
+    kb = KnowledgeBase(tmp_path)
+    runner = _mining_runner()
+
+    build_context_pack(["run-llama/llama_index"], runner=runner, kb=kb)
+    note = kb.reference_dir / "run-llama-llama_index.md"
+    first_pass = note.read_text()
+    assert "`.github/workflows/issue_classifier.yml`" in first_pass
+    assert "`CONTRIBUTING.md`" in first_pass
+
+    build_context_pack(["run-llama/llama_index"], runner=runner, kb=kb)
+    second_pass = note.read_text()
+    assert second_pass.startswith(first_pass)  # byte-identical prefix
+    assert len(second_pass) > len(first_pass)  # a new dated entry was appended
+    record = kb.read_field_notes()[0]
+    assert len(record.observed_dates) == 2 * len(record.practice_ids)
+
+
+def test_build_context_pack_without_a_knowledge_base_writes_nothing(tmp_path):
+    """The miner stays usable as a pure read - persistence is opt-in."""
+    kb = KnowledgeBase(tmp_path)
+    build_context_pack(["run-llama/llama_index"], runner=_mining_runner())
+    assert kb.reference_notes() == []
+
+
+# --- the adoption index: what we DID about what we saw ------------------------
+
+def _lesson(kb, title, *, outcome, practices):
+    kb.write_lesson(Lesson(
+        title=title, outcome=outcome, kind="implement",
+        context="c", what_happened="w", lesson="l", practices=practices,
+    ))
+
+
+def _open_issue(number, title, body, *, labels=("self-improve",)):
+    return github.Issue(number=number, title=title, labels=tuple(labels),
+                        assignees=(), body=body)
+
+
+def test_adoption_index_buckets_merged_failed_and_in_flight(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    _lesson(kb, "implement: triage gate", outcome="pass", practices=("llama--triage",))
+    _lesson(kb, "implement: freeze docs", outcome="fail", practices=("crewai--freeze",))
+    kb.append_field_note(FieldNote(
+        repo="openai/swarm",
+        observations=(Observation(
+            practice="handoff protocol", artifact="`README.md`", what="w",
+            observed="2026-08-14", practice_id="swarm--handoff",
+        ),),
+    ))
+
+    index = AdoptionIndex.build(kb=kb, open_issues=(
+        _open_issue(77, "feat: metagpt news log",
+                    "## Synthesis rationale\nx\n- practice_ids: `metagpt--news`\n"),
+    ))
+
+    assert index.status("llama--triage") == "adopted"
+    assert index.status("crewai--freeze") == "failed"
+    assert index.status("metagpt--news") == "in-flight"
+    assert index.status("swarm--handoff") == ""       # observed, never acted on
+    assert index.status("nobody--knows") == ""
+    assert "swarm--handoff" in index.observed
+    assert "#77" in index.evidence("metagpt--news")
+
+
+def test_adoption_index_never_lets_an_open_ticket_mask_a_recorded_outcome(tmp_path):
+    """"We shipped it" and "we tried and it failed" both outrank "someone is on it"."""
+    kb = KnowledgeBase(tmp_path)
+    _lesson(kb, "implement: triage gate", outcome="pass", practices=("llama--triage",))
+    _lesson(kb, "implement: freeze docs", outcome="fail", practices=("crewai--freeze",))
+
+    index = AdoptionIndex.build(kb=kb, open_issues=(
+        _open_issue(80, "feat: again", "- practice_ids: `llama--triage`, `crewai--freeze`\n"),
+    ))
+    assert index.status("llama--triage") == "adopted"
+    assert index.status("crewai--freeze") == "failed"
+    assert index.in_flight == {}
+
+
+def test_adoption_index_is_empty_without_a_knowledge_base():
+    index = AdoptionIndex.build()
+    assert index.adopted == {} and index.failed == {} and index.in_flight == {}
+    assert "_(none)_" in index.render()
+
+
+def test_prompt_names_adopted_failed_and_in_flight_practice_ids(tmp_path):
+    """AC: the planner is told, by id, what not to re-file."""
+    cfg = _cfg()
+    pack = ContextPack(repos=["a/b"], sections={"a/b": "digest"})
+    index = AdoptionIndex(
+        adopted={"llama--triage": "[[2026-08-01-x]] (pass)"},
+        failed={"crewai--freeze": "[[2026-08-02-y]] (fail)"},
+        in_flight={"metagpt--news": "#77"},
+        observed=("swarm--handoff",),
+    )
+
+    prompt = build_prompt(cfg, pack, MemoryPack(), index)
+
+    assert ADOPTION_HEADING in prompt
+    assert "llama--triage" in prompt and "Already adopted" in prompt
+    assert "crewai--freeze" in prompt and "Already failed" in prompt
+    assert "metagpt--news" in prompt and "Currently in flight" in prompt
+    assert "swarm--handoff" in prompt          # observed but not yet acted on
+    assert "practice_ids" in prompt            # the emitted spec must carry them
+    # memory first, then adoption, then the study material it should judge
+    assert prompt.index(MEMORY_HEADING) < prompt.index(ADOPTION_HEADING)
+    assert prompt.index(ADOPTION_HEADING) < prompt.index("Study digest of reference projects")
+    # the heading survives an empty index, so the planner always sees the section
+    assert ADOPTION_HEADING in build_prompt(cfg, pack)
+
+
+def test_adoption_section_is_hard_capped():
+    index = AdoptionIndex(adopted={f"repo--practice-{i}": "[[note]]" for i in range(500)})
+    capped = index.render(max_chars=300)
+    assert len(capped) <= 300
+    assert capped.endswith("...")
+
+
+# --- the dedupe gate: accept and refuse branches ------------------------------
+
+def _pid_spec(title: str, *practice_ids: str) -> TicketSpec:
+    return TicketSpec(
+        title=title, problem="p", proposal="pp",
+        acceptance_criteria=("a", "b", "c"), verification_plan=("v1", "v2"),
+        practice_ids=practice_ids,
+    )
+
+
+def test_gate_accepts_a_novel_spec_with_an_unseen_practice():
+    index = AdoptionIndex(adopted={"llama--triage": "[[note]] (pass)"})
+    spec = _pid_spec("feat: cost ledger dashboard", "swarm--handoff")
+
+    survivors, refused = screen_specs([spec], MemoryPack(), index)
+
+    assert survivors == [spec]
+    assert refused == []
+
+
+def test_gate_refuses_an_already_adopted_practice_with_a_reason():
+    index = AdoptionIndex(adopted={"llama--triage": "[[2026-08-01-x]] (pass)"})
+    spec = _pid_spec("feat: automatic proposal triage", "llama--triage")
+
+    survivors, refused = screen_specs([spec], MemoryPack(), index)
+
+    assert survivors == []
+    assert len(refused) == 1
+    assert refused[0].title == "feat: automatic proposal triage"
+    assert refused[0].matched == "llama--triage"
+    assert "already adopted" in refused[0].reason
+    assert "2026-08-01-x" in refused[0].reason  # the evidence, not just the verdict
+
+
+def test_gate_refuses_a_practice_that_is_already_in_flight():
+    index = AdoptionIndex(in_flight={"metagpt--news": "#77"})
+    survivors, refused = screen_specs(
+        [_pid_spec("feat: dated project memory", "metagpt--news")], MemoryPack(), index
+    )
+    assert survivors == []
+    assert "already in-flight" in refused[0].reason and "#77" in refused[0].reason
+
+
+def test_gate_lets_a_failed_practice_be_re_proposed():
+    """A failure is an argument for a different approach, not a permanent ban."""
+    index = AdoptionIndex(failed={"crewai--freeze": "[[2026-08-02-y]] (fail)"})
+    spec = _pid_spec("feat: append-only snapshots, second attempt", "crewai--freeze")
+
+    survivors, refused = screen_specs([spec], MemoryPack(), index)
+
+    assert survivors == [spec]
+    assert refused == []
+
+
+def test_gate_names_where_a_duplicate_title_came_from():
+    memory = MemoryPack(open_tickets=(_open_issue(40, "feat: lesson-retrieval memory", ""),))
+    survivors, refused = screen_specs(
+        [_pid_spec("feat: lesson-retrieval memory", "brand--new")], memory, AdoptionIndex()
+    )
+    assert survivors == []
+    assert "open ticket #40" in refused[0].reason
+    assert refused[0].matched == "feat: lesson-retrieval memory"
+
+
+def test_gate_checks_practice_ids_before_titles():
+    """A reworded re-proposal is caught by its id even when the title sails past."""
+    index = AdoptionIndex(adopted={"llama--triage": "[[note]] (pass)"})
+    spec = _pid_spec("feat: something that shares no words at all", "llama--triage")
+
+    _, refused = screen_specs([spec], MemoryPack(), index)
+    assert refused[0].matched == "llama--triage"
+
+
+# --- synthesize() end to end: refuse, report, file the rest -------------------
+
+ADOPTED_AND_NOVEL_OUTPUT = """PHASE 3:
+```json
+[
+  {"title": "feat: automatic proposal triage", "problem": "p", "proposal": "pp",
+   "acceptance_criteria": ["a", "b", "c"], "verification_plan": ["v1", "v2"],
+   "size": "M", "goal_ids": ["G4"], "synthesis_rationale": "combines x+y+z",
+   "practice_ids": ["llama--triage"]},
+  {"title": "feat: cost ledger visualization dashboard", "problem": "p", "proposal": "pp",
+   "acceptance_criteria": ["a", "b", "c"], "verification_plan": ["v1", "v2"],
+   "size": "M", "goal_ids": ["G1"], "synthesis_rationale": "combines a+b+c",
+   "practice_ids": ["swarm--handoff"]}
+]
+```"""
+
+
+def test_synthesize_refuses_an_adopted_practice_and_files_the_rest(tmp_path):
+    """AC + verification plan: a spec whose practice is already adopted is
+    refused with a reason and reported, never filed - and the survivor lands."""
+    cfg = _cfg()
+    kb = KnowledgeBase(tmp_path)
+    _lesson(kb, "implement: inbound triage gate", outcome="pass",
+            practices=("llama--triage",))
+    created: list[tuple[str, str]] = []
+
+    def runner(cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None):
+        if cmd[:1] == ["claude"]:
+            return Proc(cmd, 0, ADOPTED_AND_NOVEL_OUTPUT, "")
+        if cmd[:3] == ["gh", "issue", "create"]:
+            created.append((cmd[cmd.index("--title") + 1], cmd[cmd.index("--body") + 1]))
+            return Proc(cmd, 0, "https://github.com/o/r/issues/902\n", "")
+        if cmd[:3] == ["gh", "issue", "list"]:
+            return Proc(cmd, 0, "[]", "")
+        return Proc(cmd, 0, "", "")
+
+    res = synthesize(cfg, cycle_index=0, root=str(tmp_path), runner=runner, ai_runner=runner)
+
+    assert res.filed == [902]
+    assert [t for t, _ in created] == ["feat: cost ledger visualization dashboard"]
+    assert len(res.refused) == 1
+    assert res.refused[0].title == "feat: automatic proposal triage"
+    assert "already adopted" in res.refused[0].reason
+    assert res.ok is True
+
+    # the filed ticket carries its practice_ids, and they parse back out
+    body = created[0][1]
+    assert "- practice_ids: `swarm--handoff`" in body
+    assert parse_practice_ids(body) == ("swarm--handoff",)

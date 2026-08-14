@@ -52,13 +52,25 @@ Clone the repo and **open the folder as an Obsidian vault** - the committed
 
 ```
 knowledge/
-├── MOCs/          # Maps of Content: Knowledge Base / Lessons / Whitepapers
+├── MOCs/          # Maps of Content: Knowledge Base / Lessons / Whitepapers / Reference
 ├── lessons/       # one article per iteration (pass or fail)
 ├── whitepapers/   # periodic syntheses (every N lessons)
+├── reference/     # append-only field notes on the top-10 reference projects
 └── templates/     # note templates
 ```
 
 `hsai reindex` rebuilds the MOCs from what is on disk.
+
+**The reference set has a memory now (G1).** Every synthesis pass mines a
+rotating subset of the top-10 - README, commit subjects, CI **workflow bodies**,
+recently closed PR titles *with their labels*, `CONTRIBUTING.md`, issue
+templates - and appends what it saw to `knowledge/reference/<owner>-<repo>.md`
+as dated entries. Each entry cites the artifact it came from and carries a
+stable `practice_id`; appending never rewrites a prior entry, so *"what did we
+already learn from crewAI in July?"* stays answerable. Filed tickets carry the
+`practice_ids` they adopt, and the merged PR's lesson carries them forward in
+its `practices:` frontmatter - so a change traces back to a named observed
+practice, not a bare repo slug.
 
 **The loop reads the vault back.** Before an agent starts, `hsai.recall` builds
 a BM25 index over `knowledge/lessons`, `knowledge/whitepapers` and `docs/adr`
@@ -67,14 +79,20 @@ first, and biased toward notes whose `kind/` matches the task at hand. The
 planner gets the same treatment: a *What this loop has already tried* memory
 section (open tickets, recently closed tickets, lesson outcomes) so it stops
 re-proposing ideas that are already queued, shipped, or recorded as a
-failure, and `synthesis.is_duplicate` drops any candidate the model proposes
-anyway before it is filed. Retrieval is deterministic, costs no quota, and
-adds no dependency; what it returned - and what was rejected as a duplicate -
-is recorded in the lesson's `recalled:` frontmatter, on the PR, and in the
-block review brief, so it stays auditable. Tune it under `knowledge.recall`
-and `synthesis` in `.ai-swarm/core.yaml` (`enabled`, `k`, `max_chars`,
-`fail_weight`, `kind_weight`, `memory_max_chars`, `duplicate_threshold`), or
-set `enabled: false` to restore the previous prompt exactly.
+failure, plus a *Practices already acted on* adoption index naming - by
+`practice_id` - what was merged, what was tried and failed, and what an open
+ticket already covers. `synthesis.screen_specs` then refuses any candidate the
+model proposes anyway: by practice (already adopted or in flight) or by
+near-duplicate title. Refusals are never silent - each carries a reason into
+`SynthesisResult.refused` and its own section of the block review brief, so a
+wrongly-suppressed idea is visible to the architect. Retrieval is
+deterministic, costs no quota, and adds no dependency; what it returned - and
+what was refused - is recorded in the lesson's `recalled:` frontmatter, on the
+PR, and in the block review brief, so it stays auditable. Tune it under
+`knowledge.recall` and `synthesis` in `.ai-swarm/core.yaml` (`enabled`, `k`,
+`max_chars`, `fail_weight`, `kind_weight`, `memory_max_chars`,
+`adoption_max_chars`, `duplicate_threshold`), or set `enabled: false` to
+restore the previous prompt exactly.
 
 ```bash
 hsai recall "remote CI gate"       # what would a worker be shown for this task?

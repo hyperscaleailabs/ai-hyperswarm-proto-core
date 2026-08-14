@@ -86,17 +86,31 @@ closes the loop.
   `enabled: false` renders nothing at all.
 - **Plan.** `synthesis.build_prompt` carries a *What this loop has already
   tried* section (`synthesis.MemoryPack`) - open tickets, recently closed
-  tickets, and lesson outcomes, titles only and hard-capped - ahead of the
-  reference-project digest, so the planner stops re-proposing dead ideas.
-  `synthesis.is_duplicate` then filters the model's own output before filing:
-  a candidate whose title exactly matches, or whose normalized-token overlap
-  with a prior title clears the configured Jaccard threshold, is dropped and
-  its slot is never back-filled - `SynthesisResult.rejected` and
-  `.rejected_titles` carry the count and matches into `BlockReport.notes`.
+  tickets, and lesson outcomes, titles only and hard-capped - and a *Practices
+  already acted on* adoption index (`synthesis.AdoptionIndex`) keyed by
+  `practice_id`, both ahead of the reference-project digest, so the planner
+  stops re-proposing dead ideas.
+- **Refuse.** `synthesis.screen_specs` filters the model's own output before
+  filing, on two independent grounds: a `practice_id` already **adopted** (a
+  passing lesson cites it) or **in flight** (an open ticket cites it); or a
+  title that exactly matches, or whose normalized-token overlap with a prior
+  title clears the configured Jaccard threshold. A practice recorded as
+  *failed* is deliberately allowed through. Refused slots are never
+  back-filled, and never silent: each `SynthesisResult.refused` entry carries a
+  reason into `BlockReport.refused` and its own section of the review brief.
+- **Remember the field.** Each mining pass appends what it saw to
+  `knowledge/reference/<owner>-<repo>.md` (`KnowledgeBase.append_field_note`) -
+  dated, artifact-citing entries keyed by `practice_id`. Appending uses the
+  existing file verbatim as the prefix of the new content, so a pass can only
+  add; it can never rewrite history. `hsai reindex` publishes them as the
+  *Reference MOC*.
 - **Audit.** What was retrieved is recorded three times: on `IterationResult`,
   as a `recalled:` list in the lesson's frontmatter, and as a
   *Prior lessons consulted* section on the PR. `hsai recall "<query>"` prints
-  the same ranking by hand.
+  the same ranking by hand. The evidence trail runs the other way too: a filed
+  ticket's `- practice_ids:` line is parsed back by
+  `tickets.parse_practice_ids` and lands in the merged lesson's `practices:`
+  frontmatter, which is exactly what the adoption index reads next cycle.
 
 Reference-set lineage: retrieval-before-planning from `assafelovic/gpt-researcher`,
 index-then-retrieve with metadata preserved from `run-llama/llama_index`, and

@@ -58,6 +58,31 @@ def test_brief_links_everything(tmp_path):
     assert "/review-next" in body
 
 
+def test_brief_surfaces_ideas_the_dedupe_gate_refused():
+    """A suppressed idea has to be visible, or the gate is unauditable."""
+    cfg = load_config()
+    report = BlockReport(
+        cycle_index=7,
+        synthesized=[31],
+        refused=[
+            "feat: automatic proposal triage - practice `llama--triage` is already "
+            "adopted ([[2026-08-01-x]] (pass))",
+        ],
+    )
+    body = render_brief(cfg, report)
+    assert "## Ideas refused by the dedupe gate" in body
+    assert "feat: automatic proposal triage" in body
+    assert "`llama--triage`" in body
+    assert "already adopted" in body
+
+
+def test_brief_says_so_when_nothing_was_refused():
+    cfg = load_config()
+    body = render_brief(cfg, BlockReport(cycle_index=7))
+    assert "## Ideas refused by the dedupe gate" in body
+    assert "every candidate this block was new work" in body
+
+
 def test_preserved_notes_default_when_missing(tmp_path):
     assert "never overwritten" in preserved_notes(tmp_path / "nope.md")
 
