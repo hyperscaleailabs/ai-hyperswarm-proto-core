@@ -77,6 +77,13 @@ class Task:
     body: str = ""
     labels: tuple[str, ...] = ()
     est_files: int = 1
+    # Retry context (the "Handoff" - see module docstring below). ``attempt``
+    # is 1 on a ticket's first try and increments with every recorded
+    # ``attempts:N`` label; ``prior_failure`` is the previous attempt's failure
+    # dossier (see :func:`hsai.orchestrator._recover_failed`), fed back in
+    # rather than restarting blind (SWE-agent/SWE-agent's trajectory replay).
+    attempt: int = 1
+    prior_failure: str = ""
 
 
 @dataclass(frozen=True)
@@ -99,7 +106,7 @@ def _score(task: Task) -> int:
     - (-3, 5): Standard tasks (features, small bugfixes, simple refactors)
     - [5, inf]: Heavy tasks (architecture, hard bugs, migrations)
     """
-    text = f"{task.title}\n{task.body}\n{' '.join(task.labels)}".lower()
+    text = f"{task.title}\n{task.body}\n{' '.join(task.labels)}\n{task.prior_failure}".lower()
     score = 0
 
     # Keyword-based signals: moderate weight to allow structural signals
@@ -140,6 +147,21 @@ def _score(task: Task) -> int:
     return score
 
 
+def escalate(tier: str, attempt: int) -> str:
+    """The tier ``attempt - 1`` rungs heavier than ``tier``, saturating at heavy.
+
+    A first try (``attempt <= 1``) has nothing to escalate from and returns
+    ``tier`` unchanged. This is the "Handoff" primitive from openai/swarm
+    (an agent transferring control to a better-suited agent) applied to model
+    tiers instead of personas: a ticket that a lighter model already failed is
+    routed to a heavier one rather than repeating the same tier blind.
+    """
+    if attempt <= 1 or tier not in _TIER_ORDER:
+        return tier
+    i = _TIER_ORDER.index(tier) + (attempt - 1)
+    return _TIER_ORDER[min(i, len(_TIER_ORDER) - 1)]
+
+
 def select(task: Task, cfg: CoreConfig, *, demote: bool = False) -> ModelChoice:
     """Pick a tier for ``task`` and resolve it to a concrete model alias.
 
@@ -147,6 +169,14 @@ def select(task: Task, cfg: CoreConfig, *, demote: bool = False) -> ModelChoice:
     - Heavy (>= 5): Architecture, migrations, hard bugs, large refactors
     - Light (<= -3): Docs, formatting, trivial edits, chores
     - Standard: Everything else (features, small bugfixes, simple refactors)
+
+    ``task.attempt > 1`` escalates one tier heavier per retry (see
+    :func:`escalate`), UNLESS ``demote`` is set - the budget gate always wins
+    over escalation, so a soft breach demotes exactly as it would on a first
+    attempt rather than compounding an escalation on top of a burning budget.
+    A hard breach means this function is never called at all: the caller
+    (``_implementation_block``) stops starting new work before selecting a
+    model for it.
 
     ``demote`` biases the choice one tier cheaper (heavy->standard->light). The
     budget gate sets it on a soft breach so a block that is burning quota keeps
@@ -175,14 +205,28 @@ def select(task: Task, cfg: CoreConfig, *, demote: bool = False) -> ModelChoice:
         tier = cfg.default_tier
         why = "no strong signal; using default tier"
 
+    # Escalation ladder: a retried ticket (attempt > 1) is routed to a heavier
+    # tier than the attempt before it - UNLESS a soft budget breach demotes
+    # instead (see the `demote` branch below, which always wins).
+    if task.attempt > 1 and not demote:
+        escalated = escalate(tier, task.attempt)
+        if escalated != tier:
+            why = f"escalated {tier}->{escalated} on attempt {task.attempt} ({why})"
+            tier = escalated
+
     # Soft budget breach: bias one tier cheaper so the block keeps progressing
-    # without burning more heavy-tier quota.
+    # without burning more heavy-tier quota. Wins over escalation - a block
+    # that is already burning budget must not spend even more on a retry.
     if demote:
         from .ledger import demote_tier
 
         cheaper = demote_tier(tier)
         if cheaper != tier:
-            why = f"{why}; demoted {tier}->{cheaper} under soft budget breach"
+            suffix = (
+                f"; demoted {tier}->{cheaper} under soft budget breach"
+                + (" (wins over escalation)" if task.attempt > 1 else "")
+            )
+            why = f"{why}{suffix}"
             tier = cheaper
 
     # Fall back gracefully if a tier is not configured.

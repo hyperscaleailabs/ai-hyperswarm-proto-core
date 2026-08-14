@@ -111,6 +111,26 @@ def comment_issue(repo: str, number: int, body: str, *, runner: Runner = run) ->
     )
 
 
+def list_issue_comments(repo: str, number: int, *, runner: Runner = run) -> list[str]:
+    """Every comment body on an issue, oldest first (empty on any parse failure).
+
+    Used to fetch a prior attempt's failure dossier back off the ticket (see
+    ``_recover_failed`` / ``_fetch_prior_failure`` in :mod:`hsai.orchestrator`)
+    - it is posted as a comment, not stored on the Issue itself, so it survives
+    the worktree that recorded it being deleted.
+    """
+    p = _gh(
+        ["issue", "view", str(number), "--repo", repo, "--json", "comments"],
+        runner=runner,
+    )
+    try:
+        data = json.loads(p.stdout or "{}")
+    except json.JSONDecodeError:
+        return []
+    comments = data.get("comments", []) or []
+    return [c.get("body", "") for c in comments if isinstance(c, dict)]
+
+
 def list_open_issues(repo: str, *, runner: Runner = run) -> list[Issue]:
     """List open issues, highest priority first."""
     p = _gh(

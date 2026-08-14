@@ -58,6 +58,23 @@ def test_brief_links_everything(tmp_path):
     assert "/review-next" in body
 
 
+def test_brief_lists_escalated_tickets():
+    cfg = load_config()
+    report = BlockReport(
+        cycle_index=7,
+        escalations=["#42: score=3 -> heavy (escalated standard->heavy on attempt 2 (...))"],
+    )
+    body = render_brief(cfg, report)
+    assert "## Escalations (tier moved up on retry)" in body
+    assert "#42" in body and "escalated standard->heavy on attempt 2" in body
+
+
+def test_brief_says_no_escalations_when_none_happened():
+    cfg = load_config()
+    body = render_brief(cfg, BlockReport(cycle_index=7))
+    assert "_none - no retried ticket needed a heavier model this block_" in body
+
+
 def test_preserved_notes_default_when_missing(tmp_path):
     assert "never overwritten" in preserved_notes(tmp_path / "nope.md")
 

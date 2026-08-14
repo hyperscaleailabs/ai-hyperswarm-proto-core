@@ -46,6 +46,7 @@ class BlockReport:
     articles: list[str] = field(default_factory=list)      # file paths
     cost: BlockAggregate | None = None                     # quota-ledger aggregate
     notes: list[str] = field(default_factory=list)
+    escalations: list[str] = field(default_factory=list)   # tickets whose tier moved up
 
 
 def preserved_notes(direction_path: Path) -> str:
@@ -169,6 +170,9 @@ def render_brief(cfg: CoreConfig, report: BlockReport) -> str:
     articles = "\n".join(f"- `{a}`" for a in report.articles) or "_none_"
     cost = _cost_summary(report.cost)
     extra = "\n".join(f"- {n}" for n in report.notes)
+    escalations = "\n".join(f"- {e}" for e in report.escalations) or (
+        "_none - no retried ticket needed a heavier model this block_"
+    )
     return f"""# Block review - cycle {report.cycle_index}
 
 One block of the twice-daily governance rhythm. Review here, then run
@@ -180,6 +184,9 @@ sequentially, records your feedback as ADRs, and ends with a merged PR.
 
 ## Iterations
 {iters}
+
+## Escalations (tier moved up on retry)
+{escalations}
 
 ## PRs merged
 {merged}
