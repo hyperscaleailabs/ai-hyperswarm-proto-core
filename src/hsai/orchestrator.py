@@ -8,20 +8,26 @@ independent review by a different model -> record a lesson -> open a linked PR
 Decision logic (:func:`decide_path`) and PR-body assembly
 (:func:`build_pr_body`) are pure and unit-tested; the orchestration around them
 performs the real side effects through the wrapper modules.
+
+:func:`run_once` is a *staged* runner: every numbered step above appends a
+:class:`hsai.trajectory.Stage` to the iteration's JSONL record before the next
+one begins, and the whole body is wrapped in ``try/finally`` so the worktree is
+removed - and a claimed ticket handed back - on every path, exceptions included.
 """
 from __future__ import annotations
 
 import threading
 import time
+import traceback
 from dataclasses import dataclass, field
 from uuid import uuid4
 
 from . import ai, ci, github, gitops, ledger, recall, repro, review, trajectory
 from .config import CoreConfig
-from .knowledge import KnowledgeBase, Lesson
+from .knowledge import NO_PROVENANCE, KnowledgeBase, Lesson
 from .models import ModelChoice, Task, select
 from .proc import Runner, run
-from .tickets import NEEDS_REFINEMENT, issue_well_formed
+from .tickets import NEEDS_REFINEMENT, cited_projects, issue_well_formed
 
 HEAL = "heal"
 IMPLEMENT = "implement"
@@ -113,10 +119,15 @@ def build_pr_body(
     """Assemble a PR body that satisfies the traceability invariants.
 
     Raises if there is no ticket - every PR MUST be linked to one.
+
+    ``references`` is the provenance the ticket actually cited (see
+    :func:`hsai.tickets.cited_projects`). An empty tuple renders as an explicit
+    no-provenance marker; it is never backfilled from the reference set, which
+    would present a constant as if it were a citation.
     """
     if not ticket:
         raise ValueError("Every PR must be linked to a ticket (traceability invariant).")
-    refs = ", ".join(f"`{r}`" for r in references) or "_(none)_"
+    refs = ", ".join(f"`{r}`" for r in references) or NO_PROVENANCE
     artifacts = _phase_artifacts(kind) if kind else ""
     artifacts_section = f"\n## Phase artifacts\n{artifacts}\n" if artifacts else ""
     # Which prior notes the worker was shown - retrieval is only trustworthy if
@@ -293,186 +304,246 @@ def run_once(
     else:
         wt = repo_dir
 
-    # 2. CI check (skipped in dry-run so we never recurse into a real build)
-    ci_before = (
-        ci.run_local(cwd=wt, runner=runner)
-        if not dry_run
-        else ci.CIResult(ok=True, steps={}, log="dry-run")
+    # The staged record of this iteration: one JSONL line per numbered step,
+    # flushed the moment each step ends (SWE-agent's `.traj` discipline). It is
+    # written into the WORKTREE, so the PR that carries the change also carries
+    # the record of how the change was produced, and the lesson wikilinks it.
+    stages = trajectory.StageLog(wt, branch, iteration=iteration)
+    stages.record(
+        "sync",
+        summary=f"worktree for {branch} off origin/{cfg.default_branch}",
+        detail="dry-run: reused the repo root as the worktree" if dry_run else str(wt),
     )
 
-    # 3. choose work + claim a ticket (serialized so workers never collide)
     ticket_num: int | None = None
     ticket_title = ""
     ticket_body = ""
     claimed_issue: github.Issue | None = None
 
-    if dry_run:
-        kind = decide_path(ci_before.ok, has_tickets=False)
-        if kind == IMPROVE:
-            ticket_title, ticket_body = _improvement_idea(cfg)
-        elif kind == HEAL:
-            ticket_title, ticket_body = "ci: main is red - auto-heal", "dry-run"
-    idle_reason = ""
-    if not dry_run:
-        with _SERIAL:
-            all_open = github.list_open_issues(repo, runner=runner)
-            # Consider only UNASSIGNED, non-blocked, non-review tickets.
-            candidates = [
-                i for i in all_open
-                if not i.assignees and not i.is_blocked
-                and "review" not in i.labels and NEEDS_REFINEMENT not in i.labels
-            ]
-            # Quality gate: vague tickets are refused, not implemented badly.
-            open_unassigned = []
-            for i in candidates:
-                wf = issue_well_formed(i)
-                if wf.ok:
-                    open_unassigned.append(i)
-                else:
-                    github.edit_labels(repo, i.number, add=[NEEDS_REFINEMENT], runner=runner)
-            kind = decide_path(ci_before.ok, has_tickets=bool(open_unassigned))
-            if kind == HEAL:
-                ticket_title = "ci: main is red - auto-heal"
-                ticket_body = (
-                    f"CI failing on {cfg.default_branch}.\n\n```\n{ci_before.summary()}\n```"
-                )
-                ticket_num = github.create_issue(
-                    repo, ticket_title, ticket_body, ["priority:P0", "ci", "hsai"],
-                    assignee=login, runner=runner,
-                )
-            elif kind == IMPLEMENT:
-                top = open_unassigned[0]
-                ticket_num, ticket_title, ticket_body = top.number, top.title, top.body
-                claimed_issue = top
-                github.assign(repo, top.number, login, runner=runner)
-            else:  # IMPROVE - file a ticket FIRST so the PR has one
-                ticket_title, ticket_body = _improvement_idea(cfg)
-                # Dedupe: never spam the backlog with copies of the same idea
-                # (a stranded run once filed nine identical chore tickets).
-                existing = next((i for i in all_open if i.title == ticket_title), None)
-                if existing is not None:
-                    if existing.assignees or existing.is_blocked:
-                        idle_reason = (
-                            f"idle: improvement #{existing.number} already in flight/blocked"
+    try:
+        # 2. CI check (skipped in dry-run so we never recurse into a real build)
+        with stages.stage("ci_before") as st:
+            ci_before = (
+                ci.run_local(cwd=wt, runner=runner)
+                if not dry_run
+                else ci.CIResult(ok=True, steps={}, log="dry-run")
+            )
+            st.ok, st.summary, st.detail = ci_before.ok, ci_before.summary(), ci_before.log
+
+        # 3. choose work + claim a ticket (serialized so workers never collide)
+        idle_reason = ""
+        with stages.stage("claim") as st:
+            if dry_run:
+                kind = decide_path(ci_before.ok, has_tickets=False)
+                if kind == IMPROVE:
+                    ticket_title, ticket_body = _improvement_idea(cfg)
+                elif kind == HEAL:
+                    ticket_title, ticket_body = "ci: main is red - auto-heal", "dry-run"
+            else:
+                with _SERIAL:
+                    all_open = github.list_open_issues(repo, runner=runner)
+                    # Consider only UNASSIGNED, non-blocked, non-review tickets.
+                    candidates = [
+                        i for i in all_open
+                        if not i.assignees and not i.is_blocked
+                        and "review" not in i.labels and NEEDS_REFINEMENT not in i.labels
+                    ]
+                    # Quality gate: vague tickets are refused, not implemented badly.
+                    open_unassigned = []
+                    for i in candidates:
+                        wf = issue_well_formed(i)
+                        if wf.ok:
+                            open_unassigned.append(i)
+                        else:
+                            github.edit_labels(
+                                repo, i.number, add=[NEEDS_REFINEMENT], runner=runner
+                            )
+                    kind = decide_path(ci_before.ok, has_tickets=bool(open_unassigned))
+                    if kind == HEAL:
+                        ticket_title = "ci: main is red - auto-heal"
+                        ticket_body = (
+                            f"CI failing on {cfg.default_branch}.\n\n"
+                            f"```\n{ci_before.summary()}\n```"
                         )
-                    else:
-                        ticket_num = existing.number
-                        ticket_body = existing.body
-                        claimed_issue = existing
-                        github.assign(repo, existing.number, login, runner=runner)
+                        ticket_num = github.create_issue(
+                            repo, ticket_title, ticket_body, ["priority:P0", "ci", "hsai"],
+                            assignee=login, runner=runner,
+                        )
+                    elif kind == IMPLEMENT:
+                        top = open_unassigned[0]
+                        ticket_num, ticket_title, ticket_body = top.number, top.title, top.body
+                        claimed_issue = top
+                        github.assign(repo, top.number, login, runner=runner)
+                    else:  # IMPROVE - file a ticket FIRST so the PR has one
+                        ticket_title, ticket_body = _improvement_idea(cfg)
+                        # Dedupe: never spam the backlog with copies of the same
+                        # idea (a stranded run once filed nine identical chores).
+                        existing = next(
+                            (i for i in all_open if i.title == ticket_title), None
+                        )
+                        if existing is not None:
+                            if existing.assignees or existing.is_blocked:
+                                idle_reason = (
+                                    f"idle: improvement #{existing.number} "
+                                    "already in flight/blocked"
+                                )
+                            else:
+                                ticket_num = existing.number
+                                ticket_body = existing.body
+                                claimed_issue = existing
+                                github.assign(repo, existing.number, login, runner=runner)
+                        else:
+                            ticket_num = github.create_issue(
+                                repo, ticket_title, ticket_body,
+                                ["priority:P3", "self-improve", "hsai"],
+                                assignee=login, runner=runner,
+                            )
+            st.ok = not idle_reason
+            st.summary = idle_reason or f"{kind}: #{ticket_num or '-'} {ticket_title}"
+            st.detail = ticket_body
+
+        if idle_reason:
+            res = IterationResult(kind=kind, ci_before=ci_before.ok)
+            res.notes.append(idle_reason)
+            res.notes.append(f"stages={stages.note_name}")
+            return res
+
+        # 4. model selection (recorded for audit); a soft budget breach biases it
+        # one tier cheaper.
+        with stages.stage("select") as st:
+            task = Task(kind=kind, title=ticket_title, body=ticket_body, labels=(
+                tuple(claimed_issue.labels) if claimed_issue else ()
+            ))
+            choice = select(task, cfg, demote=demote_tier)
+
+            # Read side of the knowledge base: pull the most relevant prior notes
+            # for this ticket out of the vault in the worktree. Computed before the
+            # agent runs (and regardless of dry-run) so the lesson can record what
+            # was shown.
+            recalled = recall.for_task(
+                wt, cfg, title=ticket_title, body=ticket_body, kind=kind
+            )
+            st.summary = f"{choice.tier}/{choice.model}: {choice.rationale}"
+            st.detail = "recalled: " + (", ".join(recalled.note_names) or "(none)")
+
+        result = IterationResult(
+            kind=kind, ticket=ticket_num, model=choice.model, ci_before=ci_before.ok,
+            recalled=list(recalled.note_names),
+        )
+        result.notes.append(f"stages={stages.note_name}")
+        if recalled.notes:
+            result.notes.append(f"recalled {len(recalled.notes)} prior note(s)")
+
+        # Provenance, carried from the ticket rather than invented: the projects
+        # its `## Synthesis rationale` actually cites. An empty tuple stays empty
+        # and renders as an explicit marker - it is never backfilled from
+        # `reference_top10`, which would be a fabricated citation (G1, G2).
+        references = cited_projects(ticket_body, [r.repo for r in cfg.reference_top10])
+        result.notes.append(
+            "cited provenance: " + (", ".join(references) or "(none)")
+        )
+
+        # Quota ledger: every iteration that runs a model appends one cost record.
+        # Written to the repo root (not the ephemeral worktree) so the block-level
+        # aggregate and budget gate can read across iterations; the governance PR
+        # later commits it so the economics stay auditable.
+        attempts = (claimed_issue.attempts() if claimed_issue else 0) + 1
+        block = iteration // 100 if block is None else block
+        tokens: tuple[int, int] | None = None
+        traj: trajectory.Trajectory | None = None
+
+        def _record_cost(outcome: str) -> None:
+            # Every terminal path passes through here, so it is also where the
+            # trajectory learns how its run ended.
+            if traj is not None:
+                traj.outcome = outcome
+                trajectory.write(traj, repo_dir)
+            ledger.append_record(
+                ledger.ledger_path(cfg, repo_dir),
+                ledger.LedgerRecord(
+                    iteration=iteration,
+                    block=block,
+                    ticket=ticket_num,
+                    kind=kind,
+                    tier=choice.tier,
+                    model=choice.model,
+                    wall_clock_seconds=round(max(0.0, time.time() - started), 3),
+                    attempts=attempts,
+                    outcome=outcome,
+                    input_tokens=tokens[0] if tokens else None,
+                    output_tokens=tokens[1] if tokens else None,
+                ),
+            )
+
+        # 5. run the agent (subscription-only)
+        agent_ok = True
+        agent_err = ""
+        reverted_workflows: list[str] = []
+        repro_result: repro.ReproResult | None = None
+        incomplete = False
+        if not dry_run:
+            prompt = _task_prompt(kind, cfg, ticket_title, ticket_body, recalled.section)
+            with stages.stage("agent") as st:
+                agent_started = time.time()
+                ares = ai.run_agent(
+                    prompt, choice, cfg, cwd=wt, runner=ai_runner, timeout=cfg.agent_timeout
+                )
+                # Persist the trajectory FIRST: a guard below can return early, and
+                # the run that gets aborted is exactly the one worth being able to
+                # replay. It lands in the repo root (not the ephemeral worktree) and
+                # stays local - only a redacted tail is quoted in the committed lesson.
+                traj = trajectory.record(
+                    repo_dir,
+                    iteration=iteration, ticket=ticket_num, kind=kind,
+                    tier=choice.tier, model=choice.model, prompt=prompt, result=ares,
+                    block=block, duration_seconds=time.time() - agent_started,
+                )
+                result.notes.append(f"trajectory={traj.identifier}")
+                agent_ok, agent_err = ares.ok, ares.error
+                # Fed from the parsed envelope, not re-parsed from stdout: this is
+                # the path that finally populates the ledger's token columns.
+                tokens = ledger.parse_tokens(ares.payload)
+                if agent_err:
+                    agent_err = _format_error_with_context(agent_err, kind, ticket_num)
+                st.ok = agent_ok
+                st.summary = f"`{choice.model}` {traj.digest()}"
+                st.detail = traj.excerpt()
+
+            # Guard: a task must not change the CI checks, or local and remote CI
+            # would diverge (as happened once when a worker added mypy). Revert any
+            # workflow edits before they are committed and note it in the lesson.
+            with stages.stage("workflow_guard") as st:
+                reverted_workflows = [
+                    p for p in gitops.changed_paths(cwd=wt, runner=runner)
+                    if p.startswith(".github/workflows/")
+                ]
+                if reverted_workflows:
+                    gitops.restore_pathspec(".github/workflows", cwd=wt, runner=runner)
+                    result.notes.append(f"reverted workflow edits: {reverted_workflows}")
+                st.ok = not reverted_workflows
+                st.summary = (
+                    f"reverted {len(reverted_workflows)} workflow edit(s)"
+                    if reverted_workflows else "no CI workflow file was touched"
+                )
+                st.detail = "\n".join(reverted_workflows)
+
+            # Completeness guard: a code ticket (feat/skill/refactor/fix) cannot be
+            # satisfied by a knowledge-only diff. PR #17 once "closed" a feature
+            # ticket by committing nothing but its own lesson file - never again.
+            with stages.stage("completeness_guard") as st:
+                if not _requires_code(ticket_title):
+                    st.summary = "not applicable: this ticket does not promise code"
                 else:
-                    ticket_num = github.create_issue(
-                        repo, ticket_title, ticket_body,
-                        ["priority:P3", "self-improve", "hsai"],
-                        assignee=login, runner=runner,
+                    touched = gitops.changed_paths(cwd=wt, runner=runner)
+                    code_files = [p for p in touched if not p.startswith("knowledge/")]
+                    incomplete = not code_files
+                    st.ok = not incomplete
+                    st.summary = (
+                        "knowledge-only diff on a code ticket"
+                        if incomplete else f"{len(code_files)} code file(s) changed"
                     )
-
-    if idle_reason:
-        res = IterationResult(kind=kind, ci_before=ci_before.ok)
-        res.notes.append(idle_reason)
-        gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
-        return res
-
-    # 4. model selection (recorded for audit); a soft budget breach biases it
-    # one tier cheaper.
-    task = Task(kind=kind, title=ticket_title, body=ticket_body, labels=(
-        tuple(claimed_issue.labels) if claimed_issue else ()
-    ))
-    choice = select(task, cfg, demote=demote_tier)
-
-    # Read side of the knowledge base: pull the most relevant prior notes for
-    # this ticket out of the vault in the worktree. Computed before the agent
-    # runs (and regardless of dry-run) so the lesson can record what was shown.
-    recalled = recall.for_task(
-        wt, cfg, title=ticket_title, body=ticket_body, kind=kind
-    )
-
-    result = IterationResult(
-        kind=kind, ticket=ticket_num, model=choice.model, ci_before=ci_before.ok,
-        recalled=list(recalled.note_names),
-    )
-    if recalled.notes:
-        result.notes.append(f"recalled {len(recalled.notes)} prior note(s)")
-
-    # Quota ledger: every iteration that runs a model appends one cost record.
-    # Written to the repo root (not the ephemeral worktree) so the block-level
-    # aggregate and budget gate can read across iterations; the governance PR
-    # later commits it so the economics stay auditable.
-    attempts = (claimed_issue.attempts() if claimed_issue else 0) + 1
-    block = iteration // 100 if block is None else block
-    tokens: tuple[int, int] | None = None
-    traj: trajectory.Trajectory | None = None
-
-    def _record_cost(outcome: str) -> None:
-        # Every terminal path passes through here, so it is also where the
-        # trajectory learns how its run ended.
-        if traj is not None:
-            traj.outcome = outcome
-            trajectory.write(traj, repo_dir)
-        ledger.append_record(
-            ledger.ledger_path(cfg, repo_dir),
-            ledger.LedgerRecord(
-                iteration=iteration,
-                block=block,
-                ticket=ticket_num,
-                kind=kind,
-                tier=choice.tier,
-                model=choice.model,
-                wall_clock_seconds=round(max(0.0, time.time() - started), 3),
-                attempts=attempts,
-                outcome=outcome,
-                input_tokens=tokens[0] if tokens else None,
-                output_tokens=tokens[1] if tokens else None,
-            ),
-        )
-
-    # 5. run the agent (subscription-only)
-    agent_ok = True
-    agent_err = ""
-    reverted_workflows: list[str] = []
-    repro_result: repro.ReproResult | None = None
-    if not dry_run:
-        prompt = _task_prompt(kind, cfg, ticket_title, ticket_body, recalled.section)
-        agent_started = time.time()
-        ares = ai.run_agent(
-            prompt, choice, cfg, cwd=wt, runner=ai_runner, timeout=cfg.agent_timeout
-        )
-        # Persist the trajectory FIRST: a guard below can return early, and the
-        # run that gets aborted is exactly the one worth being able to replay.
-        # It lands in the repo root (not the ephemeral worktree) and stays
-        # local - only a redacted tail is quoted in the committed lesson.
-        traj = trajectory.record(
-            repo_dir,
-            iteration=iteration, ticket=ticket_num, kind=kind,
-            tier=choice.tier, model=choice.model, prompt=prompt, result=ares,
-            block=block, duration_seconds=time.time() - agent_started,
-        )
-        result.notes.append(f"trajectory={traj.identifier}")
-        agent_ok, agent_err = ares.ok, ares.error
-        # Fed from the parsed envelope, not re-parsed from stdout: this is the
-        # path that finally populates the ledger's token columns.
-        tokens = ledger.parse_tokens(ares.payload)
-        if agent_err:
-            agent_err = _format_error_with_context(agent_err, kind, ticket_num)
-
-        # Guard: a task must not change the CI checks, or local and remote CI
-        # would diverge (as happened once when a worker added mypy). Revert any
-        # workflow edits before they are committed and note it in the lesson.
-        reverted_workflows = [
-            p for p in gitops.changed_paths(cwd=wt, runner=runner)
-            if p.startswith(".github/workflows/")
-        ]
-        if reverted_workflows:
-            gitops.restore_pathspec(".github/workflows", cwd=wt, runner=runner)
-            result.notes.append(f"reverted workflow edits: {reverted_workflows}")
-
-        # Completeness guard: a code ticket (feat/skill/refactor/fix) cannot be
-        # satisfied by a knowledge-only diff. PR #17 once "closed" a feature
-        # ticket by committing nothing but its own lesson file - never again.
-        if _requires_code(ticket_title):
-            touched = gitops.changed_paths(cwd=wt, runner=runner)
-            code_files = [p for p in touched if not p.startswith("knowledge/")]
-            if not code_files:
+                    st.detail = "\n".join(touched)
+            if incomplete:
                 result.notes.append("completeness guard: knowledge-only diff on a code ticket")
                 _recover_failed(
                     cfg, repo, 0, kind=kind, ticket_num=ticket_num,
@@ -481,26 +552,32 @@ def run_once(
                 )
                 result.recovered = True
                 _record_cost("incomplete")
-                gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
                 return result
 
-        # Reproduce-before-fix guard: heal/bugfix tickets must add or modify a
-        # test that FAILS on the pre-fix (parent) tree and PASSES on the fix
-        # branch, proving the bug was real (llama_index's fix-stream
-        # discipline). Docs/chore tickets are exempt.
-        if repro.requires_repro_guard(kind, ticket_title):
-            base_ref = gitops.merge_base(
-                "HEAD", f"origin/{cfg.default_branch}", cwd=wt, runner=runner,
-            ) or f"origin/{cfg.default_branch}"
-            test_files = repro.changed_test_files(
-                gitops.changed_paths(cwd=wt, runner=runner)
-            )
-            repro_result = repro.check_repro(
-                repo_root=repo_dir, wt=wt, base_ref=base_ref,
-                test_files=test_files, worktrees_dir=cfg.worktrees_dir, runner=runner,
-            )
-            result.notes.append(f"repro guard: {repro_result.reason}")
-            if not repro_result.ok:
+            # Reproduce-before-fix guard: heal/bugfix tickets must add or modify a
+            # test that FAILS on the pre-fix (parent) tree and PASSES on the fix
+            # branch, proving the bug was real (llama_index's fix-stream
+            # discipline). Docs/chore tickets are exempt.
+            with stages.stage("repro_guard") as st:
+                if not repro.requires_repro_guard(kind, ticket_title):
+                    st.summary = "not applicable: not a heal/bugfix ticket"
+                else:
+                    base_ref = gitops.merge_base(
+                        "HEAD", f"origin/{cfg.default_branch}", cwd=wt, runner=runner,
+                    ) or f"origin/{cfg.default_branch}"
+                    test_files = repro.changed_test_files(
+                        gitops.changed_paths(cwd=wt, runner=runner)
+                    )
+                    repro_result = repro.check_repro(
+                        repo_root=repo_dir, wt=wt, base_ref=base_ref,
+                        test_files=test_files, worktrees_dir=cfg.worktrees_dir,
+                        runner=runner,
+                    )
+                    result.notes.append(f"repro guard: {repro_result.reason}")
+                    st.ok = repro_result.ok
+                    st.summary = repro_result.reason
+                    st.detail = repro.render_evidence(repro_result)
+            if repro_result is not None and not repro_result.ok:
                 _recover_failed(
                     cfg, repo, 0, kind=kind, ticket_num=ticket_num,
                     claimed_issue=claimed_issue, login=login,
@@ -508,179 +585,231 @@ def run_once(
                 )
                 result.recovered = True
                 _record_cost("no_repro")
-                gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
                 return result
 
-    # 6. re-check CI
-    ci_after = ci.run_local(cwd=wt, runner=runner) if not dry_run else ci_before
-    result.ci_after = ci_after.ok
+        # 6. re-check CI
+        with stages.stage("ci_after") as st:
+            ci_after = ci.run_local(cwd=wt, runner=runner) if not dry_run else ci_before
+            result.ci_after = ci_after.ok
+            st.ok, st.summary, st.detail = ci_after.ok, ci_after.summary(), ci_after.log
 
-    # 6b. Independent review gate: a SECOND opinion, from a different tier than
-    # the author, on whether the diff actually satisfies the ticket. Every other
-    # guard so far only checks the change's shape. The agent's work is committed
-    # first because the reviewer reads `git diff <merge-base>...HEAD`; nothing is
-    # pushed until the verdict is in, so a blocking verdict never opens a PR.
-    verdict = review.skip_review("dry-run: nothing was committed to review")
-    if not dry_run:
-        commit_msg = f"{kind}: {ticket_title}\n\nRefs #{ticket_num}\nModel: {choice.model}"
-        gitops.commit_all(commit_msg, cwd=wt, runner=runner)
-        if not ci_after.ok:
-            # A red branch is already headed for _recover_failed via remote CI;
-            # spending review quota on it would buy nothing.
-            verdict = review.skip_review("local CI is red; the CI gate decides this one")
-        else:
-            base_ref = gitops.merge_base(
-                "HEAD", f"origin/{cfg.default_branch}", cwd=wt, runner=runner,
-            ) or f"origin/{cfg.default_branch}"
-            verdict = review.review_change(
-                cfg,
-                repo_root=repo_dir, wt=wt, base_ref=base_ref,
-                ticket_title=ticket_title, ticket_body=ticket_body,
-                author=choice, iteration=iteration, block=block,
-                ticket=ticket_num, attempts=attempts,
-                runner=runner, ai_runner=ai_runner,
-            )
-    result.review = verdict.status
-    result.notes.append(f"independent review: {verdict.summary()}")
+        # 6b. Independent review gate: a SECOND opinion, from a different tier than
+        # the author, on whether the diff actually satisfies the ticket. Every other
+        # guard so far only checks the change's shape. The agent's work is committed
+        # first because the reviewer reads `git diff <merge-base>...HEAD`; nothing is
+        # pushed until the verdict is in, so a blocking verdict never opens a PR.
+        with stages.stage("review") as st:
+            verdict = review.skip_review("dry-run: nothing was committed to review")
+            if not dry_run:
+                commit_msg = (
+                    f"{kind}: {ticket_title}\n\nRefs #{ticket_num}\nModel: {choice.model}"
+                )
+                gitops.commit_all(commit_msg, cwd=wt, runner=runner)
+                if not ci_after.ok:
+                    # A red branch is already headed for _recover_failed via remote
+                    # CI; spending review quota on it would buy nothing.
+                    verdict = review.skip_review(
+                        "local CI is red; the CI gate decides this one"
+                    )
+                else:
+                    base_ref = gitops.merge_base(
+                        "HEAD", f"origin/{cfg.default_branch}", cwd=wt, runner=runner,
+                    ) or f"origin/{cfg.default_branch}"
+                    verdict = review.review_change(
+                        cfg,
+                        repo_root=repo_dir, wt=wt, base_ref=base_ref,
+                        ticket_title=ticket_title, ticket_body=ticket_body,
+                        author=choice, iteration=iteration, block=block,
+                        ticket=ticket_num, attempts=attempts,
+                        runner=runner, ai_runner=ai_runner,
+                    )
+            result.review = verdict.status
+            st.ok = verdict.approve
+            st.summary = verdict.summary()
+            st.detail = verdict.render()
+        result.notes.append(f"independent review: {verdict.summary()}")
 
-    # 7. lesson (ALWAYS, pass or fail)
-    outcome = "pass" if (agent_ok and ci_after.ok) else "fail"
-    if traj is not None:
-        # The digest quoted below should state what is known now; `_record_cost`
-        # refines it to the merge outcome once that is settled.
-        traj.outcome = outcome
-    kb = KnowledgeBase.from_config(cfg, wt)
-    references = tuple(r.repo for r in cfg.reference_top10[:3])
-    lesson = Lesson(
-        title=f"{kind}: {ticket_title}"[:120],
-        outcome=outcome,
-        kind=kind,
-        context=f"Iteration {iteration}. Ticket #{ticket_num}. CI before: {ci_before.summary()}.",
-        what_happened=(
-            f"Model `{choice.model}` ({choice.tier}) ran the task. "
-            f"Agent ok={agent_ok}. CI after: {ci_after.summary()}."
-            + (
-                f"\n\nReverted off-spec workflow edits: {reverted_workflows}."
-                if reverted_workflows else ""
+        # 7. lesson (ALWAYS, pass or fail)
+        with stages.stage("lesson") as st:
+            outcome = "pass" if (agent_ok and ci_after.ok) else "fail"
+            if traj is not None:
+                # The digest quoted below should state what is known now;
+                # `_record_cost` refines it to the merge outcome once settled.
+                traj.outcome = outcome
+            kb = KnowledgeBase.from_config(cfg, wt)
+            lesson = Lesson(
+                title=f"{kind}: {ticket_title}"[:120],
+                outcome=outcome,
+                kind=kind,
+                context=(
+                    f"Iteration {iteration}. Ticket #{ticket_num}. "
+                    f"CI before: {ci_before.summary()}."
+                ),
+                what_happened=(
+                    f"Model `{choice.model}` ({choice.tier}) ran the task. "
+                    f"Agent ok={agent_ok}. CI after: {ci_after.summary()}."
+                    + (
+                        f"\n\nReverted off-spec workflow edits: {reverted_workflows}."
+                        if reverted_workflows else ""
+                    )
+                    + (f"\n\nAgent error:\n```\n{agent_err[:800]}\n```" if agent_err else "")
+                    # Only a digest line plus a redacted tail of the trajectory is
+                    # committed; the full record stays in the (gitignored) local
+                    # store, replayable with `hsai traj <iteration>`.
+                    + (
+                        f"\n\nTrajectory `{traj.identifier}` digest: {traj.digest()}"
+                        f"\n\nRedacted tail:\n```\n{traj.excerpt()}\n```"
+                        if traj else ""
+                    )
+                ),
+                lesson=(
+                    "Change merged cleanly under a green build."
+                    if outcome == "pass"
+                    else "Change did not reach green; auto-merge will hold until CI "
+                    "passes. Investigate the failure captured above before the next "
+                    "attempt."
+                ),
+                iteration=iteration,
+                ticket=ticket_num,
+                model=choice.model,
+                references=references,
+                repro_evidence=repro.render_evidence(repro_result) if repro_result else "",
+                recalled=recalled.note_names,
+                review_verdict=verdict.render(),
+                execution_trace=traj.execution_trace() if traj else "",
+                trajectory_note=stages.note_name,
             )
-            + (f"\n\nAgent error:\n```\n{agent_err[:800]}\n```" if agent_err else "")
-            # Only a digest line plus a redacted tail of the trajectory is
-            # committed; the full record stays in the (gitignored) local store,
-            # replayable with `hsai traj <iteration>`.
-            + (
-                f"\n\nTrajectory `{traj.identifier}` digest: {traj.digest()}"
-                f"\n\nRedacted tail:\n```\n{traj.excerpt()}\n```"
-                if traj else ""
-            )
-        ),
-        lesson=(
-            "Change merged cleanly under a green build."
-            if outcome == "pass"
-            else "Change did not reach green; auto-merge will hold until CI passes. "
-            "Investigate the failure captured above before the next attempt."
-        ),
-        iteration=iteration,
-        ticket=ticket_num,
-        model=choice.model,
-        references=references,
-        repro_evidence=repro.render_evidence(repro_result) if repro_result else "",
-        recalled=recalled.note_names,
-        review_verdict=verdict.render(),
-        execution_trace=traj.execution_trace() if traj else "",
-    )
-    # Each PR commits ONLY its own uniquely-named lesson file. The MOC indexes
-    # and whitepapers are regenerated by the serialized `hsai reindex`
-    # maintenance step (see cli.cmd_reindex), so parallel PRs never collide on
-    # shared, derived index files.
-    lesson_path = kb.write_lesson(lesson)
-    result.lesson_path = str(lesson_path)
-    result.notes.append(f"lesson outcome={outcome}")
+            # Each PR commits ONLY its own uniquely-named lesson file. The MOC
+            # indexes and whitepapers are regenerated by the serialized
+            # `hsai reindex` maintenance step (see cli.cmd_reindex), so parallel
+            # PRs never collide on shared, derived index files.
+            lesson_path = kb.write_lesson(lesson)
+            result.lesson_path = str(lesson_path)
+            result.notes.append(f"lesson outcome={outcome}")
+            st.ok = outcome == "pass"
+            st.summary = f"outcome={outcome}, note={lesson.note_name()}"
+            st.detail = str(lesson_path)
 
-    if dry_run:
-        result.notes.append("dry-run: skipped commit/push/PR/merge")
-        _record_cost(outcome)
+        if dry_run:
+            result.notes.append("dry-run: skipped commit/push/PR/merge")
+            _record_cost(outcome)
+            return result
+
+        # 7b. A blocking verdict stops here: nothing is pushed, no PR is opened, and
+        # the ticket goes back through the SAME retry policy a red PR uses - one
+        # attempt spent, ``blocked`` at max_ticket_attempts. No new stall state.
+        if not verdict.approve:
+            _recover_failed(
+                cfg, repo, 0, kind=kind, ticket_num=ticket_num,
+                claimed_issue=claimed_issue, login=login,
+                remote="REVIEW_BLOCKED", runner=runner,
+            )
+            result.recovered = True
+            result.notes.append("recovered: independent review blocked the change")
+            # The lesson was written into a worktree that is about to be discarded
+            # unpushed; the durable record of this run is its ledger + trajectory.
+            result.lesson_path = ""
+            _record_cost("review_blocked")
+            return result
+
+        # 8-11. commit the lesson, push, PR (linked + model + lesson), merge on green
+        with stages.stage("pr") as st:
+            gitops.commit_all(
+                f"docs: record lesson for {kind}\n\nRefs #{ticket_num}",
+                cwd=wt, runner=runner,
+            )
+            gitops.push_branch(branch, cwd=wt, runner=runner)
+
+            pr_body = build_pr_body(
+                ticket=ticket_num or 0,
+                choice=choice,
+                lesson_note=lesson.note_name(),
+                lesson_summary=lesson.lesson,
+                ci_summary=ci_after.summary(),
+                kind=kind,
+                references=references,
+                trajectory_digest=traj.digest() if traj else "",
+                recalled=recalled.note_names,
+                review_verdict=verdict.render(),
+            )
+            pr_num = github.create_pr(
+                repo, branch, f"{kind}: {ticket_title}"[:120], pr_body,
+                base=cfg.default_branch, runner=runner,
+            )
+            result.pr = pr_num
+            st.ok = bool(pr_num)
+            st.summary = f"opened PR #{pr_num} from {branch}"
+
+        # 12. Poll the REAL (remote) CI to conclusion BEFORE relying on auto-merge -
+        # it is the source of truth for whether the change may merge, and arming
+        # auto-merge first (as opposed to gating on this poll) raced GitHub's own
+        # merge against our recovery bookkeeping.
+        remote_started = time.time()
+        remote = ci.wait_remote(
+            pr_num, repo,
+            timeout=cfg.ci_remote_timeout, interval=cfg.ci_poll_interval, runner=runner,
+        )
+        result.remote = remote
+        result.notes.append(f"remote CI={remote}")
+        # Flushed BEFORE the lesson-update commit below, so the staged record that
+        # ships with the PR includes the verdict that decided the merge.
+        stages.record(
+            "remote_ci", ok=(remote == ci.SUCCESS), summary=f"remote CI={remote}",
+            duration_s=time.time() - remote_started,
+        )
+
+        # Record the true remote outcome in the lesson itself, then push that
+        # update so it lands in the knowledge base once the PR merges.
+        lesson.remote_ci = remote
+        kb.write_lesson(lesson)
+        gitops.commit_all(
+            f"docs: record remote CI outcome ({remote}) in lesson\n\nRefs #{ticket_num}",
+            cwd=wt, runner=runner,
+        )
+        gitops.push_branch(branch, cwd=wt, runner=runner)
+
+        with stages.stage("merge_or_recover") as st:
+            if remote == ci.SUCCESS:
+                github.merge_pr(repo, pr_num, auto=True, runner=runner)
+                result.merged = True
+                st.summary = f"auto-merge armed on PR #{pr_num}"
+            else:
+                result.merged = False
+                _recover_failed(
+                    cfg, repo, pr_num, kind=kind, ticket_num=ticket_num,
+                    claimed_issue=claimed_issue, login=login, remote=remote,
+                    runner=runner,
+                )
+                result.recovered = True
+                result.notes.append("recovered: closed PR, returned ticket to backlog")
+                st.ok = False
+                st.summary = f"closed PR #{pr_num}; ticket returned to the backlog"
+
+        _record_cost("merged" if result.merged else "recovered")
         return result
 
-    # 7b. A blocking verdict stops here: nothing is pushed, no PR is opened, and
-    # the ticket goes back through the SAME retry policy a red PR uses - one
-    # attempt spent, ``blocked`` at max_ticket_attempts. No new stall state.
-    if not verdict.approve:
-        _recover_failed(
-            cfg, repo, 0, kind=kind, ticket_num=ticket_num,
-            claimed_issue=claimed_issue, login=login,
-            remote="REVIEW_BLOCKED", runner=runner,
-        )
-        result.recovered = True
-        result.notes.append("recovered: independent review blocked the change")
-        # The lesson was written into a worktree that is about to be discarded
-        # unpushed; the durable record of this run is its ledger + trajectory.
-        result.lesson_path = ""
-        _record_cost("review_blocked")
-        gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
-        return result
-
-    # 8-11. commit the lesson, push, PR (linked + model + lesson), merge on green
-    gitops.commit_all(
-        f"docs: record lesson for {kind}\n\nRefs #{ticket_num}", cwd=wt, runner=runner
-    )
-    gitops.push_branch(branch, cwd=wt, runner=runner)
-
-    pr_body = build_pr_body(
-        ticket=ticket_num or 0,
-        choice=choice,
-        lesson_note=lesson.note_name(),
-        lesson_summary=lesson.lesson,
-        ci_summary=ci_after.summary(),
-        kind=kind,
-        references=references,
-        trajectory_digest=traj.digest() if traj else "",
-        recalled=recalled.note_names,
-        review_verdict=verdict.render(),
-    )
-    pr_num = github.create_pr(
-        repo, branch, f"{kind}: {ticket_title}"[:120], pr_body,
-        base=cfg.default_branch, runner=runner,
-    )
-    result.pr = pr_num
-
-    # 12. Poll the REAL (remote) CI to conclusion BEFORE relying on auto-merge -
-    # it is the source of truth for whether the change may merge, and arming
-    # auto-merge first (as opposed to gating on this poll) raced GitHub's own
-    # merge against our recovery bookkeeping.
-    remote = ci.wait_remote(
-        pr_num, repo,
-        timeout=cfg.ci_remote_timeout, interval=cfg.ci_poll_interval, runner=runner,
-    )
-    result.remote = remote
-    result.notes.append(f"remote CI={remote}")
-
-    # Record the true remote outcome in the lesson itself, then push that
-    # update so it lands in the knowledge base once the PR merges.
-    lesson.remote_ci = remote
-    kb.write_lesson(lesson)
-    gitops.commit_all(
-        f"docs: record remote CI outcome ({remote}) in lesson\n\nRefs #{ticket_num}",
-        cwd=wt, runner=runner,
-    )
-    gitops.push_branch(branch, cwd=wt, runner=runner)
-
-    if remote == ci.SUCCESS:
-        github.merge_pr(repo, pr_num, auto=True, runner=runner)
-        result.merged = True
-    else:
-        result.merged = False
-        _recover_failed(
-            cfg, repo, pr_num, kind=kind, ticket_num=ticket_num,
-            claimed_issue=claimed_issue, login=login, remote=remote, runner=runner,
-        )
-        result.recovered = True
-        result.notes.append("recovered: closed PR, returned ticket to backlog")
-
-    _record_cost("merged" if result.merged else "recovered")
-
-    # 13. cleanup worktree
-    gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
-    return result
+    except BaseException as exc:
+        # Nothing below the worktree is allowed to leak on an unexpected failure.
+        # Before this, an exception anywhere between worktree creation and the
+        # cleanup call stranded the worktree on disk AND left the ticket assigned
+        # to the bot forever, so no later iteration could ever pick it up again.
+        try:
+            stages.record(
+                "crash", ok=False, summary=f"{type(exc).__name__}: {exc}",
+                detail=traceback.format_exc(),
+            )
+            if ticket_num and not dry_run:
+                github.unassign(repo, ticket_num, login, runner=runner)
+        except Exception:
+            # Bookkeeping must never mask the failure it is bookkeeping about:
+            # the original exception is the one worth propagating.
+            pass
+        raise
+    finally:
+        # 13. cleanup worktree - the ONE place it is removed, so neither an early
+        # return nor an exception can leak it.
+        if not dry_run:
+            gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
 
 
 def _recover_failed(

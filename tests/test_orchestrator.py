@@ -7,12 +7,14 @@ import pytest
 
 from hsai import ledger, orchestrator, recall, review, trajectory
 from hsai.config import load_config
+from hsai.knowledge import NO_PROVENANCE
 from hsai.models import ModelChoice
 from hsai.orchestrator import (
     HEAL,
     IMPLEMENT,
     IMPROVE,
     _format_error_with_context,
+    _improvement_idea,
     _phase_artifacts,
     _task_prompt,
     build_pr_body,
@@ -20,6 +22,7 @@ from hsai.orchestrator import (
     run_once,
 )
 from hsai.proc import Proc
+from hsai.tickets import cited_projects
 
 # The envelope `claude -p --output-format json` returns: the usage object the
 # quota ledger needs, plus (when the CLI exposes it) the message stream the
@@ -1358,3 +1361,260 @@ def test_dry_run_still_records_what_it_recalled(tmp_path):
     assert result.kind == IMPROVE
     assert result.recalled                       # retrieval runs without an agent
     assert "recalled:" in Path(result.lesson_path).read_text().split("---\n")[1]
+
+
+# --- staged iteration records -------------------------------------------------
+#
+# An iteration used to be one opaque call whose evidence evaporated with its
+# worktree. Each numbered step now appends a JSONL stage record, so a run can be
+# diagnosed after the fact - including the runs a guard aborts and the runs that
+# crash outright.
+
+FULL_PASS_STAGES = [
+    "sync", "ci_before", "claim", "select", "agent", "workflow_guard",
+    "completeness_guard", "repro_guard", "ci_after", "review", "lesson",
+    "pr", "remote_ci", "merge_or_recover",
+]
+
+
+def _stage_files(root: Path) -> list[Path]:
+    """Staged records anywhere under ``root`` (they live in the worktree)."""
+    return sorted(root.glob(f"**/{trajectory.STAGE_DIR}/*.jsonl"))
+
+
+def _stages(root: Path) -> list[trajectory.Stage]:
+    files = _stage_files(root)
+    assert len(files) == 1, f"expected exactly one staged record, got {files}"
+    return trajectory.read_stages(files[0])
+
+
+def test_every_numbered_step_of_a_passing_iteration_is_recorded(tmp_path):
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[dict(WIDGET_ISSUE)]
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.merged is True
+    stages = _stages(tmp_path)
+    assert [s.name for s in stages] == FULL_PASS_STAGES
+    assert all(s.ok for s in stages)              # nothing tripped on a clean run
+    assert all(s.started for s in stages)         # every record is timestamped...
+    assert all(s.duration_s >= 0.0 for s in stages)   # ...and timed
+    # The vault must not bloat: per-stage detail is hard-capped.
+    assert all(len(s.detail) <= trajectory.STAGE_DETAIL_CHARS for s in stages)
+
+    # The lesson wikilinks its own staged record, so the audit chain is
+    # navigable from inside Obsidian rather than only from a shell.
+    assert f"[[{_stage_files(tmp_path)[0].stem}.jsonl]]" in Path(
+        result.lesson_path
+    ).read_text()
+    assert any(n.startswith("stages=") for n in result.notes)
+
+
+def test_a_completeness_guard_abort_still_records_its_stages(tmp_path):
+    cfg = load_config()
+    issue = dict(WIDGET_ISSUE, number=9, title="feat: add widget")
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[issue],
+        worktree_status="?? knowledge/lessons/2026-07-26-fake.md\n",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.recovered is True and result.pr is None
+    stages = _stages(tmp_path)
+    assert [s.name for s in stages] == [
+        "sync", "ci_before", "claim", "select", "agent",
+        "workflow_guard", "completeness_guard",
+    ]
+    guard = stages[-1]
+    assert guard.ok is False and "knowledge-only diff" in guard.summary
+    # the steps the abort skipped were never claimed to have run
+    assert not {"pr", "remote_ci", "merge_or_recover"} & {s.name for s in stages}
+
+
+def test_a_repro_guard_abort_still_records_its_stages(tmp_path):
+    cfg = load_config()
+    runner = FakeRunner(repo_root=str(tmp_path), ci_sequence=[False, True])
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.kind == HEAL and result.recovered is True and result.pr is None
+    stages = _stages(tmp_path)
+    assert [s.name for s in stages] == [
+        "sync", "ci_before", "claim", "select", "agent",
+        "workflow_guard", "completeness_guard", "repro_guard",
+    ]
+    assert stages[1].ok is False                   # ci_before was red - that is why
+    guard = stages[-1]
+    assert guard.ok is False and "no test file" in guard.summary
+
+
+def test_an_idle_iteration_still_records_the_stages_it_ran(tmp_path):
+    cfg = load_config()
+    # The one improvement idea is already in flight, so there is nothing to do.
+    in_flight = {
+        "number": 12, "title": _improvement_idea(cfg)[0], "labels": [],
+        "assignees": [{"login": "hsai-bot"}], "body": "already being worked",
+    }
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True], open_issues=[in_flight]
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.kind == IMPROVE and result.pr is None
+    assert any(n.startswith("idle:") for n in result.notes)
+    stages = _stages(tmp_path)
+    assert [s.name for s in stages] == ["sync", "ci_before", "claim"]
+    assert stages[-1].ok is False and stages[-1].summary.startswith("idle:")
+    # An idle iteration is still an iteration: it must not leak its worktree.
+    assert any(c[:3] == ["git", "worktree", "remove"] for c in runner.calls)
+
+
+class _ExplodingRunner(FakeRunner):
+    """A runner whose worker invocation raises instead of returning a `Proc`."""
+
+    def _dispatch(self, cmd: list[str], cwd: str | None = None) -> Proc:
+        prompt = cmd[2] if len(cmd) > 2 else ""
+        if cmd[:1] == ["claude"] and review.PROMPT_MARKER not in prompt:
+            raise RuntimeError("agent runner exploded")
+        return super()._dispatch(cmd, cwd)
+
+
+def test_a_crashing_iteration_frees_its_worktree_and_hands_the_ticket_back(tmp_path):
+    """The try/finally invariant: an exception mid-iteration used to strand the
+    worktree on disk AND leave the ticket assigned to the bot forever, so no
+    later iteration could ever pick it up again."""
+    cfg = load_config()
+    runner = _ExplodingRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[dict(WIDGET_ISSUE)]
+    )
+
+    with pytest.raises(RuntimeError, match="agent runner exploded"):
+        run_once(
+            cfg, repo_dir=str(tmp_path), dry_run=False,
+            runner=runner, ai_runner=runner, iteration=1,
+        )
+
+    # the worktree is removed even though step 13 was never reached
+    assert any(c[:3] == ["git", "worktree", "remove"] for c in runner.calls)
+    # ...and the claimed ticket goes back to the backlog, unassigned
+    assert any(
+        c[:3] == ["gh", "issue", "edit"] and "--remove-assignee" in c
+        for c in runner.calls
+    )
+    # nothing was pushed or opened on a crashed run
+    assert not any(c[:3] == ["gh", "pr", "create"] for c in runner.calls)
+
+    stages = _stages(tmp_path)
+    assert [s.name for s in stages] == [
+        "sync", "ci_before", "claim", "select", "agent", "crash",
+    ]
+    agent = stages[-2]
+    assert agent.ok is False and agent.summary == "RuntimeError: agent runner exploded"
+    assert "Traceback" in agent.detail          # where to start reading
+    crash = stages[-1]
+    assert crash.ok is False and "agent runner exploded" in crash.summary
+
+
+# --- provenance ---------------------------------------------------------------
+#
+# The reference-set evidence block used to be `reference_top10[:3]` - a constant
+# rendered as if it were a citation. It now comes from what the ticket actually
+# cited, and says so explicitly when the ticket cited nothing.
+
+SYNTHESIS_TICKET_BODY = WELL_FORMED_BODY + """
+## Synthesis rationale
+Combines openai/swarm (structured `Result` objects rather than bare strings)
+with SWE-agent/SWE-agent (its `.traj` run record), applied in `src/hsai/ai.py`.
+"""
+
+
+def _cited(cfg, body: str) -> tuple[str, ...]:
+    return cited_projects(body, [r.repo for r in cfg.reference_top10])
+
+
+def test_build_pr_body_cites_the_projects_the_ticket_actually_named():
+    cfg = load_config()
+    choice = ModelChoice(tier="standard", model="sonnet", rationale="x")
+    refs = _cited(cfg, SYNTHESIS_TICKET_BODY)
+    assert refs == ("openai/swarm", "SWE-agent/SWE-agent")
+
+    body = build_pr_body(
+        ticket=42, choice=choice, lesson_note="n", lesson_summary="s",
+        ci_summary="green", references=refs,
+    )
+    assert "`openai/swarm`, `SWE-agent/SWE-agent`" in body
+    assert NO_PROVENANCE not in body
+    # a path inside a code span is an identifier, never a citation
+    assert "src/hsai" not in body
+
+
+def test_build_pr_body_marks_a_ticket_that_cited_nothing_as_such():
+    cfg = load_config()
+    choice = ModelChoice(tier="standard", model="sonnet", rationale="x")
+    assert _cited(cfg, WELL_FORMED_BODY) == ()
+
+    body = build_pr_body(
+        ticket=42, choice=choice, lesson_note="n", lesson_summary="s",
+        ci_summary="green", references=(),
+    )
+    assert NO_PROVENANCE in body
+    # and never the old fabricated fallback
+    for repo in [r.repo for r in cfg.reference_top10[:3]]:
+        assert repo not in body
+
+
+def test_cited_provenance_reaches_the_lesson_and_the_pr(tmp_path):
+    cfg = load_config()
+    issue = dict(WIDGET_ISSUE, body=SYNTHESIS_TICKET_BODY)
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[issue]
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    lesson_text = Path(result.lesson_path).read_text()
+    assert "- `openai/swarm`" in lesson_text
+    assert "- `SWE-agent/SWE-agent`" in lesson_text
+    assert "langchain-ai/langchain" not in lesson_text   # not cited, not claimed
+
+    pr_create = next(c for c in runner.calls if c[:3] == ["gh", "pr", "create"])
+    body = pr_create[pr_create.index("--body") + 1]
+    assert "`openai/swarm`" in body and NO_PROVENANCE not in body
+    assert any("cited provenance: openai/swarm" in n for n in result.notes)
+
+
+def test_a_ticket_without_a_rationale_never_fabricates_reference_evidence(tmp_path):
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[dict(WIDGET_ISSUE)]
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    lesson_text = Path(result.lesson_path).read_text()
+    assert NO_PROVENANCE in lesson_text
+    for repo in [r.repo for r in cfg.reference_top10[:3]]:
+        assert repo not in lesson_text
