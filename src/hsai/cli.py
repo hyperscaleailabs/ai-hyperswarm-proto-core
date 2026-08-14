@@ -52,12 +52,18 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     for e in v.errors:
         print(f"  config ERR: {e}")
         ok = False
-    # Subscription-only guard
+    # Subscription-only guard (config inspection: would preflight() raise?)
     try:
         ai.preflight(cfg)
         print("  subscription guard: OK (no metered API path)")
     except ai.SubscriptionGuardError as exc:
         print(f"  subscription guard: FAIL - {exc}")
+        ok = False
+    # Live counterpart: actually spawn a child with the sanitized env and read
+    # back what it saw, instead of only trusting our own in-memory dict.
+    live_ok, live_msg = ai.check_child_env(cfg)
+    print(f"  child-environment guard: {'PASS' if live_ok else 'FAIL'} - {live_msg}")
+    if not live_ok:
         ok = False
     print(f"  constraints: subscription_only={cfg.subscription_only}, "
           f"require_ticket_per_pr={cfg.constraints.get('require_ticket_per_pr')}")

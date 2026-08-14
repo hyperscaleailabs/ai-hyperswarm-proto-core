@@ -194,6 +194,7 @@ class Trajectory:
     exit_status: str = "ok"
     error: str = ""
     usage: dict[str, Any] | None = None
+    num_turns: int | None = None
     duration_seconds: float = 0.0
     outcome: str = "ran"
     created: str = field(default_factory=_now)
@@ -225,6 +226,41 @@ class Trajectory:
             return "usage: (not reported)"
         parts = ", ".join(f"{k}={self.usage[k]}" for k in sorted(self.usage))
         return f"usage: {parts}"
+
+    def tools_used(self) -> list[str]:
+        """Distinct tool names invoked, in first-seen order."""
+        seen: list[str] = []
+        for step in self.steps:
+            if step.kind == "tool_use" and step.name and step.name not in seen:
+                seen.append(step.name)
+        return seen
+
+    def execution_trace(self) -> str:
+        """Committed telemetry table for the lesson's '## Execution trace'.
+
+        This is the fix for the other half of the defect this module exists
+        for: a null token dimension. When ``usage`` never arrived (an older
+        CLI, a crash mid-run, an envelope without a usage object) this says so
+        explicitly - ``telemetry=unavailable`` - rather than the ledger's
+        silent ``null`` or the lesson simply not mentioning it.
+        """
+        toks = self.tokens()
+        telemetry = "ok" if toks else "unavailable"
+        tokens_cell = f"{toks[0]} in / {toks[1]} out" if toks else "unavailable"
+        tools = self.tools_used()
+        tools_cell = ", ".join(f"`{t}`" for t in tools) if tools else "_(none recorded)_"
+        turns_cell = str(self.num_turns) if self.num_turns is not None else "unavailable"
+        return (
+            "| field | value |\n"
+            "| --- | --- |\n"
+            f"| turns | {turns_cell} |\n"
+            f"| tools used | {tools_cell} |\n"
+            f"| tokens | {tokens_cell} |\n"
+            f"| exit status | {self.exit_status} |\n"
+            f"| duration | {self.duration_seconds:.1f}s |\n"
+            f"| telemetry | {telemetry} |\n"
+            f"| replay | `hsai traj {self.identifier}` |"
+        )
 
     def first_failing_step(self) -> str:
         """The earliest step that looks like a failure - where to start reading."""
@@ -384,6 +420,7 @@ def record(
     so this module stays independent of :mod:`hsai.ai`.
     """
     payload = getattr(result, "payload", None)
+    num_turns = payload.get("num_turns") if isinstance(payload, dict) else None
     traj = Trajectory(
         iteration=iteration,
         ticket=ticket,
@@ -399,6 +436,7 @@ def record(
         exit_status="ok" if getattr(result, "ok", False) else "error",
         error=redact(_clip(getattr(result, "error", "") or "")),
         usage=getattr(result, "usage", None),
+        num_turns=int(num_turns) if isinstance(num_turns, int) else None,
         duration_seconds=round(max(0.0, duration_seconds), 3),
         outcome=outcome,
     )

@@ -61,6 +61,7 @@ class Lesson:
     repro_evidence: str = ""  # heal/bugfix only: failing-then-passing reproduction proof
     recalled: tuple[str, ...] = ()  # prior notes injected into this run's prompt
     review_verdict: str = ""  # the independent reviewer's verdict, verbatim
+    execution_trace: str = ""  # turns/tools/tokens/exit/duration - the committed digest
 
     def note_name(self) -> str:
         return f"{self.created}-{slugify(self.title)}"
@@ -352,6 +353,9 @@ class KnowledgeBase:
 
 ## Lesson learned
 {lesson.lesson}
+
+## Execution trace
+{lesson.execution_trace or "_(no model run this iteration)_"}
 
 ## Independent review
 {review}

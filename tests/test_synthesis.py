@@ -84,7 +84,7 @@ def _plain_text_runner():
     calls: list[list[str]] = []
     issue_numbers = iter(range(321, 400))
 
-    def runner(cmd, *, cwd=None, env=None, timeout=None, input_text=None):
+    def runner(cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None):
         calls.append(list(cmd))
         if cmd[:1] == ["claude"]:
             return Proc(cmd, 0, PLAIN_TEXT_OUTPUT, "")
@@ -143,7 +143,7 @@ CLOSED_ISSUES = [
 def _memory_runner(*, open_issues=None, closed_issues=None):
     """A fake `gh` that answers both `issue list --state open` and `--state closed`."""
 
-    def runner(cmd, *, cwd=None, env=None, timeout=None, input_text=None):
+    def runner(cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None):
         if cmd[:3] == ["gh", "issue", "list"]:
             state = cmd[cmd.index("--state") + 1] if "--state" in cmd else "open"
             if state == "closed":
@@ -213,7 +213,7 @@ def test_memory_pack_gathering_degrades_gracefully_when_gh_is_unavailable(tmp_pa
     yield an empty memory section, never raise."""
     cfg = _cfg()
 
-    def broken_runner(cmd, *, cwd=None, env=None, timeout=None, input_text=None):
+    def broken_runner(cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None):
         return Proc(cmd, 127, "", "gh: command not found")
 
     memory = MemoryPack.gather(cfg, root=str(tmp_path), runner=broken_runner)
@@ -340,7 +340,7 @@ def _duplicate_fixture_runner():
     calls: list[list[str]] = []
     issue_numbers = iter(range(500, 600))
 
-    def runner(cmd, *, cwd=None, env=None, timeout=None, input_text=None):
+    def runner(cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None):
         calls.append(list(cmd))
         if cmd[:1] == ["claude"]:
             return Proc(cmd, 0, DUPLICATE_AND_NOVEL_OUTPUT, "")

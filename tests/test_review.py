@@ -66,7 +66,9 @@ class _ReviewRunner:
         self.ok = ok
         self.calls: list[list[str]] = []
 
-    def __call__(self, cmd, *, cwd=None, env=None, timeout=None, input_text=None) -> Proc:
+    def __call__(
+        self, cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None
+    ) -> Proc:
         cmd = list(cmd)
         self.calls.append(cmd)
         if cmd[:2] == ["git", "diff"] and "--name-only" in cmd:

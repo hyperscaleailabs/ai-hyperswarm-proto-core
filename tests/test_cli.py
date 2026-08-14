@@ -31,6 +31,29 @@ def test_status_command_returns_zero(capsys):
     assert "hyperscaleailabs/ai-hyperswarm-proto-core" in out
 
 
+def test_doctor_reports_the_live_child_env_check_and_exits_zero_on_pass(monkeypatch, capsys):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy")
+    rc = main(["doctor"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "child-environment guard: PASS" in out
+    assert "ANTHROPIC_API_KEY" in out
+
+
+def test_doctor_exits_nonzero_when_the_live_check_reports_a_leak(monkeypatch, capsys):
+    # Isolate the live-check failure from the (separate) preflight guard.
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(
+        cli_module.ai, "check_child_env",
+        lambda cfg: (False, "leaked into a real spawned child process: ANTHROPIC_API_KEY"),
+    )
+    rc = main(["doctor"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "child-environment guard: FAIL" in out
+    assert "ANTHROPIC_API_KEY" in out
+
+
 def test_parser_cycle_resume_args():
     parser = build_parser()
     plain = parser.parse_args(["cycle"])

@@ -1,4 +1,5 @@
 import json
+import subprocess
 from dataclasses import replace
 
 from hsai import ai
@@ -32,7 +33,7 @@ CLAUDE_JSON_PAYLOAD = json.dumps(
 def _runner(stdout: str, code: int = 0, stderr: str = ""):
     calls: list[list[str]] = []
 
-    def runner(cmd, *, cwd=None, env=None, timeout=None, input_text=None):
+    def runner(cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None):
         calls.append(list(cmd))
         return Proc(cmd, code, stdout, stderr)
 
@@ -119,13 +120,78 @@ def test_run_agent_plain_text_fallback():
 
 
 def test_run_agent_strips_billing_env(monkeypatch):
+    """Acceptance criterion #1: a capturing fake runner never sees the key."""
     cfg = load_config()
-    seen: dict[str, dict] = {}
+    seen: dict[str, object] = {}
 
-    def runner(cmd, *, cwd=None, env=None, timeout=None, input_text=None):
+    def runner(cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None):
         seen["env"] = dict(env or {})
+        seen["env_remove"] = tuple(env_remove or ())
         return Proc(cmd, 0, CLAUDE_JSON_PAYLOAD, "")
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-should-be-stripped")
     ai.run_agent("prompt", CHOICE, cfg, runner=runner)
     assert "ANTHROPIC_API_KEY" not in seen["env"]
+    # ...and the runner was actually TOLD to remove it, not just left it out of
+    # an override map (which is what let the real leak through proc.run).
+    assert "ANTHROPIC_API_KEY" in seen["env_remove"]
+
+
+def test_sanitized_env_reports_removals_even_when_not_in_os_environ():
+    """`removals` names what MUST be absent - independent of the parent's own
+    environment, so proc.run can enforce it whether or not the key is set."""
+    cfg = load_config()
+    env, removals = ai._sanitized_env(cfg)
+    assert "ANTHROPIC_API_KEY" in removals
+    assert "ANTHROPIC_API_KEY" not in env
+
+
+def test_run_agent_env_leak_is_blocked_at_the_real_runner(monkeypatch):
+    """Regression pin for the actual defect.
+
+    Unlike the fake-runner test above, this goes through the DEFAULT runner
+    (`hsai.proc.run`, the real subprocess wrapper) - only `subprocess.run`
+    itself is mocked, so it exercises proc.run's env-merge logic. Before
+    proc.run supported `env_remove`, `full_env.update(env)` could never
+    remove a key `_sanitized_env` had merely omitted, and this test would
+    catch that: revert only the proc.run fix and it goes red.
+    """
+    cfg = load_config()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-should-be-stripped")
+    captured: dict[str, dict] = {}
+
+    def fake_subprocess_run(cmd, *, cwd, env, input, capture_output, text, timeout):
+        captured["env"] = dict(env or {})
+        return subprocess.CompletedProcess(cmd, 0, CLAUDE_JSON_PAYLOAD, "")
+
+    monkeypatch.setattr("hsai.proc.subprocess.run", fake_subprocess_run)
+    ai.run_agent("prompt", CHOICE, cfg)  # default runner = the real hsai.proc.run
+    assert "ANTHROPIC_API_KEY" not in captured["env"]
+
+
+def test_check_child_env_passes_with_a_real_spawned_child(monkeypatch):
+    """The live doctor check actually spawns a process and reads its env back."""
+    cfg = load_config()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-should-be-stripped")
+    ok, msg = ai.check_child_env(cfg)
+    assert ok is True
+    assert "ANTHROPIC_API_KEY" in msg
+
+
+def test_check_child_env_fails_when_a_key_leaks():
+    cfg = load_config()
+
+    def leaking_runner(cmd, *, cwd=None, env=None, env_remove=None, timeout=None,
+                        input_text=None):
+        return Proc(cmd, 0, "ANTHROPIC_API_KEY", "")
+
+    ok, msg = ai.check_child_env(cfg, runner=leaking_runner)
+    assert ok is False
+    assert "ANTHROPIC_API_KEY" in msg
+
+
+def test_check_child_env_passes_trivially_with_nothing_configured():
+    cfg = replace(load_config(), constraints={"subscription_only": False, "forbid_env": []})
+    ok, msg = ai.check_child_env(cfg)
+    assert ok is True
+    assert "no forbidden variables" in msg
