@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import github, gitops, journal, ledger, trajectory
+from . import evals, github, gitops, journal, ledger, trajectory
 from .ai import run_agent
 from .config import CoreConfig
 from .governance import BlockReport, open_review_issue, write_direction
@@ -255,6 +255,11 @@ def run_cycle(
     # Fold the block's ledger records into the summary the review brief surfaces.
     # Derived from the durable ledger, so it needs no journal record of its own.
     report.cost = ledger.aggregate_block(ledger.read_records(ledger_file), idx)
+
+    # Decision quality beside cost: replay the labeled benchmark over the pure
+    # decision functions. Free (no model call, no network), derived from files
+    # on disk, so it needs no journal record either.
+    report.evals = evals.score_or_none(cfg, repo_root)
 
     # Trajectories are local forensics, not repo content: keep the recent blocks
     # replayable and drop the rest so the store stays bounded.

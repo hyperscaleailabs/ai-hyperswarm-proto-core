@@ -1,6 +1,7 @@
 import json
 
 from hsai.config import load_config
+from hsai.evals import FunctionScore, Scorecard
 from hsai.governance import (
     NOTES_END,
     NOTES_START,
@@ -99,3 +100,31 @@ def test_brief_says_when_tokens_per_merged_pr_is_unavailable():
     cost = BlockAggregate(block=7, iterations=2, total_seconds=10.0)
     body = render_brief(cfg, BlockReport(cycle_index=7, cost=cost))
     assert "tokens per merged PR: _not available_" in body
+
+
+def test_brief_carries_a_one_line_eval_scorecard():
+    """Decision quality sits beside cost: a cheaper block that decides worse
+    is not an improvement, and the brief has to show both."""
+    cfg = load_config()
+    card = Scorecard(
+        cases=44,
+        scores={
+            "models.select": FunctionScore("models.select", correct=13, total=24),
+            "decide_path": FunctionScore("decide_path", correct=4, total=4),
+        },
+        tier_cost=45,
+        mismatches=(),
+    )
+    body = render_brief(cfg, BlockReport(cycle_index=7, evals=card))
+    assert "## Decision quality this block (`hsai eval`)" in body
+    line = body.split("## Decision quality this block (`hsai eval`)\n")[1].split("\n")[0]
+    assert "models.select=54% (13/24)" in line
+    assert "decide_path=100% (4/4)" in line
+    assert "tier-cost=45" in line
+    assert "mismatched: none" in line
+
+
+def test_brief_says_when_the_eval_suite_was_not_scored():
+    cfg = load_config()
+    body = render_brief(cfg, BlockReport(cycle_index=7))
+    assert "_eval suite not scored for this block_" in body

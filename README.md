@@ -104,8 +104,17 @@ hsai loop          # one real iteration (opens & merges a PR on green)
 hsai loop --max-parallel 3 -n 1   # ramp to the swarm (after proving one iteration)
 hsai traj 12       # print what agent run (iteration) 12 did (spends no quota)
 hsai recall "knowledge-only diff on a code ticket"   # rank prior lessons for a task
+hsai eval          # score the decision core against evals/cases.yaml (spends no quota)
 hsai cycle --resume   # finish an interrupted governance block, replaying what completed
 ```
+
+The heuristics the loop steers on - `decide_path`, `models.select`,
+`tickets.check_well_formed`, `repro.requires_repro_guard`,
+`ledger.evaluate_budget` - are measured, not asserted. `evals/cases.yaml` holds
+labeled cases seeded from this repo's own ledger records, lesson notes and past
+tickets; `hsai eval` scores them and `tests/test_evals.py` fails when accuracy
+drops below the committed `evals/baseline.json`. Changing a heuristic means
+shipping an eval delta. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 Every agent run persists a **trajectory** - prompt, step stream, exit status,
 token usage, session id - to `.hsai/traj/<block>/<iteration>.json`. Those files

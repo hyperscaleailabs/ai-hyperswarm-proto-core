@@ -1,0 +1,573 @@
+# evals/cases.yaml - the labeled decision-core benchmark.
+#
+# Every case is traceable to something that actually happened in this repo: a
+# record in knowledge/ledger/iterations.jsonl, a lesson note under
+# knowledge/lessons/, a merged ticket/PR, or docs/adr/0001. The `source` field
+# names that artifact so any label can be audited back to evidence.
+#
+# Labeling rules (so a label is never just "whatever the code does today"):
+#
+#   models.select        The tier that DEMONSTRABLY delivered the work. A lesson
+#                        note records both the model that ran (haiku=light,
+#                        sonnet=standard, opus=heavy) and the outcome, so an
+#                        outcome/pass run labels its own tier. Where the light
+#                        tier failed on a code ticket, ADR-0001 raises the label
+#                        one tier ("haiku is demoted to genuinely mechanical,
+#                        narrow edits").
+#                        Inputs mirror production: hsai.orchestrator builds its
+#                        Task from the ticket title, body and labels only, and
+#                        never sets est_files - so est_files stays at its
+#                        default of 1. Lesson notes do not record the ticket's
+#                        size label, so lesson-derived cases omit labels and
+#                        therefore probe the keyword/structural scorer alone;
+#                        the two `select-size-*` cases probe the label override
+#                        against sources where the size IS verifiable.
+#
+#   everything else      The behaviour the module's own contract states, applied
+#                        to a real title/ticket/ledger record.
+#
+# Run with `hsai eval`. tests/test_evals.py fails when a per-function accuracy
+# drops below evals/baseline.json, so this file is a regression gate, not a
+# report. Enforcement lives in pytest on purpose: workers may not add or edit
+# .github/workflows (run_once reverts such diffs), so pytest is the only gate a
+# self-improving worker can legitimately strengthen.
+
+cases:
+
+  # --- decide_path: which branch of the loop runs ------------------------------
+
+  - id: path-red-main-preempts-the-backlog
+    source: >
+      knowledge/lessons/2026-07-26-loop-reliability-retry-and-ci-parity.md -
+      a red main preempts backlog work; healing comes first.
+    probes:
+      decide_path:
+        ci_green: false
+        has_tickets: true
+        expect: heal
+
+  - id: path-red-main-with-empty-backlog-still-heals
+    source: >
+      orchestrator.run_once files its own "ci: main is red - auto-heal" ticket
+      before any backlog fetch (see the heal path); lesson
+      2026-07-26-loop-reliability-retry-and-ci-parity.md.
+    probes:
+      decide_path:
+        ci_green: false
+        has_tickets: false
+        expect: heal
+
+  - id: path-green-main-with-backlog-implements
+    source: >
+      knowledge/ledger/iterations.jsonl record iteration 4133501 (block 41335,
+      ticket #42, kind=implement, outcome=merged) - green main, ticket claimed.
+    probes:
+      decide_path:
+        ci_green: true
+        has_tickets: true
+        expect: implement
+
+  - id: path-green-main-with-empty-backlog-improves
+    source: >
+      commit "improve: chore: refresh reference-set snapshot and extract one
+      practice (#49)" - the self-improve branch taken on a green main with no
+      unassigned ticket.
+    probes:
+      decide_path:
+        ci_green: true
+        has_tickets: false
+        expect: improve
+
+  # --- models.select: the tier that actually delivered --------------------------
+
+  - id: select-lesson-sequence-diagram-docs
+    source: >
+      knowledge/lessons/2026-07-26-implement-docs-add-a-one-iteration-sequence-diagram-to-architecture-md.md
+      - ran on `sonnet` (standard), outcome/pass. Ticket #19.
+    probes:
+      models.select:
+        task:
+          kind: implement
+          title: "docs: add a one-iteration sequence diagram to ARCHITECTURE.md"
+        expect: standard
+
+  - id: select-lesson-structured-execution-context
+    source: >
+      knowledge/lessons/2026-07-26-implement-add-structured-execution-context-to-error-messages.md
+      - ran on `haiku` (light), outcome/pass: a genuinely narrow edit.
+    probes:
+      models.select:
+        task:
+          kind: implement
+          title: "add structured execution context to error messages"
+        expect: light
+
+  - id: select-lesson-reference-set-miner-must-not-route-light
+    source: >
+      knowledge/lessons/2026-07-26-implement-chore-reference-set-miner-extract-one-practice-from-a-top-10-project-s-history.md
+      - ran on `haiku` (light), outcome/FAIL (timeout after 1200s), and
+      docs/adr/0001 records the same run: "PR #17 (haiku) closed feature ticket
+      #4 with a knowledge-only diff - zero code". ADR-0001 therefore demotes
+      haiku to mechanical, narrow edits, so the correct tier here is standard.
+    probes:
+      models.select:
+        task:
+          kind: implement
+          title: "chore: reference-set miner - extract one practice from a top-10 project's history"
+        expect: standard
+
+  - id: select-lesson-deepen-whitepaper-synthesizer
+    source: >
+      knowledge/lessons/2026-07-26-implement-feat-deepen-the-whitepaper-synthesizer.md
+      - ran on `sonnet` (standard), outcome/pass. Ticket #15.
+    probes:
+      models.select:
+        task:
+          kind: implement
+          title: "feat: deepen the whitepaper synthesizer"
+        expect: standard
+
+  - id: select-lesson-poll-remote-ci
+    source: >
+      knowledge/lessons/2026-07-26-implement-feat-poll-remote-ci-gh-checks-as-an-explicit-pre-merge-gate.md
+      - ran on `sonnet` (standard), outcome/pass. Ticket #16.
+    probes:
+      models.select:
+        task:
+          kind: implement
+          title: "feat: poll remote CI (gh checks) as an explicit pre-merge gate"
+        expect: standard
+
+  - id: select-lesson-reproduce-before-fix-guard
+    source: >
+      knowledge/lessons/2026-07-26-implement-feat-reproduce-before-fix-regression-guard-for-heal-and-bugfix-tickets.md
+      - ran on `sonnet` (standard), outcome/pass. Ticket #46.
+    probes:
+      models.select:
+        task:
+          kind: implement
+          title: "feat: reproduce-before-fix regression guard for heal and bugfix tickets"
+        expect: standard
+
+  - id: select-lesson-quota-cost-ledger
+    source: >
+      knowledge/lessons/2026-07-26-implement-feat-quota-cost-telemetry-ledger-with-a-warn-then-halt-per-block-budget-gate.md
+      - ran on `opus` (heavy), outcome/pass. Ticket #47.
+    probes:
+      models.select:
+        task:
+          kind: implement
+          title: "feat: quota/cost telemetry ledger with a warn-then-halt per-block budget gate"
+        expect: heavy
+
+  - id: select-lesson-model-selection-skill
+    source: >
+      knowledge/lessons/2026-07-26-implement-skill-task-complexity-based-model-selection-learned.md
+      - ran on `haiku` (light), outcome/pass. Ticket #2, the first version of
+      the very heuristic under test here.
+    probes:
+      models.select:
+        task:
+          kind: implement
+          title: "skill: task-complexity-based model selection (learned)"
+        expect: light
+
+  - id: select-lesson-fake-runner-integration-tests
+    source: >
+      knowledge/lessons/2026-07-26-implement-test-fake-runner-integration-tests-for-orchestrator-run-once-heal-implement-paths.md
+      - ran on `sonnet` (standard), outcome/pass. Ticket #7.
+    probes:
+      models.select:
+        task:
+          kind: implement
+          title: "test: fake-runner integration tests for orchestrator.run_once (heal & implement paths)"
+        expect: standard
+
+  - id: select-lesson-metagpt-phase-artifacts
+    source: >
+      knowledge/lessons/2026-07-26-improve-explicit-phase-artifacts-from-metagpt.md
+      - ran on `haiku` (light), outcome/pass, on the self-improve branch.
+    probes:
+      models.select:
+        task:
+          kind: improve
+          title: "explicit phase artifacts from MetaGPT"
+        expect: light
+
+  - id: select-lesson-refresh-reference-set-snapshot
+    source: >
+      knowledge/lessons/2026-07-26-improve-chore-refresh-reference-set-snapshot-and-extract-one-practice.md
+      - ran on `haiku` (light), outcome/pass. Tickets #38 / #49.
+    probes:
+      models.select:
+        task:
+          kind: improve
+          title: "chore: refresh reference-set snapshot and extract one practice"
+        expect: light
+
+  - id: select-lesson-trajectory-capture-telemetry
+    source: >
+      knowledge/lessons/2026-08-04-implement-feat-worker-trajectory-capture-and-working-token-cost-telemetry.md
+      - ran on `opus` (heavy), outcome/pass. Ticket #94.
+    probes:
+      models.select:
+        task:
+          kind: implement
+          title: "feat: worker trajectory capture and working token/cost telemetry"
+        expect: heavy
+
+  - id: select-lesson-trajectory-store-and-replay
+    source: >
+      knowledge/lessons/2026-08-04-implement-feat-worker-trajectory-store-json-agent-output-and-hsai-replay.md
+      - ran on `opus` (heavy), outcome/pass. Ticket #84.
+    probes:
+      models.select:
+        task:
+          kind: implement
+          title: "feat: worker trajectory store, JSON agent output, and `hsai replay`"
+        expect: heavy
+
+  - id: select-lesson-governance-artifacts-41339
+    source: >
+      knowledge/lessons/2026-08-05-implement-chore-governance-artifacts-for-block-41339.md
+      - ran on `haiku` (light), outcome/pass. Filed by `hsai cycle` with labels
+      [hsai, priority:P2] and no size label (see cycle._governance_pr).
+    probes:
+      models.select:
+        task:
+          kind: implement
+          title: "chore: governance artifacts for block 41339"
+          labels: ["hsai", "priority:P2"]
+        expect: light
+
+  - id: select-lesson-durable-cycle-journal
+    source: >
+      knowledge/lessons/2026-08-05-implement-feat-durable-cycle-journal-with-idempotent-resume-for-interrupted-blocks.md
+      - ran on `opus` (heavy), outcome/pass. Ticket #104.
+    probes:
+      models.select:
+        task:
+          kind: implement
+          title: "feat: durable cycle journal with idempotent --resume for interrupted blocks"
+        expect: heavy
+
+  - id: select-lesson-governance-artifacts-41343
+    source: >
+      knowledge/lessons/2026-08-08-implement-chore-governance-artifacts-for-block-41343.md
+      - ran on `haiku` (light), outcome/fail. The retry (#137) shipped the same
+      artifacts on the same tier, so the tier label stands.
+    probes:
+      models.select:
+        task:
+          kind: implement
+          title: "chore: governance artifacts for block 41343"
+          labels: ["hsai", "priority:P2"]
+        expect: light
+
+  - id: select-lesson-lesson-retrieval-memory
+    source: >
+      knowledge/lessons/2026-08-10-implement-feat-lesson-retrieval-memory-inject-prior-lessons-into-worker-and-synthesis-prompts.md
+      - ran on `opus` (heavy). Ticket #170, merged as a substantial change.
+    probes:
+      models.select:
+        task:
+          kind: implement
+          title: "feat: lesson-retrieval memory - inject prior lessons into worker and synthesis prompts"
+        expect: heavy
+
+  - id: select-lesson-vault-backlog-watchdog
+    source: >
+      knowledge/lessons/2026-08-11-implement-feat-vault-and-backlog-hygiene-watchdog-that-files-its-own-tickets.md
+      - ran on `sonnet` (standard). Ticket #187, merged.
+    probes:
+      models.select:
+        task:
+          kind: implement
+          title: "feat: vault and backlog hygiene watchdog that files its own tickets"
+        expect: standard
+
+  - id: select-lesson-governance-artifacts-41357
+    source: >
+      knowledge/lessons/2026-08-14-implement-chore-governance-artifacts-for-block-41357.md
+      - ran on `haiku` (light), outcome/pass. Ticket #236.
+    probes:
+      models.select:
+        task:
+          kind: implement
+          title: "chore: governance artifacts for block 41357"
+          labels: ["hsai", "priority:P2"]
+        expect: light
+
+  - id: select-lesson-adversarial-review-gate
+    source: >
+      knowledge/lessons/2026-08-12-implement-feat-adversarial-cross-model-pr-review-gate-with-a-merge-gatekeeper.md
+      - ran on `opus` (heavy), outcome/pass. Ticket #203.
+    probes:
+      models.select:
+        task:
+          kind: implement
+          title: "feat: adversarial cross-model PR review gate with a merge gatekeeper"
+        expect: heavy
+
+  - id: select-lesson-synthesis-memory-dedup
+    source: >
+      knowledge/lessons/2026-08-13-implement-feat-synthesis-memory-and-duplicate-proposal-rejection.md
+      - ran on `sonnet` (standard), outcome/pass. Ticket #223.
+    probes:
+      models.select:
+        task:
+          kind: implement
+          title: "feat: synthesis memory and duplicate-proposal rejection"
+        expect: standard
+
+  - id: select-lesson-verifiable-subscription-only
+    source: >
+      knowledge/lessons/2026-08-14-implement-feat-verifiable-subscription-only-execution-and-real-agent-telemetry.md
+      - ran on `sonnet` (standard). Ticket #233, merged.
+    probes:
+      models.select:
+        task:
+          kind: implement
+          title: "feat: verifiable subscription-only execution and real agent telemetry"
+        expect: standard
+
+  - id: select-size-l-label-overrides-keyword-scoring
+    source: >
+      docs/adr/0001 consequence "size-labeled tickets can never route light",
+      applied to the size:L ticket this suite ships under ("feat: hsai eval - a
+      labeled decision-core benchmark ...", Meta: size: L).
+    probes:
+      models.select:
+        task:
+          kind: implement
+          title: "feat: hsai eval - a labeled decision-core benchmark with a committed baseline and a pytest regression gate"
+          labels: ["size:L"]
+        expect: heavy
+
+  - id: select-size-m-label-uses-the-default-tier
+    source: >
+      tickets.TicketSpec defaults to size "M" and tickets.SIZE_LABELS renders it
+      as `size:M`; models.select maps that to the configured default tier.
+      Title taken from ticket #223 (merged).
+    probes:
+      models.select:
+        task:
+          kind: implement
+          title: "feat: synthesis memory and duplicate-proposal rejection"
+          labels: ["size:M"]
+        expect: standard
+
+  # --- tickets.check_well_formed: is this ticket implementable? -----------------
+
+  - id: wellformed-structured-feat-ticket-accepted
+    source: >
+      The rendered body of the size:L ticket this suite ships under, produced by
+      tickets.TicketSpec.render(): Acceptance criteria + Verification plan with
+      checkboxes.
+    probes:
+      tickets.check_well_formed:
+        title: "feat: hsai eval - a labeled decision-core benchmark with a committed baseline and a pytest regression gate"
+        body: |
+          ## Problem
+          Every claim of learning in this harness is currently unmeasured.
+
+          ## Proposal
+          Add evals/cases.yaml, src/hsai/evals.py and a pytest baseline gate.
+
+          ## Acceptance criteria
+          - [ ] `evals/cases.yaml` contains >= 25 traceable cases
+          - [ ] `hsai eval` prints a scorecard and exits non-zero on regression
+
+          ## Verification plan
+          - [ ] `pytest tests/test_evals.py` passes
+          - [ ] `ruff check .` is clean
+        expect: "True"
+
+  - id: wellformed-vague-one-liner-refused
+    source: >
+      docs/adr/0001 context: "tickets were unstructured, so a trivial diff could
+      'satisfy' them" - the decay the well-formedness gate was added to stop.
+    probes:
+      tickets.check_well_formed:
+        title: "feat: make the loop better"
+        body: "Improve the orchestrator somehow."
+        expect: "False"
+
+  - id: wellformed-acceptance-criteria-without-verification-plan-refused
+    source: >
+      docs/adr/0001 decision 2: feature/skill tickets need acceptance criteria
+      (>= 2 checkboxes) AND a verification plan; one without the other is not
+      implementable.
+    probes:
+      tickets.check_well_formed:
+        title: "feat: surface the eval scorecard in the review brief"
+        body: |
+          ## Acceptance criteria
+          - [ ] render_brief includes a one-line scorecard
+          - [ ] a governance test covers it
+        expect: "False"
+
+  - id: wellformed-governance-chore-is-exempt
+    source: >
+      Ticket #236 "chore: governance artifacts for block 41357", filed by
+      cycle._governance_pr with a two-sentence body and no sections - chores are
+      legitimately small (tickets._EXEMPT_PREFIXES).
+    probes:
+      tickets.check_well_formed:
+        title: "chore: governance artifacts for block 41357"
+        body: >
+          Whitepaper, persona articles, MOC reindex, and DIRECTION refresh for
+          block 41357. Filed automatically by `hsai cycle`.
+        expect: "True"
+
+  - id: wellformed-docs-ticket-is-exempt
+    source: >
+      Ticket #19 "docs: add a one-iteration sequence diagram to ARCHITECTURE.md"
+      (lesson outcome/pass) - a docs ticket that shipped without the full schema.
+    probes:
+      tickets.check_well_formed:
+        title: "docs: add a one-iteration sequence diagram to ARCHITECTURE.md"
+        body: "The architecture doc describes the loop in prose only."
+        expect: "True"
+
+  - id: wellformed-auto-heal-ticket-is-exempt
+    source: >
+      The heal ticket orchestrator.run_once files for itself mid-incident:
+      "ci: main is red - auto-heal". It cannot carry a verification plan written
+      in advance.
+    probes:
+      tickets.check_well_formed:
+        title: "ci: main is red - auto-heal"
+        body: "ruff/pytest failing on main; see the CI summary."
+        expect: "True"
+
+  # --- repro.requires_repro_guard: who must prove the bug was real --------------
+
+  - id: repro-auto-heal-ticket-must-reproduce
+    source: >
+      Ticket #46 "feat: reproduce-before-fix regression guard for heal and
+      bugfix tickets" - the guard's own contract, applied to the auto-heal
+      ticket title run_once files.
+    probes:
+      repro.requires_repro_guard:
+        kind: heal
+        title: "ci: main is red - auto-heal"
+        expect: "True"
+
+  - id: repro-fix-titled-bugfix-must-reproduce
+    source: >
+      Commit "fix: remote-CI-gated outcomes, CI parity guard, and ticket
+      recovery (#11, #12) (#14)" - a fix: ticket taken through the implement
+      branch, which the guard still covers.
+    probes:
+      repro.requires_repro_guard:
+        kind: implement
+        title: "fix: remote-CI-gated outcomes, CI parity guard, and ticket recovery"
+        expect: "True"
+
+  - id: repro-feature-ticket-is-exempt
+    source: >
+      Ticket #223 "feat: synthesis memory and duplicate-proposal rejection"
+      (merged) - a feature, not a bugfix: it adds behaviour rather than pinning
+      a broken one.
+    probes:
+      repro.requires_repro_guard:
+        kind: implement
+        title: "feat: synthesis memory and duplicate-proposal rejection"
+        expect: "False"
+
+  - id: repro-chore-is-exempt-even-on-the-heal-branch
+    source: >
+      repro._EXEMPT_TITLE_PREFIXES: docs:/chore: tickets are exempt regardless
+      of loop-kind. Title from ticket #236, filed by `hsai cycle`.
+    probes:
+      repro.requires_repro_guard:
+        kind: heal
+        title: "chore: governance artifacts for block 41357"
+        expect: "False"
+
+  - id: repro-docs-ticket-is-exempt
+    source: >
+      Ticket #19 "docs: add a one-iteration sequence diagram to ARCHITECTURE.md"
+      - documentation ships without a regression test.
+    probes:
+      repro.requires_repro_guard:
+        kind: implement
+        title: "docs: add a one-iteration sequence diagram to ARCHITECTURE.md"
+        expect: "False"
+
+  # --- ledger.evaluate_budget: the warn-then-halt quota gate --------------------
+
+  - id: budget-block-41335-hard-breach-on-the-heavy-ceiling
+    source: >
+      knowledge/ledger/iterations.jsonl block 41335: three heavy-tier records
+      (iterations 4133501/02/03) totalling 3501.272s. core.yaml sets
+      max_heavy_iterations_per_block: 3, so the block is at its heavy ceiling.
+    probes:
+      ledger.evaluate_budget:
+        aggregate:
+          block: 41335
+          iterations: 3
+          heavy_iterations: 3
+          total_seconds: 3501.272
+        expect: hard
+
+  - id: budget-block-41339-stays-within-both-ceilings
+    source: >
+      knowledge/ledger/iterations.jsonl block 41339: two heavy-tier records
+      (iterations 4133902/03) totalling 2820.0s - under 3 heavy runs and under
+      5400s.
+    probes:
+      ledger.evaluate_budget:
+        aggregate:
+          block: 41339
+          iterations: 2
+          heavy_iterations: 2
+          total_seconds: 2820.0
+        expect: ok
+
+  - id: budget-heavy-soft-band-is-unreachable-at-a-ceiling-of-three
+    source: >
+      core.yaml budget: max_heavy_iterations_per_block: 3, soft_ratio: 0.8. The
+      soft band is [2.4, 3), which contains no integer - so the heavy dimension
+      jumps straight from ok to hard and never demotes. Pinned here as a real
+      property of the current configuration, observable in block 41339 (2 heavy
+      runs, still "ok").
+    probes:
+      ledger.evaluate_budget:
+        aggregate:
+          block: 41339
+          iterations: 2
+          heavy_iterations: 2
+          total_seconds: 0.0
+        expect: ok
+
+  - id: budget-soft-breach-on-the-wall-clock-ratio
+    source: >
+      Block 41335's three heavy iterations averaged 1167s (3501.272s / 3), so a
+      fourth crosses 0.8 x max_seconds_per_block (0.8 x 5400 = 4320s) while the
+      heavy count is still under its ceiling - the soft breach that biases
+      selection one tier cheaper.
+    probes:
+      ledger.evaluate_budget:
+        aggregate:
+          block: 41335
+          iterations: 4
+          heavy_iterations: 1
+          total_seconds: 4400.0
+        expect: soft
+
+  - id: budget-empty-ledger-never-gates
+    source: >
+      A block before its first record: knowledge/ledger/iterations.jsonl holds
+      nothing for it, and ledger.evaluate_budget's contract is that unset
+      ceilings disable that dimension - so an empty budget never gates.
+    probes:
+      ledger.evaluate_budget:
+        aggregate:
+          block: 41359
+          iterations: 0
+          heavy_iterations: 0
+          total_seconds: 0.0
+        budget: {}
+        expect: ok

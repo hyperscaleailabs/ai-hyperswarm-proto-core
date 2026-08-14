@@ -8,16 +8,18 @@ Commands:
   hsai reindex                                                 rebuild knowledge MOCs
   hsai recall "<query>" [--k N] [--kind K]                     rank prior lessons/ADRs
   hsai doctor                                                  verify environment + invariants
+  hsai eval [--baseline P] [--update-baseline] [--json]        score the decision core
   hsai traj <iteration> [--json]                               print a stored agent run
   hsai replay <iteration> [--json]                             alias of `hsai traj`
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
-from . import __version__, ai, recall, repro, trajectory
+from . import __version__, ai, evals, recall, repro, trajectory
 from .config import CoreConfig, load_config, validate
 from .knowledge import KnowledgeBase
 from .orchestrator import run_loop
@@ -159,6 +161,49 @@ def cmd_repro_check(args: argparse.Namespace) -> int:
     return 0 if result.ok else 1
 
 
+def cmd_eval(args: argparse.Namespace) -> int:
+    """Score the decision core against the labeled benchmark.
+
+    Pure reading: replays ``evals/cases.yaml`` through five pure functions. No
+    model call, no network, no quota. Exits non-zero on a regression against the
+    committed baseline so the same command works by hand and inside pytest.
+    """
+    cfg = _load(args)
+    try:
+        root = evals.repo_root()
+        cases = evals.load_cases(args.cases or evals.cases_path(root))
+    except (OSError, evals.EvalError) as exc:
+        print(f"eval: {exc}", file=sys.stderr)
+        return 1
+    card = evals.run_suite(cfg, cases)
+
+    baseline_file = args.baseline or evals.baseline_path(root)
+    if args.update_baseline:
+        path = evals.write_baseline(baseline_file, card)
+        print(card.render())
+        print(f"eval: baseline rewritten -> {path}")
+        return 0
+
+    baseline = evals.load_baseline(baseline_file)
+    regressions = evals.compare(card, baseline) if baseline else []
+    if args.json:
+        print(json.dumps(
+            {
+                "scorecard": card.to_dict(),
+                "baseline": str(baseline_file),
+                "regressions": [{"kind": r.kind, "detail": r.detail} for r in regressions],
+            },
+            indent=2, sort_keys=True,
+        ))
+    else:
+        print(card.render())
+        if baseline is None:
+            print(f"eval: no baseline at {baseline_file} - run with --update-baseline")
+        else:
+            print(evals.render_regressions(regressions))
+    return 1 if regressions else 0
+
+
 def _print_trajectory(args: argparse.Namespace, label: str) -> int:
     """Reconstruct a stored agent run from the local trajectory store.
 
@@ -264,6 +309,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     br = sub.add_parser("brief", help="refresh governance/DIRECTION.md")
     br.set_defaults(func=cmd_brief)
+
+    ev = sub.add_parser("eval", help="score the decision core against the labeled benchmark")
+    ev.add_argument("--cases", default=None, help=f"case file (default: {evals.CASES_FILE})")
+    ev.add_argument("--baseline", default=None,
+                    help=f"baseline to grade against (default: {evals.BASELINE_FILE})")
+    ev.add_argument("--update-baseline", action="store_true",
+                    help="rewrite the baseline from this run instead of grading against it")
+    ev.add_argument("--json", action="store_true", help="print the machine-readable scorecard")
+    ev.set_defaults(func=cmd_eval)
 
     for name, help_text, func in (
         ("traj", "print a stored trajectory for a post-mortem", cmd_traj),
