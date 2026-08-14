@@ -136,7 +136,7 @@ class FakeRunner:
         self._pr_seq = 200
 
     def __call__(
-        self, cmd, *, cwd=None, env=None, timeout=None, input_text=None
+        self, cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None
     ) -> Proc:
         cmd = list(cmd)
         self.calls.append(cmd)
@@ -973,6 +973,46 @@ def test_token_counts_reach_the_ledger_and_the_block_aggregate(tmp_path):
     assert "2280 tokens/merged PR" in agg.summary()
 
 
+def test_run_once_honors_an_explicit_block_over_the_iteration_derived_default(tmp_path):
+    """`hsai cycle` passes its own index explicitly rather than relying on the
+    `iteration // 100` fallback, so real cycle 0 and an ad-hoc run never
+    collide on the same block just because both happened to use small
+    iteration numbers."""
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[dict(WIDGET_ISSUE)]
+    )
+
+    run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1, block=41355,
+    )
+
+    records = ledger.read_records(ledger.ledger_path(cfg, tmp_path))
+    assert all(r.block == 41355 for r in records)
+
+
+def test_adhoc_loop_iterations_do_not_pollute_cycle_zero(tmp_path):
+    """`hsai loop` runs outside any governed cycle. Acceptance criterion: its
+    iterations must not share a block index with a real cycle 0."""
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True, True, True],
+        open_issues=[dict(WIDGET_ISSUE)],
+    )
+
+    orchestrator.run_loop(
+        cfg, repo_dir=str(tmp_path), max_iterations=2, runner=runner, ai_runner=runner,
+    )
+
+    records = ledger.read_records(ledger.ledger_path(cfg, tmp_path))
+    assert records                                       # the loop did run
+    assert all(r.block == orchestrator.AD_HOC_BLOCK for r in records)
+    # A real cycle 0's aggregate stays untouched by the ad-hoc noise.
+    cycle_zero = ledger.aggregate_block(records, block=0)
+    assert cycle_zero.iterations == 0
+
+
 def test_trajectory_digest_reaches_the_lesson_and_the_pr_body(tmp_path):
     """The audit trail is visible on the PR, not only on local disk."""
     cfg = load_config()
@@ -1021,6 +1061,33 @@ def test_non_json_agent_output_still_produces_an_iteration_and_trajectory(tmp_pa
     # The ledger record still exists; its token columns are simply null.
     authored = _iteration_records(cfg, tmp_path)[0]
     assert authored.input_tokens is None and authored.output_tokens is None
+
+    # The lesson says so explicitly rather than silently omitting telemetry.
+    lesson_text = Path(result.lesson_path).read_text()
+    assert "## Execution trace" in lesson_text
+    assert "| telemetry | unavailable |" in lesson_text
+    assert "| exit status | ok |" in lesson_text
+
+
+def test_execution_trace_section_reports_turns_tools_and_tokens(tmp_path):
+    """Acceptance criterion: every lesson from a model run carries turns,
+    tools used, token counts, exit status, and duration."""
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[dict(WIDGET_ISSUE)],
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=21,
+    )
+
+    lesson_text = Path(result.lesson_path).read_text()
+    assert "## Execution trace" in lesson_text
+    assert "| tools used | `Read` |" in lesson_text     # AGENT_JSON's tool_use step
+    assert "| tokens | 1500 in / 320 out |" in lesson_text
+    assert "| exit status | ok |" in lesson_text
+    assert "| telemetry | ok |" in lesson_text
 
 
 LOUD_AGENT_JSON = json.dumps(

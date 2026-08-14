@@ -212,7 +212,7 @@ def test_run_agent_output_populates_the_ledger_record(tmp_path):
     """
     cfg = load_config()
 
-    def runner(cmd, *, cwd=None, env=None, timeout=None, input_text=None):
+    def runner(cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None):
         return Proc(cmd, 0, REAL_CLAUDE_STDOUT, "")
 
     ares = run_agent(

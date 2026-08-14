@@ -249,6 +249,25 @@ def test_record_builds_from_an_ai_result(tmp_path):
     assert trajectory.path_for(tmp_path, "3", 0).is_file()
 
 
+def test_record_captures_num_turns_when_exposed(tmp_path):
+    payload = dict(MESSAGES_PAYLOAD, num_turns=3)
+    ares = AIResult(
+        ok=True, model="sonnet", output=json.dumps(payload), error="",
+        cmd=["claude"], usage=payload["usage"], payload=payload,
+    )
+    traj = trajectory.record(
+        tmp_path, iteration=6, ticket=1, kind="implement", tier="standard",
+        model="sonnet", prompt="do it", result=ares, block=0,
+    )
+    assert traj.num_turns == 3
+    # A plain-text run exposes no `num_turns` - unavailable, not zero.
+    plain = AIResult(ok=True, model="sonnet", output="done", error="", cmd=["claude"])
+    assert trajectory.record(
+        tmp_path, iteration=7, ticket=1, kind="implement", tier="standard",
+        model="sonnet", prompt="do it", result=plain, block=0,
+    ).num_turns is None
+
+
 def test_record_captures_the_session_id_when_exposed(tmp_path):
     payload = dict(MESSAGES_PAYLOAD, session_id="b2f0e1d4")
     ares = AIResult(
@@ -266,6 +285,42 @@ def test_record_captures_the_session_id_when_exposed(tmp_path):
         tmp_path, iteration=5, ticket=1, kind="implement", tier="standard",
         model="sonnet", prompt="do it", result=plain, block=0,
     ).session_id == ""
+
+
+# --- execution trace (the '## Execution trace' section in the lesson) ------
+
+def test_tools_used_lists_distinct_tool_names_in_first_seen_order():
+    steps = steps_from_output(MESSAGES_PAYLOAD, "")
+    traj = _traj(steps=steps)
+    assert traj.tools_used() == ["Read"]
+
+
+def test_tools_used_is_empty_for_plain_text_output():
+    assert _traj(steps=steps_from_output(None, "plain output")).tools_used() == []
+
+
+def test_execution_trace_reports_turns_tools_tokens_exit_and_duration():
+    traj = _traj(
+        steps=steps_from_output(MESSAGES_PAYLOAD, ""),
+        usage={"input_tokens": 1500, "output_tokens": 320},
+        num_turns=3, duration_seconds=12.4, exit_status="ok",
+    )
+    trace = traj.execution_trace()
+    assert "| turns | 3 |" in trace
+    assert "| tools used | `Read` |" in trace
+    assert "| tokens | 1500 in / 320 out |" in trace
+    assert "| exit status | ok |" in trace
+    assert "| duration | 12.4s |" in trace
+    assert "| telemetry | ok |" in trace
+    assert "hsai traj 12" in trace
+
+
+def test_execution_trace_reports_telemetry_unavailable_without_usage():
+    trace = _traj(usage=None, num_turns=None).execution_trace()
+    assert "| tokens | unavailable |" in trace
+    assert "| telemetry | unavailable |" in trace
+    assert "| turns | unavailable |" in trace
+    assert "| tools used | _(none recorded)_ |" in trace
 
 
 # --- excerpt (what the committed lesson may quote) --------------------------

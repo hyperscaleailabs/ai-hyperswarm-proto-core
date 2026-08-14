@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -68,17 +69,29 @@ def parse_output(stdout: str) -> tuple[dict[str, Any] | None, dict[str, Any] | N
     return data, usage if isinstance(usage, dict) else None
 
 
-def _sanitized_env(cfg: CoreConfig) -> dict[str, str]:
-    """Return an env with forbidden (billing) variables removed."""
-    env = dict(os.environ)
-    for key in cfg.forbidden_env:
-        env.pop(key, None)
-    # Belt and suspenders: never let a stray key leak in.
+def _sanitized_env(cfg: CoreConfig) -> tuple[dict[str, str], tuple[str, ...]]:
+    """Build the child environment for ``claude -p``: ``(overrides, removals)``.
+
+    ``removals`` is returned alongside the override map - not just applied to
+    it - because :func:`hsai.proc.run` cannot honor an omission: its ``env``
+    parameter is an overlay merged on top of a fresh ``os.environ`` read, and
+    ``dict.update`` can only add or overwrite a key, never delete one back
+    out. A key simply absent from ``overrides`` is still inherited from the
+    parent process. Passing ``removals`` through as ``env_remove`` is what
+    actually enforces the subscription-only guard at the real subprocess
+    boundary.
+    """
+    removals = set(cfg.forbidden_env)
+    # Belt and suspenders: never let a stray key leak in, even if the config
+    # forgot to list it (constraints.forbid_env is also validated separately).
     if cfg.subscription_only:
-        env.pop("ANTHROPIC_API_KEY", None)
+        removals.add("ANTHROPIC_API_KEY")
+
+    overrides: dict[str, str] = {}
+    if cfg.subscription_only:
         # Signal to the CLI to prefer subscription auth where supported.
-        env.setdefault("CLAUDE_CODE_SUBSCRIPTION_ONLY", "1")
-    return env
+        overrides["CLAUDE_CODE_SUBSCRIPTION_ONLY"] = "1"
+    return overrides, tuple(sorted(removals))
 
 
 def build_command(
@@ -130,6 +143,32 @@ def preflight(cfg: CoreConfig) -> None:
             )
 
 
+def check_child_env(cfg: CoreConfig, *, runner: Runner = run) -> tuple[bool, str]:
+    """Spawn a real child process with the exact env :func:`run_agent` would
+    use, and read back what that child actually saw.
+
+    `hsai doctor`'s subscription guard used to only inspect config (would
+    ``preflight`` raise?) and never asked the question a real leak needs
+    answered: does the forbidden variable actually reach a spawned process?
+    This is the live counterpart - it is the one check that would have caught
+    :func:`hsai.proc.run`'s env-merge asymmetry (``dict.update`` cannot
+    remove a key) before it shipped. Uses the current Python interpreter as
+    the probe so it needs no external binary.
+    """
+    env, removals = _sanitized_env(cfg)
+    if not removals:
+        return True, "no forbidden variables configured (constraints.forbid_env is empty)"
+    probe = "import os,sys;sys.stdout.write(','.join(k for k in sys.argv[1:] if os.environ.get(k)))"
+    result = runner(
+        [sys.executable, "-c", probe, *removals],
+        env=env, env_remove=removals, timeout=10,
+    )
+    leaked = result.stdout.strip()
+    if leaked:
+        return False, f"leaked into a real spawned child process: {leaked}"
+    return True, f"{', '.join(removals)} confirmed absent from a real spawned child process"
+
+
 def run_agent(
     prompt: str,
     choice: ModelChoice,
@@ -143,7 +182,8 @@ def run_agent(
     """Run a headless Claude Code agent for one task."""
     preflight(cfg)
     cmd = build_command(prompt, choice, cfg, permission_mode=permission_mode)
-    proc: Proc = runner(cmd, cwd=cwd, env=_sanitized_env(cfg), timeout=timeout)
+    env, env_remove = _sanitized_env(cfg)
+    proc: Proc = runner(cmd, cwd=cwd, env=env, env_remove=env_remove, timeout=timeout)
     payload, usage = parse_output(proc.stdout)
     return AIResult(
         ok=proc.ok,

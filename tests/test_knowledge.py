@@ -60,6 +60,36 @@ def test_lesson_records_the_independent_review_verdict(tmp_path):
     assert "## Lesson learned" in text and "## Reproduction evidence" in text
 
 
+def test_lesson_renders_the_execution_trace_section(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    lesson = Lesson(
+        title="implement: add widget",
+        outcome="pass",
+        kind="implement",
+        context="ctx",
+        what_happened="did the thing",
+        lesson="kept it small",
+        ticket=7,
+    )
+    # No model run this iteration (e.g. a dry run): the section still appears,
+    # with an explicit placeholder rather than being silently omitted.
+    path = kb.write_lesson(lesson)
+    text = path.read_text()
+    assert "## Execution trace" in text
+    assert "_(no model run this iteration)_" in text
+
+    lesson.execution_trace = (
+        "| field | value |\n| --- | --- |\n| tokens | 1500 in / 320 out |\n"
+        "| exit status | ok |"
+    )
+    kb.write_lesson(lesson)
+    text = path.read_text()
+    assert "1500 in / 320 out" in text
+    assert "| exit status | ok |" in text
+    # and the surrounding sections are untouched
+    assert "## Lesson learned" in text and "## Independent review" in text
+
+
 def test_write_lesson_and_reindex(tmp_path):
     kb = KnowledgeBase(tmp_path)
     lesson = Lesson(

@@ -35,7 +35,9 @@ class _Runner:
         self.review_bodies: list[str] = []
         self._issue = 900
 
-    def __call__(self, cmd, *, cwd=None, env=None, timeout=None, input_text=None) -> Proc:
+    def __call__(
+        self, cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None
+    ) -> Proc:
         cmd = list(cmd)
         if cmd[:3] == ["gh", "issue", "list"]:
             return Proc(cmd, 0, "[]", "")
@@ -54,7 +56,8 @@ def _make_fake_run_once(ledger_file, *, tier: str, seconds: float):
     """
     state = {"demotes": [], "started_prs": [], "merged_prs": []}
 
-    def fake(cfg, *, repo_dir, runner, ai_runner, iteration, demote_tier=False, dry_run=False):
+    def fake(cfg, *, repo_dir, runner, ai_runner, iteration, block=None,
+             demote_tier=False, dry_run=False):
         state["demotes"].append(demote_tier)
         pr = 500 + len(state["demotes"])
         state["started_prs"].append(pr)
@@ -175,7 +178,7 @@ def test_persona_articles_survive_output_without_a_json_envelope(tmp_path):
 
     article = "# What this block changed\n\nPlain text, no JSON envelope.\n"
 
-    def ai_runner(cmd, *, cwd=None, env=None, timeout=None, input_text=None):
+    def ai_runner(cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None):
         return Proc(cmd, 0, article, "")
 
     written = cycle._persona_articles(
@@ -241,7 +244,9 @@ class _GhRunner:
         self._issue = 900
         self._pr = 700
 
-    def __call__(self, cmd, *, cwd=None, env=None, timeout=None, input_text=None) -> Proc:
+    def __call__(
+        self, cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None
+    ) -> Proc:
         cmd = list(cmd)
         self.calls.append(cmd)
         if cmd[:3] == ["gh", "issue", "list"]:
@@ -268,7 +273,9 @@ class _GhRunner:
         return [t for t in self.issue_titles if t.startswith(prefix)]
 
 
-def _article_runner(cmd, *, cwd=None, env=None, timeout=None, input_text=None) -> Proc:
+def _article_runner(
+    cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None
+) -> Proc:
     return Proc(list(cmd), 0, ARTICLE, "")
 
 
@@ -294,7 +301,8 @@ def _make_run_once(ledger_file, *, crash_at: int | None = None):
     """
     state: dict[str, list[int]] = {"iterations": []}
 
-    def fake(cfg, *, repo_dir, runner, ai_runner, iteration, demote_tier=False, dry_run=False):
+    def fake(cfg, *, repo_dir, runner, ai_runner, iteration, block=None,
+             demote_tier=False, dry_run=False):
         position = iteration % 100
         if crash_at is not None and position == crash_at:
             raise RuntimeError(f"worker died during iteration {iteration}")
