@@ -1,0 +1,18 @@
+name: improve-goes-idle-when-its-ticket-is-already-in-flight
+description: >
+  The self-improve idea is deduped against the open backlog: when the identical
+  ticket is already assigned to a worker, the run goes idle instead of filing a
+  copy. A stranded loop once filed nine identical chore tickets.
+lesson: 2026-08-13-implement-feat-synthesis-memory-and-duplicate-proposal-rejection
+
+issues:
+  - number: 21
+    title: "chore: refresh reference-set snapshot and extract one practice"
+    labels: ["priority:P3", "self-improve"]
+    assignees: ["hsai-bot"]
+    body: "Already claimed by another worker."
+
+expect:
+  path: improve
+  guards: [idle_dedupe]
+  outcome: idle

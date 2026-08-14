@@ -1,0 +1,36 @@
+name: implement-remote-ci-failure-recovers-the-ticket
+description: >
+  Local green is not remote green. When the PR's real check rollup concludes
+  FAILURE the change does not merge: the PR is closed and the ticket returns to
+  the backlog with an attempt spent.
+lesson: 2026-07-26-implement-feat-poll-remote-ci-gh-checks-as-an-explicit-pre-merge-gate
+
+remote_ci: FAILURE
+
+issues:
+  - number: 14
+    title: "feat: add a widget helper"
+    labels: ["priority:P2"]
+    body: |
+      ## Problem
+      The widget helper does not exist yet.
+
+      ## Proposal
+      Add a small widget helper and cover it with a test.
+
+      ## Acceptance criteria
+      - [ ] `widget()` returns a value
+      - [ ] a test covers the new helper
+
+      ## Verification plan
+      - [ ] `pytest` passes
+
+transcript:
+  - cmd: [git, status]
+    stdout: "?? src/hsai/widget.py\n"
+
+expect:
+  path: implement
+  tier: standard
+  guards: [remote_ci]
+  outcome: recovered

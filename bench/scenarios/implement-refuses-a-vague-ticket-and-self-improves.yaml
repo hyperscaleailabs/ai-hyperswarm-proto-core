@@ -1,0 +1,22 @@
+name: implement-refuses-a-vague-ticket-and-self-improves
+description: >
+  A ticket without acceptance criteria is refused rather than implemented
+  badly: it is labelled needs-refinement, the backlog is then effectively
+  empty, and the loop falls through to the self-improve path.
+lesson: 2026-07-26-architect-steering-quality-over-throughput
+
+issues:
+  - number: 11
+    title: "feat: vague wish"
+    labels: ["priority:P2"]
+    body: "make everything better somehow"
+
+transcript:
+  - cmd: [git, status]
+    stdout: "?? src/hsai/reference.py\n"
+
+expect:
+  path: improve
+  tier: light
+  guards: [needs_refinement]
+  outcome: merged

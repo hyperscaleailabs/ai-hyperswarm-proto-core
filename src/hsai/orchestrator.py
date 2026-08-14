@@ -27,6 +27,25 @@ HEAL = "heal"
 IMPLEMENT = "implement"
 IMPROVE = "improve"
 
+# Guard identifiers recorded on :attr:`IterationResult.guards` whenever a guard
+# actually *acts* on a run (reverts something, blocks it, or refuses to start
+# it). Notes stay human prose; these are the machine-readable decision record -
+# what `hsai bench` scores and what a post-mortem greps for. A guard that ran
+# and approved is deliberately absent: only interventions are recorded.
+GUARD_NEEDS_REFINEMENT = "needs_refinement"  # a vague ticket was refused
+GUARD_IDLE_DEDUPE = "idle_dedupe"            # improvement already in flight
+GUARD_WORKFLOW_REVERT = "workflow_revert"    # edits under .github/workflows reverted
+GUARD_COMPLETENESS = "completeness"          # knowledge-only diff on a code ticket
+GUARD_REPRO = "repro"                        # no reproduced bug on a heal/bugfix
+GUARD_REVIEW_BLOCK = "review_block"          # independent reviewer withheld approval
+GUARD_REMOTE_CI = "remote_ci"                # remote CI did not conclude SUCCESS
+
+# Terminal outcomes of one iteration (see :meth:`IterationResult.terminal`).
+MERGED = "merged"
+RECOVERED = "recovered"
+IDLE = "idle"
+OPEN = "open"
+
 # Sentinel block index for iterations run outside a governed `hsai cycle`
 # (ad-hoc `hsai loop`/`hsai run-once`). Real cycle indices are always >= 0
 # (`resolve_cycle_index` derives them from wall-clock epoch // 43200, or an
@@ -172,7 +191,24 @@ class IterationResult:
     review: str = ""  # approve | blocked | skipped (independent review gate)
     lesson_path: str = ""
     recalled: list[str] = field(default_factory=list)
+    guards: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+
+    def terminal(self) -> str:
+        """How the iteration ended, as one of a closed set of outcomes.
+
+        The decision `hsai bench` scores (and the brief summarizes): a run
+        either merged, was recovered back into the backlog, went idle without
+        claiming work, or is still open (a PR that neither merged nor
+        recovered - which only happens in a dry run).
+        """
+        if self.merged:
+            return MERGED
+        if self.recovered:
+            return RECOVERED
+        if self.ticket is None and self.pr is None:
+            return IDLE
+        return OPEN
 
     def describe(self) -> str:
         parts = [
@@ -183,6 +219,7 @@ class IterationResult:
             f"ci:{self.ci_before}->{self.ci_after}",
             f"review={self.review or '-'}",
             f"remote={self.remote or '-'}",
+            f"guards={','.join(self.guards) or '-'}",
             f"merged={self.merged}",
             f"recovered={self.recovered}",
         ]
@@ -305,6 +342,8 @@ def run_once(
     ticket_title = ""
     ticket_body = ""
     claimed_issue: github.Issue | None = None
+    # Guards that acted before the IterationResult exists; folded into it below.
+    guards: list[str] = []
 
     if dry_run:
         kind = decide_path(ci_before.ok, has_tickets=False)
@@ -330,6 +369,8 @@ def run_once(
                     open_unassigned.append(i)
                 else:
                     github.edit_labels(repo, i.number, add=[NEEDS_REFINEMENT], runner=runner)
+                    if GUARD_NEEDS_REFINEMENT not in guards:
+                        guards.append(GUARD_NEEDS_REFINEMENT)
             kind = decide_path(ci_before.ok, has_tickets=bool(open_unassigned))
             if kind == HEAL:
                 ticket_title = "ci: main is red - auto-heal"
@@ -368,7 +409,9 @@ def run_once(
                     )
 
     if idle_reason:
-        res = IterationResult(kind=kind, ci_before=ci_before.ok)
+        res = IterationResult(
+            kind=kind, ci_before=ci_before.ok, guards=[*guards, GUARD_IDLE_DEDUPE],
+        )
         res.notes.append(idle_reason)
         gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
         return res
@@ -389,7 +432,7 @@ def run_once(
 
     result = IterationResult(
         kind=kind, ticket=ticket_num, model=choice.model, ci_before=ci_before.ok,
-        recalled=list(recalled.note_names),
+        recalled=list(recalled.note_names), guards=list(guards),
     )
     if recalled.notes:
         result.notes.append(f"recalled {len(recalled.notes)} prior note(s)")
@@ -464,6 +507,7 @@ def run_once(
         ]
         if reverted_workflows:
             gitops.restore_pathspec(".github/workflows", cwd=wt, runner=runner)
+            result.guards.append(GUARD_WORKFLOW_REVERT)
             result.notes.append(f"reverted workflow edits: {reverted_workflows}")
 
         # Completeness guard: a code ticket (feat/skill/refactor/fix) cannot be
@@ -473,6 +517,7 @@ def run_once(
             touched = gitops.changed_paths(cwd=wt, runner=runner)
             code_files = [p for p in touched if not p.startswith("knowledge/")]
             if not code_files:
+                result.guards.append(GUARD_COMPLETENESS)
                 result.notes.append("completeness guard: knowledge-only diff on a code ticket")
                 _recover_failed(
                     cfg, repo, 0, kind=kind, ticket_num=ticket_num,
@@ -501,6 +546,7 @@ def run_once(
             )
             result.notes.append(f"repro guard: {repro_result.reason}")
             if not repro_result.ok:
+                result.guards.append(GUARD_REPRO)
                 _recover_failed(
                     cfg, repo, 0, kind=kind, ticket_num=ticket_num,
                     claimed_issue=claimed_issue, login=login,
@@ -611,6 +657,7 @@ def run_once(
             remote="REVIEW_BLOCKED", runner=runner,
         )
         result.recovered = True
+        result.guards.append(GUARD_REVIEW_BLOCK)
         result.notes.append("recovered: independent review blocked the change")
         # The lesson was written into a worktree that is about to be discarded
         # unpushed; the durable record of this run is its ledger + trajectory.
@@ -674,6 +721,7 @@ def run_once(
             claimed_issue=claimed_issue, login=login, remote=remote, runner=runner,
         )
         result.recovered = True
+        result.guards.append(GUARD_REMOTE_CI)
         result.notes.append("recovered: closed PR, returned ticket to backlog")
 
     _record_cost("merged" if result.merged else "recovered")

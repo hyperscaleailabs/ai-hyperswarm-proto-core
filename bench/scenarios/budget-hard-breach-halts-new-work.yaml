@@ -1,0 +1,34 @@
+name: budget-hard-breach-halts-new-work
+description: >
+  Three heavy-tier iterations already on this block's ledger meet the configured
+  ceiling. The budget gate refuses to start new work for the rest of the block:
+  no worker runs, no quota is spent, and in-flight PRs are left alone.
+lesson: 2026-07-26-implement-feat-quota-cost-telemetry-ledger-with-a-warn-then-halt-per-block-budget-gate
+
+# Already spent in block 0 (budget.max_heavy_iterations_per_block = 3).
+ledger:
+  - {iteration: 1, tier: heavy, model: opus, wall_clock_seconds: 300, outcome: merged}
+  - {iteration: 2, tier: heavy, model: opus, wall_clock_seconds: 300, outcome: merged}
+  - {iteration: 3, tier: heavy, model: opus, wall_clock_seconds: 300, outcome: merged}
+
+issues:
+  - number: 24
+    title: "feat: add a widget helper"
+    labels: ["priority:P2"]
+    body: |
+      ## Problem
+      The widget helper does not exist yet.
+
+      ## Proposal
+      Add a small widget helper and cover it with a test.
+
+      ## Acceptance criteria
+      - [ ] `widget()` returns a value
+      - [ ] a test covers the new helper
+
+      ## Verification plan
+      - [ ] `pytest` passes
+
+expect:
+  guards: [budget_hard]
+  outcome: halted

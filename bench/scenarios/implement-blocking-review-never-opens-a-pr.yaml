@@ -1,0 +1,37 @@
+name: implement-blocking-review-never-opens-a-pr
+description: >
+  The independent reviewer is a second opinion with teeth: a blocking verdict
+  stops the run before anything is pushed, even though the worker succeeded and
+  local CI is green.
+lesson: 2026-08-12-implement-feat-adversarial-cross-model-pr-review-gate-with-a-merge-gatekeeper
+
+issues:
+  - number: 16
+    title: "feat: add a widget helper"
+    labels: ["priority:P2"]
+    body: |
+      ## Problem
+      The widget helper does not exist yet.
+
+      ## Proposal
+      Add a small widget helper and cover it with a test.
+
+      ## Acceptance criteria
+      - [ ] `widget()` returns a value
+      - [ ] a test covers the new helper
+
+      ## Verification plan
+      - [ ] `pytest` passes
+
+transcript:
+  - cmd: [claude]
+    role: reviewer
+    stdout_ref: review_block
+  - cmd: [git, status]
+    stdout: "?? src/hsai/widget.py\n"
+
+expect:
+  path: implement
+  tier: standard
+  guards: [review_block]
+  outcome: recovered

@@ -7,6 +7,7 @@ Commands:
   hsai cycle [--cycle-index N] [--resume] [--dry-run]          one governance block
   hsai reindex                                                 rebuild knowledge MOCs
   hsai recall "<query>" [--k N] [--kind K]                     rank prior lessons/ADRs
+  hsai bench [--json] [--scenario NAME]                        score the loop's decisions
   hsai doctor                                                  verify environment + invariants
   hsai traj <iteration> [--json]                               print a stored agent run
   hsai replay <iteration> [--json]                             alias of `hsai traj`
@@ -14,8 +15,10 @@ Commands:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
+from pathlib import Path
 
 from . import __version__, ai, recall, repro, trajectory
 from .config import CoreConfig, load_config, validate
@@ -104,6 +107,65 @@ def cmd_recall(args: argparse.Namespace) -> int:
     for note in notes:
         print(f"{note.score:8.3f}  {note.note_name}  ({note.label()})")
     return 0
+
+
+def cmd_bench(args: argparse.Namespace) -> int:
+    """Replay the frozen scenario suite and score the harness's decisions.
+
+    Offline by construction: every subprocess the loop would spawn is answered
+    from the scenario's transcript, so this spends no quota and makes no
+    network, ``git`` or ``claude`` call. Exits non-zero when any scenario's
+    decisions differ from its declaration, or when the aggregate score
+    regresses below the committed baseline.
+    """
+    from . import bench
+
+    cfg = _load(args)
+    root = Path(args.root)
+    try:
+        scenarios = bench.load_scenarios(
+            root / (args.scenarios or bench.DEFAULT_SCENARIO_DIR), repo_root=root
+        )
+        baseline = bench.load_baseline(root / (args.baseline or bench.DEFAULT_BASELINE))
+    except bench.ScenarioError as exc:
+        print(f"bench: {exc}", file=sys.stderr)
+        return 2
+
+    selected = [s for s in scenarios if not args.scenario or s.name == args.scenario]
+    if not selected:
+        print(f"bench: no scenario named {args.scenario!r}", file=sys.stderr)
+        return 2
+
+    result = bench.run_suite(selected, cfg)
+    # A subset run cannot be graded against a baseline that counts scenarios.
+    full_run = len(selected) == len(scenarios)
+    problems = bench.check_baseline(result, baseline) if full_run else []
+
+    written = ""
+    if full_run and not args.no_write:
+        written = str(root / (args.scoreboard or bench.DEFAULT_SCOREBOARD))
+        Path(written).parent.mkdir(parents=True, exist_ok=True)
+        Path(written).write_text(bench.render_scoreboard(result, baseline), encoding="utf-8")
+
+    if args.json:
+        payload = result.to_dict()
+        payload["baseline"] = baseline
+        payload["regressions"] = problems
+        payload["scoreboard"] = written
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(bench.render_table(result))
+        print()
+        for score in result.failures():
+            print(f"FAIL {score.scenario}: {score.reason()}")
+        print(f"aggregate: {result.passed}/{result.total} ({result.aggregate:.2f})")
+        for problem in problems:
+            print(f"REGRESSION: {problem}")
+        if written:
+            print(f"scoreboard: {written}")
+        elif not full_run:
+            print("scoreboard: not written (partial run)")
+    return 0 if result.ok and not problems else 1
 
 
 def cmd_cycle(args: argparse.Namespace) -> int:
@@ -247,6 +309,18 @@ def build_parser() -> argparse.ArgumentParser:
     rl.add_argument("--kind", default="", help="bias toward this task kind (heal/implement/improve)")
     rl.add_argument("--root", default=".", help="repo root holding knowledge/ and docs/adr")
     rl.set_defaults(func=cmd_recall)
+
+    bn = sub.add_parser(
+        "bench", help="replay the frozen scenario suite and score the loop's decisions"
+    )
+    bn.add_argument("--json", action="store_true", help="print the full scored result as JSON")
+    bn.add_argument("--scenario", default="", help="run only the scenario with this name")
+    bn.add_argument("--root", default=".", help="repo root holding bench/ and knowledge/")
+    bn.add_argument("--scenarios", default=None, help="scenario dir (default: bench/scenarios)")
+    bn.add_argument("--baseline", default=None, help="baseline file (default: bench/baseline.json)")
+    bn.add_argument("--scoreboard", default=None, help="board to write (default: bench/SCOREBOARD.md)")
+    bn.add_argument("--no-write", action="store_true", help="score without rewriting the board")
+    bn.set_defaults(func=cmd_bench)
 
     cy = sub.add_parser("cycle", help="run one half-day governance block")
     cy.add_argument("--index", "--cycle-index", dest="index", type=int, default=None,
