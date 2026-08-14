@@ -13,12 +13,16 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from . import github
 from .config import CoreConfig
 from .knowledge import KnowledgeBase
 from .ledger import BlockAggregate
 from .proc import Runner, run
+
+if TYPE_CHECKING:  # rendering only needs the type; keep this module import-light
+    from .evals import Scorecard
 
 NOTES_START = "<!-- architect-notes:start -->"
 NOTES_END = "<!-- architect-notes:end -->"
@@ -45,6 +49,7 @@ class BlockReport:
     whitepaper: str = ""                                   # note name
     articles: list[str] = field(default_factory=list)      # file paths
     cost: BlockAggregate | None = None                     # quota-ledger aggregate
+    evals: Scorecard | None = None                         # decision-core scorecard
     notes: list[str] = field(default_factory=list)
 
 
@@ -150,6 +155,18 @@ def _cost_summary(cost: BlockAggregate | None) -> str:
     return f"{cost.summary()}\n\n**Efficiency:** {efficiency}"
 
 
+def _eval_summary(card: Scorecard | None) -> str:
+    """Decision quality in one line, so the brief shows it beside the cost.
+
+    Cost alone is a half-answer: a block that got cheaper by routing everything
+    to haiku has not improved. This line is the other half - per-function
+    accuracy against ``evals/cases.yaml``, plus the tier-cost proxy.
+    """
+    if card is None:
+        return "_eval suite not scored for this block_"
+    return card.summary()
+
+
 def render_brief(cfg: CoreConfig, report: BlockReport) -> str:
     """The review-issue body for one block: everything clickable in one place."""
     repo = cfg.repo_slug
@@ -168,6 +185,7 @@ def render_brief(cfg: CoreConfig, report: BlockReport) -> str:
     paper = f"`knowledge/whitepapers/{report.whitepaper}.md`" if report.whitepaper else "_none_"
     articles = "\n".join(f"- `{a}`" for a in report.articles) or "_none_"
     cost = _cost_summary(report.cost)
+    decisions = _eval_summary(report.evals)
     extra = "\n".join(f"- {n}" for n in report.notes)
     return f"""# Block review - cycle {report.cycle_index}
 
@@ -189,6 +207,9 @@ sequentially, records your feedback as ADRs, and ends with a merged PR.
 
 ## Cost this block (quota ledger)
 {cost}
+
+## Decision quality this block (`hsai eval`)
+{decisions}
 
 ## Knowledge produced
 - Whitepaper: {paper}

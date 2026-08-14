@@ -1,0 +1,48 @@
+{
+  "accuracy": {
+    "decide_path": 1.0,
+    "ledger.evaluate_budget": 1.0,
+    "models.select": 0.541667,
+    "repro.requires_repro_guard": 1.0,
+    "tickets.check_well_formed": 1.0
+  },
+  "cases": 44,
+  "counts": {
+    "decide_path": {
+      "correct": 4,
+      "total": 4
+    },
+    "ledger.evaluate_budget": {
+      "correct": 5,
+      "total": 5
+    },
+    "models.select": {
+      "correct": 13,
+      "total": 24
+    },
+    "repro.requires_repro_guard": {
+      "correct": 5,
+      "total": 5
+    },
+    "tickets.check_well_formed": {
+      "correct": 6,
+      "total": 6
+    }
+  },
+  "mismatches": [
+    "select-lesson-structured-execution-context: models.select expected light, got standard",
+    "select-lesson-reference-set-miner-must-not-route-light: models.select expected standard, got light",
+    "select-lesson-quota-cost-ledger: models.select expected heavy, got standard",
+    "select-lesson-model-selection-skill: models.select expected light, got standard",
+    "select-lesson-metagpt-phase-artifacts: models.select expected light, got standard",
+    "select-lesson-refresh-reference-set-snapshot: models.select expected light, got standard",
+    "select-lesson-trajectory-capture-telemetry: models.select expected heavy, got standard",
+    "select-lesson-trajectory-store-and-replay: models.select expected heavy, got standard",
+    "select-lesson-durable-cycle-journal: models.select expected heavy, got standard",
+    "select-lesson-lesson-retrieval-memory: models.select expected heavy, got standard",
+    "select-lesson-adversarial-review-gate: models.select expected heavy, got standard"
+  ],
+  "probes": 44,
+  "schema": 1,
+  "tier_cost": 45
+}

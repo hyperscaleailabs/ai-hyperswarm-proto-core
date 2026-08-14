@@ -19,6 +19,7 @@ so the decision logic stays pure and unit-tested.
 | `hsai.knowledge` | lessons, whitepapers, MOC reindex (Obsidian) | write files |
 | `hsai.recall` | BM25 index over the vault; retrieve prior notes | read files |
 | `hsai.review` | independent, different-tier review of the branch diff | subprocess |
+| `hsai.evals` | labeled decision-core benchmark + baseline gate | read files |
 | `hsai.orchestrator` | one iteration; `decide_path`, `build_pr_body` (pure) | composes above |
 | `hsai.swarm` | run N iterations concurrently | threads |
 | `hsai.cli` | `hsai` entry point | - |
@@ -108,6 +109,42 @@ Every wrapper takes an injectable `runner` (default: real subprocess). Tests
 inject a fake runner or use `dry_run=True`, so CI never touches the network.
 The pure core - `decide_path`, `build_pr_body`, `models.select`, the knowledge
 renderers - is tested directly.
+
+## Measurability: the decision-core benchmark
+
+Unit tests prove a decision function does what its author intended. They cannot
+prove the *heuristic* is any good - that needs labeled data. `hsai.evals` is
+that data:
+
+- `evals/cases.yaml` - labeled cases seeded from this repo's own history
+  (ledger records, lesson notes with the tier that actually delivered, past
+  tickets, ADR-0001). Every case names its source, so a label is auditable.
+- `hsai eval` - replays them through `decide_path`, `models.select`,
+  `tickets.check_well_formed`, `repro.requires_repro_guard` and
+  `ledger.evaluate_budget`, printing per-function accuracy, a tier-cost proxy
+  (heavy=3 / standard=2 / light=1) and the mismatched case ids.
+- `evals/baseline.json` - the committed scorecard. `tests/test_evals.py` fails
+  when any per-function accuracy drops below it, when coverage shrinks, when the
+  tier-cost proxy rises with no accuracy gain, or when the committed file no
+  longer matches what the suite scores - a stale baseline measures nothing.
+
+**Rule: a change to any of those five heuristics must ship with an eval delta.**
+Either the accuracy figures improve, or the PR explains why they are unchanged.
+"Calibrated over multiple runs" is not evidence; `hsai eval --update-baseline`
+followed by a visible `git diff` on `evals/baseline.json` is. A block review
+carries the same one-liner beside the cost summary, so decision quality and
+quota spend are read together - a block that got cheaper by routing everything
+to the light tier has not improved.
+
+The gate lives in pytest, not in a workflow: `run_once` reverts any diff under
+`.github/workflows/**`, so pytest is the only gate a self-improving worker can
+legitimately strengthen.
+
+Reference-set lineage: `microsoft/JARVIS`'s TaskBench (benchmarking controller
+model-selection), `SWE-agent/SWE-agent`'s SWE-bench discipline of justifying an
+agent change with a scored delta, `openai/swarm`'s `evals/` directory testing
+pure orchestration primitives, and `FoundationAgents/MetaGPT`'s per-role
+artifact evaluation (the per-function breakdown).
 
 ## Safety model
 
