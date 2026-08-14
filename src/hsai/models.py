@@ -85,6 +85,10 @@ class ModelChoice:
     model: str
     rationale: str
     strategy: str = "heuristic-v1"
+    # The complexity score the tier was derived from. Kept as a field (not only
+    # baked into ``rationale``) so the trajectory can record the number a future
+    # calibration pass wants to compare against, without re-parsing prose.
+    score: int = 0
 
 
 def _score(task: Task) -> int:
@@ -191,7 +195,9 @@ def select(task: Task, cfg: CoreConfig, *, demote: bool = False) -> ModelChoice:
 
     model = cfg.tiers[tier].model
     rationale = f"score={score} -> {tier} ({why})"
-    return ModelChoice(tier=tier, model=model, rationale=rationale, strategy="heuristic-v1")
+    return ModelChoice(
+        tier=tier, model=model, rationale=rationale, strategy="heuristic-v1", score=score
+    )
 
 
 def _adjacent_tier(tier: str, cfg: CoreConfig) -> str:

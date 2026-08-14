@@ -10,6 +10,8 @@ Commands:
   hsai doctor                                                  verify environment + invariants
   hsai traj <iteration> [--json]                               print a stored agent run
   hsai replay <iteration> [--json]                             alias of `hsai traj`
+  hsai trace show <path>                                       one iteration's timeline
+  hsai trace stats [--block N]                                 per-step duration/failures
 """
 from __future__ import annotations
 
@@ -17,7 +19,7 @@ import argparse
 import os
 import sys
 
-from . import __version__, ai, recall, repro, trajectory
+from . import __version__, ai, recall, repro, trace, trajectory
 from .config import CoreConfig, load_config, validate
 from .knowledge import KnowledgeBase
 from .orchestrator import run_loop
@@ -183,6 +185,31 @@ def cmd_traj(args: argparse.Namespace) -> int:
     return _print_trajectory(args, "traj")
 
 
+def cmd_trace_show(args: argparse.Namespace) -> int:
+    """Render one iteration's trajectory as a timeline. Pure reading."""
+    try:
+        rendered = trace.read(args.path).render()
+    except OSError as exc:
+        print(f"trace show: {exc}", file=sys.stderr)
+        return 1
+    print(rendered)
+    return 0
+
+
+def cmd_trace_stats(args: argparse.Namespace) -> int:
+    """Roll up per-step duration and failure rate across stored trajectories."""
+    cfg = _load(args)
+    subdir = str((cfg.knowledge or {}).get("trajectories_dir", trace.DEFAULT_DIR))
+    traces = trace.load_all(args.root, block=args.block, subdir=subdir)
+    if not traces:
+        where = f"{args.root}/{subdir}"
+        scope = f" for block {args.block}" if args.block is not None else ""
+        print(f"trace stats: no trajectories under {where}{scope}", file=sys.stderr)
+        return 1
+    print(trace.render_stats(traces))
+    return 0
+
+
 def cmd_brief(args: argparse.Namespace) -> int:
     from .governance import write_direction
 
@@ -275,6 +302,18 @@ def build_parser() -> argparse.ArgumentParser:
         tp.add_argument("--root", default=".", help="repo root holding .hsai/traj")
         tp.add_argument("--json", action="store_true", help="print the raw trajectory JSON")
         tp.set_defaults(func=func)
+
+    tr = sub.add_parser("trace", help="inspect committed per-iteration trajectories")
+    tr_sub = tr.add_subparsers(dest="trace_command", required=True)
+    tr_show = tr_sub.add_parser("show", help="render one trajectory as a timeline")
+    tr_show.add_argument("path", help="path to a knowledge/trajectories/*.jsonl file")
+    tr_show.set_defaults(func=cmd_trace_show)
+    tr_stats = tr_sub.add_parser(
+        "stats", help="per-step duration and failure-rate rollup across iterations"
+    )
+    tr_stats.add_argument("--block", type=int, default=None, help="limit to one block")
+    tr_stats.add_argument("--root", default=".", help="repo root holding knowledge/")
+    tr_stats.set_defaults(func=cmd_trace_stats)
 
     rc = sub.add_parser(
         "repro-check", help="reproduce-before-fix guard for heal/bugfix PRs (CI gate)"

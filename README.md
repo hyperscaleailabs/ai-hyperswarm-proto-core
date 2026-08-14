@@ -103,6 +103,8 @@ hsai loop --dry-run   # a full iteration with no side effects
 hsai loop          # one real iteration (opens & merges a PR on green)
 hsai loop --max-parallel 3 -n 1   # ramp to the swarm (after proving one iteration)
 hsai traj 12       # print what agent run (iteration) 12 did (spends no quota)
+hsai trace show knowledge/trajectories/<branch>.jsonl   # one iteration, phase by phase
+hsai trace stats   # where the wall clock goes, and which phase fails most often
 hsai recall "knowledge-only diff on a code ticket"   # rank prior lessons for a task
 hsai cycle --resume   # finish an interrupted governance block, replaying what completed
 ```
@@ -115,6 +117,17 @@ committed lesson and the PR body carry only a digest line (tokens, duration,
 exit status) plus a redacted tail. `hsai traj <iteration> [--json]` reads one
 back without invoking `claude`; older blocks are pruned per
 `execution.trajectory_retention_blocks`.
+
+Every **iteration** also persists a per-phase trajectory to
+`knowledge/trajectories/<branch>.jsonl` - worktree setup, CI, ticket claim,
+model selection, the agent run, each guard, review, PR, remote CI, and the merge
+or recovery - with a duration and an outcome per step. Unlike the agent-run
+store above, this one *is* committed: it ships in the same PR as the lesson,
+which links it, so a failed iteration leaves behind a replayable record instead
+of a single ledger row. Every field is scrubbed (forbidden env keys dropped,
+credentials and home paths rewritten) and capped at
+`knowledge.trajectory_max_chars` with an explicit truncation marker. Read it
+with `hsai trace show <path>`; roll it up with `hsai trace stats [--block N]`.
 
 ## Learning targets (top-10, pinned snapshot)
 

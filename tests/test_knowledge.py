@@ -90,6 +90,29 @@ def test_lesson_renders_the_execution_trace_section(tmp_path):
     assert "## Lesson learned" in text and "## Independent review" in text
 
 
+def test_lesson_links_the_iteration_trajectory(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    lesson = Lesson(
+        title="implement: add widget",
+        outcome="pass",
+        kind="implement",
+        context="ctx",
+        what_happened="did the thing",
+        lesson="kept it small",
+        ticket=7,
+    )
+    # Nothing recorded: the section is still there, saying so out loud.
+    text = kb.write_lesson(lesson).read_text()
+    assert "## Trajectory" in text
+    assert "_(no trajectory recorded)_" in text
+
+    lesson.trajectory = "knowledge/trajectories/hsai-iter-1-2-abc123.jsonl"
+    text = kb.write_lesson(lesson).read_text()
+    assert f"`{lesson.trajectory}`" in text
+    assert f"hsai trace show {lesson.trajectory}" in text
+    assert "## Execution trace" in text and "## Independent review" in text
+
+
 def test_write_lesson_and_reindex(tmp_path):
     kb = KnowledgeBase(tmp_path)
     lesson = Lesson(
