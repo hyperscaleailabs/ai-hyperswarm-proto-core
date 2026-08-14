@@ -62,6 +62,7 @@ class Lesson:
     recalled: tuple[str, ...] = ()  # prior notes injected into this run's prompt
     review_verdict: str = ""  # the independent reviewer's verdict, verbatim
     execution_trace: str = ""  # turns/tools/tokens/exit/duration - the committed digest
+    trajectory: str = ""  # repo-relative path to this iteration's committed trajectory
 
     def note_name(self) -> str:
         return f"{self.created}-{slugify(self.title)}"
@@ -329,6 +330,13 @@ class KnowledgeBase:
         repro = lesson.repro_evidence or "_(not applicable: not a heal/bugfix ticket)_"
         # Who checked the work, not just who wrote it (G2).
         review = lesson.review_verdict or "_(no independent review recorded)_"
+        # Where the replayable, step-by-step record of this iteration lives.
+        trajectory = (
+            f"`{lesson.trajectory}` - replay with "
+            f"`hsai trace show {lesson.trajectory}`"
+            if lesson.trajectory
+            else "_(no trajectory recorded)_"
+        )
         return f"""{fm}
 
 # {lesson.title}
@@ -356,6 +364,9 @@ class KnowledgeBase:
 
 ## Execution trace
 {lesson.execution_trace or "_(no model run this iteration)_"}
+
+## Trajectory
+{trajectory}
 
 ## Independent review
 {review}

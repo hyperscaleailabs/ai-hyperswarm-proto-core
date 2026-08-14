@@ -157,6 +157,46 @@ review brief, including **tokens per merged PR** - report real numbers instead
 of nulls. Output that is not JSON (an older `claude` binary) degrades to a
 single-step trajectory with null usage rather than breaking the loop.
 
+## The layer above: per-iteration trajectories
+
+`hsai.trajectory` records what happened *inside* one `claude -p` call.
+`hsai.trace` records the layer above it - the **iteration** - and that record is
+committed, because it is the one that used to vanish. A guard-aborted iteration
+left one aggregate ledger row and an 800-char stderr slice; what the worker was
+asked, which tier was chosen and why, which guard rejected the diff, and what
+remote CI concluded were all unrecoverable.
+
+`run_once` opens one `trace.Trajectory` per iteration and appends a step for
+every phase: `worktree_setup`, `ci_before`, `ticket_claim` (including the
+well-formedness verdict on every ticket it passed over), `model_select` (tier,
+score, rationale, demote flag), `agent_run` (prompt + its digest, stdout,
+stderr, exit status, timeout), `guard_workflow_revert`, `guard_completeness`,
+`guard_repro`, `ci_after`, `review_gate`, `pr_open`, `ci_remote`, and -
+whichever exit the iteration takes - `merge_or_recover`. Each step carries its
+own duration, so `hsai trace stats` can say where the wall clock goes and which
+phase fails most often.
+
+The file is `knowledge/trajectories/<branch>.jsonl`, append-only, one JSONL
+record per step after a `meta` header. Branch names are already unique per
+worker, so parallel workers never collide - the same rule the lesson files
+follow. It is written at the **repo root** (a guard failure deletes the
+worktree, and that is precisely the run worth keeping) and mirrored into the
+worktree before each commit, so the iteration's own PR ships the evidence its
+body points at. The lesson's `## Trajectory` section and the PR body both carry
+the path.
+
+Because these files are committed, `trace.scrub` runs on every field on the way
+in, never on the way out: keys named by `constraints.forbid_env` are dropped,
+credential shapes (`sk-`, `ghp_`, `github_pat_`, `Bearer …`) and the live values
+of forbidden variables are rewritten to `[redacted]`, home paths collapse to
+`~`, and each field is capped at `knowledge.trajectory_max_chars` with an
+explicit truncation marker. Redaction runs *before* truncation, so a secret
+cannot survive by being cut in half.
+
+Read them with `hsai trace show <path>` (a timeline with per-step durations) and
+`hsai trace stats [--block N]` (per-step duration and failure-rate rollup across
+iterations). Both are pure reads: no `claude`, no network, no quota.
+
 ## Durability: the cycle journal
 
 A block is a long chain of expensive, side-effecting steps - synthesis, N

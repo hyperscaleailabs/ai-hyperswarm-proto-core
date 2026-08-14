@@ -200,6 +200,11 @@ knowledge:
   templates_dir: knowledge/templates
   whitepaper_every_lessons: 10       # synthesize a whitepaper every N new lessons
   obsidian_ready: true               # wikilinks + committed .obsidian config
+  # Per-iteration trajectories (see src/hsai/trace.py): one committed, redacted
+  # JSONL per iteration recording every phase of the loop - claim, selection,
+  # agent run, each guard, CI, PR, merge. Read with `hsai trace show|stats`.
+  trajectories_dir: knowledge/trajectories
+  trajectory_max_chars: 20000        # per-field cap; overflow is marked, never silent
   # Lesson retrieval (see src/hsai/recall.py): the read half of the knowledge
   # base. A deterministic BM25 index over lessons + whitepapers + ADRs injects
   # the most relevant prior notes into every worker prompt. No model call, no

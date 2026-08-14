@@ -1,7 +1,7 @@
 import json
 
 from hsai import cli as cli_module
-from hsai import trajectory
+from hsai import trace, trajectory
 from hsai.cli import build_parser, main
 from hsai.repro import ReproResult
 from hsai.trajectory import Step, Trajectory
@@ -267,3 +267,78 @@ def test_replay_unknown_id_exits_nonzero(tmp_path, monkeypatch, capsys):
     rc = main(["replay", "999", "--root", str(tmp_path)])
     assert rc == 1
     assert "no trajectory" in capsys.readouterr().err
+
+
+# --- `hsai trace`: the per-iteration trajectory reader --------------------------
+def _seed_trace(root, branch: str, block: int, steps) -> trace.Trajectory:
+    """Write one iteration trajectory with fixed durations (no real clock)."""
+    traj = trace.Trajectory(
+        trace.trajectory_path(root, branch), root=root, branch=branch,
+        iteration=int(branch.rsplit("-", 1)[-1]), block=block, env={},
+    )
+    for name, ok, duration in steps:
+        traj.record(name, ok=ok, summary=f"{name} finished", duration_s=duration)
+    return traj
+
+
+def test_trace_show_renders_a_timeline_from_a_fixture(tmp_path, monkeypatch, capsys):
+    traj = _seed_trace(
+        tmp_path, "hsai/iter-1700000000-11", 4,
+        [(trace.TICKET_CLAIM, True, 0.2), (trace.AGENT_RUN, False, 12.5)],
+    )
+    spy = _no_subprocess(monkeypatch)
+
+    rc = main(["trace", "show", str(traj.path)])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "iteration 11  block 4" in out
+    assert trace.TICKET_CLAIM in out and trace.AGENT_RUN in out
+    assert "12.500s" in out                      # durations, per step
+    assert "FAIL" in out and f"failed: {trace.AGENT_RUN}" in out
+    assert "2 step(s), 1 failed" in out
+    assert spy.calls == []                       # reading disk spends no quota
+
+
+def test_trace_show_on_a_missing_file_exits_nonzero(tmp_path, monkeypatch, capsys):
+    _no_subprocess(monkeypatch)
+    rc = main(["trace", "show", str(tmp_path / "nope.jsonl")])
+    assert rc == 1
+    assert "trace show" in capsys.readouterr().err
+
+
+def test_trace_stats_aggregates_across_iterations(tmp_path, monkeypatch, capsys):
+    _seed_trace(tmp_path, "hsai/iter-1700000000-11", 4,
+                [(trace.AGENT_RUN, True, 10.0), (trace.CI_AFTER, True, 2.0)])
+    _seed_trace(tmp_path, "hsai/iter-1700000000-12", 4,
+                [(trace.AGENT_RUN, False, 20.0), (trace.CI_AFTER, True, 4.0)])
+    spy = _no_subprocess(monkeypatch)
+
+    rc = main(["trace", "stats", "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "trajectories: 2" in out
+    assert "1 with at least one failed step" in out
+    assert trace.AGENT_RUN in out and trace.CI_AFTER in out
+    assert "30.000" in out                       # agent_run total across both runs
+    assert "50.0%" in out                        # ...and its failure rate
+    assert spy.calls == []
+
+
+def test_trace_stats_can_be_scoped_to_one_block(tmp_path, monkeypatch, capsys):
+    _seed_trace(tmp_path, "hsai/iter-1700000000-11", 4, [(trace.AGENT_RUN, True, 1.0)])
+    _seed_trace(tmp_path, "hsai/iter-1700000000-12", 9, [(trace.AGENT_RUN, True, 1.0)])
+    _no_subprocess(monkeypatch)
+
+    assert main(["trace", "stats", "--root", str(tmp_path), "--block", "9"]) == 0
+    assert "trajectories: 1" in capsys.readouterr().out
+
+
+def test_trace_stats_exits_nonzero_when_there_is_nothing_to_aggregate(
+    tmp_path, monkeypatch, capsys
+):
+    _no_subprocess(monkeypatch)
+    rc = main(["trace", "stats", "--root", str(tmp_path)])
+    assert rc == 1
+    assert "no trajectories" in capsys.readouterr().err

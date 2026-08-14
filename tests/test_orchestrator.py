@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from hsai import ledger, orchestrator, recall, review, trajectory
+from hsai import ledger, orchestrator, recall, review, trace, trajectory
 from hsai.config import load_config
 from hsai.models import ModelChoice
 from hsai.orchestrator import (
@@ -1358,3 +1358,235 @@ def test_dry_run_still_records_what_it_recalled(tmp_path):
     assert result.kind == IMPROVE
     assert result.recalled                       # retrieval runs without an agent
     assert "recalled:" in Path(result.lesson_path).read_text().split("---\n")[1]
+
+
+# --- per-iteration trajectory (src/hsai/trace.py) ------------------------------
+def _only_trace(root: Path) -> trace.Trace:
+    traces = trace.load_all(root)
+    assert len(traces) == 1, f"expected exactly one trajectory, got {len(traces)}"
+    return traces[0]
+
+
+def test_run_once_writes_an_ordered_trajectory_of_the_whole_iteration(tmp_path):
+    """Acceptance: the decision-relevant phases are on disk, in the order run."""
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[dict(WIDGET_ISSUE)],
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=31, block=5,
+    )
+
+    recorded = _only_trace(tmp_path)
+    assert (recorded.iteration, recorded.block) == (31, 5)
+    assert [s.name for s in recorded.steps] == [
+        trace.WORKTREE_SETUP,
+        trace.CI_BEFORE,
+        trace.TICKET_CLAIM,
+        trace.MODEL_SELECT,
+        trace.AGENT_RUN,
+        trace.GUARD_WORKFLOW_REVERT,
+        trace.GUARD_COMPLETENESS,
+        trace.GUARD_REPRO,
+        trace.CI_AFTER,
+        trace.REVIEW_GATE,
+        trace.PR_OPEN,
+        trace.CI_REMOTE,
+        trace.MERGE_OR_RECOVER,
+    ]
+
+    by_name = {s.name: s for s in recorded.steps}
+    # the claim: which ticket, and why the ones passed over were passed over
+    claim = by_name[trace.TICKET_CLAIM]
+    assert claim.detail["kind"] == IMPLEMENT and claim.detail["ticket"] == 7
+    assert claim.detail["well_formedness"] == ["#7: well-formed"]
+    # the selection, as numbers rather than prose
+    assert by_name[trace.MODEL_SELECT].detail["model"] == result.model
+    assert by_name[trace.MODEL_SELECT].detail["demote"] is False
+    assert "score" in by_name[trace.MODEL_SELECT].detail
+    # the run: what was asked, what came back, how it ended
+    agent = by_name[trace.AGENT_RUN]
+    assert agent.detail["prompt"].startswith("You are a worker in the hsai")
+    assert agent.detail["prompt_sha256"] == trace.prompt_digest(agent.detail["prompt"])
+    assert agent.detail["exit_status"] == "ok"
+    assert agent.detail["tokens"] == {"input": 1500, "output": 320}
+    assert "Implemented the widget" in agent.detail["stdout"]
+    # ...and how the whole iteration ended
+    end = by_name[trace.MERGE_OR_RECOVER]
+    assert end.summary == "merged" and end.ok is True
+    assert end.detail["pr"] == result.pr and end.detail["remote_ci"] == "SUCCESS"
+    assert all(s.ok for s in recorded.steps)
+    # the result points at it, and `hsai trace show` renders it
+    assert any(n.startswith("trajectory=knowledge/trajectories/") for n in result.notes)
+    assert trace.CI_REMOTE in recorded.render()
+
+
+def test_a_blocked_iteration_still_records_which_guard_stopped_it(tmp_path):
+    """The failing run is the one the evidence was always missing for."""
+    cfg = load_config()
+    issue = dict(WIDGET_ISSUE, title="feat: add widget")
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[issue],
+        worktree_status="?? knowledge/lessons/note.md\n",   # knowledge-only diff
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=32, block=5,
+    )
+    assert result.recovered is True and result.pr is None
+
+    recorded = _only_trace(tmp_path)
+    names = [s.name for s in recorded.steps]
+    assert names[-1] == trace.MERGE_OR_RECOVER
+    assert trace.PR_OPEN not in names               # it never got that far
+    guard = next(s for s in recorded.steps if s.name == trace.GUARD_COMPLETENESS)
+    assert guard.ok is False
+    assert "knowledge-only diff" in guard.summary
+    assert guard.detail["code_files"] == []
+    assert recorded.steps[-1].summary == "incomplete"
+    # the trajectory outlives the worktree it judged
+    assert recorded.path.is_file()
+
+
+def test_the_trajectory_is_committed_alongside_the_lesson(tmp_path):
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[dict(WIDGET_ISSUE)],
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=33,
+    )
+
+    recorded = _only_trace(tmp_path)
+    relpath = recorded.path.relative_to(tmp_path).as_posix()
+    wt = Path(result.lesson_path).parents[2]        # <wt>/knowledge/lessons/<note>.md
+    in_worktree = wt / relpath
+    assert in_worktree.is_file(), "the PR must carry the evidence it points at"
+    committed = [s.name for s in trace.read(in_worktree).steps]
+    assert committed[:5] == [s.name for s in recorded.steps][:5]
+    assert trace.CI_REMOTE in committed             # refreshed after remote CI
+
+    # the lesson links it...
+    lesson_text = Path(result.lesson_path).read_text()
+    assert "## Trajectory" in lesson_text
+    assert f"hsai trace show {relpath}" in lesson_text
+
+    # ...and so does the PR body
+    pr_create = next(c for c in runner.calls if c[:3] == ["gh", "pr", "create"])
+    pr_body = pr_create[pr_create.index("--body") + 1]
+    assert f"hsai trace show {relpath}" in pr_body
+
+
+def test_two_parallel_iterations_never_share_a_trajectory_path(tmp_path):
+    """Acceptance: one uniquely-named file per iteration, same rule as lessons."""
+    cfg = load_config()
+    for iteration in (41, 42):
+        runner = FakeRunner(
+            repo_root=str(tmp_path), ci_sequence=[True, True],
+            open_issues=[dict(WIDGET_ISSUE)],
+        )
+        run_once(
+            cfg, repo_dir=str(tmp_path), dry_run=False,
+            runner=runner, ai_runner=runner, iteration=iteration, block=5,
+        )
+
+    traces = trace.load_all(tmp_path)
+    assert len(traces) == 2
+    assert len({t.path for t in traces}) == 2
+    assert sorted(t.iteration for t in traces) == [41, 42]
+    assert len({t.branch for t in traces}) == 2
+
+
+def test_a_leaked_credential_never_reaches_the_committed_trajectory(tmp_path, monkeypatch):
+    """Acceptance: agent output seeded with secrets is written scrubbed."""
+    cfg = load_config()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "an-env-value-nobody-should-see")
+    leaky = json.dumps(
+        {
+            "type": "result",
+            "result": (
+                "Set ANTHROPIC_API_KEY=sk-ant-api03-LEAKEDKEYVALUE0001, pushed with "
+                "ghp_LEAKEDGITHUBTOKEN00000000000000000, env had "
+                "an-env-value-nobody-should-see."
+            ),
+            "usage": {"input_tokens": 10, "output_tokens": 2},
+        }
+    )
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[dict(WIDGET_ISSUE)], agent_output=leaky,
+    )
+
+    run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=51,
+    )
+
+    written = _only_trace(tmp_path).path.read_text()
+    for secret in (
+        "sk-ant-api03-LEAKEDKEYVALUE0001",
+        "ghp_LEAKEDGITHUBTOKEN00000000000000000",
+        "an-env-value-nobody-should-see",
+    ):
+        assert secret not in written
+    assert trace.REDACTED in written
+
+
+def test_a_huge_agent_output_is_truncated_with_an_explicit_marker(tmp_path):
+    cfg = load_config()
+    cap = int(cfg.knowledge["trajectory_max_chars"])
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[dict(WIDGET_ISSUE)],
+        agent_output=json.dumps({"type": "result", "result": "z" * (cap + 500)}),
+    )
+
+    run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=52,
+    )
+
+    agent = next(s for s in _only_trace(tmp_path).steps if s.name == trace.AGENT_RUN)
+    assert len(agent.detail["stdout"]) < cap + 200
+    assert "[truncated:" in agent.detail["stdout"]
+
+
+def test_dry_run_produces_a_readable_trajectory_without_touching_anything(tmp_path):
+    cfg = load_config()
+    result = run_once(cfg, repo_dir=str(tmp_path), dry_run=True, iteration=1)
+
+    recorded = _only_trace(tmp_path)
+    names = [s.name for s in recorded.steps]
+    assert names[0] == trace.WORKTREE_SETUP and names[-1] == trace.MERGE_OR_RECOVER
+    assert trace.AGENT_RUN not in names          # no quota spent in a dry run
+    assert trace.TICKET_CLAIM in names
+    assert "dry-run" in recorded.steps[0].summary
+    assert trace.render_stats([recorded])        # the rollup reads it
+    assert "## Trajectory" in Path(result.lesson_path).read_text()
+
+
+def test_build_pr_body_links_the_trajectory_without_disturbing_traceability():
+    choice = ModelChoice(tier="standard", model="sonnet", rationale="x")
+    kwargs = dict(
+        ticket=42, choice=choice, lesson_note="2026-01-03-note",
+        lesson_summary="s", ci_summary="green", kind=IMPLEMENT,
+    )
+    body = build_pr_body(**kwargs, trajectory_path="knowledge/trajectories/it.jsonl")
+    assert "## Trajectory" in body
+    assert "`knowledge/trajectories/it.jsonl`" in body
+    assert "hsai trace show knowledge/trajectories/it.jsonl" in body
+    assert "Closes #42" in body                  # the invariant is untouched
+
+    # digest and path share the one section, and neither is required
+    both = build_pr_body(
+        **kwargs, trajectory_digest="tokens=1in/2out",
+        trajectory_path="knowledge/trajectories/it.jsonl",
+    )
+    assert both.count("## Trajectory") == 1
+    assert "tokens=1in/2out" in both and "it.jsonl" in both
+    assert "## Trajectory" not in build_pr_body(**kwargs)
