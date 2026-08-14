@@ -356,3 +356,72 @@ def test_render_shows_prompt_steps_and_usage():
 
 def test_render_reports_missing_usage():
     assert "usage: (not reported)" in _traj(usage=None).render()
+
+
+# --- staged iteration records -------------------------------------------------
+
+BRANCH = "hsai/iter-1700000000-1-abc123"
+
+
+def test_a_stage_log_appends_jsonl_and_round_trips(tmp_path):
+    log = trajectory.StageLog(str(tmp_path), BRANCH, iteration=1)
+    log.record("sync", summary="worktree ready")
+    with log.stage("agent") as stage:
+        stage.ok = False
+        stage.summary = "agent came back red"
+        stage.detail = "ruff: 1 error"
+
+    # The branch flattens into one vault-safe note name, which is what makes
+    # the lesson's wikilink resolve.
+    assert log.note_name == "hsai-iter-1700000000-1-abc123"
+    assert log.wikilink == "[[hsai-iter-1700000000-1-abc123.jsonl]]"
+    assert log.path == tmp_path / "knowledge" / "trajectories" / f"{log.note_name}.jsonl"
+
+    stages = trajectory.read_stages(log.path)
+    assert [s.name for s in stages] == ["sync", "agent"]
+    assert stages[0].ok is True and stages[1].ok is False
+    assert stages[1].summary == "agent came back red"
+    assert stages[1].detail == "ruff: 1 error"
+    assert all(s.started for s in stages)
+    assert all(s.duration_s >= 0.0 for s in stages)
+
+
+def test_a_stage_is_recorded_even_when_its_body_raises(tmp_path):
+    log = trajectory.StageLog(tmp_path, BRANCH)
+
+    with pytest.raises(ValueError, match="nope"):
+        with log.stage("agent"):
+            raise ValueError("nope")
+
+    recorded = trajectory.read_stages(log.path)
+    assert [s.name for s in recorded] == ["agent"]
+    assert recorded[0].ok is False
+    assert recorded[0].summary == "ValueError: nope"
+    assert "Traceback" in recorded[0].detail     # where to start reading
+
+
+def test_stage_detail_is_capped_so_the_vault_cannot_bloat(tmp_path):
+    log = trajectory.StageLog(tmp_path, BRANCH)
+    log.record("ci_before", summary="y" * 50_000, detail="x" * 50_000)
+
+    stage = trajectory.read_stages(log.path)[0]
+    assert len(stage.detail) <= trajectory.STAGE_DETAIL_CHARS
+    assert len(stage.summary) <= trajectory.STAGE_DETAIL_CHARS
+    assert stage.detail.endswith("chars]")      # and says how much it dropped
+
+
+def test_stage_records_are_redacted_before_they_are_committed(tmp_path):
+    log = trajectory.StageLog(tmp_path, BRANCH)
+    log.record("agent", detail="token: sk-ant-abcdefgh12345678 under /Users/someone/repo")
+
+    stage = trajectory.read_stages(log.path)[0]
+    assert "sk-ant-" not in stage.detail
+    assert "/Users/someone" not in stage.detail
+    assert REDACTED in stage.detail
+
+
+def test_stage_logs_are_discoverable_under_a_root(tmp_path):
+    assert trajectory.stage_logs(tmp_path) == []
+    log = trajectory.StageLog(tmp_path, BRANCH)
+    log.record("sync")
+    assert trajectory.stage_logs(tmp_path) == [log.path]

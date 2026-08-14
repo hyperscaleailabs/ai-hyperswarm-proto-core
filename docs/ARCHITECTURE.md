@@ -14,7 +14,7 @@ so the decision logic stays pure and unit-tested.
 | `hsai.gitops` | worktrees, sync, branch, commit, push | git |
 | `hsai.github` | tickets, labels, PRs, merge | gh |
 | `hsai.ci` | local CI gate (ruff+pytest) + remote status | subprocess |
-| `hsai.trajectory` | one durable record per agent run; redaction, replay | write files |
+| `hsai.trajectory` | per-run record + per-iteration stage log; redaction, replay | write files |
 | `hsai.journal` | append-only per-block step journal; `once()` replay | write files |
 | `hsai.knowledge` | lessons, whitepapers, MOC reindex (Obsidian) | write files |
 | `hsai.recall` | BM25 index over the vault; retrieve prior notes | read files |
@@ -156,6 +156,37 @@ directly), so the quota ledger's token columns - and the block aggregate in the
 review brief, including **tokens per merged PR** - report real numbers instead
 of nulls. Output that is not JSON (an older `claude` binary) degrades to a
 single-step trajectory with null usage rather than breaking the loop.
+
+## Observability: the staged iteration record
+
+A trajectory covers one *agent run*. `trajectory.StageLog` covers the *whole
+iteration* around it: `run_once` records one `Stage` per numbered step (`sync`,
+`ci_before`, `claim`, `select`, `agent`, `workflow_guard`,
+`completeness_guard`, `repro_guard`, `ci_after`, `review`, `lesson`, `pr`,
+`remote_ci`, `merge_or_recover`) as a JSONL line in
+`knowledge/trajectories/<branch>.jsonl`, flushed the moment each step ends.
+Guard-blocked and idle iterations therefore leave a record of exactly the steps
+they reached, and the lesson wikilinks the file so the chain
+`PR -> lesson -> staged record -> trajectory` is navigable inside Obsidian.
+
+Unlike a trajectory, this record *is* committed, so it is bounded on the way to
+disk: every stage is redacted and its `detail` is hard-capped at
+`trajectory.STAGE_DETAIL_CHARS` (4 KB), marker included.
+
+`run_once` wraps that whole body in `try/finally`. The worktree is removed in
+exactly one place, and an unexpected exception records a `crash` stage and hands
+the claimed ticket back to the backlog. Before this, a raise anywhere mid-run
+leaked the worktree and left the ticket assigned to the bot forever.
+
+## Provenance: cited, never fabricated
+
+The "Reference-set evidence" block on every PR and lesson used to be
+`reference_top10[:3]` - a constant rendered as though it were a citation.
+`tickets.cited_projects` now parses the ticket's own `## Synthesis rationale`
+section (code spans stripped first, since paths and identifiers live there, and
+filtered against the configured reference set). A ticket that cites nothing
+renders `_(no cited provenance)_` rather than borrowing three repos it never
+looked at - an absent citation is honest, a fabricated one is not (G1, G2).
 
 ## Durability: the cycle journal
 

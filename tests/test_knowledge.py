@@ -1,4 +1,5 @@
 from hsai.knowledge import (
+    NO_PROVENANCE,
     KnowledgeBase,
     Lesson,
     LessonRecord,
@@ -88,6 +89,44 @@ def test_lesson_renders_the_execution_trace_section(tmp_path):
     assert "| exit status | ok |" in text
     # and the surrounding sections are untouched
     assert "## Lesson learned" in text and "## Independent review" in text
+
+
+def test_lesson_wikilinks_its_staged_trajectory_record(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    lesson = Lesson(
+        title="implement: add widget",
+        outcome="pass",
+        kind="implement",
+        context="ctx",
+        what_happened="did the thing",
+        lesson="kept it small",
+        ticket=7,
+        trajectory_note="hsai-iter-1700000000-1-abc123",
+    )
+    text = kb.write_lesson(lesson).read_text()
+    # The audit chain has to be navigable from inside the vault, not only from
+    # a shell: PR -> lesson -> staged record.
+    assert "Staged record: [[hsai-iter-1700000000-1-abc123.jsonl]]" in text
+
+    # Absent (a dry run, an older lesson) the line simply does not appear.
+    lesson.trajectory_note = ""
+    assert "Staged record:" not in kb.write_lesson(lesson).read_text()
+
+
+def test_a_lesson_citing_nothing_says_so_instead_of_naming_repos(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    lesson = Lesson(
+        title="implement: add widget",
+        outcome="pass",
+        kind="implement",
+        context="ctx",
+        what_happened="did the thing",
+        lesson="kept it small",
+        ticket=7,
+    )
+    text = kb.write_lesson(lesson).read_text()
+    assert "## References (reference-set evidence)" in text
+    assert NO_PROVENANCE in text
 
 
 def test_write_lesson_and_reindex(tmp_path):

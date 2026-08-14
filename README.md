@@ -116,6 +116,13 @@ exit status) plus a redacted tail. `hsai traj <iteration> [--json]` reads one
 back without invoking `claude`; older blocks are pruned per
 `execution.trajectory_retention_blocks`.
 
+Each *iteration* additionally appends a **staged record** - one JSONL line per
+numbered step (sync, CI, claim, agent, each guard, review, lesson, PR, remote
+CI, merge) - to `knowledge/trajectories/<branch>.jsonl`. That one is committed
+with the PR and wikilinked from the lesson, with every stage redacted and its
+detail capped at 4 KB, so a guard-blocked or crashed run stays diagnosable from
+the repo alone.
+
 ## Learning targets (top-10, pinned snapshot)
 
 Ranked by stars, weighted to swarm/multi-agent relevance; all ≥10k stars and

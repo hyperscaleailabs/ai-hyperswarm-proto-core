@@ -8,6 +8,7 @@ one-liners can never again be "satisfied" by a trivial diff.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from .github import Issue
@@ -97,6 +98,53 @@ def check_well_formed(title: str, body: str) -> WellFormedness:
 
 def issue_well_formed(issue: Issue) -> WellFormedness:
     return check_well_formed(issue.title, issue.body)
+
+
+SYNTHESIS_HEADING = re.compile(
+    r"^#{2,3}\s*synthesis rationale\s*$", re.IGNORECASE | re.MULTILINE
+)
+_ANY_HEADING = re.compile(r"^#{1,6}\s", re.MULTILINE)
+# Code spans hold identifiers and paths (`src/hsai/ai.py`, `top10[:3]`), never
+# citations: stripping them first is what keeps a path from being read as a
+# project name. Cited projects are named in prose, by convention and by schema.
+_CODE_SPAN = re.compile(r"`[^`]*`")
+_PROJECT = re.compile(r"(?<![\w./-])([A-Za-z0-9][\w.-]*/[A-Za-z0-9][\w.-]*)(?![\w/])")
+
+
+def synthesis_rationale(body: str) -> str:
+    """The ``## Synthesis rationale`` section of a ticket body (``""`` if absent)."""
+    match = SYNTHESIS_HEADING.search(body or "")
+    if not match:
+        return ""
+    rest = (body or "")[match.end():]
+    nxt = _ANY_HEADING.search(rest)
+    return (rest[: nxt.start()] if nxt else rest).strip()
+
+
+def cited_projects(body: str, known: Sequence[str] = ()) -> tuple[str, ...]:
+    """The reference-set projects a ticket actually cites, in first-mention order.
+
+    This is the provenance the lesson and the PR report as reference-set
+    evidence. It used to be ``reference_top10[:3]`` - a constant, presented as
+    if it were a citation - which is fabricated provenance and exactly what
+    goals G1 and G2 forbid. A ticket that cites nothing now yields ``()`` and
+    renders as an explicit no-provenance marker instead.
+
+    ``known`` (the configured reference set) is an allow-list: prose contains
+    incidental slashes (``and/or``, ``input/output``) that are shaped like a
+    repo slug but are not one. Passing nothing disables the filter, which is
+    what makes the parse itself testable.
+    """
+    prose = _CODE_SPAN.sub(" ", synthesis_rationale(body))
+    allowed = {k.lower(): k for k in known}
+    cited: list[str] = []
+    for match in _PROJECT.finditer(prose):
+        name = match.group(1).rstrip(".,;:")
+        if allowed:
+            name = allowed.get(name.lower(), "")
+        if name and name not in cited:
+            cited.append(name)
+    return tuple(cited)
 
 
 def size_of(issue: Issue) -> str:

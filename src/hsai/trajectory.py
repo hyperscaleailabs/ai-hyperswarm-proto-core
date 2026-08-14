@@ -1,4 +1,12 @@
-"""Worker trajectories: the durable record of what one agent run actually did.
+"""Worker trajectories: the durable record of what an iteration actually did.
+
+Two records live here, at two different granularities:
+
+- :class:`Trajectory` - one **agent run**, start to finish. Local and complete.
+- :class:`StageLog` - one **iteration**, as a JSONL stream of :class:`Stage`
+  records (sync, ci_before, claim, ... merge_or_recover). Committed with the
+  PR and wikilinked from the lesson, so the audit chain is navigable without
+  access to the machine the loop ran on.
 
 Before this module a ``claude -p`` run left nothing behind but a boolean and a
 truncated stderr excerpt, so the loop could not answer forensic questions about
@@ -34,18 +42,30 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
+import traceback
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 TRAJECTORY_DIR = ".hsai/traj"
+# Staged iteration records, in contrast, ARE committed: they are the navigable
+# half of the audit chain, so they live in the vault next to the lessons.
+STAGE_DIR = "knowledge/trajectories"
 
 # Per-step text is clipped so one runaway tool result cannot bloat the store.
 STEP_CHARS = 2000
 # What the committed lesson may quote: a short tail, tightly clipped.
 EXCERPT_STEPS = 5
 EXCERPT_CHARS = 240
+# A stage's detail IS committed, so its cap is a hard one: 4 KB per stage keeps
+# a full iteration's record well under a single vault note's weight.
+STAGE_DETAIL_CHARS = 4096
+# Room reserved for the "... [+N chars]" marker inside that cap.
+_CAP_MARKER_ROOM = 40
 
 REDACTED = "[redacted]"
 
@@ -100,6 +120,19 @@ def redact_value(value: Any) -> Any:
 def _clip(text: str, limit: int = STEP_CHARS) -> str:
     text = (text or "").strip()
     return text if len(text) <= limit else text[:limit] + f"... [+{len(text) - limit} chars]"
+
+
+def _cap(text: str, limit: int = STAGE_DETAIL_CHARS) -> str:
+    """Clip ``text`` so the result - marker included - never exceeds ``limit``.
+
+    :func:`_clip` appends its marker *after* the limit, which is fine for a
+    local file but not for a committed one where the cap is the contract.
+    """
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    head = text[: max(0, limit - _CAP_MARKER_ROOM)]
+    return head + f"... [+{len(text) - len(head)} chars]"
 
 
 @dataclass
@@ -393,6 +426,136 @@ def prune(repo_root: str | Path, keep_blocks: int) -> list[int]:
             child.unlink()
         target.rmdir()
     return dropped
+
+
+# --- staged iteration records -----------------------------------------------
+
+_SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+
+def stage_note_name(branch: str) -> str:
+    """The vault-safe note name for a branch's staged record.
+
+    Branch names carry a ``/`` (``hsai/iter-...``); flattening it keeps the
+    whole record one file in one directory, which is what makes the lesson's
+    ``[[wikilink]]`` resolve.
+    """
+    return _SLUG_RE.sub("-", (branch or "").lower()).strip("-") or "iteration"
+
+
+@dataclass
+class Stage:
+    """One numbered step of an iteration - the unit :class:`StageLog` appends.
+
+    Mirrors SWE-agent's per-step ``.traj`` entry: what ran, how long it took,
+    whether it held, and just enough detail to start a diagnosis without
+    re-running anything. ``detail`` is capped at :data:`STAGE_DETAIL_CHARS`.
+    """
+
+    name: str
+    started: str = field(default_factory=_now)
+    duration_s: float = 0.0
+    ok: bool = True
+    summary: str = ""
+    detail: str = ""
+
+    def to_json(self) -> str:
+        data = redact_value(asdict(self))
+        data["summary"] = _cap(str(data.get("summary") or ""))
+        data["detail"] = _cap(str(data.get("detail") or ""))
+        return json.dumps(data, sort_keys=True)
+
+
+@dataclass
+class StageLog:
+    """The append-only staged record of ONE iteration.
+
+    Written into the worktree so the PR that carries the change also carries
+    the record of how it was produced (G2). Each stage is flushed the moment it
+    ends rather than at the end of the run: an iteration that crashes - the
+    case worth diagnosing - still leaves every stage it completed on disk.
+
+    Stages recorded after the iteration's final commit (``merge_or_recover``)
+    exist in this object but cannot reach the committed snapshot; the merge
+    outcome is carried by the ledger and the PR instead.
+    """
+
+    root: Path
+    branch: str
+    iteration: int = 0
+    stages: list[Stage] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.root = Path(self.root)
+
+    @property
+    def note_name(self) -> str:
+        return stage_note_name(self.branch)
+
+    @property
+    def path(self) -> Path:
+        return self.root / STAGE_DIR / f"{self.note_name}.jsonl"
+
+    @property
+    def wikilink(self) -> str:
+        """How the lesson points here - Obsidian resolves non-markdown by name."""
+        return f"[[{self.note_name}.jsonl]]"
+
+    def record(
+        self,
+        name: str,
+        *,
+        ok: bool = True,
+        summary: str = "",
+        detail: str = "",
+        duration_s: float = 0.0,
+    ) -> Stage:
+        """Append one already-finished stage."""
+        entry = Stage(
+            name=name, ok=ok, summary=summary, detail=detail,
+            duration_s=round(max(0.0, duration_s), 3),
+        )
+        self._append(entry)
+        return entry
+
+    @contextmanager
+    def stage(self, name: str) -> Iterator[Stage]:
+        """Time a stage, then append it - even if the body raises.
+
+        The yielded :class:`Stage` is mutable: the body sets ``ok``/``summary``/
+        ``detail`` as it learns them. An escaping exception is itself the
+        record - ``ok=False`` plus the traceback - and is re-raised untouched.
+        """
+        entry = Stage(name=name)
+        clock = time.perf_counter()
+        try:
+            yield entry
+        except BaseException as exc:  # recorded as the stage's outcome, then re-raised
+            entry.ok = False
+            entry.summary = entry.summary or f"{type(exc).__name__}: {exc}"
+            entry.detail = entry.detail or traceback.format_exc()
+            raise
+        finally:
+            entry.duration_s = round(max(0.0, time.perf_counter() - clock), 3)
+            self._append(entry)
+
+    def _append(self, entry: Stage) -> None:
+        self.stages.append(entry)
+        path = self.path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(entry.to_json() + "\n")
+
+
+def read_stages(path: str | Path) -> list[Stage]:
+    """Parse a staged record back off disk, in the order it was written."""
+    text = Path(path).read_text(encoding="utf-8")
+    return [Stage(**json.loads(line)) for line in text.splitlines() if line.strip()]
+
+
+def stage_logs(root: str | Path) -> list[Path]:
+    """Every staged record under ``root``, oldest name first."""
+    return sorted((Path(root) / STAGE_DIR).glob("*.jsonl"))
 
 
 def prompt_digest(prompt: str) -> str:

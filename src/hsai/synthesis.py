@@ -403,7 +403,9 @@ def synthesize(
     if not ares.ok:
         return SynthesisResult(ok=False, studied=repos, filed=[], error=ares.error[:500])
 
-    specs = parse_ticket_specs(ares.output)
+    # `.text` unwraps the JSON envelope; the fenced ticket JSON the model wrote
+    # lives inside `result`, not in the envelope's own escaped stdout.
+    specs = parse_ticket_specs(ares.text)
     threshold = float(cfg.synthesis.get("duplicate_threshold", DUPLICATE_JACCARD_THRESHOLD))
     survivors, rejected_titles = _filter_duplicates(specs, memory, threshold=threshold)
 

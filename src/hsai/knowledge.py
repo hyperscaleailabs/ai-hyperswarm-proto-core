@@ -15,6 +15,10 @@ from pathlib import Path
 
 from .config import CoreConfig
 
+# Rendered wherever a ticket cited no reference-set project. An explicit marker,
+# never a stand-in list: a fabricated citation is worse than an absent one (G1/G2).
+NO_PROVENANCE = "_(no cited provenance)_"
+
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _TAG_RE = re.compile(r"^\s*-\s+(\S.*)$", re.MULTILINE)
 _FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
@@ -62,6 +66,7 @@ class Lesson:
     recalled: tuple[str, ...] = ()  # prior notes injected into this run's prompt
     review_verdict: str = ""  # the independent reviewer's verdict, verbatim
     execution_trace: str = ""  # turns/tools/tokens/exit/duration - the committed digest
+    trajectory_note: str = ""  # note name of this iteration's staged JSONL record
 
     def note_name(self) -> str:
         return f"{self.created}-{slugify(self.title)}"
@@ -323,12 +328,17 @@ class KnowledgeBase:
         if lesson.recalled:
             extra["recalled"] = lesson.recalled
         fm = self._frontmatter(tags, extra)
-        refs = "\n".join(f"- `{r}`" for r in lesson.references) or "- _(none cited)_"
+        refs = "\n".join(f"- `{r}`" for r in lesson.references) or f"- {NO_PROVENANCE}"
         ticket = f"#{lesson.ticket}" if lesson.ticket else "_(none)_"
         pr = f"#{lesson.pr}" if lesson.pr else "_(none)_"
         repro = lesson.repro_evidence or "_(not applicable: not a heal/bugfix ticket)_"
         # Who checked the work, not just who wrote it (G2).
         review = lesson.review_verdict or "_(no independent review recorded)_"
+        # The stage-by-stage record of the iteration, linked so the audit chain
+        # stays navigable from inside the vault.
+        trace = lesson.execution_trace or "_(no model run this iteration)_"
+        if lesson.trajectory_note:
+            trace += f"\n\nStaged record: [[{lesson.trajectory_note}.jsonl]]"
         return f"""{fm}
 
 # {lesson.title}
@@ -355,7 +365,7 @@ class KnowledgeBase:
 {lesson.lesson}
 
 ## Execution trace
-{lesson.execution_trace or "_(no model run this iteration)_"}
+{trace}
 
 ## Independent review
 {review}
