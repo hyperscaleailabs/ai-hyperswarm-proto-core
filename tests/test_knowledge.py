@@ -2,8 +2,11 @@ from hsai.knowledge import (
     KnowledgeBase,
     Lesson,
     LessonRecord,
+    Observation,
     Whitepaper,
+    parse_field_note,
     parse_note,
+    reference_note_name,
     slugify,
     split_sections,
 )
@@ -84,7 +87,9 @@ def test_write_lesson_and_reindex(tmp_path):
 
     written = kb.reindex_mocs()
     names = {p.name for p in written}
-    assert names == {"Lessons MOC.md", "Whitepapers MOC.md", "Knowledge Base MOC.md"}
+    assert names == {
+        "Lessons MOC.md", "Whitepapers MOC.md", "Reference MOC.md", "Knowledge Base MOC.md",
+    }
     lessons_moc = (kb.mocs_dir / "Lessons MOC.md").read_text()
     assert f"[[{lesson.note_name()}]]" in lessons_moc
 
@@ -170,6 +175,144 @@ def test_parse_note_reads_any_vault_note_not_just_lessons(tmp_path):
     assert record.outcome == "unknown" and record.kind == "unknown"
     assert record.body.startswith("# ADR-0007")
     assert split_sections(record.body)["decision"] == "Do the thing."
+
+
+# --- reference field notes: durable, append-only project memory ---------------
+
+def _obs(practice_id="crewaiinc-crewai-workflow-ci-yml", artifact=".github/workflows/ci.yml",
+         detail="matrix build on 3 python versions", observed="2026-08-14"):
+    return Observation(
+        practice_id=practice_id, artifact=artifact, detail=detail, observed=observed
+    )
+
+
+def test_reference_note_name_is_stable_for_a_repo_slug():
+    assert reference_note_name("crewAIInc/crewAI") == "crewaiinc-crewai"
+    assert reference_note_name("run-llama/llama_index") == "run-llama-llama-index"
+
+
+def test_append_observations_creates_a_note_with_frontmatter_and_a_dated_entry(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    path, appended = kb.append_observations(
+        "crewAIInc/crewAI", [_obs()], stars=56129, license="MIT", snapshot_date="2026-07-25",
+    )
+
+    assert path == kb.reference_dir / "crewaiinc-crewai.md"
+    assert [o.practice_id for o in appended] == ["crewaiinc-crewai-workflow-ci-yml"]
+    text = path.read_text()
+    assert "repo: crewAIInc/crewAI" in text
+    assert "stars: 56129" in text
+    assert "license: MIT" in text
+    assert "snapshot_date: 2026-07-25" in text
+    assert "## Observations" in text
+    # dated, citing its artifact, and addressable by practice_id
+    assert "### 2026-08-14 - `crewaiinc-crewai-workflow-ci-yml`" in text
+    assert "- artifact: `.github/workflows/ci.yml`" in text
+    assert "matrix build on 3 python versions" in text
+    assert "[[Reference MOC]]" in text
+
+
+def test_appending_is_idempotent_and_never_rewrites_prior_entries(tmp_path):
+    """A second mining pass may only ADD - the bytes already on disk are frozen."""
+    kb = KnowledgeBase(tmp_path)
+    path, _ = kb.append_observations("crewAIInc/crewAI", [_obs()])
+    first = path.read_text()
+
+    # Same artifact, same content, mined again: nothing to say, nothing appended.
+    _, appended = kb.append_observations("crewAIInc/crewAI", [_obs(observed="2026-09-01")])
+    assert appended == []
+    assert path.read_text() == first
+
+    # The artifact drifted: a NEW dated entry lands and the old one is untouched.
+    _, appended = kb.append_observations(
+        "crewAIInc/crewAI",
+        [_obs(detail="matrix build on 4 python versions", observed="2026-09-01")],
+    )
+    assert len(appended) == 1
+    text = path.read_text()
+    assert text.startswith(first)
+    assert "### 2026-09-01 - `crewaiinc-crewai-workflow-ci-yml`" in text
+    assert "matrix build on 3 python versions" in text  # history preserved
+    assert "matrix build on 4 python versions" in text
+
+
+def test_parse_field_note_reads_repo_and_recorded_practice_ids(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    path, _ = kb.append_observations(
+        "crewAIInc/crewAI",
+        [_obs(), _obs(practice_id="crewaiinc-crewai-commits", artifact="last 30 commit subjects",
+                      detail="[docs-freeze] snapshot commits")],
+        stars=56129, license="MIT",
+    )
+    note = parse_field_note(path)
+    assert note.note_name == "crewaiinc-crewai"
+    assert note.repo == "crewAIInc/crewAI"
+    assert note.practice_ids == (
+        "crewaiinc-crewai-workflow-ci-yml", "crewaiinc-crewai-commits",
+    )
+    assert note.observations == 2
+
+
+def test_reference_moc_wikilinks_every_field_note(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    kb.append_observations("crewAIInc/crewAI", [_obs()])
+    kb.append_observations(
+        "run-llama/llama_index",
+        [_obs(practice_id="run-llama-llama-index-workflow-issue-classifier-yml",
+              artifact=".github/workflows/issue_classifier.yml", detail="auto-labels issues")],
+    )
+    kb.reindex_mocs()
+
+    moc = (kb.mocs_dir / "Reference MOC.md").read_text()
+    assert "[[crewaiinc-crewai]]" in moc
+    assert "[[run-llama-llama-index]]" in moc
+    assert "`crewAIInc/crewAI`" in moc
+    assert "Up: [[Knowledge Base MOC]]" in moc
+    # ...and the root MOC links down to it, so the graph stays connected
+    assert "[[Reference MOC]]" in (kb.mocs_dir / "Knowledge Base MOC.md").read_text()
+
+
+def test_lesson_records_the_practices_it_adopted(tmp_path):
+    """G1/G2: a merged PR must trace to a named practice, not a bare repo slug."""
+    kb = KnowledgeBase(tmp_path)
+    kb.append_observations("crewAIInc/crewAI", [_obs()])
+    lesson = Lesson(
+        title="implement: freeze docs snapshots",
+        outcome="pass",
+        kind="implement",
+        context="c",
+        what_happened="w",
+        lesson="l",
+        references=("crewAIInc/crewAI",),
+        practices=("crewaiinc-crewai-workflow-ci-yml",),
+    )
+    path = kb.write_lesson(lesson)
+    text = path.read_text()
+
+    assert "practices:\n  - crewaiinc-crewai-workflow-ci-yml\n" in text.split("---\n")[1]
+    assert "### Practices adopted" in text
+    # the practice resolves to the field note that owns it
+    assert "`crewaiinc-crewai-workflow-ci-yml` - see [[crewaiinc-crewai]]" in text
+
+    # ...and reads back off disk, which is what the adoption index scans
+    record = kb.read_lessons()[0]
+    assert record.practices == ("crewaiinc-crewai-workflow-ci-yml",)
+    assert record.tags == ("lesson", "outcome/pass", "kind/implement")  # not leaked as tags
+
+    # a practice with no field note still renders, just without a dangling link
+    lesson.practices = ("some-unmined-practice",)
+    assert "- `some-unmined-practice`\n" in kb.write_lesson(lesson).read_text()
+
+
+def test_lesson_without_practices_renders_as_before(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    path = kb.write_lesson(
+        Lesson(title="implement: x", outcome="pass", kind="implement",
+               context="c", what_happened="w", lesson="l")
+    )
+    text = path.read_text()
+    assert "practices" not in text.split("---\n")[1]
+    assert "### Practices adopted" not in text
 
 
 def test_synthesize_whitepaper_groups_outcomes_and_surfaces_recurring_failures(tmp_path):

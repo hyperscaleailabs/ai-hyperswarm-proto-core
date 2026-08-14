@@ -140,6 +140,7 @@ synthesis:
   memory_closed_limit: 15      # recently-closed tickets folded into synthesis memory
   memory_max_lessons: 25       # knowledge-base lessons folded into synthesis memory
   duplicate_threshold: 0.6     # Jaccard token overlap above which a candidate is a duplicate
+  adoption_max_chars: 2000     # hard cap on the "practices already adopted / in flight" section
 
 # Quota/cost budget for one half-day block (subscription-only: purely local
 # measurement, never a metered API call). The ledger aggregates each block's
@@ -196,6 +197,7 @@ knowledge:
   root: knowledge                    # Obsidian vault content lives under the repo root
   lessons_dir: knowledge/lessons
   whitepapers_dir: knowledge/whitepapers
+  reference_dir: knowledge/reference   # append-only field notes on the reference set
   mocs_dir: knowledge/MOCs
   templates_dir: knowledge/templates
   whitepaper_every_lessons: 10       # synthesize a whitepaper every N new lessons

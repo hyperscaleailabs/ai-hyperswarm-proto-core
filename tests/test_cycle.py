@@ -25,7 +25,7 @@ from hsai.config import load_config
 from hsai.knowledge import KnowledgeBase, Lesson
 from hsai.orchestrator import IterationResult
 from hsai.proc import Proc
-from hsai.synthesis import SynthesisResult
+from hsai.synthesis import Refusal, SynthesisResult
 
 
 class _Runner:
@@ -133,10 +133,10 @@ def test_block_soft_biases_then_hard_halts_but_inflight_merges(tmp_path, monkeyp
         json.loads(line)
 
 
-# --- synthesis duplicate rejections reach the review brief -------------------
+# --- refused synthesis ideas reach the review brief ---------------------------
 
-def test_synthesis_duplicate_rejections_surface_in_block_notes(tmp_path, monkeypatch):
-    """`SynthesisResult.rejected` must reach `BlockReport.notes` (and the brief)."""
+def test_synthesis_refusals_surface_in_the_block_review_brief(tmp_path, monkeypatch):
+    """`SynthesisResult.refused` must reach the brief - with its reason."""
     cfg = load_config()
     cfg.budget.clear()
     cfg.cycle["block_size"] = 0  # isolate: no implementation iterations needed
@@ -144,7 +144,11 @@ def test_synthesis_duplicate_rejections_surface_in_block_notes(tmp_path, monkeyp
     def fake_synthesize(cfg, *, cycle_index, runner, ai_runner):
         return SynthesisResult(
             ok=True, studied=["a/b"], filed=[901],
-            rejected=1, rejected_titles=["feat: already open ticket"],
+            refused=[Refusal(
+                title="feat: re-file the practice we already shipped",
+                reason="practice `crewaiinc-crewai-commits` is already adopted",
+                matched="crewaiinc-crewai-commits",
+            )],
         )
 
     runner = _Runner()
@@ -155,13 +159,41 @@ def test_synthesis_duplicate_rejections_surface_in_block_notes(tmp_path, monkeyp
     res = cycle.run_cycle(cfg, repo_dir=str(tmp_path), cycle_index=1, runner=runner)
 
     assert res.report.synthesized == [901]
+    assert res.report.refused == [
+        "feat: re-file the practice we already shipped - practice "
+        "`crewaiinc-crewai-commits` is already adopted"
+    ]
     note = next(n for n in res.report.notes if n.startswith("synthesis:"))
-    assert "1 duplicate(s) rejected" in note
-    assert "feat: already open ticket" in note
+    assert "1 idea(s) refused" in note
 
-    # The review brief renders every note verbatim.
+    # The review brief renders the refusal and its reason, not just a count.
     assert runner.review_bodies, "a review issue should have been opened"
-    assert note in runner.review_bodies[-1]
+    brief = runner.review_bodies[-1]
+    assert "## Ideas refused by the dedupe gate" in brief
+    assert "already adopted" in brief
+    assert note in brief
+
+
+def test_resuming_a_pre_refusal_journal_degrades_to_titles(tmp_path, monkeypatch):
+    """An in-flight block journaled before refusals carried reasons must resume."""
+    cfg = load_config()
+    cfg.budget.clear()
+    cfg.cycle["block_size"] = 0
+    monkeypatch.setattr(cycle, "_governance_pr", lambda *a, **k: 0)
+
+    jr = journal.open_journal(Path(tmp_path).resolve(), 5)
+    jr.append(journal.JournalRecord(
+        step="synthesis", key="block",
+        payload={
+            "ran": True, "filed": [901], "error": "",
+            "rejected": 1, "rejected_titles": ["feat: already open ticket"],
+        },
+    ))
+
+    res = cycle.run_cycle(
+        cfg, repo_dir=str(tmp_path), cycle_index=5, resume=True, runner=_Runner()
+    )
+    assert res.report.refused == ["feat: already open ticket - duplicate of prior work"]
 
 
 # --- plain-text agent output must not break article generation --------------

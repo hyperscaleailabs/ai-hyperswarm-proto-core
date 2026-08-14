@@ -16,7 +16,7 @@ so the decision logic stays pure and unit-tested.
 | `hsai.ci` | local CI gate (ruff+pytest) + remote status | subprocess |
 | `hsai.trajectory` | one durable record per agent run; redaction, replay | write files |
 | `hsai.journal` | append-only per-block step journal; `once()` replay | write files |
-| `hsai.knowledge` | lessons, whitepapers, MOC reindex (Obsidian) | write files |
+| `hsai.knowledge` | lessons, whitepapers, reference field notes, MOC reindex (Obsidian) | write files |
 | `hsai.recall` | BM25 index over the vault; retrieve prior notes | read files |
 | `hsai.review` | independent, different-tier review of the branch diff | subprocess |
 | `hsai.orchestrator` | one iteration; `decide_path`, `build_pr_body` (pure) | composes above |
@@ -88,15 +88,29 @@ closes the loop.
   tried* section (`synthesis.MemoryPack`) - open tickets, recently closed
   tickets, and lesson outcomes, titles only and hard-capped - ahead of the
   reference-project digest, so the planner stops re-proposing dead ideas.
-  `synthesis.is_duplicate` then filters the model's own output before filing:
-  a candidate whose title exactly matches, or whose normalized-token overlap
-  with a prior title clears the configured Jaccard threshold, is dropped and
-  its slot is never back-filled - `SynthesisResult.rejected` and
-  `.rejected_titles` carry the count and matches into `BlockReport.notes`.
+  It also carries an *adoption index* (`synthesis.AdoptionIndex`) built from
+  `knowledge/reference/` field notes, lesson `practices:` frontmatter, and open
+  tickets: which `practice_id`s are adopted, failed, or in flight.
+- **Refuse.** `synthesis.refuse_reason` then filters the model's own output
+  before filing. A candidate is refused when it re-proposes an adopted or
+  in-flight practice, or when its title exactly matches / clears the configured
+  Jaccard threshold against a prior title. A failed practice is *not* refused -
+  a lost idea may deserve a better design. Slots are never back-filled, and
+  every refusal keeps its reason: `SynthesisResult.refused` carries them into
+  `BlockReport.refused` and the *Ideas refused by the dedupe gate* section of
+  the review brief, so suppression is visible and overrulable.
+- **Remember.** `synthesis.mine_repo` reads each rotated project down to
+  workflow bodies, closed-PR labels, CONTRIBUTING and issue templates (each
+  clipped at the source, then per repo), and `build_context_pack` appends what
+  it saw to that project's field note as dated, artifact-citing observations.
+  Appending is idempotent on content digest, so a re-mine of unchanged
+  artifacts writes nothing and drift lands as a new entry beside the old one.
 - **Audit.** What was retrieved is recorded three times: on `IterationResult`,
   as a `recalled:` list in the lesson's frontmatter, and as a
-  *Prior lessons consulted* section on the PR. `hsai recall "<query>"` prints
-  the same ranking by hand.
+  *Prior lessons consulted* section on the PR. What a change *adopted* is
+  recorded as the lesson's `practices:` frontmatter and under its References,
+  so a merged PR traces to a named practice rather than a bare repo slug.
+  `hsai recall "<query>"` prints the same ranking by hand.
 
 Reference-set lineage: retrieval-before-planning from `assafelovic/gpt-researcher`,
 index-then-retrieve with metadata preserved from `run-llama/llama_index`, and

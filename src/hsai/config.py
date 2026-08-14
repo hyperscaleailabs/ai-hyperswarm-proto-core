@@ -69,6 +69,11 @@ class CoreConfig:
         return tuple(self.constraints.get("forbid_env", []) or [])
 
     @property
+    def reference_snapshot(self) -> str:
+        """When the pinned reference set was last refreshed (field-note frontmatter)."""
+        return str((self.raw.get("reference_set") or {}).get("snapshot_date", ""))
+
+    @property
     def subscription_only(self) -> bool:
         return bool(self.constraints.get("subscription_only", True))
 

@@ -126,8 +126,8 @@ def cmd_synthesize(args: argparse.Namespace) -> int:
     res = synthesize(cfg, cycle_index=args.index)
     print(f"studied: {', '.join(res.studied)}")
     print(f"filed tickets: {res.filed or 'none'}")
-    if res.rejected:
-        print(f"duplicates rejected: {res.rejected} (matched: {', '.join(res.rejected_titles)})")
+    for refusal in res.refused:
+        print(f"refused: {refusal.line()}")
     if res.error:
         print(f"error: {res.error}")
     return 0 if res.ok else 1

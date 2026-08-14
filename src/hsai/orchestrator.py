@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from uuid import uuid4
 
-from . import ai, ci, github, gitops, ledger, recall, repro, review, trajectory
+from . import ai, ci, github, gitops, ledger, recall, repro, review, tickets, trajectory
 from .config import CoreConfig
 from .knowledge import KnowledgeBase, Lesson
 from .models import ModelChoice, Task, select
@@ -533,6 +533,10 @@ def run_once(
         traj.outcome = outcome
     kb = KnowledgeBase.from_config(cfg, wt)
     references = tuple(r.repo for r in cfg.reference_top10[:3])
+    # Which named practice this change adopted, straight off the ticket the
+    # synthesizer filed - a repo slug says we looked at a project, a practice_id
+    # says what we took from it (G1/G2). Absent on hand-written tickets.
+    practices = tickets.practice_ids_in(ticket_body)
     lesson = Lesson(
         title=f"{kind}: {ticket_title}"[:120],
         outcome=outcome,
@@ -565,6 +569,7 @@ def run_once(
         ticket=ticket_num,
         model=choice.model,
         references=references,
+        practices=practices,
         repro_evidence=repro.render_evidence(repro_result) if repro_result else "",
         recalled=recalled.note_names,
         review_verdict=verdict.render(),

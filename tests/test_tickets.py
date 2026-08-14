@@ -1,4 +1,4 @@
-from hsai.tickets import TicketSpec, check_well_formed
+from hsai.tickets import TicketSpec, check_well_formed, practice_ids_in
 
 
 def test_spec_renders_all_required_sections():
@@ -21,6 +21,48 @@ def test_spec_renders_all_required_sections():
     assert "size:M" in spec.all_labels()
     wf = check_well_formed(spec.title, body)
     assert wf.ok, wf.reasons
+
+
+def test_spec_renders_practice_ids_and_they_read_back():
+    """The filed body is the only channel from the planner to the worker's lesson."""
+    spec = TicketSpec(
+        title="feat: automate inbound triage",
+        problem="p",
+        proposal="pp",
+        acceptance_criteria=("a", "b"),
+        verification_plan=("v",),
+        synthesis_rationale="Combines llama_index triage + crewAI snapshots + MetaGPT SOPs.",
+        practice_ids=("run-llama-llama-index-workflow-issue-classifier-yml",
+                      "crewaiinc-crewai-commits"),
+    )
+    body = spec.render()
+
+    assert "## Synthesis rationale" in body
+    assert "`run-llama-llama-index-workflow-issue-classifier-yml`" in body
+    assert practice_ids_in(body) == (
+        "run-llama-llama-index-workflow-issue-classifier-yml", "crewaiinc-crewai-commits",
+    )
+
+
+def test_practice_ids_are_optional_everywhere():
+    """Hand-written tickets (and every ticket filed before this existed) still work."""
+    assert practice_ids_in("## Problem\nnothing structured here") == ()
+    spec = TicketSpec(
+        title="feat: x", problem="p", proposal="pp",
+        acceptance_criteria=("a", "b"), verification_plan=("v",),
+        synthesis_rationale="just a rationale",
+    )
+    assert "Practice IDs" not in spec.render()
+    assert practice_ids_in(spec.render()) == ()
+
+
+def test_spec_renders_practice_ids_without_a_rationale():
+    spec = TicketSpec(
+        title="feat: x", problem="p", proposal="pp",
+        acceptance_criteria=("a", "b"), verification_plan=("v",),
+        practice_ids=("crewaiinc-crewai-commits",),
+    )
+    assert practice_ids_in(spec.render()) == ("crewaiinc-crewai-commits",)
 
 
 def test_vague_feature_ticket_is_malformed():

@@ -127,11 +127,11 @@ def _synthesis_step(
     """Synthesize tickets when the well-formed backlog is thin (journaled once)."""
     low_water = int(cfg.cycle.get("backlog_low_watermark", 4))
     if dry_run or _well_formed_backlog(cfg, runner=runner) >= low_water:
-        return {"ran": False, "filed": [], "error": "", "rejected": 0, "rejected_titles": []}
+        return {"ran": False, "filed": [], "error": "", "refused": []}
     sres = synthesize(cfg, cycle_index=idx, runner=runner, ai_runner=ai_runner)
     return {
         "ran": True, "filed": list(sres.filed), "error": sres.error,
-        "rejected": sres.rejected, "rejected_titles": list(sres.rejected_titles),
+        "refused": [r.payload() for r in sres.refused],
     }
 
 
@@ -238,10 +238,16 @@ def run_cycle(
     report.synthesized = list(synth["filed"])
     if synth["ran"] and not report.synthesized:
         report.notes.append(f"synthesis produced no tickets: {synth['error']}")
-    if synth["rejected"]:
-        matched = "; ".join(f'"{t}"' for t in synth["rejected_titles"] if t) or "-"
+    # Older journals (pre-refusal-reasons) carry `rejected_titles` instead; a
+    # resume of one of those degrades to titles without reasons, never a crash.
+    refused = synth.get("refused") or [
+        {"title": t, "reason": "duplicate of prior work"}
+        for t in synth.get("rejected_titles", [])
+    ]
+    report.refused = [f"{r['title']} - {r['reason']}" for r in refused]
+    if refused:
         report.notes.append(
-            f"synthesis: {synth['rejected']} duplicate(s) rejected (matched: {matched}) - "
+            f"synthesis: {len(refused)} idea(s) refused by the dedupe gate - "
             f"filed {len(report.synthesized)} survivor(s), no back-fill"
         )
 

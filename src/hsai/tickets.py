@@ -22,6 +22,15 @@ CHECKBOX = re.compile(r"^\s*-\s*\[[ xX]?\]\s+\S", re.MULTILINE)
 NEEDS_REFINEMENT = "needs-refinement"
 SIZE_LABELS = ("size:S", "size:M", "size:L")
 
+# How a filed ticket names the reference-set practices it adopts. Written by
+# `TicketSpec.render`, read back by `practice_ids_in` when the orchestrator
+# records the lesson - so the label is a contract, not decoration.
+PRACTICE_IDS_LABEL = "**Practice IDs** (see `knowledge/reference/`)"
+_PRACTICE_IDS_RE = re.compile(
+    r"^\*\*Practice IDs\*\*[^\n:]*:(.+)$", re.IGNORECASE | re.MULTILINE
+)
+_BACKTICKED_RE = re.compile(r"`([^`]+)`")
+
 # Kinds of tickets exempt from the substantial-schema gate (docs and chores may
 # be legitimately small; heal tickets are filed by the loop itself mid-incident).
 _EXEMPT_PREFIXES = ("docs:", "chore:", "ci: main is red")
@@ -39,15 +48,25 @@ class TicketSpec:
     size: str = "M"  # S | M | L
     goal_ids: tuple[str, ...] = ()
     synthesis_rationale: str = ""  # which reference projects were combined, and how
+    practice_ids: tuple[str, ...] = ()  # observed practices this ticket adopts
     labels: tuple[str, ...] = ()
 
     def render(self) -> str:
         ac = "\n".join(f"- [ ] {c}" for c in self.acceptance_criteria)
         vp = "\n".join(f"- [ ] {v}" for v in self.verification_plan)
         goals = ", ".join(self.goal_ids) or "-"
+        # Named practices, not bare repo slugs: this is the line the orchestrator
+        # reads back so a merged PR's lesson can say WHICH observed practice it
+        # adopted (G1/G2). Keep the label stable - `practice_ids_in` parses it.
+        practices = (
+            f"\n\n{PRACTICE_IDS_LABEL}: "
+            + ", ".join(f"`{p}`" for p in self.practice_ids)
+            if self.practice_ids
+            else ""
+        )
         synth = (
-            f"\n## Synthesis rationale\n{self.synthesis_rationale}\n"
-            if self.synthesis_rationale
+            f"\n## Synthesis rationale\n{self.synthesis_rationale}{practices}\n"
+            if self.synthesis_rationale or practices
             else ""
         )
         return f"""## Problem
@@ -70,6 +89,20 @@ class TicketSpec:
     def all_labels(self) -> list[str]:
         base = [f"size:{self.size}", *self.labels]
         return list(dict.fromkeys(base))  # dedupe, keep order
+
+
+def practice_ids_in(body: str) -> tuple[str, ...]:
+    """The practice_ids a filed ticket claims, in order, deduped.
+
+    Tolerant by design: a ticket a human wrote (or one filed before practice ids
+    existed) simply yields ``()`` rather than failing the run.
+    """
+    ids: list[str] = []
+    for line in _PRACTICE_IDS_RE.findall(body):
+        for pid in _BACKTICKED_RE.findall(line):
+            if pid not in ids:
+                ids.append(pid)
+    return tuple(ids)
 
 
 @dataclass

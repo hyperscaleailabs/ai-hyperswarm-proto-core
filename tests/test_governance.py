@@ -58,6 +58,29 @@ def test_brief_links_everything(tmp_path):
     assert "/review-next" in body
 
 
+def test_brief_surfaces_ideas_the_dedupe_gate_refused():
+    """A suppressed idea is a decision the architect must be able to overrule."""
+    cfg = load_config()
+    report = BlockReport(
+        cycle_index=7,
+        synthesized=[31],
+        refused=[
+            "feat: re-file the practice we already shipped - practice "
+            "`crewaiinc-crewai-commits` is already adopted ([[2026-01-01-a]])",
+        ],
+    )
+    body = render_brief(cfg, report)
+    assert "## Ideas refused by the dedupe gate" in body
+    assert "crewaiinc-crewai-commits" in body
+    assert "already adopted" in body
+
+
+def test_brief_says_so_when_nothing_was_refused():
+    body = render_brief(load_config(), BlockReport(cycle_index=7))
+    assert "## Ideas refused by the dedupe gate" in body
+    assert "_none - every candidate was novel_" in body
+
+
 def test_preserved_notes_default_when_missing(tmp_path):
     assert "never overwritten" in preserved_notes(tmp_path / "nope.md")
 

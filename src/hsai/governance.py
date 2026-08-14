@@ -39,6 +39,7 @@ class BlockReport:
 
     cycle_index: int
     synthesized: list[int] = field(default_factory=list)  # ticket numbers filed
+    refused: list[str] = field(default_factory=list)      # "<title> - <reason>" per refusal
     iterations: list[str] = field(default_factory=list)   # IterationResult.describe() lines
     merged_prs: list[int] = field(default_factory=list)
     recovered_prs: list[int] = field(default_factory=list)
@@ -157,6 +158,11 @@ def render_brief(cfg: CoreConfig, report: BlockReport) -> str:
         "\n".join(f"- #{n} (synthesized this block)" for n in report.synthesized)
         or "_none - backlog was sufficient_"
     )
+    # A suppressed idea is a decision, not a non-event: the architect has to be
+    # able to see (and overrule) what the dedupe gate refused to file.
+    refused = "\n".join(f"- {line}" for line in report.refused) or (
+        "_none - every candidate was novel_"
+    )
     iters = "\n".join(f"- `{line}`" for line in report.iterations) or "_none_"
     merged = "\n".join(
         f"- https://github.com/{repo}/pull/{n}" for n in report.merged_prs
@@ -177,6 +183,9 @@ sequentially, records your feedback as ADRs, and ends with a merged PR.
 
 ## Tickets synthesized (heavy model)
 {synth}
+
+## Ideas refused by the dedupe gate
+{refused}
 
 ## Iterations
 {iters}
