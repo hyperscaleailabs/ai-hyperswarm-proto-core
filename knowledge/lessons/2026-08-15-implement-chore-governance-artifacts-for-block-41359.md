@@ -19,7 +19,7 @@ iteration: 4136102
 | ticket | #249 |
 | pull request | _(none)_ |
 | model | `haiku` |
-| remote CI | _(pending)_ |
+| remote CI | SUCCESS |
 
 ## Context
 Iteration 4136102. Ticket #249. CI before: CI green (ruff=pass, pytest=pass).
