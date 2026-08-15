@@ -1,5 +1,6 @@
 import json
 
+from hsai import practices
 from hsai.config import load_config
 from hsai.governance import (
     NOTES_END,
@@ -11,6 +12,26 @@ from hsai.governance import (
 )
 from hsai.ledger import BlockAggregate
 from hsai.proc import Proc
+
+
+def _seed_practices(root, records):
+    path = root / "knowledge" / "reference" / "practices.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(r.to_json() for r in records) + "\n")
+    return path
+
+
+def _practice(id_, repo, *, status=practices.OBSERVED, **kw):
+    return practices.Practice(
+        id=id_,
+        repo=repo,
+        artifact=kw.pop("artifact", "src/pkg/mod.py"),
+        category=kw.pop("category", "testing"),
+        observation=kw.pop("observation", "observed something concrete"),
+        goal_ids=kw.pop("goal_ids", ("G1",)),
+        status=status,
+        **kw,
+    )
 
 
 def _issues_runner(cmd, **kwargs):
@@ -99,3 +120,43 @@ def test_brief_says_when_tokens_per_merged_pr_is_unavailable():
     cost = BlockAggregate(block=7, iterations=2, total_seconds=10.0)
     body = render_brief(cfg, BlockReport(cycle_index=7, cost=cost))
     assert "tokens per merged PR: _not available_" in body
+
+
+# --- reference-set coverage table (G1) ----------------------------------------
+
+def test_direction_includes_reference_set_coverage_table(tmp_path):
+    cfg = load_config()
+    _seed_practices(tmp_path, [
+        _practice("p1", "run-llama/llama_index", status=practices.ADOPTED),
+        _practice("p2", "openai/swarm", status=practices.OBSERVED),
+    ])
+    text = render_direction(cfg, repo_root=tmp_path, runner=_issues_runner)
+    assert "## Reference-set coverage" in text
+    assert "`run-llama/llama_index`" in text
+    assert "`openai/swarm`" in text
+    # every reference-set repo is listed, including unmined ones
+    assert "`FoundationAgents/MetaGPT`" in text
+
+
+def test_direction_coverage_table_is_all_zero_without_a_practices_store(tmp_path):
+    cfg = load_config()
+    text = render_direction(cfg, repo_root=tmp_path, runner=_issues_runner)
+    assert "## Reference-set coverage" in text
+    assert "| 1 | `langchain-ai/langchain` | 0 | 0 |" in text
+
+
+def test_brief_includes_reference_set_coverage_table(tmp_path):
+    cfg = load_config()
+    _seed_practices(tmp_path, [
+        _practice("p1", "run-llama/llama_index", status=practices.ADOPTED),
+    ])
+    body = render_brief(cfg, BlockReport(cycle_index=7), repo_root=tmp_path)
+    assert "## Reference-set coverage (G1)" in body
+    assert "`run-llama/llama_index`" in body
+
+
+def test_brief_coverage_table_defaults_to_empty_without_a_repo_root():
+    cfg = load_config()
+    body = render_brief(cfg, BlockReport(cycle_index=7))
+    assert "## Reference-set coverage (G1)" in body
+    assert "| 1 | `langchain-ai/langchain` | 0 | 0 |" in body
