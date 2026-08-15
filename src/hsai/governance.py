@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import github
+from . import github, practices
 from .config import CoreConfig
 from .knowledge import KnowledgeBase
 from .ledger import BlockAggregate
@@ -79,6 +79,28 @@ def _issues_map(cfg: CoreConfig, *, runner: Runner = run) -> str:
     return "\n".join(lines)
 
 
+def _coverage_table(rows: list[dict]) -> str:
+    """Render :func:`hsai.practices.coverage_report` rows as a markdown table.
+
+    ``observed`` counts every distinct practice ever logged for a repo
+    (any status); ``adopted`` is the subset that actually merged. A repo
+    showing ``0 / 0`` has never been mined at all - the gap G1 is meant to
+    close over time.
+    """
+    if not rows:
+        return "_no reference-set data_"
+    lines = ["| rank | repo | observed | adopted |", "| --- | --- | --- | --- |"]
+    for r in rows:
+        lines.append(f"| {r['rank']} | `{r['repo']}` | {r['observed']} | {r['adopted']} |")
+    return "\n".join(lines)
+
+
+def _practices_coverage(cfg: CoreConfig, repo_root: str | Path | None) -> str:
+    """Best-effort coverage table: an absent/unreachable store reads as empty."""
+    store = practices.load(practices.practices_path(cfg, repo_root)) if repo_root else []
+    return _coverage_table(practices.coverage_report(cfg, store))
+
+
 def render_direction(
     cfg: CoreConfig,
     *,
@@ -107,6 +129,11 @@ def render_direction(
 - Knowledge: {len(lessons)} lessons, {len(papers)} whitepapers ([[Knowledge Base MOC]]).
 - Invariants: ticket-linked PRs, model recorded, lesson per PR, green-gated
   merges (remote CI is truth), subscription-only models, SDLC evidence per PR.
+
+## Reference-set coverage
+Per-repo practices mined from `knowledge/reference/practices.jsonl` (G1) -
+observed vs actually adopted (merged).
+{_practices_coverage(cfg, repo_root)}
 
 ## Issues Map
 {_issues_map(cfg, runner=runner)}
@@ -150,8 +177,15 @@ def _cost_summary(cost: BlockAggregate | None) -> str:
     return f"{cost.summary()}\n\n**Efficiency:** {efficiency}"
 
 
-def render_brief(cfg: CoreConfig, report: BlockReport) -> str:
-    """The review-issue body for one block: everything clickable in one place."""
+def render_brief(
+    cfg: CoreConfig, report: BlockReport, *, repo_root: str | Path | None = None
+) -> str:
+    """The review-issue body for one block: everything clickable in one place.
+
+    ``repo_root`` is optional so pre-existing callers (and tests) that only
+    care about the block's own numbers keep working unchanged; without it the
+    coverage table below reads as all-zero rather than erroring.
+    """
     repo = cfg.repo_slug
     synth = (
         "\n".join(f"- #{n} (synthesized this block)" for n in report.synthesized)
@@ -168,6 +202,7 @@ def render_brief(cfg: CoreConfig, report: BlockReport) -> str:
     paper = f"`knowledge/whitepapers/{report.whitepaper}.md`" if report.whitepaper else "_none_"
     articles = "\n".join(f"- `{a}`" for a in report.articles) or "_none_"
     cost = _cost_summary(report.cost)
+    coverage = _practices_coverage(cfg, repo_root)
     extra = "\n".join(f"- {n}" for n in report.notes)
     return f"""# Block review - cycle {report.cycle_index}
 
@@ -190,6 +225,9 @@ sequentially, records your feedback as ADRs, and ends with a merged PR.
 ## Cost this block (quota ledger)
 {cost}
 
+## Reference-set coverage (G1)
+{coverage}
+
 ## Knowledge produced
 - Whitepaper: {paper}
 - Persona articles:
@@ -204,14 +242,18 @@ Direction** layers and leave comments below or in your Architect Notes section.
 
 
 def open_review_issue(
-    cfg: CoreConfig, report: BlockReport, *, runner: Runner = run
+    cfg: CoreConfig,
+    report: BlockReport,
+    *,
+    repo_root: str | Path | None = None,
+    runner: Runner = run,
 ) -> int:
     label = cfg.governance.get("review_label", "review")
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
     return github.create_issue(
         cfg.repo_slug,
         f"review: block {report.cycle_index} - {stamp} UTC",
-        render_brief(cfg, report),
+        render_brief(cfg, report, repo_root=repo_root),
         [label],
         runner=runner,
     )

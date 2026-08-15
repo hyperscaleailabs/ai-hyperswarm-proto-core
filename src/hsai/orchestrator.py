@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from uuid import uuid4
 
-from . import ai, ci, github, gitops, ledger, recall, repro, review, trajectory
+from . import ai, ci, github, gitops, ledger, practices, recall, repro, review, trajectory
 from .config import CoreConfig
 from .knowledge import KnowledgeBase, Lesson
 from .models import ModelChoice, Task, select
@@ -231,22 +231,46 @@ def _requires_code(ticket_title: str) -> bool:
     return lowered.startswith(("feat:", "fix:", "skill:", "refactor:", "perf:", "test:"))
 
 
-def _improvement_idea(cfg: CoreConfig) -> tuple[str, str]:
+def _improvement_idea(
+    cfg: CoreConfig, store: list[practices.Practice]
+) -> tuple[str, str, practices.Practice | None]:
     """Pick one improvement toward the goals when the backlog is empty.
 
-    v0: deterministic, evidence-anchored suggestion. Improving this selection is
-    itself a tracked skill (see seeded backlog).
+    v1: practices-backed generator (see :mod:`hsai.practices`). ``store`` is the
+    reference-practice ledger already loaded from
+    ``knowledge/reference/practices.jsonl``; :func:`practices.next_unadopted`
+    selects the highest-value practice that is not yet adopted, rejected, or
+    in flight. The ticket title names the practice and the body cites its
+    source repo, artifact, and observation - so dedupe keys on the practice id
+    (via the caller marking it in-flight) rather than on a fixed title. Falls
+    back to the original chore title only when the store is exhausted (every
+    observed practice has already been adopted, rejected, or claimed).
     """
-    title = "chore: refresh reference-set snapshot and extract one practice"
+    candidate = practices.next_unadopted(cfg, store)
+    if candidate is None:
+        title = "chore: refresh reference-set snapshot and extract one practice"
+        body = (
+            "The reference-practice ledger (knowledge/reference/practices.jsonl) "
+            "is exhausted: every observed practice is adopted, rejected, or "
+            "already in flight. Toward goal G1, revisit the pinned reference set "
+            "in .ai-swarm/core.yaml, observe ONE new concrete practice (code, "
+            "CI, or issue-handling) from those projects, APPEND it to "
+            "knowledge/reference/practices.jsonl as a `status: observed` record, "
+            "then adopt a small version of it here.\n\n"
+            "Reference set: " + ", ".join(r.repo for r in cfg.reference_top10)
+        )
+        return title, body, None
+    title = f"feat: adopt '{candidate.id}' from {candidate.repo}"[:120]
     body = (
-        "Backlog is empty. Toward goal G1, revisit the pinned reference set in "
-        ".ai-swarm/core.yaml, pick ONE concrete practice observed in those "
-        "projects (code, CI, or issue-handling), and adopt a small version of it "
-        "here. Cite the source project in the lesson.\n\n"
-        "Reference set: "
-        + ", ".join(r.repo for r in cfg.reference_top10)
+        f"Toward {', '.join(candidate.goal_ids) or 'G1'}, adopt the practice "
+        f"observed in `{candidate.repo}` at `{candidate.artifact}` "
+        f"(practice id `{candidate.id}`).\n\n"
+        f"Observation: {candidate.observation}\n\n"
+        "Implement a small, focused version of this practice here, then cite "
+        f"practice id `{candidate.id}` (repo + artifact) in the lesson and PR "
+        "body - do not fall back to the old top-3 reference-set slice."
     )
-    return title, body
+    return title, body, candidate
 
 
 def run_once(
@@ -305,11 +329,20 @@ def run_once(
     ticket_title = ""
     ticket_body = ""
     claimed_issue: github.Issue | None = None
+    # The practice selected for an IMPROVE iteration (see `_improvement_idea`),
+    # kept around so the lesson/PR references and the eventual adopted-mark
+    # can cite it. Reading/writing the store is purely local file I/O - no
+    # `gh` call is added to this path.
+    improve_practice: practices.Practice | None = None
+    practices_file = practices.practices_path(cfg, repo_dir)
 
     if dry_run:
         kind = decide_path(ci_before.ok, has_tickets=False)
         if kind == IMPROVE:
-            ticket_title, ticket_body = _improvement_idea(cfg)
+            store = practices.load(practices_file)
+            ticket_title, ticket_body, improve_practice = _improvement_idea(cfg, store)
+            if improve_practice is not None:
+                practices.mark(practices_file, improve_practice.id, practices.IN_FLIGHT)
         elif kind == HEAL:
             ticket_title, ticket_body = "ci: main is red - auto-heal", "dry-run"
     idle_reason = ""
@@ -346,9 +379,14 @@ def run_once(
                 claimed_issue = top
                 github.assign(repo, top.number, login, runner=runner)
             else:  # IMPROVE - file a ticket FIRST so the PR has one
-                ticket_title, ticket_body = _improvement_idea(cfg)
+                store = practices.load(practices_file)
+                ticket_title, ticket_body, improve_practice = _improvement_idea(cfg, store)
                 # Dedupe: never spam the backlog with copies of the same idea
-                # (a stranded run once filed nine identical chore tickets).
+                # (a stranded run once filed nine identical chore tickets). The
+                # title now names the selected practice id, so this also keys
+                # dedupe on the practice rather than a fixed chore title -
+                # marking the practice in-flight below is what actually stops a
+                # LATER iteration from re-selecting the same one.
                 existing = next((i for i in all_open if i.title == ticket_title), None)
                 if existing is not None:
                     if existing.assignees or existing.is_blocked:
@@ -365,6 +403,11 @@ def run_once(
                         repo, ticket_title, ticket_body,
                         ["priority:P3", "self-improve", "hsai"],
                         assignee=login, runner=runner,
+                    )
+                if improve_practice is not None and not idle_reason:
+                    practices.mark(
+                        practices_file, improve_practice.id, practices.IN_FLIGHT,
+                        ticket=ticket_num,
                     )
 
     if idle_reason:
@@ -550,7 +593,15 @@ def run_once(
         # refines it to the merge outcome once that is settled.
         traj.outcome = outcome
     kb = KnowledgeBase.from_config(cfg, wt)
-    references = tuple(r.repo for r in cfg.reference_top10[:3])
+    # An IMPROVE iteration cites the practice it actually selected (repo +
+    # artifact + practice id) instead of the fixed top-3 slice of the
+    # reference set - the citation now carries real information about what
+    # was done, not the same three names on every PR (G1).
+    references = (
+        (improve_practice.citation(),)
+        if improve_practice is not None
+        else tuple(r.repo for r in cfg.reference_top10[:3])
+    )
     lesson = Lesson(
         title=f"{kind}: {ticket_title}"[:120],
         outcome=outcome,
@@ -667,6 +718,15 @@ def run_once(
     if remote == ci.SUCCESS:
         github.merge_pr(repo, pr_num, auto=True, runner=runner)
         result.merged = True
+        # The practice is only "adopted" once it actually merges - a recovered
+        # (unmerged) attempt leaves it `in-flight` so the retry that follows
+        # (via the normal implement path, since the ticket now exists) does
+        # not free it up for a second, competing improve iteration to re-pick.
+        if improve_practice is not None:
+            practices.mark(
+                practices_file, improve_practice.id, practices.ADOPTED,
+                pr=pr_num, lesson=lesson.note_name(),
+            )
     else:
         result.merged = False
         _recover_failed(

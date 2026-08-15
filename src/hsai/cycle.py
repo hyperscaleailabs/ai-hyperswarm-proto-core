@@ -302,7 +302,9 @@ def run_cycle(
     # 6. Review issue - the architect's entrance for this block.
     review = journal.once(
         jr, "review_issue", "block",
-        lambda: {"number": 0 if dry_run else open_review_issue(cfg, report, runner=runner)},
+        lambda: {"number": 0 if dry_run else open_review_issue(
+            cfg, report, repo_root=repo_root, runner=runner
+        )},
     )["number"]
 
     # Close the journal so `--resume` never picks this block up again.

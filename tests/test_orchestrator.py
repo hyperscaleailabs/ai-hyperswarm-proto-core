@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from hsai import ledger, orchestrator, recall, review, trajectory
+from hsai import ledger, orchestrator, practices, recall, review, trajectory
 from hsai.config import load_config
 from hsai.models import ModelChoice
 from hsai.orchestrator import (
@@ -1211,6 +1211,166 @@ def test_malformed_ticket_is_refused_and_labeled(tmp_path):
         if c[:3] == ["gh", "issue", "edit"] and "needs-refinement" in c and "11" in c
     ]
     assert labeled, "vague ticket should be labeled needs-refinement"
+
+
+# --- reference-practice provenance ledger drives the improve path (G1) -------
+
+def _practice(id_, repo, *, status=practices.OBSERVED, first_seen="2020-01-01", **kw):
+    return practices.Practice(
+        id=id_,
+        repo=repo,
+        artifact=kw.pop("artifact", "src/pkg/mod.py"),
+        category=kw.pop("category", "testing"),
+        observation=kw.pop("observation", "observed something concrete"),
+        goal_ids=kw.pop("goal_ids", ("G1",)),
+        status=status,
+        first_seen=first_seen,
+        **kw,
+    )
+
+
+def _seed_practices(root: Path, records: list[practices.Practice]) -> Path:
+    path = root / "knowledge" / "reference" / "practices.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(r.to_json() for r in records) + "\n")
+    return path
+
+
+def test_improvement_idea_cites_selected_practice_repo_and_artifact():
+    cfg = load_config()
+    store = [
+        _practice("p-a", "repoA/x", artifact="path/a.py", first_seen="2020-01-01"),
+        _practice("p-b", "repoB/y", artifact="path/b.py", first_seen="2020-01-02"),
+    ]
+    title, body, candidate = orchestrator._improvement_idea(cfg, store)
+    assert candidate is not None and candidate.id == "p-a"  # earliest evidence first
+    assert "p-a" in title
+    assert "repoA/x" in body and "path/a.py" in body
+    assert "p-a" in body
+
+
+def test_improvement_idea_falls_back_to_chore_when_store_is_exhausted():
+    cfg = load_config()
+    store = [
+        _practice("p-a", "repoA/x", status=practices.ADOPTED),
+        _practice("p-b", "repoB/y", status=practices.REJECTED),
+        _practice("p-c", "repoC/z", status=practices.IN_FLIGHT),
+    ]
+    title, body, candidate = orchestrator._improvement_idea(cfg, store)
+    assert candidate is None
+    assert title == "chore: refresh reference-set snapshot and extract one practice"
+    assert "exhausted" in body
+
+
+def test_two_consecutive_improve_idea_calls_pick_two_different_practices():
+    """Simulates the orchestrator's own claim step (mark in-flight) between two
+    calls, independent of any FakeRunner/GitHub plumbing."""
+    cfg = load_config()
+    store = [
+        _practice("p-a", "repoA/x", first_seen="2020-01-01"),
+        _practice("p-b", "repoB/y", first_seen="2020-01-02"),
+    ]
+    _t1, _b1, first = orchestrator._improvement_idea(cfg, store)
+    store = [
+        replace(p, status=practices.IN_FLIGHT) if p.id == first.id else p for p in store
+    ]
+    _t2, _b2, second = orchestrator._improvement_idea(cfg, store)
+    assert first is not None and second is not None
+    assert first.id != second.id
+
+
+def test_run_once_improve_path_adopts_the_practice_then_moves_to_the_next(tmp_path):
+    cfg = load_config()
+    _seed_practices(tmp_path, [
+        _practice("p-a", "repoA/x", artifact="path/a.py", first_seen="2020-01-01"),
+        _practice("p-b", "repoB/y", artifact="path/b.py", first_seen="2020-01-02"),
+    ])
+    store_path = tmp_path / "knowledge" / "reference" / "practices.jsonl"
+
+    runner1 = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        worktree_status="?? src/hsai/adopted_a.py\n",
+    )
+    result1 = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner1, ai_runner=runner1, iteration=1,
+    )
+    assert result1.kind == IMPROVE
+    assert result1.merged is True
+
+    pr_create1 = next(c for c in runner1.calls if c[:3] == ["gh", "pr", "create"])
+    pr_title1 = pr_create1[pr_create1.index("--title") + 1]
+    pr_body1 = pr_create1[pr_create1.index("--body") + 1]
+    assert "p-a" in pr_title1
+    assert "repoA/x" in pr_body1 and "path/a.py" in pr_body1
+    assert "## Reference-set evidence" in pr_body1 and "p-a" in pr_body1
+    lesson_text1 = Path(result1.lesson_path).read_text()
+    assert "p-a" in lesson_text1 and "repoA/x" in lesson_text1
+
+    # the practices store now records p-a as adopted, tied to this PR + lesson
+    after_first = {p.id: p for p in practices.load(store_path)}
+    assert after_first["p-a"].status == practices.ADOPTED
+    assert after_first["p-a"].pr == result1.pr
+    assert after_first["p-b"].status == practices.OBSERVED  # untouched
+
+    # a second, independent iteration must not re-pick the now-adopted practice
+    runner2 = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        worktree_status="?? src/hsai/adopted_b.py\n",
+    )
+    result2 = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner2, ai_runner=runner2, iteration=2,
+    )
+    assert result2.kind == IMPROVE
+    pr_create2 = next(c for c in runner2.calls if c[:3] == ["gh", "pr", "create"])
+    pr_title2 = pr_create2[pr_create2.index("--title") + 1]
+    assert "p-b" in pr_title2
+    assert "p-a" not in pr_title2
+
+    after_second = {p.id: p for p in practices.load(store_path)}
+    assert after_second["p-a"].status == practices.ADOPTED   # unchanged
+    assert after_second["p-b"].status == practices.ADOPTED
+
+    # Selecting and marking a practice is pure local file I/O - the set of
+    # `gh` subcommands this path issues is unchanged from a plain ticket-based
+    # iteration (no live reference-set/repo fetch was added). FakeRunner
+    # itself would already fail loudly on any unrecognised command, so this
+    # pins the exact, known surface rather than relying on that alone.
+    known_gh_subcommands = {
+        ("gh", "api", "user"), ("gh", "issue", "list"), ("gh", "issue", "create"),
+        ("gh", "pr", "create"), ("gh", "pr", "view"), ("gh", "pr", "merge"),
+    }
+    gh_calls = {tuple(c[:3]) for c in runner1.calls + runner2.calls if c[:1] == ["gh"]}
+    assert gh_calls and gh_calls <= known_gh_subcommands
+
+
+def test_run_once_improve_path_falls_back_to_chore_when_store_is_exhausted(tmp_path):
+    cfg = load_config()
+    _seed_practices(tmp_path, [_practice("p-a", "repoA/x", status=practices.ADOPTED)])
+
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        worktree_status="?? knowledge/lessons/2026-01-01-fake.md\n",
+    )
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+    assert result.kind == IMPROVE
+    issue_create = next(c for c in runner.calls if c[:3] == ["gh", "issue", "create"])
+    title = issue_create[issue_create.index("--title") + 1]
+    assert title == "chore: refresh reference-set snapshot and extract one practice"
+
+
+def test_dry_run_improve_reads_but_never_writes_a_missing_practices_store(tmp_path):
+    """No practices.jsonl on disk -> falls back to the chore idea, and nothing
+    is written (an absent store is not the same as an exhausted one, but with
+    no candidates available there is nothing to mark)."""
+    cfg = load_config()
+    result = run_once(cfg, repo_dir=str(tmp_path), dry_run=True, iteration=1)
+    assert result.kind == IMPROVE
+    assert not (tmp_path / "knowledge" / "reference" / "practices.jsonl").exists()
 
 
 # --- lesson recall: the knowledge base as an INPUT ---------------------------
