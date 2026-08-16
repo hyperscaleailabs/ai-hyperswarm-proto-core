@@ -88,11 +88,6 @@ closes the loop.
   tried* section (`synthesis.MemoryPack`) - open tickets, recently closed
   tickets, and lesson outcomes, titles only and hard-capped - ahead of the
   reference-project digest, so the planner stops re-proposing dead ideas.
-  `synthesis.is_duplicate` then filters the model's own output before filing:
-  a candidate whose title exactly matches, or whose normalized-token overlap
-  with a prior title clears the configured Jaccard threshold, is dropped and
-  its slot is never back-filled - `SynthesisResult.rejected` and
-  `.rejected_titles` carry the count and matches into `BlockReport.notes`.
 - **Audit.** What was retrieved is recorded three times: on `IterationResult`,
   as a `recalled:` list in the lesson's frontmatter, and as a
   *Prior lessons consulted* section on the PR. `hsai recall "<query>"` prints
@@ -101,6 +96,68 @@ closes the loop.
 Reference-set lineage: retrieval-before-planning from `assafelovic/gpt-researcher`,
 index-then-retrieve with metadata preserved from `run-llama/llama_index`, and
 scoped agent memory from `OpenBMB/ChatDev`.
+
+## Retrieval-augmented synthesis
+
+`MemoryPack` tells the planner what our work is *called*; prior art tells it
+what that work *found*. `recall.build_prior_art(query, budget_chars)` is the
+retrieval contract, and it is deliberately narrow:
+
+- **Four sources, one index.** Vault notes (`vault_documents`), per-block cost
+  aggregates (`ledger_documents`), and closed + blocked tickets read through
+  `gh` (`issue_documents`) are scored by a single `Corpus`, so IDF is computed
+  over the union and the scores are comparable across sources. Still stdlib
+  only: no embeddings, no new runtime dependency.
+- **Stable refs.** Every item renders the exact string a ticket must cite back:
+  `[[note-name]]` for a note, `#142` for a ticket, `` `ledger:block-41339` ``
+  for a ledger block. `tickets.prior_art_citations` recognises exactly those
+  three shapes, so "we learned this before" cites nothing and is refused.
+- **Query.** `synthesis.prior_art_query` is the cycle's goals plus the repos it
+  is about to study - deterministic and model-free, so the same cycle index
+  always retrieves the same artifacts.
+- **Degradation is per source.** A missing ledger, an empty vault, or an absent
+  `gh` removes one source and returns `[]`; only the empty *union* renders an
+  empty section. Retrieval can thin the prompt, never fail synthesis.
+- **Budget.** The rendered section never exceeds `synthesis.prior_art_max_chars`.
+  The preamble and the cost-pressure line are kept first - they are the framing
+  the planner needs even when one artifact survives - and whole items are then
+  dropped to fit, never truncated mid-line.
+
+### The prompt budget
+
+`synthesis.max_prompt_chars` (32 000) caps the *whole* rendered prompt. When it
+binds, the **study digest** is what gives: it is the bulkiest section, it scales
+with `refs_per_cycle`, and it degrades gracefully with length, whereas the
+memory and prior-art sections are already individually capped and are precisely
+what stops the planner re-proposing dead work. The fixed instruction text is a
+floor - a cap below it empties the digest rather than mangling the schema.
+`hsai synthesize --dry-run` renders that prompt and files nothing, so the
+retrieved excerpts and the resulting size can be inspected before a heavy run.
+
+### Screening what comes back
+
+Every candidate is graded by `synthesis.screen_candidates` before anything is
+filed:
+
+| verdict | trigger | effect |
+| --- | --- | --- |
+| refused | `tickets.check_spec` fails (no internal citation) | dropped, reason logged |
+| refused | title is an **exact** duplicate - same string, or the same normalized tokens (`feat:` vs `refactor:`) | dropped, matched title logged |
+| accepted | exact duplicate of a **failed** lesson that is not currently open, whose `prior_art` cites that failure *and* says `what changed:` | filed |
+| demoted | Jaccard token overlap ≥ `duplicate_threshold` but not exact | kept, ranked below every new idea |
+| accepted | novel | filed |
+
+Demotion is what makes `file_top` meaningful: a reworded variant of prior work
+is filed only when the block has nothing better to offer. Refusals are never
+back-filled - an honest thin block beats padding the backlog - and the counts
+reach the architect through `BlockReport.notes` plus a **prior art coverage**
+line in the review brief.
+
+Reference-set lineage: an indexed local corpus retrieved before reasoning from
+`run-llama/llama_index`, the plan-retrieve-cite loop where every conclusion
+carries a source from `assafelovic/gpt-researcher`, stored trajectories reused
+as context for later runs from `SWE-agent/SWE-agent`, and SOP memory handed
+between roles from `FoundationAgents/MetaGPT`.
 
 ## Testability
 

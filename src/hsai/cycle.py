@@ -127,11 +127,16 @@ def _synthesis_step(
     """Synthesize tickets when the well-formed backlog is thin (journaled once)."""
     low_water = int(cfg.cycle.get("backlog_low_watermark", 4))
     if dry_run or _well_formed_backlog(cfg, runner=runner) >= low_water:
-        return {"ran": False, "filed": [], "error": "", "rejected": 0, "rejected_titles": []}
+        return {
+            "ran": False, "filed": [], "error": "", "rejected": 0, "rejected_titles": [],
+            "prior_art_cited": 0, "demoted_titles": [],
+        }
     sres = synthesize(cfg, cycle_index=idx, runner=runner, ai_runner=ai_runner)
     return {
         "ran": True, "filed": list(sres.filed), "error": sres.error,
         "rejected": sres.rejected, "rejected_titles": list(sres.rejected_titles),
+        "prior_art_cited": sres.prior_art_cited,
+        "demoted_titles": list(sres.demoted_titles),
     }
 
 
@@ -236,13 +241,22 @@ def run_cycle(
         ),
     )
     report.synthesized = list(synth["filed"])
+    # `.get` on the new keys: a journal written before prior-art screening
+    # existed replays without them, and a resumed block must not crash on that.
+    report.prior_art_cited = int(synth.get("prior_art_cited", 0))
     if synth["ran"] and not report.synthesized:
         report.notes.append(f"synthesis produced no tickets: {synth['error']}")
     if synth["rejected"]:
         matched = "; ".join(f'"{t}"' for t in synth["rejected_titles"] if t) or "-"
         report.notes.append(
-            f"synthesis: {synth['rejected']} duplicate(s) rejected (matched: {matched}) - "
+            f"synthesis: {synth['rejected']} candidate(s) refused (matched: {matched}) - "
             f"filed {len(report.synthesized)} survivor(s), no back-fill"
+        )
+    if synth.get("demoted_titles"):
+        demoted = "; ".join(f'"{t}"' for t in synth["demoted_titles"])
+        report.notes.append(
+            f"synthesis: {len(synth['demoted_titles'])} near-duplicate(s) demoted below "
+            f"new ideas (kept, ranked last): {demoted}"
         )
 
     # 2. Sequential implementation block, under the quota budget gate.

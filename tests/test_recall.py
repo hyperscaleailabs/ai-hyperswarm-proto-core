@@ -4,16 +4,26 @@ Every ranking here is asserted EXACTLY: recall is deterministic by design (no
 model call, stable tie-break on note name), so a fuzzy assertion would hide the
 very regressions this module can suffer.
 """
+import json
 from dataclasses import replace
 from pathlib import Path
 
 from hsai.config import load_config
+from hsai.proc import Proc
 from hsai.recall import (
+    DEFAULT_PRIOR_ART_CHARS,
     HEADING,
+    PRIOR_ART_HEADING,
     Corpus,
+    PriorArtItem,
     RecallConfig,
+    build_prior_art,
+    cost_pressure,
     for_task,
+    issue_documents,
+    ledger_documents,
     render,
+    render_prior_art,
     tokenize,
 )
 
@@ -315,3 +325,167 @@ def test_the_real_repo_corpus_is_searchable():
     hits = corpus.search("remote CI gate", 3)
     assert hits and all(h.snippet for h in hits)
     assert all(h.score > 0 for h in hits)
+
+
+# --- prior art: the planner's four-source view of our own record --------------
+
+CLOSED = [
+    {
+        "number": 142, "title": "feat: quota telemetry ledger",
+        "labels": [{"name": "self-improve"}], "assignees": [], "body": "",
+        "closedAt": "2026-08-01T00:00:00Z",
+    },
+]
+BLOCKED = [
+    {
+        "number": 77, "title": "feat: widget scheduler",
+        "labels": [{"name": "blocked"}], "assignees": [],
+        "body": "## Problem\nThe widget scheduler starves long tasks.\n",
+    },
+    {
+        "number": 78, "title": "feat: unrelated open work",
+        "labels": [], "assignees": [], "body": "## Problem\nSomething else.\n",
+    },
+]
+
+
+def _gh(*, closed=None, blocked=None, broken=False):
+    """A fake `gh` answering both issue-list states (or failing outright)."""
+
+    def runner(cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None):
+        if broken:
+            return Proc(cmd, 127, "", "gh: command not found")
+        if cmd[:3] == ["gh", "issue", "list"]:
+            state = cmd[cmd.index("--state") + 1] if "--state" in cmd else "open"
+            data = (CLOSED if closed is None else closed) if state == "closed" else (
+                BLOCKED if blocked is None else blocked
+            )
+            return Proc(cmd, 0, json.dumps(data), "")
+        return Proc(cmd, 0, "", "")
+
+    return runner
+
+
+def _ledger(root: Path, cfg, *, blocks=((41339, 1425.0, "heavy"),)) -> None:
+    from hsai import ledger as ledger_mod
+
+    for i, (block, seconds, tier) in enumerate(blocks):
+        ledger_mod.append_record(
+            ledger_mod.ledger_path(cfg, root),
+            ledger_mod.LedgerRecord(
+                iteration=i, block=block, ticket=None, kind="implement", tier=tier,
+                model="opus", wall_clock_seconds=seconds, attempts=1, outcome="merged",
+            ),
+        )
+
+
+def test_prior_art_spans_lessons_whitepapers_ledger_and_closed_issues(tmp_path):
+    cfg = _cfg()
+    _lesson(tmp_path, "2026-01-02-widget-fail", title="Widget scheduling starves tasks",
+            outcome="fail", body="The widget scheduler starved long tasks.")
+    _write_note(tmp_path, "knowledge/whitepapers", "2026-01-03-widget-paper",
+                title="Widget synthesis", body="Widget scheduling recurs.", section="Summary")
+    _ledger(tmp_path, cfg)
+
+    art = build_prior_art("widget scheduling quota ledger", 4000,
+                          root=tmp_path, cfg=cfg, k=10, runner=_gh())
+
+    by_source = {i.source for i in art.items}
+    assert {"lesson", "whitepaper", "ledger", "issue"} <= by_source
+    refs = art.refs
+    assert "[[2026-01-02-widget-fail]]" in refs      # a note is cited as a wikilink
+    assert "#77" in refs                              # a ticket as its number
+    assert "`ledger:block-41339`" in refs             # a ledger block by name
+    # the blocked ticket is prior art; an ordinary open one is not
+    assert "#78" not in refs
+    # each item carries the label that says what kind of evidence it is
+    labels = {i.ref: i.detail for i in art.items}
+    assert labels["[[2026-01-02-widget-fail]]"] == "outcome/fail"
+    assert labels["#77"] == "blocked" and labels["#142"] == "closed"
+    assert labels["`ledger:block-41339`"] == "ledger"
+
+
+def test_prior_art_never_exceeds_its_budget(tmp_path):
+    cfg = _cfg()
+    for i in range(30):
+        _lesson(tmp_path, f"2026-02-{i:02d}-overflow", outcome="fail",
+                title=f"Overflowing note {i} about budgets",
+                body="budget quota spend " * 20)
+    _ledger(tmp_path, cfg)
+
+    for budget in (0, 60, 200, 500, 1200, 2500):
+        art = build_prior_art("budget quota", budget, root=tmp_path, cfg=cfg, k=20,
+                              runner=_gh())
+        assert len(art.section) <= budget
+        # the audit trail lists exactly what survived the cap, never more
+        assert len(art.items) == art.section.count("\n- ")
+        for ref in art.refs:
+            assert ref in art.section
+
+
+def test_prior_art_degrades_when_gh_is_unavailable(tmp_path):
+    """A missing `gh` removes one source; it must never fail synthesis."""
+    cfg = _cfg()
+    _lesson(tmp_path, "2026-01-02-widget-fail", title="Widget scheduling starves tasks",
+            outcome="fail", body="The widget scheduler starved long tasks.")
+
+    assert issue_documents(cfg, runner=_gh(broken=True)) == []
+
+    art = build_prior_art("widget scheduling", 4000, root=tmp_path, cfg=cfg,
+                          runner=_gh(broken=True))
+    assert art.refs == ("[[2026-01-02-widget-fail]]",)   # the vault still answers
+    assert not any(i.source == "issue" for i in art.items)
+
+
+def test_prior_art_is_empty_when_every_source_is_unavailable(tmp_path):
+    """No vault, no ledger, no `gh` - an empty section, not an exception."""
+    art = build_prior_art("anything", 4000, root=tmp_path, cfg=_cfg(),
+                          runner=_gh(broken=True))
+    assert art.section == "" and art.items == () and not art
+
+
+def test_prior_art_carries_current_cost_pressure(tmp_path):
+    cfg = _cfg()
+    _lesson(tmp_path, "l", title="A lesson", body="quota spend matters")
+    _ledger(tmp_path, cfg, blocks=((41339, 1000.0, "heavy"), (41341, 2000.0, "heavy")))
+
+    line = cost_pressure(tmp_path, cfg)
+    assert line.startswith("Cost pressure - latest ledger block 41341")  # newest block only
+    assert "2000s wall-clock" in line
+    assert "Budget verdict:" in line
+    assert "max_heavy_iterations_per_block=" in line
+
+    art = build_prior_art("quota spend", 4000, root=tmp_path, cfg=cfg, runner=_gh())
+    assert art.cost_pressure == line
+    assert line in art.section
+
+
+def test_cost_pressure_is_silent_without_a_ledger(tmp_path):
+    assert cost_pressure(tmp_path, _cfg()) == ""
+    assert cost_pressure(tmp_path, None) == ""
+
+
+def test_ledger_documents_are_one_per_block(tmp_path):
+    cfg = _cfg()
+    _ledger(tmp_path, cfg, blocks=((41339, 10.0, "heavy"), (41339, 20.0, "light"),
+                                   (41341, 30.0, "heavy")))
+    docs = ledger_documents(tmp_path, cfg)
+    assert [d.note_name for d in docs] == ["ledger:block-41339", "ledger:block-41341"]
+    assert "2 iterations" in docs[0].snippet      # both records folded into one block
+    assert ledger_documents(tmp_path, None) == []
+
+
+def test_prior_art_renders_the_preamble_before_anything_it_cannot_fit():
+    """Below the preamble's own length there is nothing honest to render."""
+    item = PriorArtItem(ref="[[n]]", source="lesson", score=1.0, excerpt="x")
+    assert render_prior_art([item], 10).section == ""
+    generous = render_prior_art([item], DEFAULT_PRIOR_ART_CHARS, cost="Cost pressure - none.")
+    assert generous.section.startswith(PRIOR_ART_HEADING)
+    assert generous.cost_pressure == "Cost pressure - none."
+    assert generous.items == (item,)
+
+    # under pressure the items give way, not the framing - and never mid-line
+    tight = render_prior_art([item], len(generous.section) - 5, cost="Cost pressure - none.")
+    assert tight.cost_pressure == "Cost pressure - none."
+    assert tight.items == ()
+    assert item.render() not in tight.section

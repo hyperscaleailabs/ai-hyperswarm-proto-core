@@ -140,6 +140,13 @@ synthesis:
   memory_closed_limit: 15      # recently-closed tickets folded into synthesis memory
   memory_max_lessons: 25       # knowledge-base lessons folded into synthesis memory
   duplicate_threshold: 0.6     # Jaccard token overlap above which a candidate is a duplicate
+  # Retrieval-augmented planning (see src/hsai/recall.py: build_prior_art). The
+  # planner is grounded in our OWN record - lessons, whitepapers, ADRs, the cost
+  # ledger and closed/blocked tickets - before it reasons about anyone else's
+  # code, and every filed ticket must cite >= 1 of the artifacts it was shown.
+  prior_art_k: 6               # ranked internal artifacts injected into the prompt
+  prior_art_max_chars: 2500    # hard cap on the prior-art section (0 disables it)
+  max_prompt_chars: 32000      # hard ceiling on the whole prompt; the study digest gives first
 
 # Quota/cost budget for one half-day block (subscription-only: purely local
 # measurement, never a metered API call). The ledger aggregates each block's

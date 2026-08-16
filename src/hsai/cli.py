@@ -7,6 +7,7 @@ Commands:
   hsai cycle [--cycle-index N] [--resume] [--dry-run]          one governance block
   hsai reindex                                                 rebuild knowledge MOCs
   hsai recall "<query>" [--k N] [--kind K]                     rank prior lessons/ADRs
+  hsai synthesize [--index N] [--dry-run]                      plan + file tickets
   hsai doctor                                                  verify environment + invariants
   hsai traj <iteration> [--json]                               print a stored agent run
   hsai replay <iteration> [--json]                             alias of `hsai traj`
@@ -126,14 +127,25 @@ def cmd_cycle(args: argparse.Namespace) -> int:
 
 
 def cmd_synthesize(args: argparse.Namespace) -> int:
-    from .synthesis import synthesize
+    from .synthesis import DEFAULT_MAX_PROMPT_CHARS, preview, synthesize
 
     cfg = _load(args)
+    if args.dry_run:
+        # Reads the vault, the ledger and the backlog; spends no quota, files
+        # nothing. The size line goes to stderr so the prompt can be piped.
+        prompt = preview(cfg, cycle_index=args.index, root=args.root)
+        print(prompt)
+        cap = int(cfg.synthesis.get("max_prompt_chars", DEFAULT_MAX_PROMPT_CHARS))
+        print(f"\nprompt: {len(prompt)} chars (cap {cap})", file=sys.stderr)
+        return 0
     res = synthesize(cfg, cycle_index=args.index)
     print(f"studied: {', '.join(res.studied)}")
     print(f"filed tickets: {res.filed or 'none'}")
-    if res.rejected:
-        print(f"duplicates rejected: {res.rejected} (matched: {', '.join(res.rejected_titles)})")
+    print(f"prior art cited by: {res.prior_art_cited}/{len(res.filed)} filed ticket(s)")
+    for line in res.refusals:
+        print(f"refused: {line}")
+    for title in res.demoted_titles:
+        print(f"demoted (near-duplicate): {title}")
     if res.error:
         print(f"error: {res.error}")
     return 0 if res.ok else 1
@@ -260,6 +272,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sy = sub.add_parser("synthesize", help="heavy-model synthesis: file substantial tickets")
     sy.add_argument("--index", type=int, default=0, help="rotation index for reference subset")
+    sy.add_argument("--root", default=".", help="repo root holding knowledge/ and the ledger")
+    sy.add_argument("--dry-run", action="store_true",
+                    help="print the rendered prompt (prior art included) and file nothing")
     sy.set_defaults(func=cmd_synthesize)
 
     br = sub.add_parser("brief", help="refresh governance/DIRECTION.md")

@@ -148,6 +148,9 @@ def test_synthesis_duplicate_rejections_surface_in_block_notes(tmp_path, monkeyp
         return SynthesisResult(
             ok=True, studied=["a/b"], filed=[901],
             rejected=1, rejected_titles=["feat: already open ticket"],
+            refusals=["feat: x: exact duplicate of prior work: 'feat: already open ticket'"],
+            demoted_titles=["feat: a reworded variant"],
+            prior_art_cited=1,
         )
 
     runner = _Runner()
@@ -159,12 +162,36 @@ def test_synthesis_duplicate_rejections_surface_in_block_notes(tmp_path, monkeyp
 
     assert res.report.synthesized == [901]
     note = next(n for n in res.report.notes if n.startswith("synthesis:"))
-    assert "1 duplicate(s) rejected" in note
+    assert "1 candidate(s) refused" in note
     assert "feat: already open ticket" in note
 
-    # The review brief renders every note verbatim.
+    # A demoted near-duplicate is reported separately: it was kept, not dropped.
+    demoted = next(n for n in res.report.notes if "demoted" in n)
+    assert "feat: a reworded variant" in demoted
+
+    # The review brief renders every note verbatim, plus the coverage line.
     assert runner.review_bodies, "a review issue should have been opened"
-    assert note in runner.review_bodies[-1]
+    body = runner.review_bodies[-1]
+    assert note in body and demoted in body
+    assert "prior art coverage: **1/1**" in body
+
+
+def test_a_journal_written_before_prior_art_screening_still_replays(tmp_path, monkeypatch):
+    """Resuming a block journaled by an older build must not crash on new keys."""
+    cfg = load_config()
+    cfg.budget.clear()
+    cfg.cycle["block_size"] = 0
+
+    def legacy_synthesis_step(cfg, *, idx, runner, ai_runner, dry_run):
+        return {"ran": True, "filed": [902], "error": "", "rejected": 0, "rejected_titles": []}
+
+    runner = _Runner()
+    monkeypatch.setattr(cycle, "_synthesis_step", legacy_synthesis_step)
+    monkeypatch.setattr(cycle, "_governance_pr", lambda *a, **k: 0)
+
+    res = cycle.run_cycle(cfg, repo_dir=str(tmp_path), cycle_index=2, runner=runner)
+    assert res.report.synthesized == [902]
+    assert res.report.prior_art_cited == 0
 
 
 # --- plain-text agent output must not break article generation --------------

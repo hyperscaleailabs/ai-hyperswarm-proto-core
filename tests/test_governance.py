@@ -99,3 +99,27 @@ def test_brief_says_when_tokens_per_merged_pr_is_unavailable():
     cost = BlockAggregate(block=7, iterations=2, total_seconds=10.0)
     body = render_brief(cfg, BlockReport(cycle_index=7, cost=cost))
     assert "tokens per merged PR: _not available_" in body
+
+
+# --- prior-art coverage: is synthesized work grounded in our own record? -------
+
+
+def test_brief_reports_full_prior_art_coverage():
+    cfg = load_config()
+    report = BlockReport(cycle_index=7, synthesized=[31, 32], prior_art_cited=2)
+    body = render_brief(cfg, report)
+    assert "prior art coverage: **2/2** filed ticket(s) cite an internal artifact" in body
+    assert "cited none" not in body
+
+
+def test_brief_calls_out_tickets_that_cited_nothing():
+    cfg = load_config()
+    body = render_brief(cfg, BlockReport(cycle_index=7, synthesized=[31, 32, 33],
+                                         prior_art_cited=1))
+    assert "prior art coverage: **1/3**" in body
+    assert "2 cited none" in body
+
+
+def test_brief_prior_art_coverage_is_n_a_without_synthesis():
+    body = render_brief(load_config(), BlockReport(cycle_index=7))
+    assert "prior art coverage: _n/a - no tickets synthesized this block_" in body

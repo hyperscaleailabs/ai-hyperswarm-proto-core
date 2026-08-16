@@ -39,6 +39,7 @@ class BlockReport:
 
     cycle_index: int
     synthesized: list[int] = field(default_factory=list)  # ticket numbers filed
+    prior_art_cited: int = 0                              # of those, how many cite our own record
     iterations: list[str] = field(default_factory=list)   # IterationResult.describe() lines
     merged_prs: list[int] = field(default_factory=list)
     recovered_prs: list[int] = field(default_factory=list)
@@ -150,6 +151,24 @@ def _cost_summary(cost: BlockAggregate | None) -> str:
     return f"{cost.summary()}\n\n**Efficiency:** {efficiency}"
 
 
+def _prior_art_coverage(report: BlockReport) -> str:
+    """How much of this block's synthesized work is grounded in our own record.
+
+    A ticket that cites no internal artifact is an idea nobody can trace back
+    to observed evidence (G1), so the ratio - not just the count - belongs in
+    front of the architect on every block.
+    """
+    filed = len(report.synthesized)
+    if not filed:
+        return "prior art coverage: _n/a - no tickets synthesized this block_"
+    cited = report.prior_art_cited
+    shortfall = "" if cited == filed else f" - {filed - cited} cited none"
+    return (
+        f"prior art coverage: **{cited}/{filed}** filed ticket(s) cite an internal "
+        f"artifact (lesson note, ledger figure, or closed ticket){shortfall}"
+    )
+
+
 def render_brief(cfg: CoreConfig, report: BlockReport) -> str:
     """The review-issue body for one block: everything clickable in one place."""
     repo = cfg.repo_slug
@@ -157,6 +176,7 @@ def render_brief(cfg: CoreConfig, report: BlockReport) -> str:
         "\n".join(f"- #{n} (synthesized this block)" for n in report.synthesized)
         or "_none - backlog was sufficient_"
     )
+    coverage = _prior_art_coverage(report)
     iters = "\n".join(f"- `{line}`" for line in report.iterations) or "_none_"
     merged = "\n".join(
         f"- https://github.com/{repo}/pull/{n}" for n in report.merged_prs
@@ -177,6 +197,8 @@ sequentially, records your feedback as ADRs, and ends with a merged PR.
 
 ## Tickets synthesized (heavy model)
 {synth}
+
+{coverage}
 
 ## Iterations
 {iters}

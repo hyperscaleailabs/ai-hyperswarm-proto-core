@@ -133,6 +133,37 @@ def test_recall_command_reports_a_miss(tmp_path, capsys):
     assert "no match" in capsys.readouterr().err
 
 
+def test_parser_synthesize_defaults():
+    parser = build_parser()
+    args = parser.parse_args(["synthesize"])
+    assert args.command == "synthesize"
+    assert args.index == 0 and args.root == "." and args.dry_run is False
+    assert parser.parse_args(["synthesize", "--index", "7", "--dry-run"]).dry_run is True
+
+
+def test_synthesize_dry_run_prints_the_prompt_and_spends_nothing(monkeypatch, capsys):
+    """The rehearsal: prior art is retrieved and rendered, no model, no ticket."""
+    calls: list[list[str]] = []
+
+    def runner(cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None):
+        calls.append(list(cmd))
+        return Proc(cmd, 127, "", "gh: command not found")
+
+    monkeypatch.setattr(cli_module.proc, "run", runner)
+
+    rc = main(["synthesize", "--index", "1", "--dry-run"])
+    out, err = capsys.readouterr()
+
+    assert rc == 0
+    assert PRIOR_ART_HEADING in out
+    assert "PHASE 1 - DIVERGE" in out
+    assert '"prior_art"' in out
+    assert "prompt:" in err and "cap" in err
+    # nothing was filed and no model ran
+    assert not any(c[:1] == ["claude"] for c in calls)
+    assert not any(c[:3] == ["gh", "issue", "create"] for c in calls)
+
+
 def test_parser_repro_check_defaults():
     parser = build_parser()
     args = parser.parse_args(["repro-check"])

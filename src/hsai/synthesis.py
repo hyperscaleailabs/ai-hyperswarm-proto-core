@@ -13,6 +13,14 @@ copied from one project, a heavy model:
    structured tickets (schema in :mod:`hsai.tickets`), which are filed on
    GitHub for the cheaper implementation agents to pick up.
 
+Before any of that, the planner is grounded in *our own* record: a
+:class:`~hsai.recall.PriorArt` digest retrieved from the vault, the quota ledger
+and the closed/blocked backlog is injected alongside the reference digest, and
+every ticket the model files must cite at least one of those artifacts. What
+comes back is then screened - an exact re-proposal is refused, a near-duplicate
+is demoted below genuinely new ideas - so heavy-tier quota is never spent
+filing work we have already shipped or already abandoned.
+
 The model call goes through :mod:`hsai.ai`, so it stays subscription-only.
 """
 from __future__ import annotations
@@ -22,12 +30,13 @@ import logging
 import re
 from dataclasses import dataclass, field
 
-from . import github
+from . import github, recall, tickets
 from .ai import run_agent
 from .config import CoreConfig
 from .knowledge import KnowledgeBase
 from .models import ModelChoice
 from .proc import Runner, run
+from .recall import PriorArt
 from .tickets import TicketSpec
 
 _logger = logging.getLogger(__name__)
@@ -37,14 +46,30 @@ _JSON_BLOCK = re.compile(r"```(?:json)?\s*(\[.*?\])\s*```", re.DOTALL)
 
 @dataclass
 class ContextPack:
-    """What the synthesizer knows about the reference projects this cycle."""
+    """What the synthesizer knows this cycle: other projects, and ourselves.
+
+    ``sections`` is the outward-looking half (what the reference projects do);
+    ``prior_art`` is the inward-looking half (what we already did about it).
+    Both are rendered into the prompt, external evidence after internal, because
+    an idea is only worth generating if it is new *to us*.
+    """
 
     repos: list[str]
     sections: dict[str, str]  # repo -> digest text
+    prior_art: PriorArt = field(default_factory=PriorArt)
 
     def render(self) -> str:
         parts = [f"### {repo}\n{text}" for repo, text in self.sections.items()]
         return "\n\n".join(parts)
+
+    def render_prior_art(self) -> str:
+        """The prior-art block, with the heading kept even when nothing matched."""
+        if self.prior_art.section:
+            return self.prior_art.section
+        return (
+            f"{recall.PRIOR_ART_HEADING}: _(nothing retrieved - the vault, the "
+            "ledger and the backlog are all empty)_"
+        )
 
 
 def pick_rotation(cfg: CoreConfig, cycle_index: int) -> list[str]:
@@ -59,7 +84,11 @@ def pick_rotation(cfg: CoreConfig, cycle_index: int) -> list[str]:
 
 
 def build_context_pack(
-    repos: list[str], *, runner: Runner = run, commits: int = 30
+    repos: list[str],
+    *,
+    runner: Runner = run,
+    commits: int = 30,
+    prior_art: PriorArt | None = None,
 ) -> ContextPack:
     """Fetch a compact study digest for each repo via the GitHub API."""
     sections: dict[str, str] = {}
@@ -87,7 +116,9 @@ def build_context_pack(
         if workflows.ok and workflows.stdout.strip():
             parts.append("CI workflows:\n" + workflows.stdout[:500])
         sections[repo] = "\n\n".join(parts) or "(no data fetched)"
-    return ContextPack(repos=repos, sections=sections)
+    return ContextPack(
+        repos=repos, sections=sections, prior_art=prior_art or PriorArt()
+    )
 
 
 MEMORY_HEADING = "What this loop has already tried"
@@ -101,8 +132,19 @@ DEFAULT_MEMORY_MAX_LESSONS = 25
 
 # Above this Jaccard token-overlap ratio (over normalized titles) a candidate
 # is treated as a re-proposal of prior work, not a new idea. Documented here
-# because it is the one number that decides what gets silently dropped.
+# because it is the one number that decides what gets demoted below new ideas.
 DUPLICATE_JACCARD_THRESHOLD = 0.6
+
+# Hard ceiling on the whole rendered prompt. The study digest is the part that
+# gives - it is bounded per repo but scales with `refs_per_cycle`, while the
+# memory and prior-art sections are already individually capped and are the two
+# the planner most needs in full.
+DEFAULT_MAX_PROMPT_CHARS = 32000
+_DIGEST_TRUNCATED = "\n... (study digest truncated to fit the prompt budget)"
+
+# Fraction of a prior title's distinctive tokens that must appear in a
+# re-proposal's `prior_art` for it to count as citing that prior failure.
+REPROPOSAL_CITATION_COVERAGE = 0.75
 
 _CONVENTIONAL_PREFIX_RE = re.compile(
     r"^\s*(feat|fix|refactor|chore|docs|test|ci|skill|perf|style|build)"
@@ -201,6 +243,19 @@ class MemoryPack:
             + [title for _, title in self.lessons]
         )
 
+    def open_titles(self) -> list[str]:
+        """Titles of work that is queued or in flight right now."""
+        return [i.title for i in self.open_tickets]
+
+    def failed_titles(self) -> list[str]:
+        """Titles of work that was tried and recorded as a failure.
+
+        These are the only titles a candidate may legitimately re-propose, and
+        only by citing the failure and saying what changed - see
+        :func:`reproposal_justification`.
+        """
+        return [title for outcome, title in self.lessons if outcome == "fail"]
+
     def render(self, *, max_chars: int = DEFAULT_MEMORY_MAX_CHARS) -> str:
         """Titles only, newest first, hard-capped so it can never crowd out
         the reference-project study material that follows it in the prompt."""
@@ -228,44 +283,150 @@ class MemoryPack:
         return text[: max(0, max_chars - 3)].rstrip() + "..."
 
 
-def is_duplicate(
+EXACT = "exact"
+NEAR = "near"
+
+
+@dataclass(frozen=True)
+class DuplicateMatch:
+    """How close a candidate came to something we already know about.
+
+    ``kind`` is ``""`` (novel), ``"near"`` (demote it below new ideas) or
+    ``"exact"`` (refuse it). The distinction is the whole point: a reworded
+    variant of open work is worth less than a new idea but may still be worth
+    filing when the block has nothing better, whereas re-filing an idea
+    verbatim is pure waste.
+    """
+
+    kind: str = ""
+    title: str = ""     # the prior title that matched
+    score: float = 0.0  # Jaccard overlap of normalized titles
+
+    def __bool__(self) -> bool:
+        return bool(self.kind)
+
+
+def _title_overlap(a: frozenset[str], b: frozenset[str]) -> float:
+    union = a | b
+    return len(a & b) / len(union) if union else 0.0
+
+
+def classify_duplicate(
     spec: TicketSpec, memory: MemoryPack, *, threshold: float = DUPLICATE_JACCARD_THRESHOLD
-) -> tuple[bool, str]:
-    """Would filing `spec` duplicate something in `memory`?
+) -> DuplicateMatch:
+    """Grade `spec` against everything in `memory`. Pure and side-effect free.
 
-    Pure and side-effect free. Two checks, either is enough to flag a match:
+    ``exact`` means the *idea* is identical, not merely the string: either the
+    raw titles match case-insensitively, or their normalized token sets are
+    equal - which is what makes ``feat: X`` and ``refactor: X`` the same
+    proposal wearing a different prefix.
 
-    1. exact title match (case-insensitive) - catches the CI-worker style
-       stranded-run repeat that filed nine identical chore tickets;
-    2. Jaccard token overlap over normalized titles (conventional-commit
-       prefix and stopwords stripped) at or above `threshold` - catches the
-       planner re-proposing the same idea with a different verb or a
-       different type prefix (``feat:`` vs ``refactor:``).
+    ``near`` is a Jaccard token overlap at or above `threshold` - the planner
+    re-proposing the same idea with a different verb or a few extra words.
 
-    Returns ``(is_duplicate, matched_prior_title)`` - the matched title is
-    what gets logged, so a rejection is always explainable.
+    The matched title travels with the verdict so a refusal is always
+    explainable in one line.
     """
     candidate = spec.title.strip()
     candidate_tokens = _normalize_title(candidate)
-    for prior in memory.all_titles():
-        if candidate.lower() == prior.strip().lower():
-            return True, prior
 
-    best_title, best_score = "", 0.0
+    best = DuplicateMatch()
     for prior in memory.all_titles():
-        prior_tokens = _normalize_title(prior)
-        if not candidate_tokens or not prior_tokens:
-            continue
-        union = candidate_tokens | prior_tokens
-        score = len(candidate_tokens & prior_tokens) / len(union) if union else 0.0
-        if score > best_score:
-            best_score, best_title = score, prior
-    if best_score >= threshold:
-        return True, best_title
-    return False, ""
+        prior_clean = prior.strip()
+        prior_tokens = _normalize_title(prior_clean)
+        score = _title_overlap(candidate_tokens, prior_tokens)
+        exact = candidate.lower() == prior_clean.lower() or (
+            bool(candidate_tokens) and candidate_tokens == prior_tokens
+        )
+        if exact:
+            return DuplicateMatch(kind=EXACT, title=prior_clean, score=1.0)
+        if score >= threshold and score > best.score:
+            best = DuplicateMatch(kind=NEAR, title=prior_clean, score=score)
+    return best
+
+
+def is_duplicate(
+    spec: TicketSpec, memory: MemoryPack, *, threshold: float = DUPLICATE_JACCARD_THRESHOLD
+) -> tuple[bool, str]:
+    """Would filing `spec` overlap something in `memory`?
+
+    The boolean view of :func:`classify_duplicate`, kept for callers that only
+    need "have we seen this before" and not what to do about it. Returns
+    ``(is_duplicate, matched_prior_title)``.
+    """
+    match = classify_duplicate(spec, memory, threshold=threshold)
+    return bool(match), match.title
+
+
+def _cites(text: str, title: str) -> bool:
+    """Does `text` name the work `title` refers to?
+
+    Coverage, not Jaccard: `text` is a paragraph and `title` a few words, so
+    symmetric overlap would score near zero however faithfully the paragraph
+    quotes the title. What matters is that the title's distinctive tokens are
+    all (or nearly all) present - whether written out or carried inside a
+    ``[[2026-01-02-some-lesson]]`` wikilink, which tokenizes the same way.
+    """
+    wanted = _normalize_title(title)
+    if not wanted:
+        return False
+    present = frozenset(w for w in _WORD_RE.findall(text.lower()) if len(w) > 2)
+    return len(wanted & present) / len(wanted) >= REPROPOSAL_CITATION_COVERAGE
+
+
+def reproposal_justification(
+    spec: TicketSpec, memory: MemoryPack, *, threshold: float = DUPLICATE_JACCARD_THRESHOLD
+) -> str:
+    """The failed prior work `spec` legitimately re-proposes, or ``""``.
+
+    A previously-failed idea is the one kind of duplicate worth filing again -
+    but only on evidence. Both halves are required, and both live in
+    ``prior_art`` so a reviewer finds them in one place:
+
+    1. the ticket cites the failing lesson it is retrying, and
+    2. it states *what changed* since that failure.
+
+    Without (1) the planner is guessing; without (2) it is repeating.
+    """
+    if not tickets.WHAT_CHANGED.search(spec.prior_art):
+        return ""
+    candidate_tokens = _normalize_title(spec.title)
+    for failed in memory.failed_titles():
+        overlap = _title_overlap(candidate_tokens, _normalize_title(failed))
+        if overlap >= threshold and _cites(spec.prior_art, failed):
+            return failed
+    return ""
 
 
 def build_prompt(cfg: CoreConfig, pack: ContextPack, memory: MemoryPack | None = None) -> str:
+    """Render the planner's instruction, hard-capped at ``max_prompt_chars``.
+
+    When the cap binds, the *study digest* is what gives: it is the bulkiest
+    section and the only one whose value degrades gracefully with length, while
+    the memory and prior-art sections are already individually capped and are
+    precisely what stops the planner re-proposing dead work.
+    """
+    cap = int(cfg.synthesis.get("max_prompt_chars", DEFAULT_MAX_PROMPT_CHARS))
+    digest = pack.render()
+    prompt = _render_prompt(cfg, pack, memory, digest)
+    if cap > 0 and len(prompt) > cap:
+        digest = _clip_digest(digest, len(digest) - (len(prompt) - cap))
+        prompt = _render_prompt(cfg, pack, memory, digest)
+    return prompt
+
+
+def _clip_digest(digest: str, limit: int) -> str:
+    """Clip to exactly ``limit`` characters, marker included, never longer."""
+    if len(digest) <= limit:
+        return digest
+    if limit <= len(_DIGEST_TRUNCATED):
+        return _DIGEST_TRUNCATED[: max(0, limit)]
+    return digest[: limit - len(_DIGEST_TRUNCATED)] + _DIGEST_TRUNCATED
+
+
+def _render_prompt(
+    cfg: CoreConfig, pack: ContextPack, memory: MemoryPack | None, digest: str
+) -> str:
     goals = "\n".join(f"- {g.get('id')}: {g.get('title')} - {g.get('description', '')}"
                       for g in cfg.goals)
     ideas = int(cfg.synthesis.get("ideas_target", 10))
@@ -274,6 +435,7 @@ def build_prompt(cfg: CoreConfig, pack: ContextPack, memory: MemoryPack | None =
     memory = memory or MemoryPack()
     max_chars = int(cfg.synthesis.get("memory_max_chars", DEFAULT_MEMORY_MAX_CHARS))
     memory_section = memory.render(max_chars=max_chars)
+    prior_art_section = pack.render_prior_art()
     return f"""You are the SYNTHESIS planner for ai-hyperswarm-proto-core, an
 autonomous self-improving AI-swarm harness. Your job is NOT to copy one idea
 from one project, but to COMBINE practices across projects into substantial,
@@ -289,8 +451,10 @@ that substantially overlaps anything listed below must be DROPPED in PHASE 2
 title of a ticket that is still open or already closed; build on them instead:
 {memory_section}
 
+{prior_art_section}
+
 Study digest of reference projects for this cycle:
-{pack.render()}
+{digest}
 
 Work in three explicit phases and show them all in your output:
 
@@ -310,7 +474,16 @@ block: a JSON array where each element has exactly these keys:
   "verification_plan" (array of 2-4 concrete check strings),
   "size" ("M" or "L" - substantial work, never "S"),
   "goal_ids" (array like ["G1","G4"]),
-  "synthesis_rationale" (string naming the >= {combine} projects combined and how).
+  "synthesis_rationale" (string naming the >= {combine} projects combined and how),
+  "prior_art" (string citing >= 1 artifact from the prior-art section above,
+    by its ref VERBATIM - a [[note-name]], a #ticket number, or a ledger figure
+    such as "ledger block 41339: 1425s per merged PR" - and saying in one
+    sentence what that evidence implies for this ticket).
+
+A ticket with no "prior_art" citation is REFUSED before it is filed, as is one
+whose title duplicates prior work. If you deliberately retry an idea recorded as
+a FAILURE, cite that failing lesson in "prior_art" and add an explicit
+"what changed: ..." clause - that is the only accepted form of a re-proposal.
 
 The JSON block must be the LAST fenced block in your reply."""
 
@@ -337,6 +510,10 @@ def parse_ticket_specs(output: str) -> list[TicketSpec]:
                     size=str(item.get("size", "M")),
                     goal_ids=tuple(str(g) for g in item.get("goal_ids", [])),
                     synthesis_rationale=str(item.get("synthesis_rationale", "")),
+                    # Absent rather than required at parse time: a missing
+                    # citation is a *screening* refusal with a logged reason,
+                    # not a silently unparseable candidate.
+                    prior_art=str(item.get("prior_art", "")),
                     labels=("self-improve", "hsai", "priority:P2"),
                 )
             )
@@ -351,29 +528,149 @@ class SynthesisResult:
     studied: list[str]
     filed: list[int]
     error: str = ""
-    rejected: int = 0                              # duplicate specs dropped before filing
+    rejected: int = 0                              # specs refused before filing
     rejected_titles: list[str] = field(default_factory=list)  # matched prior title, one per drop
+    refusals: list[str] = field(default_factory=list)         # "<title>: <reason>", one per drop
+    demoted_titles: list[str] = field(default_factory=list)   # near-duplicates ranked last
+    prior_art_cited: int = 0                       # filed tickets citing internal evidence
 
 
-def _filter_duplicates(
-    specs: list[TicketSpec], memory: MemoryPack, *, threshold: float
-) -> tuple[list[TicketSpec], list[str]]:
-    """Drop specs that duplicate something in `memory`.
+@dataclass(frozen=True)
+class Screened:
+    """The outcome of grading one batch of candidates against our own record."""
 
-    Never back-fills: an honest thin block (fewer than `file_top` tickets
-    filed) beats padding the backlog with a duplicate, and the caller surfaces
-    why in `SynthesisResult` / `BlockReport.notes`.
+    accepted: list[TicketSpec] = field(default_factory=list)   # ranked, capped
+    refusals: list[tuple[str, str, str]] = field(default_factory=list)  # title, reason, matched
+    demoted: list[str] = field(default_factory=list)           # titles ranked below new ideas
+
+    @property
+    def refused_titles(self) -> list[str]:
+        """The prior title each refusal matched (empty for schema refusals)."""
+        return [matched for _, _, matched in self.refusals]
+
+    @property
+    def refusal_lines(self) -> list[str]:
+        return [f"{title}: {reason}" for title, reason, _ in self.refusals]
+
+
+def screen_candidates(
+    specs: list[TicketSpec],
+    memory: MemoryPack,
+    *,
+    threshold: float = DUPLICATE_JACCARD_THRESHOLD,
+    file_top: int = 0,
+) -> Screened:
+    """Grade the model's candidates against our own record before anything is filed.
+
+    Three verdicts, in the order they are checked:
+
+    * **refused - malformed.** :func:`hsai.tickets.check_spec` rejects a spec
+      that cites no internal artifact. Novelty we cannot trace is not evidence.
+    * **refused - exact duplicate.** The idea is already open, closed, or
+      recorded as a lesson. The one exception is a previously *failed* idea
+      that is not currently open and whose ticket cites that failure and says
+      what changed (:func:`reproposal_justification`) - the loop is allowed to
+      retry a failure it has understood.
+    * **demoted - near duplicate.** A reworded variant of prior work is kept
+      but ranked below every genuinely new idea, so it is filed only when the
+      block has nothing better to offer.
+
+    Refusals are never back-filled: an honest thin block beats padding the
+    backlog. ``file_top`` (0 = unlimited) caps what is left, which is what makes
+    demotion bite.
     """
-    survivors: list[TicketSpec] = []
-    rejected_titles: list[str] = []
+    accepted: list[tuple[int, TicketSpec]] = []   # (rank, spec); rank 0 = novel, 1 = demoted
+    refusals: list[tuple[str, str, str]] = []
+    demoted: list[str] = []
+    open_titles = {t.strip().lower() for t in memory.open_titles()}
+
     for spec in specs:
-        dup, matched = is_duplicate(spec, memory, threshold=threshold)
-        if dup:
-            _logger.info("synthesis: dropping duplicate %r (matches %r)", spec.title, matched)
-            rejected_titles.append(matched)
-        else:
-            survivors.append(spec)
-    return survivors, rejected_titles
+        schema = tickets.check_spec(spec)
+        if not schema.ok:
+            reason = "; ".join(schema.reasons)
+            _logger.info("synthesis: refusing malformed %r (%s)", spec.title, reason)
+            refusals.append((spec.title, reason, ""))
+            continue
+
+        match = classify_duplicate(spec, memory, threshold=threshold)
+        if match.kind == EXACT:
+            retried = (
+                ""
+                if match.title.strip().lower() in open_titles
+                else reproposal_justification(spec, memory, threshold=threshold)
+            )
+            if not retried:
+                reason = f"exact duplicate of prior work: {match.title!r}"
+                _logger.info("synthesis: refusing %r (%s)", spec.title, reason)
+                refusals.append((spec.title, reason, match.title))
+                continue
+            _logger.info(
+                "synthesis: accepting re-proposal %r - cites failed %r and states what changed",
+                spec.title, retried,
+            )
+            accepted.append((0, spec))
+            continue
+
+        if match.kind == NEAR:
+            _logger.info(
+                "synthesis: demoting %r (%.2f overlap with %r)",
+                spec.title, match.score, match.title,
+            )
+            demoted.append(spec.title)
+            accepted.append((1, spec))
+            continue
+
+        accepted.append((0, spec))
+
+    # `sorted` is stable, so within a rank the planner's own prioritization holds.
+    ranked = [spec for _, spec in sorted(accepted, key=lambda pair: pair[0])]
+    if file_top > 0:
+        ranked = ranked[:file_top]
+    return Screened(accepted=ranked, refusals=refusals, demoted=demoted)
+
+
+def prior_art_query(cfg: CoreConfig, repos: list[str]) -> str:
+    """What to retrieve our own record against, for one cycle.
+
+    The planner's job this cycle *is* the goals plus the projects it is about
+    to study, so that text is the query. Deterministic and model-free: the same
+    cycle index always retrieves the same artifacts.
+    """
+    goals = " ".join(
+        f"{g.get('title', '')} {g.get('description', '')}" for g in cfg.goals
+    )
+    return f"{goals}\n{' '.join(repos)}"
+
+
+def gather_context(
+    cfg: CoreConfig, *, cycle_index: int = 0, root: str = ".", runner: Runner = run
+) -> tuple[ContextPack, MemoryPack]:
+    """Everything the planner is shown: reference digests, prior art, memory."""
+    repos = pick_rotation(cfg, cycle_index)
+    prior = recall.build_prior_art(
+        prior_art_query(cfg, repos),
+        int(cfg.synthesis.get("prior_art_max_chars", recall.DEFAULT_PRIOR_ART_CHARS)),
+        root=root,
+        cfg=cfg,
+        k=int(cfg.synthesis.get("prior_art_k", recall.DEFAULT_PRIOR_ART_K)),
+        runner=runner,
+    )
+    pack = build_context_pack(repos, runner=runner, prior_art=prior)
+    memory = MemoryPack.gather(cfg, root=root, runner=runner)
+    return pack, memory
+
+
+def preview(
+    cfg: CoreConfig, *, cycle_index: int = 0, root: str = ".", runner: Runner = run
+) -> str:
+    """Render exactly the prompt `synthesize` would send - and send nothing.
+
+    Backs ``hsai synthesize --dry-run``: it reads the vault, the ledger and the
+    backlog, but spends no quota and files no ticket, so the retrieved prior art
+    and the prompt budget can be inspected before a heavy run.
+    """
+    pack, memory = gather_context(cfg, cycle_index=cycle_index, root=root, runner=runner)
+    return build_prompt(cfg, pack, memory)
 
 
 def synthesize(
@@ -384,10 +681,9 @@ def synthesize(
     runner: Runner = run,
     ai_runner: Runner = run,
 ) -> SynthesisResult:
-    """Run one synthesis pass, drop duplicates of prior work, and file the rest."""
-    repos = pick_rotation(cfg, cycle_index)
-    pack = build_context_pack(repos, runner=runner)
-    memory = MemoryPack.gather(cfg, root=root, runner=runner)
+    """Run one synthesis pass, screen the candidates, and file the survivors."""
+    pack, memory = gather_context(cfg, cycle_index=cycle_index, root=root, runner=runner)
+    repos = pack.repos
     tier = cfg.synthesis.get("tier", "heavy")
     model = cfg.tiers[tier].model if tier in cfg.tiers else cfg.tiers[cfg.default_tier].model
     choice = ModelChoice(
@@ -404,24 +700,32 @@ def synthesize(
         return SynthesisResult(ok=False, studied=repos, filed=[], error=ares.error[:500])
 
     specs = parse_ticket_specs(ares.output)
-    threshold = float(cfg.synthesis.get("duplicate_threshold", DUPLICATE_JACCARD_THRESHOLD))
-    survivors, rejected_titles = _filter_duplicates(specs, memory, threshold=threshold)
+    screened = screen_candidates(
+        specs, memory,
+        threshold=float(cfg.synthesis.get("duplicate_threshold", DUPLICATE_JACCARD_THRESHOLD)),
+        file_top=int(cfg.synthesis.get("file_top", 0)),
+    )
 
     filed: list[int] = []
-    for spec in survivors:
+    cited = 0
+    for spec in screened.accepted:
         num = github.create_issue(
             cfg.repo_slug, spec.title, spec.render(), spec.all_labels(), runner=runner
         )
         if num:
             filed.append(num)
+            if tickets.prior_art_citations(spec.prior_art):
+                cited += 1
 
     if not specs:
         error = "no parseable ticket specs in output"
-    elif not survivors:
-        error = f"all {len(specs)} candidate(s) rejected as duplicates of prior work"
+    elif not screened.accepted:
+        error = f"all {len(specs)} candidate(s) refused: {'; '.join(screened.refusal_lines)}"
     else:
         error = ""
     return SynthesisResult(
         ok=bool(filed), studied=repos, filed=filed, error=error,
-        rejected=len(rejected_titles), rejected_titles=rejected_titles,
+        rejected=len(screened.refusals), rejected_titles=screened.refused_titles,
+        refusals=screened.refusal_lines, demoted_titles=screened.demoted,
+        prior_art_cited=cited,
     )
