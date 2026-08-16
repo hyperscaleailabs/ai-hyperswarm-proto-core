@@ -267,3 +267,22 @@ def test_replay_unknown_id_exits_nonzero(tmp_path, monkeypatch, capsys):
     rc = main(["replay", "999", "--root", str(tmp_path)])
     assert rc == 1
     assert "no trajectory" in capsys.readouterr().err
+
+
+def test_parser_bench_defaults():
+    args = build_parser().parse_args(["bench"])
+    assert args.command == "bench"
+    assert args.corpus == "tests/fixtures/trajectories"
+    assert args.baseline == "bench/baseline.json"
+    assert args.check is False
+    assert args.write_baseline is False
+    assert args.json is False
+
+
+def test_bench_command_is_green_and_spends_no_quota(monkeypatch, capsys):
+    """The committed corpus and baseline agree, without any subprocess at all."""
+    _no_subprocess(monkeypatch)
+    assert main(["bench", "--check"]) == 0
+    out = capsys.readouterr().out
+    assert "scenarios pass (100%)" in out
+    assert "tier agreement:    100%" in out

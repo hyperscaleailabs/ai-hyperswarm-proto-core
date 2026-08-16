@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "id": "agent-timeout",
+  "title": "An agent killed by the timeout leaves a red branch; remote CI decides and the ticket returns to the backlog",
+  "given": {
+    "ci_green": true,
+    "open_tickets": 2,
+    "ticket": {
+      "number": 308,
+      "title": "feat: stream partial worker output into the trajectory store",
+      "body": "Long runs are opaque until they finish.\n\n## Acceptance criteria\n- [ ] partial steps are persisted before the run ends",
+      "labels": ["priority:P2", "hsai"]
+    },
+    "attempts": 1,
+    "changed_paths": ["src/hsai/trajectory.py"],
+    "agent": {"ok": false, "timed_out": true, "seconds": 1800.0},
+    "local_ci_after_green": false,
+    "remote_ci": "FAILURE",
+    "overhead_seconds": 132.0,
+    "block_spend": {"iterations": 2, "heavy_iterations": 0, "merged_iterations": 1, "total_seconds": 700.0}
+  },
+  "expect": {
+    "kind": "implement",
+    "tier": "standard",
+    "outcome": "recovered",
+    "recovery": "retry",
+    "guard": "remote_ci"
+  }
+}

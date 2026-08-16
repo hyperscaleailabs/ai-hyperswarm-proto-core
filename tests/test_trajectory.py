@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -356,3 +357,223 @@ def test_render_shows_prompt_steps_and_usage():
 
 def test_render_reports_missing_usage():
     assert "usage: (not reported)" in _traj(usage=None).render()
+
+
+# --- iteration trajectories -------------------------------------------------
+#
+# The per-ITERATION record (what the loop decided), as opposed to the per-RUN
+# record above (what one agent did). This is the granularity `hsai bench`
+# replays, so it is versioned and read back strictly.
+
+def _iter_traj(**kw) -> trajectory.IterationTrajectory:
+    base = dict(
+        iteration=41, block=3, ticket=264, kind="implement",
+        tier="standard", model="sonnet", outcome="merged",
+    )
+    base.update(kw)
+    return trajectory.IterationTrajectory(**base)
+
+
+def test_iteration_trajectories_live_outside_the_obsidian_vault(tmp_path):
+    """A raw trajectory must never land in `knowledge/` - the vault is curated."""
+    path = trajectory.write_iteration(_iter_traj(), tmp_path)
+    relative = path.relative_to(tmp_path)
+    assert relative.parts[0] == ".hsai"
+    assert "knowledge" not in relative.parts
+    assert relative == Path(trajectory.ITERATION_DIR) / "41.json"
+
+
+def test_iteration_trajectory_round_trips(tmp_path):
+    original = trajectory.record_iteration(
+        tmp_path,
+        iteration=7, block=2, ticket=99, kind="heal", tier="heavy", model="opus",
+        rationale="score=6 -> heavy", strategy="heuristic-v1",
+        phases=[trajectory.Phase("agent", 12.5), trajectory.Phase("ci_after", 3.0)],
+        wall_clock_seconds=402.25,
+        prompt="Diagnose and fix the red build.",
+        changed_paths=["src/hsai/ci.py", "tests/test_ci.py", "knowledge/lessons/x.md"],
+        ci_local_before=trajectory.RED, ci_local=trajectory.GREEN, ci_remote="SUCCESS",
+        review="approve", agent_ok=True, agent_trajectory="7",
+        attempts=2, merged=True, pr=88, notes=["repro guard: reproduced"],
+    )
+    restored = trajectory.load_iteration(tmp_path, "7")
+
+    assert restored == original
+    assert restored.schema_version == trajectory.ITERATION_SCHEMA_VERSION
+    assert restored.wall_clock_seconds == 402.25
+    assert [p.name for p in restored.phases] == ["agent", "ci_after"]
+    assert (restored.diff.files, restored.diff.code_files, restored.diff.knowledge_files) == (
+        3, 2, 1
+    )
+    assert restored.ledger_ref == "block=2,iteration=7"
+    assert restored.prompt_digest == trajectory.prompt_digest(
+        "Diagnose and fix the red build."
+    )
+
+
+def test_reading_an_unsupported_schema_version_is_an_error_not_a_misread(tmp_path):
+    path = trajectory.write_iteration(_iter_traj(), tmp_path)
+    data = json.loads(path.read_text())
+    data["schema_version"] = trajectory.ITERATION_SCHEMA_VERSION + 1
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="schema_version"):
+        trajectory.read_iteration(path)
+
+
+def test_an_unknown_field_from_a_newer_writer_is_dropped_not_fatal(tmp_path):
+    """The versioning rule's other half: additive fields stay backwards compatible."""
+    path = trajectory.write_iteration(_iter_traj(), tmp_path)
+    data = json.loads(path.read_text())
+    data["a_field_added_later"] = {"anything": [1, 2, 3]}
+    path.write_text(json.dumps(data))
+    assert trajectory.read_iteration(path).iteration == 41
+
+
+def test_loading_an_absent_iteration_trajectory_raises(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        trajectory.load_iteration(tmp_path, "404")
+
+
+def test_iteration_summary_is_one_readable_line():
+    traj = _iter_traj(
+        phases=[trajectory.Phase("agent", 214.0)], wall_clock_seconds=310.0,
+        ci_local=trajectory.GREEN, ci_remote="SUCCESS", attempts=1,
+    )
+    line = traj.summary()
+    assert "iteration 41" in line and "[implement]" in line and "#264" in line
+    assert "outcome=merged" in line and "agent=214s" in line
+
+
+# --- iteration trajectory: redaction ----------------------------------------
+
+def test_secret_env_values_picks_forbidden_and_credential_shaped_names():
+    env = {
+        "ANTHROPIC_API_KEY": "sk-live-abcdef",
+        "GITHUB_TOKEN": "tok-abcdefgh",
+        "MY_PASSWORD": "hunter2hunter2",
+        "PATH": "/usr/local/bin",
+        "DEBUG": "1",
+        "SHORT_TOKEN": "abc",
+    }
+    values = trajectory.secret_env_values(["ANTHROPIC_API_KEY"], env)
+    assert {"sk-live-abcdef", "tok-abcdefgh", "hunter2hunter2"} <= set(values)
+    assert "/usr/local/bin" not in values     # not credential-shaped
+    assert "1" not in values and "abc" not in values   # too short to be a secret
+    # Longest first, so a value that contains a shorter one is blanked first.
+    assert list(values) == sorted(values, key=len, reverse=True)
+
+
+def test_redact_blanks_extra_literals():
+    scrubbed = trajectory.redact("the operator pasted swordfish-1234 here", ["swordfish-1234"])
+    assert "swordfish-1234" not in scrubbed
+    assert trajectory.REDACTED in scrubbed
+
+
+def test_serialized_record_carries_no_forbidden_env_value(monkeypatch):
+    """The acceptance invariant: nothing from `forbid_env` reaches the record.
+
+    The value here looks like ordinary prose, so the credential *patterns*
+    cannot catch it - only knowing the live value can.
+    """
+    secret = "correct-horse-battery-staple-42"
+    session = "sess-not-a-key-9f3c2b18"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", secret)
+    monkeypatch.setenv("HSAI_SESSION_TOKEN", session)
+
+    traj = _iter_traj(
+        prompt_excerpt=f"Ticket body quoted {secret} verbatim.",
+        notes=[f"child env carried {session}"],
+        redacted_env=["ANTHROPIC_API_KEY"],
+    )
+    raw = traj.to_json()
+
+    assert secret not in raw
+    assert session not in raw               # credential-shaped NAME, also scrubbed
+    assert trajectory.REDACTED in raw
+    assert "ANTHROPIC_API_KEY" in json.loads(raw)["redacted_env"]   # the name is safe
+
+
+def test_serialized_record_still_scrubs_credential_patterns(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    traj = _iter_traj(prompt_excerpt="export KEY=sk-ant-abcdef0123456789")
+    assert "sk-ant-abcdef0123456789" not in traj.to_json()
+
+
+# --- iteration trajectory: size caps ----------------------------------------
+
+def test_record_iteration_clips_an_oversized_prompt(tmp_path):
+    traj = trajectory.record_iteration(
+        tmp_path, iteration=1, kind="implement", tier="standard", model="sonnet",
+        outcome="merged", prompt="x" * (trajectory.PROMPT_EXCERPT_CHARS * 3),
+    )
+    assert len(traj.prompt_excerpt) < trajectory.PROMPT_EXCERPT_CHARS + 60
+    assert traj.prompt_excerpt.endswith("chars]")
+
+
+def test_record_iteration_caps_diff_paths_and_notes(tmp_path):
+    traj = trajectory.record_iteration(
+        tmp_path, iteration=1, kind="implement", tier="standard", model="sonnet",
+        outcome="merged",
+        changed_paths=[f"src/f{i:04d}.py" for i in range(trajectory.MAX_DIFF_PATHS * 2)],
+        notes=[f"note {i}" for i in range(trajectory.MAX_NOTES * 3)],
+    )
+    # The counts stay honest even though the listing is truncated.
+    assert traj.diff.files == trajectory.MAX_DIFF_PATHS * 2
+    assert len(traj.diff.paths) == trajectory.MAX_DIFF_PATHS
+    assert len(traj.notes) == trajectory.MAX_NOTES
+
+
+def test_to_json_drops_an_oversized_prompt_excerpt_rather_than_writing_it():
+    traj = _iter_traj(prompt_excerpt="x" * (trajectory.MAX_RECORD_CHARS + 1000))
+    text = traj.to_json()
+    assert len(text) < trajectory.MAX_RECORD_CHARS
+    assert "dropped" in json.loads(text)["prompt_excerpt"]
+
+
+def test_prune_iterations_keeps_only_the_newest(tmp_path):
+    for i in (1, 2, 3, 10, 11):
+        trajectory.write_iteration(_iter_traj(iteration=i), tmp_path)
+
+    dropped = trajectory.prune_iterations(tmp_path, keep=2)
+
+    assert dropped == ["1", "2", "3"]
+    remaining = sorted(p.stem for p in trajectory.iteration_dir(tmp_path).glob("*.json"))
+    assert remaining == ["10", "11"]
+
+
+def test_prune_iterations_is_disabled_by_a_non_positive_keep(tmp_path):
+    trajectory.write_iteration(_iter_traj(iteration=1), tmp_path)
+    assert trajectory.prune_iterations(tmp_path, keep=0) == []
+    assert trajectory.prune_iterations(tmp_path, keep=-1) == []
+    assert trajectory.prune_iterations(tmp_path / "absent", keep=5) == []
+
+
+# --- phase timeline ---------------------------------------------------------
+
+def test_phase_timeline_records_each_phase_in_order():
+    ticks = iter([0.0, 1.5, 4.0, 4.25])
+    timeline = trajectory.PhaseTimeline(clock=lambda: next(ticks))
+
+    timeline.mark("setup")
+    timeline.mark("agent")
+
+    assert [(p.name, p.seconds) for p in timeline.phases()] == [
+        ("setup", 1.5), ("agent", 2.5)
+    ]
+    assert timeline.elapsed == 4.25
+
+
+def test_phase_timeline_is_bounded():
+    counter = iter(range(trajectory.MAX_PHASES * 4))
+    timeline = trajectory.PhaseTimeline(clock=lambda: float(next(counter)))
+    for i in range(trajectory.MAX_PHASES * 2):
+        timeline.mark(f"phase-{i}")
+    assert len(timeline.phases()) == trajectory.MAX_PHASES
+
+
+def test_diff_stat_splits_code_from_knowledge():
+    stat = trajectory.DiffStat.from_paths(
+        ["src/hsai/bench.py", "tests/test_bench.py", "knowledge/lessons/a.md", ""]
+    )
+    assert (stat.files, stat.code_files, stat.knowledge_files) == (3, 2, 1)
+    assert stat.paths == sorted(stat.paths)

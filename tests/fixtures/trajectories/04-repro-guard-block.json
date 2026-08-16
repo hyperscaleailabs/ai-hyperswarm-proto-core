@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "id": "repro-guard-block",
+  "title": "A heal whose test also passes on the pre-fix tree never reproduced the bug",
+  "given": {
+    "ci_green": false,
+    "open_tickets": 1,
+    "ticket": {
+      "number": 304,
+      "title": "ci: main is red - auto-heal",
+      "body": "CI failing on main.\n\n```\nruff=pass, pytest=fail\n```",
+      "labels": ["priority:P0", "ci", "hsai"]
+    },
+    "attempts": 1,
+    "changed_paths": ["src/hsai/journal.py", "tests/test_journal.py"],
+    "agent": {"ok": true, "timed_out": false, "seconds": 265.0},
+    "repro": {"fix_pytest_ok": true, "parent_pytest_ok": true},
+    "local_ci_after_green": true,
+    "review_output": "{\"approve\": true, \"blocking\": [], \"advisory\": [], \"rationale\": \"Looks reasonable.\"}",
+    "remote_ci": "SUCCESS",
+    "overhead_seconds": 110.0,
+    "block_spend": {"iterations": 1, "heavy_iterations": 0, "merged_iterations": 0, "total_seconds": 400.0}
+  },
+  "expect": {
+    "kind": "heal",
+    "tier": "standard",
+    "outcome": "no_repro",
+    "recovery": "retry",
+    "guard": "repro"
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "id": "merge-conflict",
+  "title": "Local green but remote red (a conflicting parallel merge) closes the PR and returns the ticket",
+  "given": {
+    "ci_green": true,
+    "open_tickets": 3,
+    "ticket": {
+      "number": 309,
+      "title": "feat: record tokens per merged PR in the block aggregate",
+      "body": "The aggregate has totals but no efficiency ratio.\n\n## Acceptance criteria\n- [ ] the ratio is reported and tested",
+      "labels": ["priority:P3", "hsai"]
+    },
+    "attempts": 1,
+    "changed_paths": ["src/hsai/ledger.py", "tests/test_ledger.py"],
+    "agent": {"ok": true, "timed_out": false, "seconds": 178.0},
+    "local_ci_after_green": true,
+    "review_output": "{\"approve\": true, \"blocking\": [], \"advisory\": [], \"rationale\": \"Small and covered.\"}",
+    "remote_ci": "FAILURE",
+    "overhead_seconds": 205.0,
+    "block_spend": {"iterations": 4, "heavy_iterations": 1, "merged_iterations": 3, "total_seconds": 1500.0}
+  },
+  "expect": {
+    "kind": "implement",
+    "tier": "standard",
+    "outcome": "recovered",
+    "recovery": "retry",
+    "guard": "remote_ci"
+  }
+}

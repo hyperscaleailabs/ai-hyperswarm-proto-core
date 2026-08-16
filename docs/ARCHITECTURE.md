@@ -14,7 +14,8 @@ so the decision logic stays pure and unit-tested.
 | `hsai.gitops` | worktrees, sync, branch, commit, push | git |
 | `hsai.github` | tickets, labels, PRs, merge | gh |
 | `hsai.ci` | local CI gate (ruff+pytest) + remote status | subprocess |
-| `hsai.trajectory` | one durable record per agent run; redaction, replay | write files |
+| `hsai.trajectory` | one durable record per agent run *and* per iteration; redaction, replay | write files |
+| `hsai.bench` | offline replay of a scenario corpus through the decision code | none (fake runner) |
 | `hsai.journal` | append-only per-block step journal; `once()` replay | write files |
 | `hsai.knowledge` | lessons, whitepapers, MOC reindex (Obsidian) | write files |
 | `hsai.recall` | BM25 index over the vault; retrieve prior notes | read files |
@@ -156,6 +157,85 @@ directly), so the quota ledger's token columns - and the block aggregate in the
 review brief, including **tokens per merged PR** - report real numbers instead
 of nulls. Output that is not JSON (an older `claude` binary) degrades to a
 single-step trajectory with null usage rather than breaking the loop.
+
+## Measurability: iteration trajectories and the offline bench
+
+A `Trajectory` records one **agent run**. An `IterationTrajectory` records one
+**iteration of the loop**: the decisions the orchestrator made around that run.
+They are separate records at separate granularities, versioned independently,
+because only the second is a replayable unit of orchestration.
+
+### The iteration trajectory schema
+
+One JSON file per iteration at `.hsai/trajectories/<iteration>.json`.
+
+| field | meaning |
+| --- | --- |
+| `schema_version` | the record's contract version (see the rule below) |
+| `iteration`, `block`, `ticket` | what ran, in which governance block, for which ticket |
+| `kind` | `heal` / `implement` / `improve` |
+| `tier`, `model`, `rationale`, `strategy` | the recorded model choice and why |
+| `phases[]` | `{name, seconds}` per phase, in order: setup, ci_before, claim, agent, guards, ci_after, review, lesson, pr, remote_ci, merge |
+| `wall_clock_seconds` | the whole iteration, end to end |
+| `prompt_digest`, `prompt_excerpt` | a content hash plus a clipped, redacted head of the worker prompt |
+| `diff` | `{files, code_files, knowledge_files, paths}` - counted, not quoted |
+| `ci_local_before`, `ci_local` | `green` / `red` / `not-run` |
+| `ci_remote` | the source-of-truth remote conclusion |
+| `review` | `approve` / `blocked` / `skipped` |
+| `agent_ok`, `agent_trajectory` | how the run ended, and the `hsai traj <id>` cross-reference |
+| `outcome`, `attempts`, `recovered`, `pr`, `merged` | the terminal disposition |
+| `ledger_ref` | the matching `ledger` line (`block=N,iteration=M`) |
+| `redacted_env` | the variable **names** whose values were scrubbed |
+| `notes` | the iteration's own notes, clipped |
+
+**Versioning rule.** Adding an *optional* field keeps the version: readers drop
+unknown keys, so an older reader tolerates a newer writer. Removing a field, or
+changing what one means, bumps `ITERATION_SCHEMA_VERSION` - and a version a
+reader was not written for is an error, never a silent misread.
+
+**Written at one seam.** `orchestrator.run_once` emits the record from
+`_record_cost`, the same closure that appends the ledger line. Every terminal
+path - merged, recovered, `incomplete`, `no_repro`, `review_blocked`, a timed-out
+worker, dry-run - goes through it, so cost data and quality data can never
+disagree about an iteration. An *idle* iteration (an improvement already in
+flight) runs no model and writes neither artifact; that is the same rule, not an
+exception to it.
+
+**Why not under `knowledge/`.** The Obsidian vault is curated, committed,
+human-facing content, and every note in it is indexed by `hsai recall`. A
+trajectory is the opposite: raw machine telemetry that quotes repo content and
+would drown the vault's signal and skew retrieval. Trajectories live under the
+gitignored `.hsai/` instead - redacted on the way to disk (credential patterns,
+the live values behind `constraints.forbid_env`, and absolute home paths), size
+capped, and pruned by `hsai cycle` to `execution.trajectory_retention_blocks`
+blocks' worth. What *is* committed is the digest line on the PR and the redacted
+tail in the lesson.
+
+### The bench contract
+
+`hsai bench` replays a corpus of hand-authored scenarios
+(`tests/fixtures/trajectories/`) through the **real** decision code -
+`decide_path`, `models.select`, `_requires_code`, `repro.requires_repro_guard` /
+`repro.check_repro`, `review.parse_verdict`, `ledger.evaluate_budget` - in the
+same order `run_once` runs them, driven by a fake `Runner`.
+
+- **No model, ever.** The fake runner raises on a `claude` command, so the
+  offline property is enforced rather than assumed. No network, no quota.
+- **Deterministic.** Same corpus plus same code gives the same numbers; there is
+  no clock or randomness in the replay path.
+- **What it measures.** Pass rate, tier-choice agreement against each scenario's
+  expected tier, recovery correctness (retry vs blocked vs none), and mean
+  seconds per ticket.
+- **How it gates.** `bench/baseline.json` is committed; `hsai bench --check`
+  fails when a quality metric drops below it, when the corpus shrinks (fewer
+  scenarios is coverage loss), or when mean seconds exceeds the baseline by more
+  than `bench.SECONDS_TOLERANCE`. The `bench` job in `.github/workflows/ci.yml`
+  runs it on every PR, alongside but separate from `ci`.
+
+Adding a scenario, or changing the decision code on purpose, means re-reading
+the replay and regenerating the baseline with `hsai bench --write-baseline` -
+which refuses to run while any scenario is red, so a baseline can only be
+written from a bench that was made green deliberately.
 
 ## Durability: the cycle journal
 

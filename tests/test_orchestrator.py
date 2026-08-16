@@ -1358,3 +1358,228 @@ def test_dry_run_still_records_what_it_recalled(tmp_path):
     assert result.kind == IMPROVE
     assert result.recalled                       # retrieval runs without an agent
     assert "recalled:" in Path(result.lesson_path).read_text().split("---\n")[1]
+
+
+# --- iteration trajectories -------------------------------------------------
+#
+# One iteration trajectory per iteration on EVERY terminal path, written from
+# the same `_record_cost` seam as the ledger record so cost data and quality
+# data can never disagree about what an iteration did.
+
+def _iteration_trajectories(root) -> list[trajectory.IterationTrajectory]:
+    files = sorted(trajectory.iteration_dir(root).glob("*.json"), key=lambda p: int(p.stem))
+    return [trajectory.read_iteration(p) for p in files]
+
+
+def _widget_issue(number: int = 7, title: str = "add widget") -> dict:
+    return {
+        "number": number,
+        "title": title,
+        "labels": [{"name": "priority:P2"}],
+        "assignees": [],
+        "body": WELL_FORMED_BODY,
+    }
+
+
+class FailingAgentRunner(FakeRunner):
+    """A worker whose `claude -p` is killed (exit 124), exactly as a timeout does.
+
+    The independent reviewer still answers normally, so this isolates the
+    worker-timeout path instead of breaking every model call at once.
+    """
+
+    def _dispatch(self, cmd, cwd=None):
+        is_worker = cmd[:1] == ["claude"] and review.PROMPT_MARKER not in (
+            cmd[2] if len(cmd) > 2 else ""
+        )
+        if is_worker:
+            return Proc(cmd, 124, "", "timeout after 1800.0s")
+        return super()._dispatch(cmd, cwd)
+
+
+def test_run_once_writes_exactly_one_trajectory_on_the_merged_path(tmp_path):
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[_widget_issue()],
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1, block=4,
+    )
+
+    trajectories = _iteration_trajectories(tmp_path)
+    assert len(trajectories) == 1
+    traj = trajectories[0]
+    assert traj.schema_version == trajectory.ITERATION_SCHEMA_VERSION
+    assert (traj.iteration, traj.block, traj.ticket) == (1, 4, 7)
+    assert (traj.kind, traj.outcome, traj.merged) == (IMPLEMENT, "merged", True)
+    assert traj.model == result.model
+    assert traj.ci_local_before == trajectory.GREEN
+    assert traj.ci_local == trajectory.GREEN
+    assert traj.ci_remote == "SUCCESS"
+    assert traj.review == "approve"
+    assert traj.pr == result.pr
+    assert traj.attempts == 1
+    assert traj.wall_clock_seconds >= 0.0
+    # The phase timeline covers the iteration end to end, in order.
+    names = [p.name for p in traj.phases]
+    assert names[:3] == ["setup", "ci_before", "claim"]
+    assert {"agent", "ci_after", "review", "lesson", "pr", "remote_ci", "merge"} <= set(names)
+    assert all(p.seconds >= 0 for p in traj.phases)
+    # ...and it cross-references the agent-run trajectory and its ledger line.
+    assert traj.agent_trajectory == "1"
+    assert traj.ledger_ref == "block=4,iteration=1"
+
+
+def test_one_trajectory_is_written_per_ledger_record_on_every_path(tmp_path):
+    """The invariant the shared seam exists for: never one artifact without the other."""
+    cfg = load_config()
+    runners = [
+        # merged
+        FakeRunner(repo_root=str(tmp_path), ci_sequence=[True, True],
+                   open_issues=[_widget_issue()]),
+        # recovered: remote CI came back red
+        FakeRunner(repo_root=str(tmp_path), ci_sequence=[True, True],
+                   open_issues=[_widget_issue()], remote_ci="FAILURE"),
+        # review_blocked: the independent reviewer refused the change
+        FakeRunner(repo_root=str(tmp_path), ci_sequence=[True, True],
+                   open_issues=[_widget_issue()], review_output=REVIEW_BLOCK),
+        # recovered: the worker timed out and left a red branch
+        FailingAgentRunner(repo_root=str(tmp_path), ci_sequence=[True, False],
+                           open_issues=[_widget_issue()], remote_ci="FAILURE"),
+    ]
+    for iteration, runner in enumerate(runners, start=1):
+        run_once(
+            cfg, repo_dir=str(tmp_path), dry_run=False,
+            runner=runner, ai_runner=runner, iteration=iteration, block=9,
+        )
+
+    trajectories = _iteration_trajectories(tmp_path)
+    records = _iteration_records(cfg, tmp_path)
+    assert len(trajectories) == 4
+    assert [t.iteration for t in trajectories] == [1, 2, 3, 4]
+    assert [t.outcome for t in trajectories] == [
+        "merged", "recovered", "review_blocked", "recovered",
+    ]
+    # Same iterations, same outcomes, same tiers: written together or not at all.
+    assert len(records) == len(trajectories)
+    for record, traj in zip(records, trajectories, strict=True):
+        assert (record.iteration, record.outcome, record.tier, record.block) == (
+            traj.iteration, traj.outcome, traj.tier, traj.block
+        )
+    assert all(t.schema_version == trajectory.ITERATION_SCHEMA_VERSION for t in trajectories)
+
+
+def test_an_idle_iteration_writes_neither_a_trajectory_nor_a_cost_record(tmp_path):
+    """Nothing ran, so nothing is recorded - the two artifacts stay in step."""
+    cfg = load_config()
+    title, _ = orchestrator._improvement_idea(cfg)
+    in_flight = {
+        "number": 42, "title": title, "labels": [],
+        "assignees": [{"login": "someone-else"}], "body": "already in flight",
+    }
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[in_flight]
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.kind == IMPROVE
+    assert any("idle" in n for n in result.notes)
+    assert not trajectory.iteration_dir(tmp_path).exists()
+    assert _iteration_records(cfg, tmp_path) == []
+
+
+def test_trajectory_records_the_completeness_guard_recovery(tmp_path):
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[_widget_issue(title="feat: add widget")],
+        worktree_status=" M knowledge/lessons/2026-08-16-implement-widget.md\n",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=3,
+    )
+
+    assert result.recovered is True
+    (traj,) = _iteration_trajectories(tmp_path)
+    assert traj.outcome == "incomplete"
+    assert traj.recovered is True
+    assert traj.pr is None
+    # The diff stat is what makes the guard's verdict re-readable after the fact.
+    assert (traj.diff.files, traj.diff.code_files, traj.diff.knowledge_files) == (1, 0, 1)
+    # It stopped before local CI was re-run, and says so rather than guessing.
+    assert traj.ci_local == trajectory.NOT_RUN
+    assert "completeness guard" in " ".join(traj.notes)
+
+
+def test_trajectory_records_a_timed_out_worker(tmp_path):
+    cfg = load_config()
+    runner = FailingAgentRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, False],
+        open_issues=[_widget_issue()], remote_ci="FAILURE",
+    )
+
+    run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=5,
+    )
+
+    (traj,) = _iteration_trajectories(tmp_path)
+    assert traj.schema_version == trajectory.ITERATION_SCHEMA_VERSION
+    assert traj.agent_ok is False
+    assert traj.ci_local == trajectory.RED
+    assert traj.outcome == "recovered"
+    assert traj.review == "skipped"
+
+
+def test_dry_run_writes_one_schema_valid_trajectory(tmp_path):
+    cfg = load_config()
+
+    run_once(cfg, repo_dir=str(tmp_path), dry_run=True, iteration=1)
+
+    (traj,) = _iteration_trajectories(tmp_path)
+    assert traj.schema_version == trajectory.ITERATION_SCHEMA_VERSION
+    assert traj.kind == IMPROVE
+    assert traj.outcome == "pass"
+    assert traj.model
+
+
+def test_trajectory_never_serializes_a_forbidden_environment_value(tmp_path, monkeypatch):
+    """No value of a `constraints.forbid_env` variable may reach disk.
+
+    The ticket body is the nastiest carrier: it flows straight into the worker
+    prompt, which the trajectory excerpts. Here it quotes live secrets that look
+    like ordinary prose, so only the env-value scrub can catch them.
+    """
+    secret = "correct-horse-battery-staple-42"
+    session = "sess-not-a-key-9f3c2b18"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", secret)
+    monkeypatch.setenv("HSAI_SESSION_TOKEN", session)
+    cfg = load_config()
+    assert "ANTHROPIC_API_KEY" in cfg.forbidden_env
+
+    issue = _widget_issue()
+    issue["body"] = WELL_FORMED_BODY + f"\n\nThe operator pasted {secret} and {session}.\n"
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[issue]
+    )
+
+    run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    raw = (trajectory.iteration_dir(tmp_path) / "1.json").read_text()
+    assert secret not in raw
+    assert session not in raw
+    assert trajectory.REDACTED in raw
+    # The variable NAMES stay, so the scrub itself is auditable.
+    assert "ANTHROPIC_API_KEY" in json.loads(raw)["redacted_env"]

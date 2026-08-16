@@ -258,12 +258,25 @@ def run_cycle(
 
     # Trajectories are local forensics, not repo content: keep the recent blocks
     # replayable and drop the rest so the store stays bounded.
-    dropped = journal.once(
+    pruned = journal.once(
         jr, "prune", "block",
-        lambda: {"dropped": trajectory.prune(repo_root, cfg.trajectory_retention_blocks)},
-    )["dropped"]
+        lambda: {
+            "dropped": trajectory.prune(repo_root, cfg.trajectory_retention_blocks),
+            "dropped_iterations": trajectory.prune_iterations(
+                repo_root,
+                cfg.trajectory_retention_blocks * trajectory.ITERATIONS_PER_BLOCK,
+            ),
+        },
+    )
+    # `.get` on the second key: a journal written before iteration trajectories
+    # existed is still resumable.
+    dropped = pruned["dropped"]
     if dropped:
         report.notes.append(f"pruned trajectories for block(s) {dropped}")
+    if pruned.get("dropped_iterations"):
+        report.notes.append(
+            f"pruned {len(pruned['dropped_iterations'])} iteration trajectory file(s)"
+        )
 
     # 3. Sync main so knowledge produced by merged PRs is present locally.
     journal.once(

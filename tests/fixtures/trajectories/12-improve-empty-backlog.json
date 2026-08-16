@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "id": "improve-empty-backlog",
+  "title": "An empty backlog routes to self-improvement rather than idling",
+  "given": {
+    "ci_green": true,
+    "open_tickets": 0,
+    "ticket": {
+      "number": 312,
+      "title": "chore: refresh reference-set snapshot and extract one practice",
+      "body": "Backlog is empty. Toward goal G1, revisit the pinned reference set, pick ONE concrete practice observed in those projects, and adopt a small version of it here.",
+      "labels": ["priority:P3", "self-improve", "hsai"]
+    },
+    "attempts": 1,
+    "changed_paths": ["src/hsai/journal.py", "tests/test_journal.py"],
+    "agent": {"ok": true, "timed_out": false, "seconds": 244.0},
+    "local_ci_after_green": true,
+    "review_output": "{\"approve\": true, \"blocking\": [], \"advisory\": [], \"rationale\": \"Cites the source project and is covered by a test.\"}",
+    "remote_ci": "SUCCESS",
+    "overhead_seconds": 117.0,
+    "block_spend": {"iterations": 1, "heavy_iterations": 0, "merged_iterations": 1, "total_seconds": 260.0}
+  },
+  "expect": {
+    "kind": "improve",
+    "tier": "standard",
+    "outcome": "merged",
+    "recovery": "none",
+    "guard": ""
+  }
+}

@@ -279,6 +279,9 @@ def run_once(
     repo = cfg.repo_slug
     login = github.current_login(runner=runner) if not dry_run else "hsai-bot"
     started = time.time()
+    # Per-phase wall-clock for the iteration trajectory. Closed out phase by
+    # phase below so a slow iteration says *where* it was slow.
+    timeline = trajectory.PhaseTimeline()
 
     # 1. sync main + fresh worktree (serialized: touches shared .git)
     # Branch name is unique per worker even within the same second.
@@ -292,6 +295,7 @@ def run_once(
             )
     else:
         wt = repo_dir
+    timeline.mark("setup")
 
     # 2. CI check (skipped in dry-run so we never recurse into a real build)
     ci_before = (
@@ -299,6 +303,7 @@ def run_once(
         if not dry_run
         else ci.CIResult(ok=True, steps={}, log="dry-run")
     )
+    timeline.mark("ci_before")
 
     # 3. choose work + claim a ticket (serialized so workers never collide)
     ticket_num: int | None = None
@@ -367,7 +372,11 @@ def run_once(
                         assignee=login, runner=runner,
                     )
 
+    timeline.mark("claim")
+
     if idle_reason:
+        # No model runs, so no cost record is appended - and, by the same rule,
+        # no trajectory. The two artifacts are emitted together or not at all.
         res = IterationResult(kind=kind, ci_before=ci_before.ok)
         res.notes.append(idle_reason)
         gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
@@ -403,12 +412,50 @@ def run_once(
     tokens: tuple[int, int] | None = None
     traj: trajectory.Trajectory | None = None
 
+    # Iteration-trajectory state. Declared here, before `_record_cost` closes
+    # over it, because several guards below return through that seam long before
+    # the later phases would have assigned these.
+    agent_prompt = ""
+    changed: list[str] = []
+    ci_local_verdict = trajectory.NOT_RUN
+
     def _record_cost(outcome: str) -> None:
         # Every terminal path passes through here, so it is also where the
-        # trajectory learns how its run ended.
+        # trajectory learns how its run ended - both trajectories: the per-run
+        # one (what the agent did) and the per-iteration one (what the loop
+        # decided around it). Emitted alongside the ledger record so cost data
+        # and quality data can never disagree about an iteration.
         if traj is not None:
             traj.outcome = outcome
             trajectory.write(traj, repo_dir)
+        trajectory.record_iteration(
+            repo_dir,
+            iteration=iteration,
+            block=block,
+            ticket=ticket_num,
+            kind=kind,
+            tier=choice.tier,
+            model=choice.model,
+            rationale=choice.rationale,
+            strategy=choice.strategy,
+            phases=timeline.phases(),
+            wall_clock_seconds=time.time() - started,
+            prompt=agent_prompt,
+            changed_paths=changed,
+            ci_local_before=trajectory.ci_verdict(ci_before.ok),
+            ci_local=ci_local_verdict,
+            ci_remote=result.remote,
+            review=result.review,
+            agent_ok=agent_ok,
+            agent_trajectory=traj.identifier if traj else "",
+            outcome=outcome,
+            attempts=attempts,
+            recovered=result.recovered,
+            pr=result.pr,
+            merged=result.merged,
+            forbid_env=cfg.forbidden_env,
+            notes=result.notes,
+        )
         ledger.append_record(
             ledger.ledger_path(cfg, repo_dir),
             ledger.LedgerRecord(
@@ -432,7 +479,9 @@ def run_once(
     reverted_workflows: list[str] = []
     repro_result: repro.ReproResult | None = None
     if not dry_run:
-        prompt = _task_prompt(kind, cfg, ticket_title, ticket_body, recalled.section)
+        prompt = agent_prompt = _task_prompt(
+            kind, cfg, ticket_title, ticket_body, recalled.section
+        )
         agent_started = time.time()
         ares = ai.run_agent(
             prompt, choice, cfg, cwd=wt, runner=ai_runner, timeout=cfg.agent_timeout
@@ -454,26 +503,33 @@ def run_once(
         tokens = ledger.parse_tokens(ares.payload)
         if agent_err:
             agent_err = _format_error_with_context(agent_err, kind, ticket_num)
+        timeline.mark("agent")
+
+        # What the agent touched, read once and reused by every guard below (and
+        # recorded as the iteration's diff stat).
+        changed = gitops.changed_paths(cwd=wt, runner=runner)
 
         # Guard: a task must not change the CI checks, or local and remote CI
         # would diverge (as happened once when a worker added mypy). Revert any
         # workflow edits before they are committed and note it in the lesson.
         reverted_workflows = [
-            p for p in gitops.changed_paths(cwd=wt, runner=runner)
-            if p.startswith(".github/workflows/")
+            p for p in changed if p.startswith(".github/workflows/")
         ]
         if reverted_workflows:
             gitops.restore_pathspec(".github/workflows", cwd=wt, runner=runner)
+            # The reverted paths are gone from the tree; re-read so the guards
+            # below (and the recorded diff stat) see what actually survived.
+            changed = gitops.changed_paths(cwd=wt, runner=runner)
             result.notes.append(f"reverted workflow edits: {reverted_workflows}")
 
         # Completeness guard: a code ticket (feat/skill/refactor/fix) cannot be
         # satisfied by a knowledge-only diff. PR #17 once "closed" a feature
         # ticket by committing nothing but its own lesson file - never again.
         if _requires_code(ticket_title):
-            touched = gitops.changed_paths(cwd=wt, runner=runner)
-            code_files = [p for p in touched if not p.startswith("knowledge/")]
+            code_files = [p for p in changed if not p.startswith("knowledge/")]
             if not code_files:
                 result.notes.append("completeness guard: knowledge-only diff on a code ticket")
+                timeline.mark("guards")
                 _recover_failed(
                     cfg, repo, 0, kind=kind, ticket_num=ticket_num,
                     claimed_issue=claimed_issue, login=login,
@@ -492,15 +548,14 @@ def run_once(
             base_ref = gitops.merge_base(
                 "HEAD", f"origin/{cfg.default_branch}", cwd=wt, runner=runner,
             ) or f"origin/{cfg.default_branch}"
-            test_files = repro.changed_test_files(
-                gitops.changed_paths(cwd=wt, runner=runner)
-            )
+            test_files = repro.changed_test_files(changed)
             repro_result = repro.check_repro(
                 repo_root=repo_dir, wt=wt, base_ref=base_ref,
                 test_files=test_files, worktrees_dir=cfg.worktrees_dir, runner=runner,
             )
             result.notes.append(f"repro guard: {repro_result.reason}")
             if not repro_result.ok:
+                timeline.mark("guards")
                 _recover_failed(
                     cfg, repo, 0, kind=kind, ticket_num=ticket_num,
                     claimed_issue=claimed_issue, login=login,
@@ -511,9 +566,13 @@ def run_once(
                 gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
                 return result
 
+    timeline.mark("guards")
+
     # 6. re-check CI
     ci_after = ci.run_local(cwd=wt, runner=runner) if not dry_run else ci_before
     result.ci_after = ci_after.ok
+    ci_local_verdict = trajectory.ci_verdict(ci_after.ok)
+    timeline.mark("ci_after")
 
     # 6b. Independent review gate: a SECOND opinion, from a different tier than
     # the author, on whether the diff actually satisfies the ticket. Every other
@@ -542,6 +601,7 @@ def run_once(
             )
     result.review = verdict.status
     result.notes.append(f"independent review: {verdict.summary()}")
+    timeline.mark("review")
 
     # 7. lesson (ALWAYS, pass or fail)
     outcome = "pass" if (agent_ok and ci_after.ok) else "fail"
@@ -595,6 +655,7 @@ def run_once(
     lesson_path = kb.write_lesson(lesson)
     result.lesson_path = str(lesson_path)
     result.notes.append(f"lesson outcome={outcome}")
+    timeline.mark("lesson")
 
     if dry_run:
         result.notes.append("dry-run: skipped commit/push/PR/merge")
@@ -605,6 +666,7 @@ def run_once(
     # the ticket goes back through the SAME retry policy a red PR uses - one
     # attempt spent, ``blocked`` at max_ticket_attempts. No new stall state.
     if not verdict.approve:
+        timeline.mark("recover")
         _recover_failed(
             cfg, repo, 0, kind=kind, ticket_num=ticket_num,
             claimed_issue=claimed_issue, login=login,
@@ -642,6 +704,7 @@ def run_once(
         base=cfg.default_branch, runner=runner,
     )
     result.pr = pr_num
+    timeline.mark("pr")
 
     # 12. Poll the REAL (remote) CI to conclusion BEFORE relying on auto-merge -
     # it is the source of truth for whether the change may merge, and arming
@@ -653,6 +716,7 @@ def run_once(
     )
     result.remote = remote
     result.notes.append(f"remote CI={remote}")
+    timeline.mark("remote_ci")
 
     # Record the true remote outcome in the lesson itself, then push that
     # update so it lands in the knowledge base once the PR merges.
@@ -676,6 +740,7 @@ def run_once(
         result.recovered = True
         result.notes.append("recovered: closed PR, returned ticket to backlog")
 
+    timeline.mark("merge")
     _record_cost("merged" if result.merged else "recovered")
 
     # 13. cleanup worktree

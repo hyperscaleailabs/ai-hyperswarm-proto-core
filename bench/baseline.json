@@ -1,0 +1,8 @@
+{
+  "mean_seconds_per_ticket": 437.846,
+  "pass_rate": 1.0,
+  "recovery_accuracy": 1.0,
+  "scenarios": 13,
+  "schema_version": 1,
+  "tier_agreement": 1.0
+}

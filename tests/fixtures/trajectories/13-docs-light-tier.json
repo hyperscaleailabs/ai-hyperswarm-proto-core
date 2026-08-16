@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "id": "docs-light-tier",
+  "title": "A single-file docs ticket routes to the light tier and is exempt from the code-completeness and repro guards",
+  "given": {
+    "ci_green": true,
+    "open_tickets": 2,
+    "ticket": {
+      "number": 313,
+      "title": "docs: write up the trajectory schema and its versioning rule",
+      "body": "The schema is only described in the module docstring.\n\n## Acceptance criteria\n- [ ] every field is written up, with the rule for bumping the version",
+      "labels": ["priority:P3", "hsai"]
+    },
+    "attempts": 1,
+    "changed_paths": ["docs/ARCHITECTURE.md"],
+    "agent": {"ok": true, "timed_out": false, "seconds": 61.0},
+    "local_ci_after_green": true,
+    "review_output": "{\"approve\": true, \"blocking\": [], \"advisory\": [], \"rationale\": \"Accurate against the code.\"}",
+    "remote_ci": "SUCCESS",
+    "overhead_seconds": 52.0,
+    "block_spend": {"iterations": 2, "heavy_iterations": 0, "merged_iterations": 2, "total_seconds": 480.0}
+  },
+  "expect": {
+    "kind": "implement",
+    "tier": "light",
+    "outcome": "merged",
+    "recovery": "none",
+    "guard": ""
+  }
+}

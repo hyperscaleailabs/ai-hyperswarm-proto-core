@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "id": "blocked-after-max-attempts",
+  "title": "The final permitted attempt fails remote CI, so the ticket is marked blocked rather than retried forever",
+  "given": {
+    "ci_green": true,
+    "open_tickets": 2,
+    "ticket": {
+      "number": 310,
+      "title": "feat: parallel worker fairness when two workers claim the same ticket",
+      "body": "Two workers can race on the claim.\n\n## Acceptance criteria\n- [ ] a test proves only one worker wins the claim",
+      "labels": ["priority:P1", "attempts:1", "hsai"]
+    },
+    "attempts": 2,
+    "changed_paths": ["src/hsai/swarm.py", "tests/test_orchestrator.py"],
+    "agent": {"ok": true, "timed_out": false, "seconds": 296.0},
+    "local_ci_after_green": true,
+    "review_output": "{\"approve\": true, \"blocking\": [], \"advisory\": [], \"rationale\": \"Second attempt looks better.\"}",
+    "remote_ci": "FAILURE",
+    "overhead_seconds": 189.0,
+    "block_spend": {"iterations": 5, "heavy_iterations": 1, "merged_iterations": 3, "total_seconds": 2100.0}
+  },
+  "expect": {
+    "kind": "implement",
+    "tier": "standard",
+    "outcome": "recovered",
+    "recovery": "blocked",
+    "guard": "remote_ci"
+  }
+}

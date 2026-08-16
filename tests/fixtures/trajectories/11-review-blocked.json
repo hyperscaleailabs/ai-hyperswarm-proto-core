@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "id": "review-blocked",
+  "title": "A green branch the independent reviewer refuses never reaches a PR",
+  "given": {
+    "ci_green": true,
+    "open_tickets": 3,
+    "ticket": {
+      "number": 311,
+      "title": "feat: prune the recall corpus between blocks",
+      "body": "The recall corpus grows without bound.\n\n## Acceptance criteria\n- [ ] pruning is bounded by config\n- [ ] a test proves old notes are dropped",
+      "labels": ["priority:P2", "hsai"]
+    },
+    "attempts": 1,
+    "changed_paths": ["src/hsai/recall.py"],
+    "agent": {"ok": true, "timed_out": false, "seconds": 163.0},
+    "local_ci_after_green": true,
+    "review_output": "{\"approve\": false, \"blocking\": [\"src/hsai/recall.py: the second criterion has no test proving old notes are dropped\"], \"advisory\": [], \"rationale\": \"The diff claims a criterion it never demonstrates.\"}",
+    "remote_ci": "SUCCESS",
+    "overhead_seconds": 88.0,
+    "block_spend": {"iterations": 3, "heavy_iterations": 1, "merged_iterations": 2, "total_seconds": 1100.0}
+  },
+  "expect": {
+    "kind": "implement",
+    "tier": "standard",
+    "outcome": "review_blocked",
+    "recovery": "retry",
+    "guard": "review"
+  }
+}

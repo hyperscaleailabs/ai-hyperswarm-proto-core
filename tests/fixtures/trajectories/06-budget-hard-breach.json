@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "id": "budget-hard-breach",
+  "title": "A block that exhausted its heavy-tier ceiling halts before spending anything",
+  "given": {
+    "ci_green": true,
+    "open_tickets": 5,
+    "ticket": {
+      "number": 306,
+      "title": "refactor: split the orchestrator guard chain into a policy module",
+      "body": "run_once carries every guard inline.\n\n## Acceptance criteria\n- [ ] each guard is a named, independently tested policy",
+      "labels": ["priority:P2", "size:L", "hsai"]
+    },
+    "attempts": 1,
+    "changed_paths": [],
+    "agent": {"ok": true, "timed_out": false, "seconds": 0.0},
+    "remote_ci": "",
+    "overhead_seconds": 0.0,
+    "block_spend": {"iterations": 6, "heavy_iterations": 3, "merged_iterations": 4, "total_seconds": 3100.0}
+  },
+  "expect": {
+    "kind": "implement",
+    "tier": "heavy",
+    "outcome": "halted",
+    "recovery": "none",
+    "guard": "budget"
+  }
+}

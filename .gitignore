@@ -4,6 +4,10 @@
 # with `hsai traj <iteration>`); only a digest line and a redacted tail are
 # committed, inside the lesson and the PR body.
 .hsai/traj/
+# Per-iteration trajectories, same rule. Deliberately NOT under knowledge/:
+# the Obsidian vault is curated and committed, these are raw local telemetry.
+# The committed, hand-authored counterpart is tests/fixtures/trajectories/.
+.hsai/trajectories/
 *.log
 
 # Python

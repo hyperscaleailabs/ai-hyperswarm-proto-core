@@ -10,14 +10,16 @@ Commands:
   hsai doctor                                                  verify environment + invariants
   hsai traj <iteration> [--json]                               print a stored agent run
   hsai replay <iteration> [--json]                             alias of `hsai traj`
+  hsai bench [--corpus DIR] [--json] [--check]                 offline orchestration bench
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
-from . import __version__, ai, recall, repro, trajectory
+from . import __version__, ai, bench, recall, repro, trajectory
 from .config import CoreConfig, load_config, validate
 from .knowledge import KnowledgeBase
 from .orchestrator import run_loop
@@ -183,6 +185,50 @@ def cmd_traj(args: argparse.Namespace) -> int:
     return _print_trajectory(args, "traj")
 
 
+def cmd_bench(args: argparse.Namespace) -> int:
+    """Replay the scenario corpus through the real decision code.
+
+    Offline by construction: the replay's fake runner refuses a ``claude``
+    command, so this spends no quota and needs no network. Non-zero exit means
+    a scenario deviated from its expectation, or (with ``--check``) a metric
+    regressed against the committed baseline.
+    """
+    cfg = _load(args)
+    try:
+        report = bench.run_bench(cfg, args.corpus)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"bench: {exc}", file=sys.stderr)
+        return 1
+
+    problems: list[str] = []
+    if args.check:
+        try:
+            problems = bench.check_regression(report, bench.read_baseline(args.baseline))
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"bench: {exc}", file=sys.stderr)
+            return 1
+
+    if args.write_baseline:
+        if not report.ok:
+            print("bench: refusing to write a baseline from a failing run", file=sys.stderr)
+            return 1
+        print(f"bench: wrote baseline {bench.write_baseline(report, args.baseline)}")
+
+    if args.json:
+        payload = report.to_dict()
+        payload["regressions"] = problems
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(report.render())
+        for problem in problems:
+            print(f"  ! regression: {problem}")
+
+    if not report.ok:
+        print(f"bench: {len(report.deviations)} deviation(s) from the corpus",
+              file=sys.stderr)
+    return 0 if (report.ok and not problems) else 1
+
+
 def cmd_brief(args: argparse.Namespace) -> int:
     from .governance import write_direction
 
@@ -264,6 +310,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     br = sub.add_parser("brief", help="refresh governance/DIRECTION.md")
     br.set_defaults(func=cmd_brief)
+
+    bn = sub.add_parser(
+        "bench",
+        help="replay the scenario corpus through the real decision code (no model, no network)",
+    )
+    bn.add_argument("--corpus", default=bench.DEFAULT_CORPUS_DIR,
+                    help="directory of scenario JSON files")
+    bn.add_argument("--baseline", default=bench.DEFAULT_BASELINE,
+                    help="committed baseline metrics to compare against")
+    bn.add_argument("--check", action="store_true",
+                    help="fail on any regression against the baseline (the CI gate)")
+    bn.add_argument("--write-baseline", action="store_true",
+                    help="overwrite the baseline with this run's metrics")
+    bn.add_argument("--json", action="store_true", help="print the machine-readable report")
+    bn.set_defaults(func=cmd_bench)
 
     for name, help_text, func in (
         ("traj", "print a stored trajectory for a post-mortem", cmd_traj),

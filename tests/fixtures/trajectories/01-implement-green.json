@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "id": "implement-green",
+  "title": "A well-formed feature ticket runs clean and merges on green remote CI",
+  "given": {
+    "ci_green": true,
+    "open_tickets": 3,
+    "ticket": {
+      "number": 301,
+      "title": "feat: add a bounded LRU cache to task selection",
+      "body": "Selection recomputes the same score for every retry of a ticket. Cache it.\n\n## Acceptance criteria\n- [ ] repeated selection of the same task hits the cache\n- [ ] the cache is bounded and a test proves eviction",
+      "labels": ["priority:P2", "hsai"]
+    },
+    "attempts": 1,
+    "changed_paths": ["src/hsai/models.py", "tests/test_models.py"],
+    "agent": {"ok": true, "timed_out": false, "seconds": 214.0},
+    "local_ci_after_green": true,
+    "review_output": "{\"approve\": true, \"blocking\": [], \"advisory\": [\"consider a shorter helper name\"], \"rationale\": \"Every acceptance criterion is covered by code and a test.\"}",
+    "remote_ci": "SUCCESS",
+    "overhead_seconds": 96.0,
+    "block_spend": {"iterations": 1, "heavy_iterations": 0, "merged_iterations": 1, "total_seconds": 300.0}
+  },
+  "expect": {
+    "kind": "implement",
+    "tier": "standard",
+    "outcome": "merged",
+    "recovery": "none",
+    "guard": ""
+  }
+}
