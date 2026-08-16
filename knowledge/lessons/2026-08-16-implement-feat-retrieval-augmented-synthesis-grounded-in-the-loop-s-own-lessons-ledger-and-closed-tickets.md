@@ -19,7 +19,7 @@ iteration: 4136304
 | ticket | #262 |
 | pull request | _(none)_ |
 | model | `opus` |
-| remote CI | _(pending)_ |
+| remote CI | FAILURE |
 
 ## Context
 Iteration 4136304. Ticket #262. CI before: CI green (ruff=pass, pytest=pass).
