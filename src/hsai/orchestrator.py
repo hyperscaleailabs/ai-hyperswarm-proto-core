@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from uuid import uuid4
 
@@ -26,6 +27,26 @@ from .tickets import NEEDS_REFINEMENT, issue_well_formed
 HEAL = "heal"
 IMPLEMENT = "implement"
 IMPROVE = "improve"
+
+# What the retry policy decides about a ticket whose attempt just failed.
+RETRY = "retry"
+BLOCKED = "blocked"
+
+# The directory the off-spec guard protects, and the string a ticket must name
+# to authorize touching it (see :func:`workflow_edits_authorized`).
+WORKFLOW_DIR = ".github/workflows"
+
+# The outcome vocabulary `_record_cost` writes to the ledger and the iteration
+# trajectory. `hsai bench` asserts against these names, so they are constants
+# rather than scattered literals.
+IDLE = "idle"
+INCOMPLETE = "incomplete"
+NO_REPRO = "no_repro"
+REVIEW_BLOCKED = "review_blocked"
+MERGED = "merged"
+RECOVERED = "recovered"
+HALTED = "halted"  # budget hard breach: the cycle never starts the iteration
+ERROR = "error"
 
 # Sentinel block index for iterations run outside a governed `hsai cycle`
 # (ad-hoc `hsai loop`/`hsai run-once`). Real cycle indices are always >= 0
@@ -95,6 +116,34 @@ def decide_path(ci_green: bool, has_tickets: bool) -> str:
     if has_tickets:
         return IMPLEMENT
     return IMPROVE
+
+
+def workflow_edits_authorized(ticket_title: str, ticket_body: str) -> bool:
+    """May this ticket change the CI checks themselves?
+
+    The off-spec guard exists because local and remote CI must not diverge: a
+    worker that quietly adds a check nobody asked for makes every later
+    ``ci.run_local`` a lie. That argument is about *unrequested* edits. A ticket
+    whose own text names ``.github/workflows`` has requested them in writing -
+    decided when the ticket was filed, and auditable on the PR afterwards - and
+    blanket-reverting those would make an entire class of harness work (adding
+    a CI gate, which is how this loop verifies anything) impossible for the loop
+    to perform on itself.
+
+    Naming the path is the opt-in, and it lives in the ticket: a worker can
+    neither grant it to itself nor widen it beyond the workflow directory.
+    """
+    return WORKFLOW_DIR in f"{ticket_title}\n{ticket_body}".lower()
+
+
+def retry_disposition(prior_attempts: int, max_attempts: int) -> str:
+    """What happens to a ticket whose attempt just failed: retry, or give up?
+
+    Pure, and the single definition of the retry policy: `_recover_failed`
+    applies it to real labels, and `hsai bench` replays it offline. Two callers
+    of one function cannot drift the way two copies of one `>=` did.
+    """
+    return BLOCKED if prior_attempts + 1 >= max_attempts else RETRY
 
 
 def build_pr_body(
@@ -277,8 +326,66 @@ def run_once(
     every pre-existing test makes) keeps its exact prior behavior.
     """
     repo = cfg.repo_slug
-    login = github.current_login(runner=runner) if not dry_run else "hsai-bot"
     started = time.time()
+    block = iteration // 100 if block is None else block
+
+    # Iteration trajectory: the harness's own record of this iteration, opened
+    # here (before anything can fail) and emitted exactly once on every exit
+    # path by `_emit` below. `hsai bench` replays a corpus of these.
+    timeline = trajectory.PhaseTimer()
+    itraj = trajectory.IterationTrajectory(
+        iteration=iteration, block=block, dry_run=dry_run,
+    )
+    emitted = False
+
+    def _emit(outcome: str) -> None:
+        """Write this iteration's trajectory - first caller wins, and there is
+        always a caller: `_record_cost` on every settled path, the `finally`
+        below on the paths that never settle (an idle worker, a raised
+        exception)."""
+        nonlocal emitted
+        if emitted:
+            return
+        emitted = True
+        itraj.outcome = outcome
+        itraj.phases = timeline.phases
+        itraj.wall_clock_seconds = round(max(0.0, time.time() - started), 3)
+        trajectory.write_iteration(itraj, repo_dir, forbid_env=cfg.forbidden_env)
+
+    try:
+        return _run_iteration(
+            cfg, repo=repo, repo_dir=repo_dir, dry_run=dry_run, runner=runner,
+            ai_runner=ai_runner, iteration=iteration, block=block,
+            demote_tier=demote_tier, started=started, itraj=itraj,
+            timeline=timeline, emit=_emit,
+        )
+    finally:
+        # A path that reached no outcome at all still leaves a record saying so.
+        _emit(ERROR)
+
+
+def _run_iteration(
+    cfg: CoreConfig,
+    *,
+    repo: str,
+    repo_dir: str,
+    dry_run: bool,
+    runner: Runner,
+    ai_runner: Runner,
+    iteration: int,
+    block: int,
+    demote_tier: bool,
+    started: float,
+    itraj: trajectory.IterationTrajectory,
+    timeline: trajectory.PhaseTimer,
+    emit: Callable[[str], None],
+) -> IterationResult:
+    """The body of :func:`run_once`, with its trajectory bookkeeping supplied.
+
+    Split out purely so `run_once` can wrap it in the ``try/finally`` that makes
+    "exactly one trajectory per iteration" hold on paths that raise.
+    """
+    login = github.current_login(runner=runner) if not dry_run else "hsai-bot"
 
     # 1. sync main + fresh worktree (serialized: touches shared .git)
     # Branch name is unique per worker even within the same second.
@@ -292,6 +399,7 @@ def run_once(
             )
     else:
         wt = repo_dir
+    timeline.mark("sync")
 
     # 2. CI check (skipped in dry-run so we never recurse into a real build)
     ci_before = (
@@ -299,6 +407,8 @@ def run_once(
         if not dry_run
         else ci.CIResult(ok=True, steps={}, log="dry-run")
     )
+    itraj.local_ci_before = "skipped" if dry_run else ("pass" if ci_before.ok else "fail")
+    timeline.mark("ci_before")
 
     # 3. choose work + claim a ticket (serialized so workers never collide)
     ticket_num: int | None = None
@@ -367,10 +477,16 @@ def run_once(
                         assignee=login, runner=runner,
                     )
 
+    itraj.kind = kind
+    itraj.ticket = ticket_num
+    timeline.mark("claim")
+
     if idle_reason:
         res = IterationResult(kind=kind, ci_before=ci_before.ok)
         res.notes.append(idle_reason)
+        itraj.note(idle_reason)
         gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
+        emit(IDLE)
         return res
 
     # 4. model selection (recorded for audit); a soft budget breach biases it
@@ -379,6 +495,8 @@ def run_once(
         tuple(claimed_issue.labels) if claimed_issue else ()
     ))
     choice = select(task, cfg, demote=demote_tier)
+    itraj.tier, itraj.model, itraj.rationale = choice.tier, choice.model, choice.rationale
+    timeline.mark("select")
 
     # Read side of the knowledge base: pull the most relevant prior notes for
     # this ticket out of the vault in the worktree. Computed before the agent
@@ -386,6 +504,7 @@ def run_once(
     recalled = recall.for_task(
         wt, cfg, title=ticket_title, body=ticket_body, kind=kind
     )
+    timeline.mark("recall")
 
     result = IterationResult(
         kind=kind, ticket=ticket_num, model=choice.model, ci_before=ci_before.ok,
@@ -399,18 +518,20 @@ def run_once(
     # aggregate and budget gate can read across iterations; the governance PR
     # later commits it so the economics stay auditable.
     attempts = (claimed_issue.attempts() if claimed_issue else 0) + 1
-    block = iteration // 100 if block is None else block
+    itraj.attempts = attempts
     tokens: tuple[int, int] | None = None
     traj: trajectory.Trajectory | None = None
 
     def _record_cost(outcome: str) -> None:
-        # Every terminal path passes through here, so it is also where the
-        # trajectory learns how its run ended.
+        # Every settled path passes through here, so it is also where both
+        # trajectories learn how the run ended. Cost and trajectory are written
+        # from the same seam precisely so they can never disagree.
         if traj is not None:
             traj.outcome = outcome
             trajectory.write(traj, repo_dir)
+        ledger_file = ledger.ledger_path(cfg, repo_dir)
         ledger.append_record(
-            ledger.ledger_path(cfg, repo_dir),
+            ledger_file,
             ledger.LedgerRecord(
                 iteration=iteration,
                 block=block,
@@ -425,6 +546,13 @@ def run_once(
                 output_tokens=tokens[1] if tokens else None,
             ),
         )
+        itraj.ledger_ref = {
+            "file": str(ledger_file), "iteration": iteration, "block": block,
+        }
+        itraj.merged = result.merged
+        itraj.recovered = result.recovered
+        itraj.pr = result.pr
+        emit(outcome)
 
     # 5. run the agent (subscription-only)
     agent_ok = True
@@ -433,6 +561,7 @@ def run_once(
     repro_result: repro.ReproResult | None = None
     if not dry_run:
         prompt = _task_prompt(kind, cfg, ticket_title, ticket_body, recalled.section)
+        itraj.set_prompt(prompt)
         agent_started = time.time()
         ares = ai.run_agent(
             prompt, choice, cfg, cwd=wt, runner=ai_runner, timeout=cfg.agent_timeout
@@ -448,6 +577,9 @@ def run_once(
             block=block, duration_seconds=time.time() - agent_started,
         )
         result.notes.append(f"trajectory={traj.identifier}")
+        itraj.agent_trajectory = traj.identifier
+        itraj.agent_ok = traj.ok
+        timeline.mark("agent")
         agent_ok, agent_err = ares.ok, ares.error
         # Fed from the parsed envelope, not re-parsed from stdout: this is the
         # path that finally populates the ledger's token columns.
@@ -455,32 +587,42 @@ def run_once(
         if agent_err:
             agent_err = _format_error_with_context(agent_err, kind, ticket_num)
 
-        # Guard: a task must not change the CI checks, or local and remote CI
-        # would diverge (as happened once when a worker added mypy). Revert any
-        # workflow edits before they are committed and note it in the lesson.
-        reverted_workflows = [
-            p for p in gitops.changed_paths(cwd=wt, runner=runner)
-            if p.startswith(".github/workflows/")
-        ]
+        # Guard: a task must not change the CI checks *unless its ticket asked
+        # for it*, or local and remote CI would diverge (as happened once when a
+        # worker added mypy). Unauthorized workflow edits are reverted before
+        # they are committed, and noted in the lesson either way.
+        touched = gitops.changed_paths(cwd=wt, runner=runner)
+        workflow_edits = [p for p in touched if p.startswith(f"{WORKFLOW_DIR}/")]
+        authorized = workflow_edits_authorized(ticket_title, ticket_body)
+        reverted_workflows = [] if authorized else workflow_edits
+        if workflow_edits and authorized:
+            note = f"ticket authorizes workflow edits: {workflow_edits}"
+            result.notes.append(note)
+            itraj.note(note)
         if reverted_workflows:
-            gitops.restore_pathspec(".github/workflows", cwd=wt, runner=runner)
+            gitops.restore_pathspec(WORKFLOW_DIR, cwd=wt, runner=runner)
+            # Re-read: every guard below must judge the post-revert tree.
+            touched = gitops.changed_paths(cwd=wt, runner=runner)
             result.notes.append(f"reverted workflow edits: {reverted_workflows}")
+            itraj.note(f"reverted {len(reverted_workflows)} off-spec workflow edit(s)")
+        itraj.diff_stat = trajectory.diff_stat(touched)
 
         # Completeness guard: a code ticket (feat/skill/refactor/fix) cannot be
         # satisfied by a knowledge-only diff. PR #17 once "closed" a feature
         # ticket by committing nothing but its own lesson file - never again.
         if _requires_code(ticket_title):
-            touched = gitops.changed_paths(cwd=wt, runner=runner)
             code_files = [p for p in touched if not p.startswith("knowledge/")]
             if not code_files:
                 result.notes.append("completeness guard: knowledge-only diff on a code ticket")
+                itraj.note("completeness guard: knowledge-only diff on a code ticket")
                 _recover_failed(
                     cfg, repo, 0, kind=kind, ticket_num=ticket_num,
                     claimed_issue=claimed_issue, login=login,
                     remote="INCOMPLETE", runner=runner,
                 )
                 result.recovered = True
-                _record_cost("incomplete")
+                timeline.mark("guards")
+                _record_cost(INCOMPLETE)
                 gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
                 return result
 
@@ -492,14 +634,13 @@ def run_once(
             base_ref = gitops.merge_base(
                 "HEAD", f"origin/{cfg.default_branch}", cwd=wt, runner=runner,
             ) or f"origin/{cfg.default_branch}"
-            test_files = repro.changed_test_files(
-                gitops.changed_paths(cwd=wt, runner=runner)
-            )
+            test_files = repro.changed_test_files(touched)
             repro_result = repro.check_repro(
                 repo_root=repo_dir, wt=wt, base_ref=base_ref,
                 test_files=test_files, worktrees_dir=cfg.worktrees_dir, runner=runner,
             )
             result.notes.append(f"repro guard: {repro_result.reason}")
+            itraj.note(f"repro guard: {repro_result.reason}")
             if not repro_result.ok:
                 _recover_failed(
                     cfg, repo, 0, kind=kind, ticket_num=ticket_num,
@@ -507,13 +648,17 @@ def run_once(
                     remote="NO_REPRO", runner=runner,
                 )
                 result.recovered = True
-                _record_cost("no_repro")
+                timeline.mark("guards")
+                _record_cost(NO_REPRO)
                 gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
                 return result
+        timeline.mark("guards")
 
     # 6. re-check CI
     ci_after = ci.run_local(cwd=wt, runner=runner) if not dry_run else ci_before
     result.ci_after = ci_after.ok
+    itraj.local_ci_after = "skipped" if dry_run else ("pass" if ci_after.ok else "fail")
+    timeline.mark("ci_after")
 
     # 6b. Independent review gate: a SECOND opinion, from a different tier than
     # the author, on whether the diff actually satisfies the ticket. Every other
@@ -542,6 +687,8 @@ def run_once(
             )
     result.review = verdict.status
     result.notes.append(f"independent review: {verdict.summary()}")
+    itraj.review = verdict.status
+    timeline.mark("review")
 
     # 7. lesson (ALWAYS, pass or fail)
     outcome = "pass" if (agent_ok and ci_after.ok) else "fail"
@@ -595,6 +742,7 @@ def run_once(
     lesson_path = kb.write_lesson(lesson)
     result.lesson_path = str(lesson_path)
     result.notes.append(f"lesson outcome={outcome}")
+    timeline.mark("lesson")
 
     if dry_run:
         result.notes.append("dry-run: skipped commit/push/PR/merge")
@@ -612,10 +760,11 @@ def run_once(
         )
         result.recovered = True
         result.notes.append("recovered: independent review blocked the change")
+        itraj.note("recovered: independent review blocked the change")
         # The lesson was written into a worktree that is about to be discarded
         # unpushed; the durable record of this run is its ledger + trajectory.
         result.lesson_path = ""
-        _record_cost("review_blocked")
+        _record_cost(REVIEW_BLOCKED)
         gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
         return result
 
@@ -642,6 +791,7 @@ def run_once(
         base=cfg.default_branch, runner=runner,
     )
     result.pr = pr_num
+    timeline.mark("push_pr")
 
     # 12. Poll the REAL (remote) CI to conclusion BEFORE relying on auto-merge -
     # it is the source of truth for whether the change may merge, and arming
@@ -653,6 +803,8 @@ def run_once(
     )
     result.remote = remote
     result.notes.append(f"remote CI={remote}")
+    itraj.remote_ci = remote
+    timeline.mark("remote_ci")
 
     # Record the true remote outcome in the lesson itself, then push that
     # update so it lands in the knowledge base once the PR merges.
@@ -675,8 +827,10 @@ def run_once(
         )
         result.recovered = True
         result.notes.append("recovered: closed PR, returned ticket to backlog")
+        itraj.note(f"recovered: remote CI concluded {remote}")
 
-    _record_cost("merged" if result.merged else "recovered")
+    timeline.mark("merge")
+    _record_cost(MERGED if result.merged else RECOVERED)
 
     # 13. cleanup worktree
     gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
@@ -711,7 +865,7 @@ def _recover_failed(
     prior = issue.attempts() if issue else 0
     nxt = prior + 1
 
-    if nxt >= cfg.max_ticket_attempts:
+    if retry_disposition(prior, cfg.max_ticket_attempts) == BLOCKED:
         github.edit_labels(
             repo, ticket_num, add=["blocked"], remove=[f"attempts:{prior}"] if prior else None,
             runner=runner,

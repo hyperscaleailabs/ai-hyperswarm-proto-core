@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "name": "implement-green",
+  "description": "The happy path: a green backlog ticket implemented with code and a test, approved, merged. If this ever stops being the default shape, everything else in the corpus is noise.",
+  "given": {
+    "ci_green": true,
+    "has_tickets": true,
+    "ticket": {
+      "number": 41,
+      "title": "feat: add a widget renderer to the status command",
+      "body": "Render each configured tier as one line under `hsai status`.",
+      "labels": [],
+      "prior_attempts": 0
+    },
+    "prior_iterations": [],
+    "agent": {"ok": true},
+    "changed_paths": ["src/hsai/widget.py", "tests/test_widget.py"],
+    "ci_after_green": true,
+    "review_approve": true,
+    "remote_ci": "SUCCESS"
+  },
+  "expect": {
+    "kind": "implement",
+    "tier": "standard",
+    "model": "sonnet",
+    "outcome": "merged",
+    "merged": true,
+    "recovered": false,
+    "review": "approve",
+    "budget": "ok",
+    "diff_stat": {"files": 2, "code": 2, "knowledge": 0, "tests": 1, "workflows": 0}
+  }
+}

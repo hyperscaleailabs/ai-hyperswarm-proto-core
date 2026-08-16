@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "name": "heal-red",
+  "description": "Local CI is red, so the loop heals instead of implementing. The heal ships a regression test that fails on the pre-fix tree, which is what lets it past the reproduce-before-fix guard.",
+  "given": {
+    "ci_green": false,
+    "has_tickets": true,
+    "ticket": {
+      "number": 42,
+      "title": "ci: main is red - auto-heal",
+      "body": "CI failing on main. pytest reported 1 failed test in tests/test_ledger.py.",
+      "labels": ["priority:P0", "ci", "hsai"],
+      "prior_attempts": 0
+    },
+    "prior_iterations": [],
+    "agent": {"ok": true},
+    "changed_paths": ["src/hsai/ledger.py", "tests/test_ledger.py"],
+    "repro": {"fix_passes": true, "parent_passes": false},
+    "ci_after_green": true,
+    "review_approve": true,
+    "remote_ci": "SUCCESS"
+  },
+  "expect": {
+    "kind": "heal",
+    "tier": "standard",
+    "outcome": "merged",
+    "merged": true,
+    "recovered": false,
+    "local_ci_before": "fail",
+    "local_ci_after": "pass",
+    "budget": "ok"
+  }
+}

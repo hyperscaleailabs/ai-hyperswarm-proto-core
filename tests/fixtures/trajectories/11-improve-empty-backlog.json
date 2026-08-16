@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "name": "improve-empty-backlog",
+  "description": "CI is green and the backlog is empty, so the loop self-improves rather than idling. A chore-titled ticket is exempt from both the completeness guard and the reproduce-before-fix guard, which is the only reason a knowledge-heavy diff is allowed to merge here.",
+  "given": {
+    "ci_green": true,
+    "has_tickets": false,
+    "ticket": {
+      "number": 51,
+      "title": "chore: refresh reference-set snapshot and extract one practice",
+      "body": "Backlog is empty. Toward goal G1, revisit the pinned reference set, pick ONE concrete practice observed in those projects, and adopt a small version of it here.",
+      "labels": ["priority:P3", "self-improve", "hsai"],
+      "prior_attempts": 0
+    },
+    "prior_iterations": [],
+    "agent": {"ok": true},
+    "changed_paths": ["knowledge/lessons/2026-08-16-adopted-a-practice.md"],
+    "ci_after_green": true,
+    "review_approve": true,
+    "remote_ci": "SUCCESS"
+  },
+  "expect": {
+    "kind": "improve",
+    "tier": "standard",
+    "outcome": "merged",
+    "merged": true,
+    "recovered": false,
+    "diff_stat": {"files": 1, "code": 0, "knowledge": 1, "tests": 0, "workflows": 0}
+  }
+}

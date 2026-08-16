@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "name": "knowledge-only-incomplete",
+  "description": "A feature ticket 'closed' by committing nothing but its own lesson file. This actually happened (PR #17). The completeness guard catches it before a PR is ever opened, so the outcome is incomplete rather than a green merge of an empty change.",
+  "given": {
+    "ci_green": true,
+    "has_tickets": true,
+    "ticket": {
+      "number": 52,
+      "title": "feat: add a synthesis memory pack to the planner prompt",
+      "body": "Show the planner what the loop has already tried.",
+      "labels": [],
+      "prior_attempts": 0
+    },
+    "prior_iterations": [],
+    "agent": {"ok": true},
+    "changed_paths": ["knowledge/lessons/2026-08-16-implement-memory-pack.md"],
+    "ci_after_green": true,
+    "review_approve": true,
+    "remote_ci": "SUCCESS"
+  },
+  "expect": {
+    "kind": "implement",
+    "tier": "standard",
+    "outcome": "incomplete",
+    "merged": false,
+    "recovered": true,
+    "disposition": "retry",
+    "review": "",
+    "remote_ci": ""
+  }
+}

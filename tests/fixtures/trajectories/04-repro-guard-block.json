@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "name": "repro-guard-block",
+  "description": "A heal that changed source but added no regression test. The reproduce-before-fix guard blocks it: without a test that fails on the pre-fix tree there is no evidence the bug was ever real. No PR is opened and the ticket returns to the backlog.",
+  "given": {
+    "ci_green": false,
+    "has_tickets": true,
+    "ticket": {
+      "number": 44,
+      "title": "ci: main is red - auto-heal",
+      "body": "CI failing on main. The remote status poll returns an empty rollup.",
+      "labels": ["priority:P0", "ci", "hsai"],
+      "prior_attempts": 0
+    },
+    "prior_iterations": [],
+    "agent": {"ok": true},
+    "changed_paths": ["src/hsai/ci.py"],
+    "repro": {"fix_passes": true, "parent_passes": false},
+    "ci_after_green": true,
+    "review_approve": true,
+    "remote_ci": "SUCCESS"
+  },
+  "expect": {
+    "kind": "heal",
+    "tier": "standard",
+    "outcome": "no_repro",
+    "merged": false,
+    "recovered": true,
+    "disposition": "retry",
+    "remote_ci": ""
+  }
+}

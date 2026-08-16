@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "name": "authorized-workflow-edit",
+  "description": "The other side of 03: this ticket names .github/workflows in its own text, so the edit was requested in writing and survives instead of being reverted. Without this the loop could never add a CI gate to itself, which is how it verifies anything at all. The recorded diff stat must show the workflow file.",
+  "given": {
+    "ci_green": true,
+    "has_tickets": true,
+    "ticket": {
+      "number": 56,
+      "title": "feat: iteration trajectory recorder and offline replay bench",
+      "body": "Add a `bench` job to .github/workflows/ci.yml running `hsai bench --check` on every PR.",
+      "labels": ["size:L"],
+      "prior_attempts": 0
+    },
+    "prior_iterations": [],
+    "agent": {"ok": true},
+    "changed_paths": [
+      "src/hsai/bench.py",
+      "tests/test_bench.py",
+      ".github/workflows/ci.yml"
+    ],
+    "ci_after_green": true,
+    "review_approve": true,
+    "remote_ci": "SUCCESS"
+  },
+  "expect": {
+    "kind": "implement",
+    "tier": "heavy",
+    "model": "opus",
+    "outcome": "merged",
+    "merged": true,
+    "recovered": false,
+    "diff_stat": {"files": 3, "code": 3, "knowledge": 0, "tests": 1, "workflows": 1}
+  }
+}

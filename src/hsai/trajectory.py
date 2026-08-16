@@ -1,5 +1,20 @@
 """Worker trajectories: the durable record of what one agent run actually did.
 
+Two granularities live here, deliberately:
+
+- :class:`Trajectory` - **one agent run**. What ``claude -p`` did: the prompt,
+  the step stream, usage, exit status. Stored under ``.hsai/traj/``.
+- :class:`IterationTrajectory` - **one loop iteration**. What the *harness*
+  decided: which path it took, which tier it picked and why, how long each
+  phase took, what the diff looked like, how local and remote CI voted, and how
+  it ended. Stored under ``.hsai/trajectories/``, versioned by
+  :data:`SCHEMA_VERSION`, and replayable offline by :mod:`hsai.bench`.
+
+The split matters: an agent run is evidence about a *model*, an iteration is
+evidence about the *loop*. Only the second can answer "did that harness change
+help?", which is why it is a separate, schema-versioned record rather than one
+more field on the first.
+
 Before this module a ``claude -p`` run left nothing behind but a boolean and a
 truncated stderr excerpt, so the loop could not answer forensic questions about
 its own behaviour - what a failed worker tried, where the quota went, whether a
@@ -33,7 +48,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import time
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,11 +59,33 @@ from typing import Any
 
 TRAJECTORY_DIR = ".hsai/traj"
 
+# Iteration-level records: what the harness decided, not what the model typed.
+# Deliberately NOT under knowledge/ - see the module docstring and
+# docs/ARCHITECTURE.md.
+ITERATION_DIR = ".hsai/trajectories"
+
+# Bump on any breaking change to IterationTrajectory's field set. Readers gate
+# on it, so an old record is rejected loudly instead of silently misparsed.
+SCHEMA_VERSION = 1
+
 # Per-step text is clipped so one runaway tool result cannot bloat the store.
 STEP_CHARS = 2000
 # What the committed lesson may quote: a short tail, tightly clipped.
 EXCERPT_STEPS = 5
 EXCERPT_CHARS = 240
+
+# An iteration record is a *summary*: enough prompt to identify the task, never
+# the whole thing (the agent trajectory already holds that).
+PROMPT_CHARS = 600
+# Hard ceiling on one serialized iteration record. A store of these is read by
+# the bench on every PR, so a single pathological run must not bloat it.
+MAX_RECORD_BYTES = 32 * 1024
+NOTE_CHARS = 200
+MAX_NOTES = 24
+
+# Below this length an environment value is too generic to substitute safely
+# ("1", "en_US") - blanking it would shred the record instead of protecting it.
+MIN_ENV_VALUE_CHARS = 8
 
 REDACTED = "[redacted]"
 
@@ -63,14 +103,48 @@ _SECRET_PATTERNS = (
 # `/home/<name>` prefix to `~` so a trajectory can be shared as-is.
 _HOME_PATTERN = re.compile(r"/(?:Users|home)/[^/\s:\"']+")
 
+# Environment variables whose *name* marks their value as a credential. The
+# patterns above catch the shapes we know (`sk-ant-`, `ghp_`, ...); this catches
+# the ones we do not, on machines whose environment we do not control.
+_SECRET_ENV_NAME = re.compile(r"(?i)key|token|secret|password|passwd|credential")
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def redact(text: str) -> str:
-    """Scrub credentials and absolute home paths out of ``text``."""
+def env_secret_values(names: Iterable[str] = ()) -> tuple[str, ...]:
+    """Literal values that must never appear in a record, read from the env.
+
+    ``names`` is ``constraints.forbid_env``: the variables this repo has
+    declared must never reach a child process, and by the same argument must
+    never be quoted back in an artifact. Any variable whose *name* is
+    credential-shaped is folded in too, so a machine-specific token nobody
+    listed is still covered.
+
+    Returned longest-first: a value that contains another must be substituted
+    before its substring, or the outer one survives in mangled pieces.
+    """
+    wanted = {str(n) for n in names if n}
+    wanted |= {n for n in os.environ if _SECRET_ENV_NAME.search(n)}
+    values = {
+        value
+        for n in wanted
+        if len(value := os.environ.get(n, "").strip()) >= MIN_ENV_VALUE_CHARS
+    }
+    return tuple(sorted(values, key=len, reverse=True))
+
+
+def redact(text: str, *, env_values: Sequence[str] = ()) -> str:
+    """Scrub credentials and absolute home paths out of ``text``.
+
+    ``env_values`` (from :func:`env_secret_values`) are substituted first and
+    literally: a credential only has a recognizable shape if we happen to know
+    the issuer's format, but its exact value is always known here.
+    """
     out = text or ""
+    for value in env_values:
+        out = out.replace(value, REDACTED)
     for pattern in _SECRET_PATTERNS:
         out = pattern.sub(REDACTED, out)
     out = _HOME_PATTERN.sub("~", out)
@@ -80,7 +154,7 @@ def redact(text: str) -> str:
     return out.replace(home, "~") if len(home) > 1 else out
 
 
-def redact_value(value: Any) -> Any:
+def redact_value(value: Any, *, env_values: Sequence[str] = ()) -> Any:
     """Recursively :func:`redact` every string in a JSON-ish structure.
 
     Applied to the whole record just before it is written, so a field nobody
@@ -89,11 +163,11 @@ def redact_value(value: Any) -> Any:
     usage counts stay machine-readable.
     """
     if isinstance(value, str):
-        return redact(value)
+        return redact(value, env_values=env_values)
     if isinstance(value, dict):
-        return {k: redact_value(v) for k, v in value.items()}
+        return {k: redact_value(v, env_values=env_values) for k, v in value.items()}
     if isinstance(value, list):
-        return [redact_value(v) for v in value]
+        return [redact_value(v, env_values=env_values) for v in value]
     return value
 
 
@@ -380,7 +454,11 @@ def prune(repo_root: str | Path, keep_blocks: int) -> list[int]:
     for the recent past and worth bounding beyond it. Returns the blocks removed
     (a non-positive ``keep_blocks`` disables pruning entirely).
     """
-    root = trajectory_dir(repo_root)
+    return _prune_blocks(trajectory_dir(repo_root), keep_blocks)
+
+
+def _prune_blocks(root: Path, keep_blocks: int) -> list[int]:
+    """Shared retention policy for both block-sharded stores."""
     if keep_blocks <= 0 or not root.is_dir():
         return []
     blocks = sorted(
@@ -442,3 +520,196 @@ def record(
     )
     write(traj, repo_root)
     return traj
+
+
+# --- iteration trajectories -------------------------------------------------
+#
+# One record per *loop iteration*: the harness's own decisions, versioned so a
+# corpus of them stays replayable across harness changes.
+
+
+@dataclass
+class Phase:
+    """One named span of an iteration, with its wall-clock cost."""
+
+    name: str
+    seconds: float
+
+
+class PhaseTimer:
+    """Wall-clock accumulator for an iteration's phase timeline.
+
+    ``mark(name)`` closes the span that has been open since the last mark. The
+    clock is injectable so tests can assert on an exact timeline rather than on
+    whatever the machine happened to do.
+    """
+
+    def __init__(self, clock: Callable[[], float] | None = None) -> None:
+        self._clock = clock or time.monotonic
+        self._last = self._clock()
+        self.phases: list[Phase] = []
+
+    def mark(self, name: str) -> Phase:
+        now = self._clock()
+        elapsed = round(max(0.0, now - self._last), 3)
+        self._last = now
+        # A name marked twice (a retry, a guard that re-runs CI) accumulates
+        # into one span: the timeline stays a fixed vocabulary of phases.
+        for phase in self.phases:
+            if phase.name == name:
+                phase.seconds = round(phase.seconds + elapsed, 3)
+                return phase
+        phase = Phase(name=name, seconds=elapsed)
+        self.phases.append(phase)
+        return phase
+
+    def total(self) -> float:
+        return round(sum(p.seconds for p in self.phases), 3)
+
+
+def diff_stat(paths: Iterable[str]) -> dict[str, int]:
+    """Shape of an iteration's diff - counts only, never the paths themselves.
+
+    Counts are the part that is comparable across iterations (and safe to keep
+    once the paths would just re-describe the working tree). ``code`` is the
+    number the completeness guard cares about: a code ticket closed by a
+    knowledge-only diff shows up here as ``code=0``.
+    """
+    seen = [p for p in paths if p]
+    tests = [p for p in seen if Path(p).name.startswith("test_") or "tests" in Path(p).parts]
+    return {
+        "files": len(seen),
+        "code": len([p for p in seen if not p.startswith("knowledge/")]),
+        "knowledge": len([p for p in seen if p.startswith("knowledge/")]),
+        "tests": len(tests),
+        "workflows": len([p for p in seen if p.startswith(".github/workflows/")]),
+    }
+
+
+@dataclass
+class IterationTrajectory:
+    """One loop iteration as a replayable, schema-versioned object.
+
+    Every field is either a counter, an identifier, a status, or a tightly
+    clipped excerpt. Nothing here quotes a diff, a tool result, or an
+    environment: those live in the agent-run :class:`Trajectory` next door. That
+    is what lets a corpus of these be hand-authored as test fixtures.
+    """
+
+    iteration: int
+    block: int
+    schema_version: int = SCHEMA_VERSION
+    ticket: int | None = None
+    kind: str = ""
+    tier: str = ""
+    model: str = ""
+    rationale: str = ""
+    attempts: int = 0
+    dry_run: bool = False
+    phases: list[Phase] = field(default_factory=list)
+    prompt_hash: str = ""
+    prompt_excerpt: str = ""
+    diff_stat: dict[str, int] = field(default_factory=dict)
+    agent_ok: bool | None = None
+    local_ci_before: str = "unknown"  # pass | fail | skipped | unknown
+    local_ci_after: str = "unknown"
+    remote_ci: str = ""  # SUCCESS | FAILURE | TIMEOUT | ... (empty = never polled)
+    review: str = ""  # approve | blocked | skipped
+    pr: int | None = None
+    merged: bool = False
+    recovered: bool = False
+    outcome: str = "unknown"
+    wall_clock_seconds: float = 0.0
+    # Cross-reference to the two other records of the same iteration, so a
+    # trajectory is never a dead end: the agent run it drove, and the cost line
+    # it agrees with by construction (both are written by `_record_cost`).
+    agent_trajectory: str = ""
+    ledger_ref: dict[str, Any] = field(default_factory=dict)
+    notes: list[str] = field(default_factory=list)
+    created: str = field(default_factory=_now)
+
+    @property
+    def identifier(self) -> str:
+        return str(self.iteration)
+
+    def total_phase_seconds(self) -> float:
+        return round(sum(p.seconds for p in self.phases), 3)
+
+    def phase_seconds(self, name: str) -> float:
+        return next((p.seconds for p in self.phases if p.name == name), 0.0)
+
+    def set_prompt(self, prompt: str) -> None:
+        """Record a prompt as a hash plus a clipped head, never in full."""
+        self.prompt_hash = prompt_digest(prompt)
+        self.prompt_excerpt = _clip(prompt, PROMPT_CHARS)
+
+    def note(self, text: str) -> None:
+        if len(self.notes) < MAX_NOTES:
+            self.notes.append(_clip(text, NOTE_CHARS))
+
+    def to_json(self, *, forbid_env: Sequence[str] = ()) -> str:
+        """Serialize, redacted and size-capped, in that order.
+
+        The cap is enforced *after* redaction so trimming can never resurrect a
+        scrubbed value, and it drops the two unbounded-by-nature fields (notes,
+        prompt excerpt) rather than truncating the JSON into something
+        unparseable.
+        """
+        data = redact_value(asdict(self), env_values=env_secret_values(forbid_env))
+        text = json.dumps(data, indent=2, sort_keys=True)
+        if len(text.encode("utf-8")) <= MAX_RECORD_BYTES:
+            return text
+        data["notes"] = ["[record truncated: exceeded size cap]"]
+        data["prompt_excerpt"] = REDACTED
+        return json.dumps(data, indent=2, sort_keys=True)
+
+    def describe(self) -> str:
+        """One compact audit line - the bench's per-scenario output format."""
+        return (
+            f"iteration {self.iteration} block {self.block} [{self.kind or '-'}] "
+            f"ticket={self.ticket} tier={self.tier or '-'} outcome={self.outcome} "
+            f"ci={self.local_ci_before}->{self.local_ci_after} "
+            f"remote={self.remote_ci or '-'} attempts={self.attempts}"
+        )
+
+
+def iteration_dir(repo_root: str | Path) -> Path:
+    return Path(repo_root) / ITERATION_DIR
+
+
+def iteration_path_for(repo_root: str | Path, iteration: int | str, block: int) -> Path:
+    return iteration_dir(repo_root) / str(block) / f"{iteration}.json"
+
+
+def iteration_paths(repo_root: str | Path) -> list[Path]:
+    """Every stored iteration record, oldest block first."""
+    root = iteration_dir(repo_root)
+    return sorted(root.glob("*/*.json")) if root.is_dir() else []
+
+
+def write_iteration(
+    traj: IterationTrajectory, repo_root: str | Path, *, forbid_env: Sequence[str] = ()
+) -> Path:
+    """Persist one iteration record (redaction happens inside ``to_json``)."""
+    path = iteration_path_for(repo_root, traj.identifier, traj.block)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(traj.to_json(forbid_env=forbid_env), encoding="utf-8")
+    return path
+
+
+def read_iteration(path: str | Path) -> IterationTrajectory:
+    """Parse an iteration record, refusing a schema this build cannot read."""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    version = data.get("schema_version")
+    if version != SCHEMA_VERSION:
+        raise ValueError(
+            f"{path}: schema_version {version!r} is not {SCHEMA_VERSION} "
+            "(regenerate the record, or read it with the matching hsai)"
+        )
+    phases = [Phase(**p) for p in data.pop("phases", []) or []]
+    return IterationTrajectory(phases=phases, **data)
+
+
+def prune_iterations(repo_root: str | Path, keep_blocks: int) -> list[int]:
+    """Bound the iteration store the same way :func:`prune` bounds the agent one."""
+    return _prune_blocks(iteration_dir(repo_root), keep_blocks)

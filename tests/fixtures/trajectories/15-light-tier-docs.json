@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "name": "light-tier-docs",
+  "description": "Selection's lower boundary: a narrow docs edit is the one shape allowed to route light. The light tier once 'completed' a feature ticket with a code-free diff, so this scenario exists to prove the cheap tier is still reachable for genuinely mechanical work while 12-knowledge-only-incomplete proves it cannot fake a feature.",
+  "given": {
+    "ci_green": true,
+    "has_tickets": true,
+    "ticket": {
+      "number": 55,
+      "title": "docs: document the trajectory schema and its versioning rule",
+      "body": "One section describing the record and its versioning rule.",
+      "labels": [],
+      "prior_attempts": 0
+    },
+    "prior_iterations": [],
+    "agent": {"ok": true},
+    "changed_paths": ["docs/ARCHITECTURE.md"],
+    "ci_after_green": true,
+    "review_approve": true,
+    "remote_ci": "SUCCESS"
+  },
+  "expect": {
+    "kind": "implement",
+    "tier": "light",
+    "model": "haiku",
+    "outcome": "merged",
+    "merged": true,
+    "recovered": false
+  }
+}

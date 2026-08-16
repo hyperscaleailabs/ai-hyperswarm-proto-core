@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "name": "budget-hard-breach-halt",
+  "description": "Three heavy-tier runs have already landed in this block, which is the configured ceiling. The gate halts before the iteration starts: no tier is selected, no ticket is claimed, no quota is spent. Halting is the whole point, so this scenario also pins that nothing downstream ran.",
+  "given": {
+    "ci_green": true,
+    "has_tickets": true,
+    "ticket": {
+      "number": 45,
+      "title": "feat: add a bench job to the pipeline",
+      "body": "Wire the offline bench into CI.",
+      "labels": [],
+      "prior_attempts": 0
+    },
+    "prior_iterations": [
+      {"tier": "heavy", "seconds": 700, "outcome": "merged"},
+      {"tier": "heavy", "seconds": 650, "outcome": "merged"},
+      {"tier": "heavy", "seconds": 800, "outcome": "recovered"}
+    ],
+    "agent": {"ok": true},
+    "changed_paths": ["src/hsai/bench.py"],
+    "ci_after_green": true,
+    "review_approve": true,
+    "remote_ci": "SUCCESS"
+  },
+  "expect": {
+    "budget": "hard",
+    "outcome": "halted",
+    "kind": "",
+    "tier": "",
+    "model": "",
+    "merged": false,
+    "recovered": false
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "name": "review-blocked",
+  "description": "Local CI is green and the diff has real code, so every shape guard passes - and the independent reviewer still finds an acceptance criterion with no test behind it. A blocking verdict opens no PR and pushes nothing; it routes through the same retry policy a red PR uses, never a new stall state.",
+  "given": {
+    "ci_green": true,
+    "has_tickets": true,
+    "ticket": {
+      "number": 53,
+      "title": "feat: gate merges on an independent reviewer's verdict",
+      "body": "Criterion 2: a blocking verdict must never open a PR.",
+      "labels": [],
+      "prior_attempts": 0
+    },
+    "prior_iterations": [],
+    "agent": {"ok": true},
+    "changed_paths": ["src/hsai/review.py"],
+    "ci_after_green": true,
+    "review_approve": false,
+    "remote_ci": "SUCCESS"
+  },
+  "expect": {
+    "kind": "implement",
+    "tier": "standard",
+    "outcome": "review_blocked",
+    "merged": false,
+    "recovered": true,
+    "review": "blocked",
+    "remote_ci": "",
+    "disposition": "retry"
+  }
+}

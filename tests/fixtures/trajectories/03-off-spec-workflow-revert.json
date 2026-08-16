@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "name": "off-spec-workflow-revert",
+  "description": "A worker edited .github/workflows on its way past the ticket. The off-spec guard reverts those edits before any other guard sees the diff, so the recorded diff stat must show zero workflow files even though the agent touched one. Remote CI then fails on the rest of the change and the ticket goes back to the backlog.",
+  "given": {
+    "ci_green": true,
+    "has_tickets": true,
+    "ticket": {
+      "number": 43,
+      "title": "feat: record per-phase timings for each iteration",
+      "body": "Attach a wall-clock number to every phase of an iteration.",
+      "labels": [],
+      "prior_attempts": 0
+    },
+    "prior_iterations": [],
+    "agent": {"ok": true},
+    "changed_paths": [
+      "src/hsai/orchestrator.py",
+      "tests/test_orchestrator.py",
+      ".github/workflows/ci.yml"
+    ],
+    "ci_after_green": true,
+    "review_approve": true,
+    "remote_ci": "FAILURE"
+  },
+  "expect": {
+    "kind": "implement",
+    "tier": "standard",
+    "outcome": "recovered",
+    "merged": false,
+    "recovered": true,
+    "disposition": "retry",
+    "diff_stat": {"files": 2, "code": 2, "knowledge": 0, "tests": 1, "workflows": 0}
+  }
+}

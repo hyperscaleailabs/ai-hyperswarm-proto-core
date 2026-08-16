@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "name": "remote-ci-timeout",
+  "description": "The remote checks never concluded inside ci_remote_timeout_seconds. TIMEOUT is not SUCCESS, so the change does not merge - the loop must never treat an unknown verdict as a green one.",
+  "given": {
+    "ci_green": true,
+    "has_tickets": true,
+    "ticket": {
+      "number": 49,
+      "title": "feat: poll remote checks to conclusion before arming auto-merge",
+      "body": "Wait for the rollup instead of racing GitHub's own merge.",
+      "labels": [],
+      "prior_attempts": 0
+    },
+    "prior_iterations": [],
+    "agent": {"ok": true},
+    "changed_paths": ["src/hsai/ci.py", "tests/test_ci.py"],
+    "ci_after_green": true,
+    "review_approve": true,
+    "remote_ci": "TIMEOUT"
+  },
+  "expect": {
+    "kind": "implement",
+    "tier": "standard",
+    "outcome": "recovered",
+    "merged": false,
+    "recovered": true,
+    "remote_ci": "TIMEOUT",
+    "disposition": "retry"
+  }
+}

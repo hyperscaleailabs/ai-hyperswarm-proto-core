@@ -10,14 +10,16 @@ Commands:
   hsai doctor                                                  verify environment + invariants
   hsai traj <iteration> [--json]                               print a stored agent run
   hsai replay <iteration> [--json]                             alias of `hsai traj`
+  hsai bench [--corpus DIR] [--json] [--check]                 offline decision-replay bench
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
-from . import __version__, ai, recall, repro, trajectory
+from . import __version__, ai, bench, recall, repro, trajectory
 from .config import CoreConfig, load_config, validate
 from .knowledge import KnowledgeBase
 from .orchestrator import run_loop
@@ -183,6 +185,48 @@ def cmd_traj(args: argparse.Namespace) -> int:
     return _print_trajectory(args, "traj")
 
 
+def cmd_bench(args: argparse.Namespace) -> int:
+    """Replay the scenario corpus through the loop's real decision code.
+
+    Offline by construction: no ``claude`` subprocess, no network, no quota. A
+    single deviating scenario exits non-zero, because a bench that reports a
+    regression without failing is a dashboard, not a gate.
+    """
+    cfg = _load(args)
+    try:
+        report = bench.run_bench(cfg, args.corpus)
+    except bench.CorpusError as exc:
+        print(f"bench: {exc}", file=sys.stderr)
+        return 1
+
+    if args.update_baseline:
+        path = bench.write_baseline(report, args.baseline)
+        print(f"bench: wrote baseline {path}")
+
+    print(json.dumps(report.to_dict(), indent=2, sort_keys=True) if args.json else report.render())
+
+    if not report.ok:
+        print(
+            f"bench: {len(report.failures)} scenario(s) deviated from the corpus",
+            file=sys.stderr,
+        )
+        return 1
+
+    if args.check and not args.update_baseline:
+        try:
+            baseline = bench.read_baseline(args.baseline)
+        except bench.CorpusError as exc:
+            print(f"bench: {exc}", file=sys.stderr)
+            return 1
+        found = bench.regressions(report, baseline)
+        for line in found:
+            print(f"bench: REGRESSION {line}", file=sys.stderr)
+        if found:
+            return 1
+        print(f"bench: no regression against {args.baseline}")
+    return 0
+
+
 def cmd_brief(args: argparse.Namespace) -> int:
     from .governance import write_direction
 
@@ -264,6 +308,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     br = sub.add_parser("brief", help="refresh governance/DIRECTION.md")
     br.set_defaults(func=cmd_brief)
+
+    bn = sub.add_parser(
+        "bench", help="replay the scenario corpus offline (no model, no network, no quota)"
+    )
+    bn.add_argument("--corpus", default=bench.CORPUS_DIR, help="directory of scenario JSON files")
+    bn.add_argument("--json", action="store_true", help="print the full report as JSON")
+    bn.add_argument("--check", action="store_true",
+                    help="fail on regression against the committed baseline")
+    bn.add_argument("--baseline", default=bench.BASELINE_PATH, help="baseline metrics file")
+    bn.add_argument("--update-baseline", action="store_true",
+                    help="overwrite the baseline with this run (deliberate, never in CI)")
+    bn.set_defaults(func=cmd_bench)
 
     for name, help_text, func in (
         ("traj", "print a stored trajectory for a post-mortem", cmd_traj),

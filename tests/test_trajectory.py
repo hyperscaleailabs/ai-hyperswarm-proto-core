@@ -4,7 +4,15 @@ import pytest
 
 from hsai import trajectory
 from hsai.ai import AIResult
-from hsai.trajectory import REDACTED, Step, Trajectory, redact, steps_from_output
+from hsai.trajectory import (
+    REDACTED,
+    IterationTrajectory,
+    Phase,
+    Step,
+    Trajectory,
+    redact,
+    steps_from_output,
+)
 
 MESSAGES_PAYLOAD = {
     "type": "result",
@@ -356,3 +364,192 @@ def test_render_shows_prompt_steps_and_usage():
 
 def test_render_reports_missing_usage():
     assert "usage: (not reported)" in _traj(usage=None).render()
+
+
+# --- iteration trajectories -------------------------------------------------
+#
+# The other granularity: one record per loop iteration, describing what the
+# HARNESS decided rather than what the model typed.
+
+
+def _itraj(**kw) -> IterationTrajectory:
+    base = dict(
+        iteration=12, block=0, ticket=7, kind="implement", tier="standard",
+        model="sonnet", rationale="score=-1 -> standard", attempts=1,
+        local_ci_before="pass", local_ci_after="pass", review="approve",
+        remote_ci="SUCCESS", merged=True, outcome="merged",
+    )
+    base.update(kw)
+    return IterationTrajectory(**base)
+
+
+def test_iteration_record_is_schema_versioned(tmp_path):
+    path = trajectory.write_iteration(_itraj(), tmp_path)
+    assert path == tmp_path / ".hsai" / "trajectories" / "0" / "12.json"
+    assert json.loads(path.read_text())["schema_version"] == trajectory.SCHEMA_VERSION
+    assert trajectory.read_iteration(path) == _itraj()
+
+
+def test_iteration_record_lives_outside_the_obsidian_vault(tmp_path):
+    """Trajectories are operational forensics, not repo content: a vault that
+    filled up with them would poison every recall and whitepaper."""
+    trajectory.write_iteration(_itraj(), tmp_path)
+    assert not (tmp_path / "knowledge").exists()
+    assert trajectory.ITERATION_DIR.startswith(".hsai/")
+
+
+def test_reading_a_foreign_schema_version_raises(tmp_path):
+    path = trajectory.write_iteration(_itraj(), tmp_path)
+    stored = json.loads(path.read_text())
+    stored["schema_version"] = trajectory.SCHEMA_VERSION + 1
+    path.write_text(json.dumps(stored))
+    with pytest.raises(ValueError, match="schema_version"):
+        trajectory.read_iteration(path)
+
+
+def test_iteration_paths_lists_every_stored_record(tmp_path):
+    trajectory.write_iteration(_itraj(iteration=1, block=0), tmp_path)
+    trajectory.write_iteration(_itraj(iteration=201, block=2), tmp_path)
+    assert [p.name for p in trajectory.iteration_paths(tmp_path)] == ["1.json", "201.json"]
+    assert trajectory.iteration_paths(tmp_path / "empty") == []
+
+
+def test_prune_iterations_bounds_the_store(tmp_path):
+    for block in range(5):
+        trajectory.write_iteration(_itraj(iteration=block * 100 + 1, block=block), tmp_path)
+    assert trajectory.prune_iterations(tmp_path, keep_blocks=2) == [0, 1, 2]
+    assert len(trajectory.iteration_paths(tmp_path)) == 2
+
+
+def test_describe_is_one_auditable_line():
+    line = _itraj().describe()
+    assert "iteration 12" in line and "ticket=7" in line
+    assert "tier=standard" in line and "outcome=merged" in line
+    assert "ci=pass->pass" in line and "remote=SUCCESS" in line
+
+
+# --- redaction: no environment value may reach a record ---------------------
+
+def test_no_forbidden_env_value_survives_serialization(tmp_path, monkeypatch):
+    """The acceptance invariant: a record may quote neither a value of
+    `constraints.forbid_env` nor any credential-shaped environment value."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-zzz-super-secret-value")
+    monkeypatch.setenv("GH_TOKEN", "ghp_thisisafaketokenvalue000")
+    monkeypatch.setenv("DEPLOY_PASSWORD", "correct-horse-battery-staple")
+    # Named nowhere and shaped like nothing: only the forbid_env list covers it.
+    monkeypatch.setenv("CUSTOM_FORBIDDEN", "opaque-value-nobody-can-pattern-match")
+
+    leaky = _itraj(
+        prompt_excerpt=(
+            "run with ANTHROPIC_API_KEY=sk-ant-zzz-super-secret-value and "
+            "GH_TOKEN=ghp_thisisafaketokenvalue000"
+        ),
+        notes=[
+            "deploy used correct-horse-battery-staple",
+            "and opaque-value-nobody-can-pattern-match",
+        ],
+        rationale="cwd=/Users/someuser/repo",
+    )
+    written = trajectory.write_iteration(
+        leaky, tmp_path, forbid_env=("ANTHROPIC_API_KEY", "CUSTOM_FORBIDDEN"),
+    ).read_text()
+
+    for secret in (
+        "sk-ant-zzz-super-secret-value",
+        "ghp_thisisafaketokenvalue000",
+        "correct-horse-battery-staple",
+        "opaque-value-nobody-can-pattern-match",
+        "/Users/someuser",
+    ):
+        assert secret not in written, f"{secret!r} leaked into the record"
+    assert REDACTED in written
+    # Still a usable record: counters and identifiers survive intact.
+    assert json.loads(written)["iteration"] == 12
+
+
+def test_env_secret_values_ignores_short_and_absent_values(monkeypatch):
+    monkeypatch.setenv("TINY_TOKEN", "abc")  # too short to substitute safely
+    monkeypatch.setenv("REAL_TOKEN", "a-long-enough-token-value")
+    values = trajectory.env_secret_values(("NOT_SET_ANYWHERE",))
+    assert "a-long-enough-token-value" in values
+    assert "abc" not in values
+    # Longest first, so a value containing another is replaced before it.
+    assert list(values) == sorted(values, key=len, reverse=True)
+
+
+def test_redact_env_values_are_substituted_literally():
+    text = "the key is opaque-but-secret and nothing about it looks secret"
+    assert "opaque-but-secret" not in redact(text, env_values=("opaque-but-secret",))
+    assert redact(text) == text  # without the value, nothing to match on
+
+
+# --- size cap ---------------------------------------------------------------
+
+def test_oversized_record_is_capped_not_corrupted(tmp_path):
+    huge = _itraj(notes=["x" * 5000 for _ in range(50)])
+    written = trajectory.write_iteration(huge, tmp_path).read_text()
+    assert len(written.encode("utf-8")) <= trajectory.MAX_RECORD_BYTES
+    # Trimmed, still parseable, and honest about what it dropped.
+    assert json.loads(written)["notes"] == ["[record truncated: exceeded size cap]"]
+
+
+def test_note_and_prompt_are_clipped_at_capture():
+    traj = IterationTrajectory(iteration=1, block=0)
+    traj.set_prompt("p" * (trajectory.PROMPT_CHARS + 500))
+    traj.note("n" * (trajectory.NOTE_CHARS + 500))
+    assert len(traj.prompt_excerpt) < trajectory.PROMPT_CHARS + 100
+    assert len(traj.notes[0]) < trajectory.NOTE_CHARS + 100
+    assert traj.prompt_hash == trajectory.prompt_digest("p" * (trajectory.PROMPT_CHARS + 500))
+
+    for i in range(trajectory.MAX_NOTES + 10):
+        traj.note(f"note {i}")
+    assert len(traj.notes) == trajectory.MAX_NOTES
+
+
+# --- phase timeline ---------------------------------------------------------
+
+def test_phase_timer_records_a_span_per_mark():
+    clock = iter([0.0, 1.5, 4.0, 4.25]).__next__
+    timer = trajectory.PhaseTimer(clock=clock)
+    timer.mark("agent")
+    timer.mark("ci_after")
+    timer.mark("review")
+    assert [(p.name, p.seconds) for p in timer.phases] == [
+        ("agent", 1.5), ("ci_after", 2.5), ("review", 0.25)
+    ]
+    assert timer.total() == 4.25
+
+
+def test_phase_timer_accumulates_a_repeated_name():
+    """A guard that re-runs a phase must not duplicate it in the timeline."""
+    clock = iter([0.0, 1.0, 2.0, 5.0]).__next__
+    timer = trajectory.PhaseTimer(clock=clock)
+    timer.mark("guards")
+    timer.mark("ci_after")
+    timer.mark("guards")
+    assert [p.name for p in timer.phases] == ["guards", "ci_after"]
+    assert timer.phase_lookup() if False else timer.phases[0].seconds == 4.0
+
+
+def test_phase_seconds_reads_the_timeline():
+    traj = _itraj(phases=[Phase(name="agent", seconds=12.5), Phase(name="review", seconds=1.5)])
+    assert traj.phase_seconds("agent") == 12.5
+    assert traj.phase_seconds("never-ran") == 0.0
+    assert traj.total_phase_seconds() == 14.0
+
+
+# --- diff stat --------------------------------------------------------------
+
+def test_diff_stat_counts_by_category():
+    assert trajectory.diff_stat([
+        "src/hsai/bench.py",
+        "tests/test_bench.py",
+        "knowledge/lessons/2026-08-16-note.md",
+        ".github/workflows/ci.yml",
+    ]) == {"files": 4, "code": 3, "knowledge": 1, "tests": 1, "workflows": 1}
+
+
+def test_diff_stat_of_an_empty_diff():
+    assert trajectory.diff_stat([]) == {
+        "files": 0, "code": 0, "knowledge": 0, "tests": 0, "workflows": 0
+    }

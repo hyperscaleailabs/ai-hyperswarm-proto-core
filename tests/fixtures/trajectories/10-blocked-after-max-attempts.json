@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "name": "blocked-after-max-attempts",
+  "description": "The same ticket has already failed once (attempts:1) and max_ticket_attempts is 2. This failure exhausts it: instead of returning to the backlog for a third worker to burn quota on, it is labelled blocked and left for a human. The retry policy is one function, so this scenario pins it for both callers.",
+  "given": {
+    "ci_green": true,
+    "has_tickets": true,
+    "ticket": {
+      "number": 50,
+      "title": "feat: adversarial cross-model PR review gate",
+      "body": "A second opinion from a different tier than the author.",
+      "labels": ["attempts:1"],
+      "prior_attempts": 1
+    },
+    "prior_iterations": [],
+    "agent": {"ok": true},
+    "changed_paths": ["src/hsai/review.py", "tests/test_review.py"],
+    "ci_after_green": true,
+    "review_approve": true,
+    "remote_ci": "FAILURE"
+  },
+  "expect": {
+    "kind": "implement",
+    "tier": "standard",
+    "outcome": "recovered",
+    "merged": false,
+    "recovered": true,
+    "attempts": 2,
+    "disposition": "blocked"
+  }
+}

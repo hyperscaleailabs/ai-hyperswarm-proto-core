@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "name": "agent-timeout",
+  "description": "The worker hit execution.agent_timeout_seconds mid-edit. It left real code behind, so the completeness guard passes, but the half-finished tree is red locally. A red branch skips the review gate (the CI gate already decides it) and remote CI closes it out.",
+  "given": {
+    "ci_green": true,
+    "has_tickets": true,
+    "ticket": {
+      "number": 47,
+      "title": "feat: rank prior notes by recency as well as relevance",
+      "body": "Blend an age term into the retrieval score.",
+      "labels": [],
+      "prior_attempts": 0
+    },
+    "prior_iterations": [],
+    "agent": {"ok": false, "timed_out": true},
+    "changed_paths": ["src/hsai/recall.py"],
+    "ci_after_green": false,
+    "review_approve": true,
+    "remote_ci": "FAILURE"
+  },
+  "expect": {
+    "kind": "implement",
+    "tier": "standard",
+    "outcome": "recovered",
+    "merged": false,
+    "recovered": true,
+    "review": "skipped",
+    "local_ci_after": "fail",
+    "disposition": "retry"
+  }
+}

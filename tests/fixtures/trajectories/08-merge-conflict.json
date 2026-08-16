@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "name": "merge-conflict",
+  "description": "Everything the loop can check locally is green, and the change is still unmergeable: a parallel worker merged first and this branch now conflicts with main, so GitHub's rollup for the PR reports FAILURE. Remote CI is the source of truth, so the PR is closed and the ticket returns to the backlog even though local CI and the reviewer both approved.",
+  "given": {
+    "ci_green": true,
+    "has_tickets": true,
+    "ticket": {
+      "number": 48,
+      "title": "feat: synthesis memory and duplicate-proposal rejection",
+      "body": "Carry recent ticket titles into the planner prompt.",
+      "labels": [],
+      "prior_attempts": 0
+    },
+    "prior_iterations": [],
+    "agent": {"ok": true},
+    "changed_paths": ["src/hsai/synthesis.py", "tests/test_synthesis.py"],
+    "ci_after_green": true,
+    "review_approve": true,
+    "remote_ci": "FAILURE"
+  },
+  "expect": {
+    "kind": "implement",
+    "tier": "standard",
+    "outcome": "recovered",
+    "merged": false,
+    "recovered": true,
+    "review": "approve",
+    "local_ci_after": "pass",
+    "remote_ci": "FAILURE",
+    "disposition": "retry"
+  }
+}

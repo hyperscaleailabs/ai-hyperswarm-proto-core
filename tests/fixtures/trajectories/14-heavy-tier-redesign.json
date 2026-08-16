@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "name": "heavy-tier-redesign",
+  "description": "Selection's upper boundary: an explicit redesign of a subsystem must route heavy. Under budget there is nothing to demote it, so this pins that the heavy tier is still reachable at all - a scoring change that quietly made everything standard would show up here and nowhere else.",
+  "given": {
+    "ci_green": true,
+    "has_tickets": true,
+    "ticket": {
+      "number": 54,
+      "title": "refactor: redesign the cycle journal for resumable blocks",
+      "body": "Rework the journal so a killed block replays its completed steps instead of repeating their side effects.",
+      "labels": [],
+      "prior_attempts": 0
+    },
+    "prior_iterations": [],
+    "agent": {"ok": true},
+    "changed_paths": ["src/hsai/journal.py", "src/hsai/cycle.py", "tests/test_journal.py"],
+    "ci_after_green": true,
+    "review_approve": true,
+    "remote_ci": "SUCCESS"
+  },
+  "expect": {
+    "kind": "implement",
+    "tier": "heavy",
+    "model": "opus",
+    "outcome": "merged",
+    "merged": true,
+    "recovered": false,
+    "budget": "ok"
+  }
+}

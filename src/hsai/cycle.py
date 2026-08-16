@@ -260,7 +260,14 @@ def run_cycle(
     # replayable and drop the rest so the store stays bounded.
     dropped = journal.once(
         jr, "prune", "block",
-        lambda: {"dropped": trajectory.prune(repo_root, cfg.trajectory_retention_blocks)},
+        lambda: {
+            "dropped": trajectory.prune(repo_root, cfg.trajectory_retention_blocks),
+            # The iteration store is bounded by the same retention setting: one
+            # knob for "how far back can the loop see itself".
+            "dropped_iterations": trajectory.prune_iterations(
+                repo_root, cfg.trajectory_retention_blocks
+            ),
+        },
     )["dropped"]
     if dropped:
         report.notes.append(f"pruned trajectories for block(s) {dropped}")

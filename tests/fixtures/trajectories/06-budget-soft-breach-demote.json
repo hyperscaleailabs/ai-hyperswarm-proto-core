@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "name": "budget-soft-breach-demote",
+  "description": "The block has burned 4500s of its 5400s wall-clock ceiling: a soft breach. A size:L ticket that would normally route heavy is demoted one tier so the block keeps making progress instead of stopping. Selection still runs - only its output moves.",
+  "given": {
+    "ci_green": true,
+    "has_tickets": true,
+    "ticket": {
+      "number": 46,
+      "title": "feat: verifiable subscription-only execution",
+      "body": "Prove the forbidden variable never reaches a spawned child process.",
+      "labels": ["size:L"],
+      "prior_attempts": 0
+    },
+    "prior_iterations": [
+      {"tier": "standard", "seconds": 900, "outcome": "merged"},
+      {"tier": "standard", "seconds": 900, "outcome": "merged"},
+      {"tier": "standard", "seconds": 900, "outcome": "recovered"},
+      {"tier": "standard", "seconds": 900, "outcome": "merged"},
+      {"tier": "standard", "seconds": 900, "outcome": "merged"}
+    ],
+    "agent": {"ok": true},
+    "changed_paths": ["src/hsai/ai.py", "tests/test_ai.py"],
+    "ci_after_green": true,
+    "review_approve": true,
+    "remote_ci": "SUCCESS"
+  },
+  "expect": {
+    "budget": "soft",
+    "kind": "implement",
+    "tier": "standard",
+    "model": "sonnet",
+    "outcome": "merged",
+    "merged": true,
+    "recovered": false
+  }
+}
