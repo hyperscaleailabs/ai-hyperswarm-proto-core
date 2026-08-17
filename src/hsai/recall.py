@@ -26,8 +26,10 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import github, ledger
 from .config import CoreConfig
 from .knowledge import LessonRecord, parse_note, split_sections
+from .proc import Runner, run
 
 # BM25 free parameters - the standard defaults; term saturation (k1) and
 # length normalisation (b).
@@ -84,8 +86,12 @@ class RecalledNote:
     outcome: str
     kind: str
     snippet: str
-    source: str = "lesson"  # lesson | whitepaper | adr
+    source: str = "lesson"  # lesson | whitepaper | adr | issue | ledger
     title: str = ""
+    # Citation form for sources that are not vault notes (``#123`` for an issue,
+    # ``ledger/block-41335`` for a ledger aggregate). Empty means "a note", which
+    # is cited as an Obsidian wikilink.
+    ref: str = ""
 
     def label(self) -> str:
         """Compact provenance shown in prompts and on the CLI."""
@@ -93,8 +99,12 @@ class RecalledNote:
             return self.source
         return f"{self.outcome}/{self.kind}"
 
+    def citation(self) -> str:
+        """The stable source ref a ticket must quote to cite this artifact."""
+        return self.ref or f"[[{self.note_name}]]"
+
     def render(self) -> str:
-        return f"- [[{self.note_name}]] ({self.label()}) - {self.snippet}"
+        return f"- {self.citation()} ({self.label()}) - {self.snippet}"
 
 
 @dataclass(frozen=True)
@@ -123,6 +133,7 @@ class Document:
     source: str
     snippet: str
     tokens: tuple[str, ...]
+    ref: str = ""  # see RecalledNote.ref
 
 
 def tokenize(text: str) -> list[str]:
@@ -184,6 +195,31 @@ def _to_document(path: Path, source: str) -> Document:
     )
 
 
+def note_documents(root: str | Path, cfg: CoreConfig | None = None) -> list[Document]:
+    """Index documents for every Markdown note in the vault.
+
+    Missing directories are simply skipped, so a fresh worktree (or a
+    ``tmp_path`` in a test) yields an empty list rather than an error.
+    """
+    root = Path(root)
+    knowledge = (cfg.knowledge if cfg else None) or {}
+    governance = (cfg.governance if cfg else None) or {}
+    sources = (
+        ("lesson", knowledge.get("lessons_dir", "knowledge/lessons")),
+        ("whitepaper", knowledge.get("whitepapers_dir", "knowledge/whitepapers")),
+        ("adr", governance.get("adr_dir", "docs/adr")),
+    )
+    documents: list[Document] = []
+    for source, rel in sources:
+        directory = root / rel
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.glob("*.md")):
+            if _is_indexable(path):
+                documents.append(_to_document(path, source))
+    return documents
+
+
 class Corpus:
     """A BM25 index over the repo's own lessons, whitepapers and ADRs."""
 
@@ -203,23 +239,7 @@ class Corpus:
         Missing directories are simply skipped, so a fresh worktree (or a
         tmp_path in a test) yields an empty corpus rather than an error.
         """
-        root = Path(root)
-        knowledge = (cfg.knowledge if cfg else None) or {}
-        governance = (cfg.governance if cfg else None) or {}
-        sources = (
-            ("lesson", knowledge.get("lessons_dir", "knowledge/lessons")),
-            ("whitepaper", knowledge.get("whitepapers_dir", "knowledge/whitepapers")),
-            ("adr", governance.get("adr_dir", "docs/adr")),
-        )
-        documents: list[Document] = []
-        for source, rel in sources:
-            directory = root / rel
-            if not directory.is_dir():
-                continue
-            for path in sorted(directory.glob("*.md")):
-                if _is_indexable(path):
-                    documents.append(_to_document(path, source))
-        return cls(documents, RecallConfig.from_core(cfg))
+        return cls(note_documents(root, cfg), RecallConfig.from_core(cfg))
 
     def __len__(self) -> int:
         return len(self.documents)
@@ -280,6 +300,7 @@ class Corpus:
                     snippet=doc.snippet,
                     source=doc.source,
                     title=doc.title,
+                    ref=doc.ref,
                 )
             )
         scored.sort(key=lambda n: (-n.score, n.note_name))
@@ -334,3 +355,229 @@ def for_task(
         return Recall()
     notes = corpus.search(f"{title}\n{body}\n{kind}", rcfg.k, kind=kind)
     return render(notes, rcfg.max_chars)
+
+
+# --- prior art: retrieval over the loop's OWN record ---------------------------
+# `for_task` above answers "what should this worker read first?". The planner
+# needs a wider and differently-shaped answer: not only vault notes, but also
+# what shipped (closed tickets), what failed (fail lessons + blocked tickets),
+# and what the block currently costs (the quota ledger). Same BM25 index, four
+# sources, one hard character budget.
+
+PRIOR_ART_HEADING = "Prior art from this loop's own record"
+
+_PRIOR_ART_PREAMBLE = (
+    f"{PRIOR_ART_HEADING} (retrieved from our lessons, whitepapers, quota ledger "
+    "and closed/blocked tickets). Every ticket you file MUST quote at least one "
+    "of the refs below verbatim in its `prior_art` field:"
+)
+_SHIPPED_HEADING = "Already shipped or decided:"
+_FAILED_HEADING = "Tried and FAILED - do not re-propose blindly:"
+_COST_HEADING = "Current cost pressure (quota ledger):"
+
+_GROUP_ORDER = (
+    ("shipped", _SHIPPED_HEADING),
+    ("failed", _FAILED_HEADING),
+    ("cost", _COST_HEADING),
+)
+
+DEFAULT_PRIOR_ART_MAX_CHARS = 2500
+DEFAULT_PRIOR_ART_K = 12
+DEFAULT_PRIOR_ART_LEDGER_BLOCKS = 3
+DEFAULT_PRIOR_ART_CLOSED_LIMIT = 30
+
+
+@dataclass(frozen=True)
+class PriorArt:
+    """Ranked internal evidence, rendered under a hard character budget."""
+
+    items: tuple[RecalledNote, ...] = ()
+    section: str = ""
+
+    @property
+    def refs(self) -> tuple[str, ...]:
+        """The stable citation refs a filed ticket may quote."""
+        return tuple(i.citation() for i in self.items)
+
+    def __bool__(self) -> bool:
+        return bool(self.section)
+
+
+def _issue_document(issue: github.Issue, *, outcome: str, kind: str) -> Document:
+    """Index one ticket. The title identifies it; the lead line is the excerpt."""
+    lead = _first_prose_line(issue.body)
+    snippet = _clip(f"{issue.title} - {lead}" if lead else issue.title, 200)
+    return Document(
+        note_name=f"issue-{issue.number}",
+        title=issue.title,
+        outcome=outcome,
+        kind=kind,
+        source="issue",
+        snippet=snippet,
+        tokens=tuple(tokenize(f"{issue.title}\n{issue.body}")),
+        ref=f"#{issue.number}",
+    )
+
+
+def issue_documents(
+    cfg: CoreConfig, *, runner: Runner = run, closed_limit: int | None = None
+) -> list[Document]:
+    """Closed tickets (what shipped) and blocked ones (what defeated us).
+
+    Degrades to ``[]`` when `gh` is missing or unauthenticated - prior art is
+    additive evidence, so it must never be able to abort synthesis.
+    """
+    if closed_limit is None:
+        closed_limit = int(
+            cfg.synthesis.get("prior_art_closed_limit", DEFAULT_PRIOR_ART_CLOSED_LIMIT)
+        )
+    try:
+        closed = github.list_closed_issues(cfg.repo_slug, limit=closed_limit, runner=runner)
+    except (OSError, ValueError):
+        closed = []
+    try:
+        blocked = [i for i in github.list_open_issues(cfg.repo_slug, runner=runner) if i.is_blocked]
+    except (OSError, ValueError):
+        blocked = []
+    return [_issue_document(i, outcome="pass", kind="closed") for i in closed] + [
+        _issue_document(i, outcome="fail", kind="blocked") for i in blocked
+    ]
+
+
+def ledger_documents(
+    root: str | Path, cfg: CoreConfig, *, blocks: int | None = None
+) -> list[Document]:
+    """Per-block quota aggregates, newest block first.
+
+    An absent or half-written ledger yields ``[]`` rather than raising: the
+    planner losing its cost signal is bad, losing the whole synthesis is worse.
+    """
+    if blocks is None:
+        blocks = int(
+            cfg.synthesis.get("prior_art_ledger_blocks", DEFAULT_PRIOR_ART_LEDGER_BLOCKS)
+        )
+    try:
+        records = ledger.read_records(ledger.ledger_path(cfg, root))
+    except (OSError, ValueError, TypeError):
+        return []
+    documents: list[Document] = []
+    for block in sorted({r.block for r in records}, reverse=True)[: max(0, blocks)]:
+        summary = ledger.aggregate_block(records, block).summary()
+        documents.append(
+            Document(
+                note_name=f"ledger-block-{block}",
+                title=f"Block {block} cost",
+                outcome="unknown",
+                kind="ledger",
+                source="ledger",
+                snippet=_clip(f"block {block}: {summary}", 200),
+                # Seeded with the vocabulary a cost-shaped query uses, so a
+                # planner asking about quota/budget retrieves these by rank.
+                tokens=tuple(tokenize(f"quota cost budget spend ledger block {block} {summary}")),
+                ref=f"ledger/block-{block}",
+            )
+        )
+    return documents
+
+
+def _group_of(item: RecalledNote) -> str:
+    if item.source == "ledger":
+        return "cost"
+    return "failed" if item.outcome == "fail" else "shipped"
+
+
+def render_prior_art(
+    items: list[RecalledNote] | tuple[RecalledNote, ...], budget_chars: int
+) -> PriorArt:
+    """Render at most ``budget_chars``, grouped into shipped / failed / cost.
+
+    Items are *selected* round-robin across the three groups so a long run of
+    shipped work can never starve the failure history or the cost line, then
+    *rendered* grouped so the planner reads one coherent block. Whole items are
+    dropped to fit - never a truncated half-excerpt - and the returned
+    :class:`PriorArt` lists exactly what survived, so the audit trail can never
+    claim more than was actually injected.
+    """
+    if not items or budget_chars <= 0 or len(_PRIOR_ART_PREAMBLE) > budget_chars:
+        return PriorArt()
+
+    queues: dict[str, list[RecalledNote]] = {name: [] for name, _ in _GROUP_ORDER}
+    for item in items:
+        queues[_group_of(item)].append(item)
+
+    chosen: dict[str, list[RecalledNote]] = {name: [] for name, _ in _GROUP_ORDER}
+    used = len(_PRIOR_ART_PREAMBLE)
+    progress = True
+    while progress:
+        progress = False
+        for name, heading in _GROUP_ORDER:
+            queue = queues[name]
+            i = len(chosen[name])
+            if i >= len(queue):
+                continue
+            # A line costs its own length plus the newline joining it; the first
+            # item of a group also pays for the blank line and the group heading.
+            cost = 1 + len(queue[i].render())
+            if not chosen[name]:
+                cost += 2 + len(heading)
+            if used + cost > budget_chars:
+                continue
+            used += cost
+            chosen[name].append(queue[i])
+            progress = True
+
+    lines = [_PRIOR_ART_PREAMBLE]
+    kept: list[RecalledNote] = []
+    for name, heading in _GROUP_ORDER:
+        if not chosen[name]:
+            continue
+        lines += ["", heading]
+        for item in chosen[name]:
+            lines.append(item.render())
+            kept.append(item)
+    if not kept:
+        return PriorArt()
+    return PriorArt(items=tuple(kept), section="\n".join(lines))
+
+
+def build_prior_art(
+    root: str | Path,
+    cfg: CoreConfig,
+    *,
+    query: str,
+    budget_chars: int | None = None,
+    k: int | None = None,
+    runner: Runner = run,
+) -> PriorArt:
+    """Rank the loop's own evidence for ``query`` and render it under budget.
+
+    Four sources share one BM25 index (lessons + whitepapers + ADRs, closed and
+    blocked tickets, per-block ledger aggregates) so their scores are directly
+    comparable. Every source degrades independently to nothing, so a missing
+    `gh`, an empty vault or an absent ledger thins the section instead of
+    failing synthesis.
+    """
+    synthesis = cfg.synthesis or {}
+    if budget_chars is None:
+        budget_chars = int(synthesis.get("prior_art_max_chars", DEFAULT_PRIOR_ART_MAX_CHARS))
+    if k is None:
+        k = int(synthesis.get("prior_art_k", DEFAULT_PRIOR_ART_K))
+
+    ledger_docs = ledger_documents(root, cfg)
+    documents = note_documents(root, cfg) + issue_documents(cfg, runner=runner) + ledger_docs
+    if not documents:
+        return PriorArt()
+
+    ranked = Corpus(documents, RecallConfig.from_core(cfg)).search(query, k)
+    if ledger_docs and not any(n.source == "ledger" for n in ranked):
+        # Cost pressure is a CONSTRAINT, not a search hit: the planner must see
+        # the newest block's spend even when the query says nothing about cost.
+        newest = ledger_docs[0]
+        ranked.append(
+            RecalledNote(
+                note_name=newest.note_name, score=0.0, outcome=newest.outcome,
+                kind=newest.kind, snippet=newest.snippet, source=newest.source,
+                title=newest.title, ref=newest.ref,
+            )
+        )
+    return render_prior_art(ranked, budget_chars)

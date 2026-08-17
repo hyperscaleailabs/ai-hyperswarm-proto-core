@@ -4,7 +4,8 @@ This is the "planner" half of the two-phase engine. Instead of one small idea
 copied from one project, a heavy model:
 
 1. receives a context pack built from a rotating subset of the reference set
-   (README, recent commit subjects, CI workflow inventory - fetched via `gh`),
+   (README, recent commit subjects, CI workflow inventory - fetched via `gh`)
+   PLUS retrieved prior art from the loop's own record (:mod:`hsai.recall`),
 2. generates ~``ideas_target`` candidate improvements, each required to COMBINE
    practices from >= ``min_projects_combined`` different reference projects,
 3. runs a reflection pass - critiques its own candidates for feasibility,
@@ -12,6 +13,17 @@ copied from one project, a heavy model:
 4. prioritizes by impact x effort and emits the top ``file_top`` as fully
    structured tickets (schema in :mod:`hsai.tickets`), which are filed on
    GitHub for the cheaper implementation agents to pick up.
+
+Retrieval-augmented, and novelty-gated. Before a candidate is filed it passes
+two checks that the model itself cannot wave through:
+
+* **schema** - every ticket must cite >= 1 internal artifact in ``prior_art``
+  (:func:`hsai.tickets.check_prior_art`), so an idea is traceable to something
+  this loop observed, not only to another project's README;
+* **novelty** (:func:`judge_novelty`) - an exact title collision with an open or
+  closed ticket is REFUSED, a merely similar candidate is DEMOTED behind the
+  genuinely new ones, and a previously-*failed* idea may return only when it
+  cites that failure and says what changed.
 
 The model call goes through :mod:`hsai.ai`, so it stays subscription-only.
 """
@@ -22,13 +34,13 @@ import logging
 import re
 from dataclasses import dataclass, field
 
-from . import github
+from . import github, recall
 from .ai import run_agent
 from .config import CoreConfig
 from .knowledge import KnowledgeBase
 from .models import ModelChoice
 from .proc import Runner, run
-from .tickets import TicketSpec
+from .tickets import TicketSpec, check_prior_art, validate_spec
 
 _logger = logging.getLogger(__name__)
 
@@ -37,10 +49,11 @@ _JSON_BLOCK = re.compile(r"```(?:json)?\s*(\[.*?\])\s*```", re.DOTALL)
 
 @dataclass
 class ContextPack:
-    """What the synthesizer knows about the reference projects this cycle."""
+    """What the synthesizer knows this cycle: other projects, and ourselves."""
 
     repos: list[str]
     sections: dict[str, str]  # repo -> digest text
+    prior_art: recall.PriorArt = field(default_factory=recall.PriorArt)
 
     def render(self) -> str:
         parts = [f"### {repo}\n{text}" for repo, text in self.sections.items()]
@@ -58,10 +71,37 @@ def pick_rotation(cfg: CoreConfig, cycle_index: int) -> list[str]:
     return [repos[(start + i) % len(repos)] for i in range(min(k, len(repos)))]
 
 
+def prior_art_query(cfg: CoreConfig, repos: list[str]) -> str:
+    """What the planner is about to reason about, as a retrieval query.
+
+    The mission and the goals - not one narrow keyword - because the planner's
+    task *is* "advance these goals", and BM25 over the goal vocabulary is what
+    surfaces the lessons and ledger figures that bear on them.
+    """
+    goals = " ".join(
+        f"{g.get('id', '')} {g.get('title', '')} {g.get('description', '')}" for g in cfg.goals
+    )
+    return f"{cfg.mission}\n{goals}\n{' '.join(repos)}"
+
+
 def build_context_pack(
-    repos: list[str], *, runner: Runner = run, commits: int = 30
+    repos: list[str],
+    *,
+    runner: Runner = run,
+    commits: int = 30,
+    root: str = ".",
+    cfg: CoreConfig | None = None,
 ) -> ContextPack:
-    """Fetch a compact study digest for each repo via the GitHub API."""
+    """Fetch a compact study digest for each repo, plus our own prior art.
+
+    ``cfg`` is what enables retrieval; without it the pack carries the
+    reference-project digests alone (the pre-retrieval behaviour).
+    """
+    prior_art = (
+        recall.build_prior_art(root, cfg, query=prior_art_query(cfg, repos), runner=runner)
+        if cfg is not None
+        else recall.PriorArt()
+    )
     sections: dict[str, str] = {}
     for repo in repos:
         parts: list[str] = []
@@ -87,7 +127,7 @@ def build_context_pack(
         if workflows.ok and workflows.stdout.strip():
             parts.append("CI workflows:\n" + workflows.stdout[:500])
         sections[repo] = "\n\n".join(parts) or "(no data fetched)"
-    return ContextPack(repos=repos, sections=sections)
+    return ContextPack(repos=repos, sections=sections, prior_art=prior_art)
 
 
 MEMORY_HEADING = "What this loop has already tried"
@@ -101,8 +141,31 @@ DEFAULT_MEMORY_MAX_LESSONS = 25
 
 # Above this Jaccard token-overlap ratio (over normalized titles) a candidate
 # is treated as a re-proposal of prior work, not a new idea. Documented here
-# because it is the one number that decides what gets silently dropped.
+# because it is the one number that decides what gets demoted or refused.
 DUPLICATE_JACCARD_THRESHOLD = 0.6
+
+# How much of a prior failing title a citation must name before it counts as
+# citing THAT failure. Containment, not Jaccard: a citation is a note name or a
+# ticket ref, so it is legitimately longer and noisier than the title it cites.
+CITATION_COVERAGE_THRESHOLD = 0.6
+
+# Hard ceiling on the whole rendered prompt. The memory and prior-art sections
+# are individually capped; this bounds their sum plus the study digest, which is
+# the one elastic part and therefore the part that gets clipped.
+DEFAULT_MAX_PROMPT_CHARS = 24000
+
+PRIOR_ART_HEADING = recall.PRIOR_ART_HEADING
+PRIOR_ART_EMPTY = (
+    "_(no internal prior art retrieved - an early cycle, or `gh`/the ledger was "
+    "unavailable. File tickets grounded in the reference study alone this time.)_"
+)
+
+_DIGEST_TRUNCATION = "\n... (study digest truncated to fit the prompt cap)"
+
+# What judge_novelty can decide about one candidate.
+ACCEPT = "accept"
+DEMOTE = "demote"
+REFUSE = "refuse"
 
 _CONVENTIONAL_PREFIX_RE = re.compile(
     r"^\s*(feat|fix|refactor|chore|docs|test|ci|skill|perf|style|build)"
@@ -200,6 +263,26 @@ class MemoryPack:
             + list(self.closed_titles)
             + [title for _, title in self.lessons]
         )
+
+    def ticket_titles(self) -> list[str]:
+        """Titles of real tickets, open or closed - never lesson titles.
+
+        An exact collision with one of these is a hard refusal, so the set has
+        to be exactly "work that was actually filed", not "anything we wrote
+        down": a lesson is a *record* of work, and its title legitimately
+        echoes the ticket it came from.
+        """
+        return [i.title for i in self.open_tickets] + list(self.closed_titles)
+
+    def failed_titles(self) -> list[str]:
+        """Ideas this loop already tried and did not land.
+
+        Two shapes of failure: a lesson recorded ``outcome/fail``, and a ticket
+        that exhausted its retries and now carries the ``blocked`` label.
+        """
+        return [title for outcome, title in self.lessons if outcome == "fail"] + [
+            i.title for i in self.open_tickets if i.is_blocked
+        ]
 
     def render(self, *, max_chars: int = DEFAULT_MEMORY_MAX_CHARS) -> str:
         """Titles only, newest first, hard-capped so it can never crowd out
