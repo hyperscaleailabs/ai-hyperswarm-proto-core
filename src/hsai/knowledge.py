@@ -63,6 +63,10 @@ class Lesson:
     recalled: tuple[str, ...] = ()  # prior notes injected into this run's prompt
     review_verdict: str = ""  # the independent reviewer's verdict, verbatim
     execution_trace: str = ""  # turns/tools/tokens/exit/duration - the committed digest
+    # A member of hsai.postmortem.FAILURE_CLASSES, set only when outcome=="fail"
+    # (empty for a pass) - mirrored into frontmatter as a `failure/<class>` tag
+    # so the Obsidian graph can filter failures by cause.
+    failure_class: str = ""
 
     def note_name(self) -> str:
         return f"{self.created}-{slugify(self.title)}"
@@ -80,6 +84,7 @@ class LessonRecord:
     lesson_text: str
     what_happened: str = ""
     body: str = ""  # everything after the frontmatter; what the recall index reads
+    failure_class: str = ""  # "" when absent (pass, or a note predating this field)
 
 
 def split_sections(text: str) -> dict[str, str]:
@@ -128,6 +133,7 @@ def parse_note(path: str | Path) -> LessonRecord:
     tags = _frontmatter_tags(fm)
     outcome = next((t.split("/", 1)[1] for t in tags if t.startswith("outcome/")), "unknown")
     kind = next((t.split("/", 1)[1] for t in tags if t.startswith("kind/")), "unknown")
+    failure_class = next((t.split("/", 1)[1] for t in tags if t.startswith("failure/")), "")
     title_match = _TITLE_RE.search(text)
     title = title_match.group(1).strip() if title_match else path.stem
     sections = split_sections(text)
@@ -140,6 +146,7 @@ def parse_note(path: str | Path) -> LessonRecord:
         lesson_text=sections.get("lesson learned", ""),
         what_happened=sections.get("what happened", ""),
         body=body.strip(),
+        failure_class=failure_class,
     )
 
 
@@ -329,6 +336,10 @@ class KnowledgeBase:
 
     def _render_lesson(self, lesson: Lesson) -> str:
         tags = ("lesson", f"outcome/{lesson.outcome}", f"kind/{lesson.kind}", *lesson.tags)
+        # Only for failed iterations, and only a real classification - keeps a
+        # passing note byte-for-byte identical to before this field existed.
+        if lesson.outcome == "fail" and lesson.failure_class:
+            tags = (*tags, f"failure/{lesson.failure_class}")
         extra: dict[str, str | tuple[str, ...]] = {
             "created": lesson.created,
             "iteration": str(lesson.iteration),
@@ -344,6 +355,13 @@ class KnowledgeBase:
         repro = lesson.repro_evidence or "_(not applicable: not a heal/bugfix ticket)_"
         # Who checked the work, not just who wrote it (G2).
         review = lesson.review_verdict or "_(no independent review recorded)_"
+        # Same "fail only" rule as the tag above, so a pass row set is
+        # byte-for-byte unchanged (no extra line, no stray whitespace either).
+        failure_row = (
+            f"\n| failure class | `{lesson.failure_class}` |"
+            if lesson.outcome == "fail" and lesson.failure_class
+            else ""
+        )
         return f"""{fm}
 
 # {lesson.title}
@@ -358,7 +376,7 @@ class KnowledgeBase:
 | ticket | {ticket} |
 | pull request | {pr} |
 | model | `{lesson.model}` |
-| remote CI | {lesson.remote_ci or "_(pending)_"} |
+| remote CI | {lesson.remote_ci or "_(pending)_"} |{failure_row}
 
 ## Context
 {lesson.context}

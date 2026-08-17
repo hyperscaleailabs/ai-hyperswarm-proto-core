@@ -64,6 +64,11 @@ class LedgerRecord:
     outcome: str
     input_tokens: int | None = None
     output_tokens: int | None = None
+    # Causal taxonomy (see hsai.postmortem): empty for a merged/passing
+    # iteration; else a member of hsai.postmortem.FAILURE_CLASSES. Both default
+    # to "" so read_records() parses pre-existing records that lack them.
+    failure_class: str = ""
+    failure_detail: str = ""
     created: str = field(default_factory=_now)
 
     def to_json(self) -> str:
@@ -146,6 +151,9 @@ class BlockAggregate:
     input_tokens: int = 0
     output_tokens: int = 0
     tier_counts: dict[str, int] = field(default_factory=dict)
+    # Per-class failure counts this block (see hsai.postmortem.pareto_table for
+    # the richer share/exemplar breakdown the review brief renders).
+    failure_histogram: dict[str, int] = field(default_factory=dict)
 
     @property
     def total_tokens(self) -> int:
@@ -194,6 +202,10 @@ def aggregate_block(records: list[LedgerRecord], block: int) -> BlockAggregate:
             agg.merged_iterations += 1
         if r.kind == "review":
             agg.review_iterations += 1
+        if r.failure_class:
+            agg.failure_histogram[r.failure_class] = (
+                agg.failure_histogram.get(r.failure_class, 0) + 1
+            )
         agg.input_tokens += r.input_tokens or 0
         agg.output_tokens += r.output_tokens or 0
     agg.total_seconds = round(agg.total_seconds, 3)

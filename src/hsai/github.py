@@ -22,6 +22,7 @@ STANDARD_LABELS = {
     "blocked": ("000000", "Exhausted auto-retries; needs a human"),
     "review": ("e99695", "Block review brief for the architect"),
     "needs-refinement": ("f9d0c4", "Ticket lacks acceptance criteria / verification plan"),
+    "postmortem": ("5319e7", "Filed by the postmortem trigger for a dominant failure class"),
     "size:S": ("c5def5", "Small, mechanical change"),
     "size:M": ("76c7f0", "Substantial feature or refactor"),
     "size:L": ("1f77b4", "Large, multi-step change"),

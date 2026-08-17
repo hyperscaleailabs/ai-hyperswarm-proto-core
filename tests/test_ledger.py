@@ -55,6 +55,36 @@ def test_read_records_missing_file_is_empty(tmp_path):
     assert read_records(tmp_path / "nope.jsonl") == []
 
 
+# --- failure taxonomy fields (see hsai.postmortem) ---------------------------
+
+def test_ledger_record_carries_failure_class_and_detail(tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    append_record(
+        path,
+        _rec(outcome="recovered", failure_class="remote_ci_fail", failure_detail="ci red"),
+    )
+    stored = read_records(path)[0]
+    assert stored.failure_class == "remote_ci_fail"
+    assert stored.failure_detail == "ci red"
+
+
+def test_read_records_parses_pre_existing_records_lacking_failure_fields(tmp_path):
+    """Backward compatibility: a ledger written before this field existed must
+    still parse - `failure_class`/`failure_detail` default to ''."""
+    path = tmp_path / "ledger.jsonl"
+    legacy = {
+        "iteration": 101, "block": 1, "ticket": 7, "kind": "implement",
+        "tier": "standard", "model": "sonnet", "wall_clock_seconds": 12.0,
+        "attempts": 1, "outcome": "merged", "created": "2026-01-01T00:00:00+00:00",
+    }
+    path.write_text(json.dumps(legacy) + "\n")
+    records = read_records(path)
+    assert len(records) == 1
+    assert records[0].failure_class == ""
+    assert records[0].failure_detail == ""
+    assert records[0].outcome == "merged"
+
+
 def test_ledger_path_from_config(tmp_path):
     cfg = load_config()
     path = ledger_path(cfg, tmp_path)
@@ -115,6 +145,18 @@ def test_aggregate_block_folds_only_matching_block():
     assert agg.tier_counts == {"heavy": 2, "standard": 1}
     assert agg.input_tokens == 10 and agg.output_tokens == 5
     assert "heavy-tier=2" in agg.summary()
+
+
+def test_aggregate_block_folds_a_per_class_failure_histogram():
+    records = [
+        _rec(block=1, outcome="recovered", failure_class="remote_ci_fail"),
+        _rec(block=1, outcome="recovered", failure_class="remote_ci_fail"),
+        _rec(block=1, outcome="incomplete", failure_class="incomplete_diff"),
+        _rec(block=1, outcome="merged"),                 # no failure_class: not a failure
+        _rec(block=2, outcome="recovered", failure_class="agent_error"),  # other block
+    ]
+    agg = aggregate_block(records, block=1)
+    assert agg.failure_histogram == {"remote_ci_fail": 2, "incomplete_diff": 1}
 
 
 # --- budget gate transitions ------------------------------------------------
