@@ -18,6 +18,7 @@ from . import github
 from .config import CoreConfig
 from .knowledge import KnowledgeBase
 from .ledger import BlockAggregate
+from .postmortem import ParetoRow, render_pareto_table
 from .proc import Runner, run
 
 NOTES_START = "<!-- architect-notes:start -->"
@@ -45,6 +46,8 @@ class BlockReport:
     whitepaper: str = ""                                   # note name
     articles: list[str] = field(default_factory=list)      # file paths
     cost: BlockAggregate | None = None                     # quota-ledger aggregate
+    pareto: list[ParetoRow] = field(default_factory=list)  # failure-class histogram (hsai.postmortem)
+    postmortem_ticket: int = 0                             # P1 ticket filed for a dominant class
     notes: list[str] = field(default_factory=list)
     # New entries in the practices registry (see hsai.practices) that showed up
     # during this block - each a plain dict (JSON-serializable for the journal):
@@ -172,6 +175,12 @@ def render_brief(cfg: CoreConfig, report: BlockReport) -> str:
     paper = f"`knowledge/whitepapers/{report.whitepaper}.md`" if report.whitepaper else "_none_"
     articles = "\n".join(f"- `{a}`" for a in report.articles) or "_none_"
     cost = _cost_summary(report.cost)
+    pareto = render_pareto_table(report.pareto)
+    postmortem_line = (
+        f"Filed #{report.postmortem_ticket} for the dominant failure class."
+        if report.postmortem_ticket
+        else "No failure class crossed the postmortem trigger this block."
+    )
     extra = "\n".join(f"- {n}" for n in report.notes)
     practices = "\n".join(
         f"- **{p.get('title')}** (from `{p.get('source_project')}`, {p.get('status')}) "
@@ -198,6 +207,11 @@ sequentially, records your feedback as ADRs, and ends with a merged PR.
 
 ## Cost this block (quota ledger)
 {cost}
+
+## Failure taxonomy (this block)
+{pareto}
+
+{postmortem_line} See `hsai postmortem --block {report.cycle_index}` for the full breakdown.
 
 ## Knowledge produced
 - Whitepaper: {paper}

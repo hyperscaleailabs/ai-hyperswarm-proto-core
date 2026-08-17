@@ -61,6 +61,52 @@ def test_lesson_records_the_independent_review_verdict(tmp_path):
     assert "## Lesson learned" in text and "## Reproduction evidence" in text
 
 
+def test_failed_lesson_carries_a_failure_class_tag_and_row(tmp_path):
+    """G4: the Obsidian graph can filter failures by cause (see hsai.postmortem)."""
+    kb = KnowledgeBase(tmp_path)
+    lesson = Lesson(
+        title="implement: add widget",
+        outcome="fail",
+        kind="implement",
+        context="ctx",
+        what_happened="agent errored out",
+        lesson="investigate",
+        ticket=7,
+        failure_class="agent_error",
+    )
+    path = kb.write_lesson(lesson)
+    text = path.read_text()
+    assert "  - failure/agent_error" in text
+    assert "| failure class | `agent_error` |" in text
+
+    # read back through the same path recall/synthesis use
+    record = parse_note(path)
+    assert record.outcome == "fail"
+    assert record.failure_class == "agent_error"
+
+
+def test_passing_lesson_omits_the_failure_class_tag_and_row(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    lesson = Lesson(
+        title="implement: add widget",
+        outcome="pass",
+        kind="implement",
+        context="ctx",
+        what_happened="all green",
+        lesson="shipped cleanly",
+        ticket=7,
+        # A stray value here must never leak into a passing note's frontmatter.
+        failure_class="agent_error",
+    )
+    path = kb.write_lesson(lesson)
+    text = path.read_text()
+    assert "failure/" not in text
+    assert "failure class" not in text
+
+    record = parse_note(path)
+    assert record.failure_class == ""
+
+
 def test_lesson_renders_the_execution_trace_section(tmp_path):
     kb = KnowledgeBase(tmp_path)
     lesson = Lesson(

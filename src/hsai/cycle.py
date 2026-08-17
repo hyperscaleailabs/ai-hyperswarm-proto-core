@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import github, gitops, journal, ledger, trajectory
+from . import github, gitops, journal, ledger, postmortem, trajectory
 from .ai import run_agent
 from .config import CoreConfig
 from .governance import BlockReport, open_review_issue, write_direction
@@ -265,7 +265,28 @@ def run_cycle(
 
     # Fold the block's ledger records into the summary the review brief surfaces.
     # Derived from the durable ledger, so it needs no journal record of its own.
-    report.cost = ledger.aggregate_block(ledger.read_records(ledger_file), idx)
+    block_records = ledger.read_records(ledger_file)
+    report.cost = ledger.aggregate_block(block_records, idx)
+
+    # Failure-class Pareto for the brief (see hsai.postmortem). Pure reading -
+    # like `report.cost` above, it needs no journal record of its own; only the
+    # ticket-filing side effect below does.
+    report.pareto = postmortem.pareto_table(block_records, idx)
+
+    # File (at most) one P1 ticket for a dominant failure class, deduped by
+    # title against anything already open. Journaled so a resumed block never
+    # double-files it.
+    report.postmortem_ticket = journal.once(
+        jr, "postmortem", "block",
+        lambda: {"number": 0 if dry_run else postmortem.file_postmortem_ticket(
+            cfg, block_records, block=idx, runner=runner,
+        )},
+    )["number"]
+    if report.postmortem_ticket:
+        report.notes.append(
+            f"postmortem: filed #{report.postmortem_ticket} for a dominant failure class "
+            f"(see `hsai postmortem --block {idx}`)"
+        )
 
     # Trajectories are local forensics, not repo content: keep the recent blocks
     # replayable and drop the rest so the store stays bounded.

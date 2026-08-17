@@ -9,17 +9,19 @@ Commands:
   hsai recall "<query>" [--k N] [--kind K]                     rank prior lessons/ADRs
   hsai practices list                                          show the adopted-practice registry
   hsai practices add --title T --source-project P ...          record a new adopted practice
+  hsai postmortem [--block N]                                  print the failure-class Pareto for a block
   hsai doctor                                                  verify environment + invariants
   hsai traj <iteration> [--json]                               print a stored agent run
-  hsai replay <iteration> [--json]                             alias of `hsai traj`
+  hsai replay <iteration> [--json]                              alias of `hsai traj`
 """
 from __future__ import annotations
 
 import argparse
 import os
 import sys
+import time
 
-from . import __version__, ai, practices, recall, repro, trajectory
+from . import __version__, ai, ledger, postmortem, practices, recall, repro, trajectory
 from .config import CoreConfig, load_config, validate
 from .knowledge import KnowledgeBase
 from .orchestrator import run_loop
@@ -140,6 +142,32 @@ def cmd_practices_add(args: argparse.Namespace) -> int:
         print(f"practices add: refused - {exc}", file=sys.stderr)
         return 1
     print(f"wrote {path}")
+    return 0
+
+
+def cmd_postmortem(args: argparse.Namespace) -> int:
+    """Print the failure-class Pareto for one block (spends no quota, no writes)."""
+    cfg = _load(args)
+    records = ledger.read_records(ledger.ledger_path(cfg, args.root))
+    block = args.block
+    if block is None:
+        seen = {r.block for r in records}
+        block = max(seen) if seen else int(time.time()) // 43200
+    rows = postmortem.pareto_table(records, block)
+    total = sum(r.count for r in rows)
+    print(f"postmortem: block {block} - {total} failure(s) across {len(rows)} class(es)")
+    print(postmortem.render_pareto_table(rows))
+    ratio = float(cfg.postmortem.get("ratio_threshold", postmortem.DEFAULT_RATIO_THRESHOLD))
+    min_count = int(cfg.postmortem.get("min_count", postmortem.DEFAULT_MIN_COUNT))
+    dominant = postmortem.dominant_failure(rows, ratio_threshold=ratio, min_count=min_count)
+    if dominant:
+        print(
+            f"dominant: `{dominant.failure_class}` ({dominant.count}/{total}, "
+            f"{dominant.share:.0%}) clears the trigger (ratio>={ratio:g}, count>={min_count}) "
+            "- `hsai cycle` will file (or has filed) a P1 ticket for it"
+        )
+    else:
+        print(f"no class clears the postmortem trigger (ratio>={ratio:g}, count>={min_count})")
     return 0
 
 
@@ -307,6 +335,15 @@ def build_parser() -> argparse.ArgumentParser:
     pr_add.add_argument("--adopted-date", default="", help="YYYY-MM-DD (default: today)")
     pr_add.add_argument("--notes", default="")
     pr_add.set_defaults(func=cmd_practices_add)
+
+    pm = sub.add_parser(
+        "postmortem", help="print the failure-class Pareto for a block (spends no quota)"
+    )
+    pm.add_argument(
+        "--block", type=int, default=None, help="block index (default: most recent in the ledger)"
+    )
+    pm.add_argument("--root", default=".", help="repo root holding knowledge/ledger")
+    pm.set_defaults(func=cmd_postmortem)
 
     cy = sub.add_parser("cycle", help="run one half-day governance block")
     cy.add_argument("--index", "--cycle-index", dest="index", type=int, default=None,

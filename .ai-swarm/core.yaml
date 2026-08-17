@@ -170,6 +170,16 @@ review:
   max_diff_chars: 20000        # hard ceiling on the diff handed to the reviewer
   timeout_seconds: 900         # cap per reviewer run so the gate cannot hang the loop
 
+# Failure taxonomy + Pareto backlog trigger (see src/hsai/postmortem.py). Every
+# non-merged iteration is classified into a closed FailureClass vocabulary and
+# folded into a per-block histogram; when one class dominates a block's
+# failures above BOTH ceilings below, `hsai cycle` files a single P1 ticket
+# (deduped by title against anything already open) instead of relying on a
+# human to spot the pattern by reading lessons one at a time.
+postmortem:
+  ratio_threshold: 0.4   # a class must be >= this share of the block's failures
+  min_count: 3            # AND at least this many occurrences, before filing a ticket
+
 personas:                      # article targets generated from each whitepaper
   - id: cto
     audience: CTO level - business impact, risk posture, strategic direction
