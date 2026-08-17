@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import github
+from . import audit, github
 from .config import CoreConfig
 from .knowledge import KnowledgeBase
 from .ledger import BlockAggregate
@@ -45,6 +45,7 @@ class BlockReport:
     whitepaper: str = ""                                   # note name
     articles: list[str] = field(default_factory=list)      # file paths
     cost: BlockAggregate | None = None                     # quota-ledger aggregate
+    audit_summary: str = ""                                 # `hsai audit` one-liner, if run
     notes: list[str] = field(default_factory=list)
 
 
@@ -54,6 +55,20 @@ def preserved_notes(direction_path: Path) -> str:
         return _DEFAULT_NOTES
     m = _NOTES_RE.search(direction_path.read_text())
     return m.group(1) if m else _DEFAULT_NOTES
+
+
+def _vault_audit_line(cfg: CoreConfig, *, repo_root: Path) -> str:
+    """One-line vault-local audit verdict (wikilinks/orphans/MOCs/frontmatter).
+
+    Never raises: DIRECTION.md must regenerate even if the vault is in a
+    state the audit itself cannot parse. Network-free, so this costs nothing
+    to compute on every brief/direction refresh.
+    """
+    try:
+        report = audit.run_audit(cfg, repo_root)
+        return report.oneline()
+    except Exception as exc:  # a steering doc must never crash on this
+        return f"unknown ({exc})"
 
 
 def _issues_map(cfg: CoreConfig, *, runner: Runner = run) -> str:
@@ -107,6 +122,7 @@ def render_direction(
 - Knowledge: {len(lessons)} lessons, {len(papers)} whitepapers ([[Knowledge Base MOC]]).
 - Invariants: ticket-linked PRs, model recorded, lesson per PR, green-gated
   merges (remote CI is truth), subscription-only models, SDLC evidence per PR.
+- Vault audit (`hsai audit`, vault-local checks): {_vault_audit_line(cfg, repo_root=repo_root)}.
 
 ## Issues Map
 {_issues_map(cfg, runner=runner)}
@@ -194,6 +210,9 @@ sequentially, records your feedback as ADRs, and ends with a merged PR.
 - Whitepaper: {paper}
 - Persona articles:
 {articles}
+
+## Vault audit
+{report.audit_summary or "_not run this block_"} - full report: `hsai audit --json`.
 
 ## Steering doc
 `governance/DIRECTION.md` was refreshed - review the **Now / Issues Map /

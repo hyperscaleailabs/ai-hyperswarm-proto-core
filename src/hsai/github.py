@@ -209,6 +209,19 @@ def edit_labels(
     return _gh(args, runner=runner)
 
 
+def issue_state(repo: str, number: int, *, runner: Runner = run) -> str:
+    """``OPEN``/``CLOSED`` for an issue, or ``""`` if it does not exist/parse."""
+    p = _gh(["issue", "view", str(number), "--repo", repo, "--json", "state"], runner=runner)
+    try:
+        return (json.loads(p.stdout or "{}").get("state") or "").upper()
+    except json.JSONDecodeError:
+        return ""
+
+
+def update_issue_body(repo: str, number: int, body: str, *, runner: Runner = run) -> Proc:
+    return _gh(["issue", "edit", str(number), "--repo", repo, "--body", body], runner=runner)
+
+
 def get_issue(repo: str, number: int, *, runner: Runner = run) -> Issue | None:
     p = _gh(
         [
@@ -262,6 +275,75 @@ def list_open_prs(repo: str, *, runner: Runner = run) -> list[Pr]:
             head_ref=item.get("headRefName", ""),
         )
         for item in data
+    ]
+
+
+@dataclass
+class PrInfo:
+    """A single PR's state - the read shape :func:`get_pr` returns.
+
+    Distinct from :class:`Pr` (the list-shape used by ``pr list``): this one
+    also carries whether the PR actually merged, which ``pr list --state
+    open`` never needs but the audit's closure check does.
+    """
+
+    number: int
+    state: str  # OPEN | CLOSED | MERGED (gh normalizes closed+merged to CLOSED + mergedAt)
+    merged: bool
+    body: str = ""
+    title: str = ""
+
+
+def get_pr(repo: str, number: int, *, runner: Runner = run) -> PrInfo | None:
+    p = _gh(
+        ["pr", "view", str(number), "--repo", repo,
+         "--json", "number,state,mergedAt,body,title"],
+        runner=runner,
+    )
+    try:
+        item = json.loads(p.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    if not item:
+        return None
+    return PrInfo(
+        number=item.get("number", number),
+        state=(item.get("state") or "").upper(),
+        merged=bool(item.get("mergedAt")),
+        body=item.get("body", "") or "",
+        title=item.get("title", "") or "",
+    )
+
+
+def list_merged_prs_since(
+    repo: str, since_iso: str, *, limit: int = 200, runner: Runner = run
+) -> list[Pr]:
+    """Merged PRs whose ``mergedAt`` is on or after ``since_iso`` (ISO-8601).
+
+    ISO-8601 timestamps compare correctly as plain strings, so no date parsing
+    is needed - the same trick :func:`list_closed_issues` uses for sorting.
+    """
+    p = _gh(
+        [
+            "pr", "list", "--repo", repo, "--state", "merged",
+            "--limit", str(limit),
+            "--json", "number,title,body,headRefName,mergedAt",
+        ],
+        runner=runner,
+    )
+    try:
+        data = json.loads(p.stdout or "[]")
+    except json.JSONDecodeError:
+        return []
+    return [
+        Pr(
+            number=item["number"],
+            title=item.get("title", ""),
+            body=item.get("body", "") or "",
+            head_ref=item.get("headRefName", ""),
+        )
+        for item in data
+        if (item.get("mergedAt") or "") >= since_iso
     ]
 
 

@@ -1,0 +1,114 @@
+# Known exceptions for `hsai audit` (see docs/SDLC.md, "Post-merge evidence").
+#
+# Each entry documents ONE pre-invariant gap: something the audit gate would
+# otherwise flag, that predates the check (or the code fix behind it) and is
+# therefore not real drift. This list must not grow silently - a new entry
+# needs a reason, and the goal is always zero: it exists so the gate can
+# start green and stay honest about history, not so failures can be muted.
+#
+# Format: {check, target, reason}. `target` is check-specific:
+#   - wikilinks:         "<relative-path>:<dangling-target>"
+#   - orphans:            "<note-name>"
+#   - moc_freshness:       "<path>"
+#   - frontmatter:         "<relative-path>"
+#   - lesson_ticket_pr:    "<lesson-note-name>"
+#   - merged_prs_have_lessons / model_consistency: "<pr-number>"
+#
+# --- lesson_ticket_pr: `lesson.pr` was never recorded before this ticket ---
+# (feat: end-to-end traceability and vault integrity audit) taught the
+# orchestrator to write the merged PR number back into the lesson. Every
+# lesson filed before that fix legitimately names no pull request; this is
+# the one-time backfill for that gap, not an ongoing allowance.
+- check: lesson_ticket_pr
+  target: 2026-07-25-bootstrap-the-hsai-loop
+  reason: "lesson.pr was not recorded before the hsai-audit ticket shipped"
+- check: lesson_ticket_pr
+  target: 2026-07-26-architect-steering-quality-over-throughput
+  reason: "lesson.pr was not recorded before the hsai-audit ticket shipped"
+- check: lesson_ticket_pr
+  target: 2026-07-26-first-3-parallel-swarm-run
+  reason: "lesson.pr was not recorded before the hsai-audit ticket shipped"
+- check: lesson_ticket_pr
+  target: 2026-07-26-implement-add-structured-execution-context-to-error-messages
+  reason: "lesson.pr was not recorded before the hsai-audit ticket shipped"
+- check: lesson_ticket_pr
+  target: 2026-07-26-implement-chore-reference-set-miner-extract-one-practice-from-a-top-10-project-s-history
+  reason: "lesson.pr was not recorded before the hsai-audit ticket shipped"
+- check: lesson_ticket_pr
+  target: 2026-07-26-implement-docs-add-a-one-iteration-sequence-diagram-to-architecture-md
+  reason: "lesson.pr was not recorded before the hsai-audit ticket shipped"
+- check: lesson_ticket_pr
+  target: 2026-07-26-implement-feat-deepen-the-whitepaper-synthesizer
+  reason: "lesson.pr was not recorded before the hsai-audit ticket shipped"
+- check: lesson_ticket_pr
+  target: 2026-07-26-implement-feat-poll-remote-ci-gh-checks-as-an-explicit-pre-merge-gate
+  reason: "lesson.pr was not recorded before the hsai-audit ticket shipped"
+- check: lesson_ticket_pr
+  target: 2026-07-26-implement-feat-quota-cost-telemetry-ledger-with-a-warn-then-halt-per-block-budget-gate
+  reason: "lesson.pr was not recorded before the hsai-audit ticket shipped"
+- check: lesson_ticket_pr
+  target: 2026-07-26-implement-feat-reproduce-before-fix-regression-guard-for-heal-and-bugfix-tickets
+  reason: "lesson.pr was not recorded before the hsai-audit ticket shipped"
+- check: lesson_ticket_pr
+  target: 2026-07-26-implement-skill-task-complexity-based-model-selection-learned
+  reason: "lesson.pr was not recorded before the hsai-audit ticket shipped"
+- check: lesson_ticket_pr
+  target: 2026-07-26-implement-test-fake-runner-integration-tests-for-orchestrator-run-once-heal-implement-paths
+  reason: "lesson.pr was not recorded before the hsai-audit ticket shipped"
+- check: lesson_ticket_pr
+  target: 2026-07-26-improve-chore-refresh-reference-set-snapshot-and-extract-one-practice
+  reason: "lesson.pr was not recorded before the hsai-audit ticket shipped"
+- check: lesson_ticket_pr
+  target: 2026-07-26-improve-explicit-phase-artifacts-from-metagpt
+  reason: "lesson.pr was not recorded before the hsai-audit ticket shipped"
+- check: lesson_ticket_pr
+  target: 2026-07-26-loop-reliability-retry-and-ci-parity
+  reason: "lesson.pr was not recorded before the hsai-audit ticket shipped"
+- check: lesson_ticket_pr
+  target: 2026-08-04-implement-feat-worker-trajectory-capture-and-working-token-cost-telemetry
+  reason: "lesson.pr was not recorded before the hsai-audit ticket shipped"
+- check: lesson_ticket_pr
+  target: 2026-08-04-implement-feat-worker-trajectory-store-json-agent-output-and-hsai-replay
+  reason: "lesson.pr was not recorded before the hsai-audit ticket shipped"
+- check: lesson_ticket_pr
+  target: 2026-08-05-implement-chore-governance-artifacts-for-block-41339
+  reason: "lesson.pr was not recorded before the hsai-audit ticket shipped"
+- check: lesson_ticket_pr
+  target: 2026-08-05-implement-feat-durable-cycle-journal-with-idempotent-resume-for-interrupted-blocks
+  reason: "lesson.pr was not recorded before the hsai-audit ticket shipped"
+- check: lesson_ticket_pr
+  target: 2026-08-08-implement-chore-governance-artifacts-for-block-41343
+  reason: "lesson.pr was not recorded before the hsai-audit ticket shipped"
+- check: lesson_ticket_pr
+  target: 2026-08-08-implement-chore-governance-artifacts-for-block-41345
+  reason: "lesson.pr was not recorded before the hsai-audit ticket shipped"
+- check: lesson_ticket_pr
+  target: 2026-08-09-implement-chore-governance-artifacts-for-block-41347
+  reason: "lesson.pr was not recorded before the hsai-audit ticket shipped"
+- check: lesson_ticket_pr
+  target: 2026-08-10-implement-feat-lesson-retrieval-memory-inject-prior-lessons-into-worker-and-synthesis-prompts
+  reason: "lesson.pr was not recorded before the hsai-audit ticket shipped"
+- check: lesson_ticket_pr
+  target: 2026-08-11-implement-feat-vault-and-backlog-hygiene-watchdog-that-files-its-own-tickets
+  reason: "lesson.pr was not recorded before the hsai-audit ticket shipped"
+- check: lesson_ticket_pr
+  target: 2026-08-12-implement-chore-governance-artifacts-for-block-41353
+  reason: "lesson.pr was not recorded before the hsai-audit ticket shipped"
+- check: lesson_ticket_pr
+  target: 2026-08-12-implement-chore-governance-artifacts-for-block-41355
+  reason: "lesson.pr was not recorded before the hsai-audit ticket shipped"
+- check: lesson_ticket_pr
+  target: 2026-08-12-implement-feat-adversarial-cross-model-pr-review-gate-with-a-merge-gatekeeper
+  reason: "lesson.pr was not recorded before the hsai-audit ticket shipped"
+- check: lesson_ticket_pr
+  target: 2026-08-13-implement-feat-synthesis-memory-and-duplicate-proposal-rejection
+  reason: "lesson.pr was not recorded before the hsai-audit ticket shipped"
+- check: lesson_ticket_pr
+  target: 2026-08-14-implement-chore-governance-artifacts-for-block-41357
+  reason: "lesson.pr was not recorded before the hsai-audit ticket shipped"
+- check: lesson_ticket_pr
+  target: 2026-08-14-implement-feat-verifiable-subscription-only-execution-and-real-agent-telemetry
+  reason: "lesson.pr was not recorded before the hsai-audit ticket shipped"
+- check: lesson_ticket_pr
+  target: 2026-08-16-implement-chore-governance-artifacts-for-block-41361
+  reason: "lesson.pr was not recorded before the hsai-audit ticket shipped"

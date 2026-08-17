@@ -114,9 +114,37 @@ def test_write_lesson_and_reindex(tmp_path):
 
     written = kb.reindex_mocs()
     names = {p.name for p in written}
-    assert names == {"Lessons MOC.md", "Whitepapers MOC.md", "Knowledge Base MOC.md"}
+    assert names == {
+        "Lessons MOC.md", "Whitepapers MOC.md", "Articles MOC.md", "Knowledge Base MOC.md",
+    }
     lessons_moc = (kb.mocs_dir / "Lessons MOC.md").read_text()
     assert f"[[{lesson.note_name()}]]" in lessons_moc
+    root_moc = (kb.mocs_dir / "Knowledge Base MOC.md").read_text()
+    assert "[[Articles MOC]]" in root_moc
+
+
+def test_moc_drift_detects_missing_and_stale_content(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    kb.write_lesson(
+        Lesson(title="a", outcome="pass", kind="implement", context="c", what_happened="w", lesson="l")
+    )
+    # Nothing regenerated yet: every MOC is missing entirely.
+    drift = kb.moc_drift()
+    assert set(drift) == {str(p) for p in kb.rendered_mocs()}
+
+    kb.reindex_mocs()
+    assert kb.moc_drift() == {}
+
+    # A lesson lands after the last reindex: the committed Lessons MOC (and the
+    # root MOC, whose counts include it) are now stale; unrelated MOCs are not.
+    kb.write_lesson(
+        Lesson(title="b", outcome="pass", kind="implement", context="c", what_happened="w", lesson="l")
+    )
+    drift = kb.moc_drift()
+    assert str(kb.mocs_dir / "Lessons MOC.md") in drift
+    assert str(kb.mocs_dir / "Knowledge Base MOC.md") in drift
+    assert str(kb.mocs_dir / "Whitepapers MOC.md") not in drift
+    assert str(kb.mocs_dir / "Articles MOC.md") not in drift
 
 
 def test_whitepaper_cadence(tmp_path):

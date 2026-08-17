@@ -5,7 +5,9 @@ Commands:
   hsai run-once [--dry-run]                                    a single iteration
   hsai status                                                  config + backlog snapshot
   hsai cycle [--cycle-index N] [--resume] [--dry-run]          one governance block
-  hsai reindex                                                 rebuild knowledge MOCs
+  hsai reindex [--check]                                       rebuild knowledge MOCs
+                                                                 (--check: fail on drift, no writes)
+  hsai audit [--since REF] [--json] [--strict]                 traceability + vault integrity audit
   hsai recall "<query>" [--k N] [--kind K]                     rank prior lessons/ADRs
   hsai doctor                                                  verify environment + invariants
   hsai traj <iteration> [--json]                               print a stored agent run
@@ -17,7 +19,7 @@ import argparse
 import os
 import sys
 
-from . import __version__, ai, recall, repro, trajectory
+from . import __version__, ai, audit, recall, repro, trajectory
 from .config import CoreConfig, load_config, validate
 from .knowledge import KnowledgeBase
 from .orchestrator import run_loop
@@ -74,15 +76,40 @@ def cmd_reindex(args: argparse.Namespace) -> int:
     """Serialized knowledge maintenance: whitepaper cadence + MOC rebuild.
 
     Kept out of the parallel workers so PRs never collide on derived index files.
+    ``--check`` never writes: it fails loudly if the committed MOCs have
+    drifted from what a fresh regeneration would produce, instead of silently
+    rewriting them out from under a diff someone is reviewing.
     """
     cfg = _load(args)
-    kb = KnowledgeBase.from_config(cfg, ".")
+    kb = KnowledgeBase.from_config(cfg, args.root)
+    if args.check:
+        drift = kb.moc_drift()
+        if drift:
+            for path in sorted(drift):
+                print(f"stale: {path}: {drift[path]}")
+            print("reindex --check: MOCs are stale - run `hsai reindex` (no files modified)")
+            return 1
+        print("reindex --check: MOCs match a fresh regeneration (no drift)")
+        return 0
     if kb.should_write_whitepaper():
         p = kb.write_whitepaper(kb.synthesize_whitepaper())
         print(f"wrote whitepaper {p}")
     written = kb.reindex_mocs()
     for p in written:
         print(f"reindexed {p}")
+    return 0
+
+
+def cmd_audit(args: argparse.Namespace) -> int:
+    """End-to-end traceability + vault-integrity audit (see `hsai.audit`)."""
+    cfg = _load(args)
+    report = audit.run_audit(cfg, args.root, since=args.since)
+    print(report.to_json() if args.json else report.render())
+    if args.file_drift_ticket and not report.ok:
+        number = audit.file_or_update_drift_ticket(cfg, report)
+        print(f"audit-drift ticket: #{number}")
+    if args.strict and not report.ok:
+        return 1
     return 0
 
 
@@ -239,7 +266,26 @@ def build_parser() -> argparse.ArgumentParser:
     dr.set_defaults(func=cmd_doctor)
 
     ri = sub.add_parser("reindex", help="rebuild knowledge-base MOCs")
+    ri.add_argument("--root", default=".", help="repo root holding knowledge/")
+    ri.add_argument("--check", action="store_true",
+                    help="fail if MOCs are stale instead of rewriting them")
     ri.set_defaults(func=cmd_reindex)
+
+    au = sub.add_parser("audit", help="end-to-end traceability + vault integrity audit")
+    au.add_argument("--root", default=".", help="repo root holding knowledge/ and .ai-swarm/")
+    au.add_argument(
+        "--since", default=None,
+        help="git ref: also run the GitHub-dependent checks (lesson<->ticket<->PR "
+             "closure, merged-PR-has-a-lesson, model-record consistency) for merged "
+             "PRs since this ref. Omit for the vault-local checks only (no network).",
+    )
+    au.add_argument("--json", action="store_true", help="machine-readable JSON report")
+    au.add_argument("--strict", action="store_true", help="exit non-zero if any check fails")
+    au.add_argument(
+        "--file-drift-ticket", action="store_true",
+        help="on failure, file or update the single open `audit-drift` ticket (idempotent)",
+    )
+    au.set_defaults(func=cmd_audit)
 
     rl = sub.add_parser("recall", help="rank prior lessons/whitepapers/ADRs for a query")
     rl.add_argument("query", help="what the task is about, in plain words")

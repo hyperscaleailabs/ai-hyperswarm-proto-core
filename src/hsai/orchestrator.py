@@ -654,9 +654,12 @@ def run_once(
     result.remote = remote
     result.notes.append(f"remote CI={remote}")
 
-    # Record the true remote outcome in the lesson itself, then push that
-    # update so it lands in the knowledge base once the PR merges.
+    # Record the true remote outcome AND the PR number in the lesson itself
+    # (the PR did not exist yet when the lesson was first committed), then
+    # push that update so it lands in the knowledge base once the PR merges.
+    # The lesson<->ticket<->PR closure check (`hsai audit`) reads this field.
     lesson.remote_ci = remote
+    lesson.pr = pr_num
     kb.write_lesson(lesson)
     gitops.commit_all(
         f"docs: record remote CI outcome ({remote}) in lesson\n\nRefs #{ticket_num}",
