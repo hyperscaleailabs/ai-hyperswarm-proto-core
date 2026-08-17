@@ -46,6 +46,10 @@ class BlockReport:
     articles: list[str] = field(default_factory=list)      # file paths
     cost: BlockAggregate | None = None                     # quota-ledger aggregate
     notes: list[str] = field(default_factory=list)
+    # New entries in the practices registry (see hsai.practices) that showed up
+    # during this block - each a plain dict (JSON-serializable for the journal):
+    # {"id", "title", "source_project", "source_artifact", "status", "evidence"}.
+    practices_adopted: list[dict] = field(default_factory=list)
 
 
 def preserved_notes(direction_path: Path) -> str:
@@ -169,6 +173,11 @@ def render_brief(cfg: CoreConfig, report: BlockReport) -> str:
     articles = "\n".join(f"- `{a}`" for a in report.articles) or "_none_"
     cost = _cost_summary(report.cost)
     extra = "\n".join(f"- {n}" for n in report.notes)
+    practices = "\n".join(
+        f"- **{p.get('title')}** (from `{p.get('source_project')}`, {p.get('status')}) "
+        f"[id: `{p.get('id')}`] - {p.get('evidence') or 'no evidence recorded'}"
+        for p in report.practices_adopted
+    ) or "_none this block_"
     return f"""# Block review - cycle {report.cycle_index}
 
 One block of the twice-daily governance rhythm. Review here, then run
@@ -194,6 +203,9 @@ sequentially, records your feedback as ADRs, and ends with a merged PR.
 - Whitepaper: {paper}
 - Persona articles:
 {articles}
+
+## Practices adopted this block
+{practices}
 
 ## Steering doc
 `governance/DIRECTION.md` was refreshed - review the **Now / Issues Map /

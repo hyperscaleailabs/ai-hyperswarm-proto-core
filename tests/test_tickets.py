@@ -23,6 +23,32 @@ def test_spec_renders_all_required_sections():
     assert wf.ok, wf.reasons
 
 
+def test_spec_renders_practice_ids_in_the_meta_section():
+    spec = TicketSpec(
+        title="feat: adaptive retry budget",
+        problem="Retries are fixed.",
+        proposal="Budget adapts to failure class.",
+        acceptance_criteria=("budget adapts", "tests cover classes"),
+        verification_plan=("pytest green",),
+        practice_ids=("swe-agent-swe-agent--persist-a-traj-per-run",),
+    )
+    body = spec.render()
+    assert "- practice_ids: swe-agent-swe-agent--persist-a-traj-per-run" in body
+
+
+def test_spec_practice_ids_defaults_to_empty_and_still_renders():
+    """Existing specs that omit practice_ids must not break."""
+    spec = TicketSpec(
+        title="feat: thing",
+        problem="p",
+        proposal="pp",
+        acceptance_criteria=("a", "b"),
+        verification_plan=("v",),
+    )
+    assert spec.practice_ids == ()
+    assert "- practice_ids: -" in spec.render()
+
+
 def test_vague_feature_ticket_is_malformed():
     wf = check_well_formed("feat: make it better", "please improve things")
     assert not wf.ok

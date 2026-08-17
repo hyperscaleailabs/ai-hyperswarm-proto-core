@@ -39,12 +39,14 @@ class TicketSpec:
     size: str = "M"  # S | M | L
     goal_ids: tuple[str, ...] = ()
     synthesis_rationale: str = ""  # which reference projects were combined, and how
+    practice_ids: tuple[str, ...] = ()  # new/extended entries in the practices registry
     labels: tuple[str, ...] = ()
 
     def render(self) -> str:
         ac = "\n".join(f"- [ ] {c}" for c in self.acceptance_criteria)
         vp = "\n".join(f"- [ ] {v}" for v in self.verification_plan)
         goals = ", ".join(self.goal_ids) or "-"
+        practices = ", ".join(self.practice_ids) or "-"
         synth = (
             f"\n## Synthesis rationale\n{self.synthesis_rationale}\n"
             if self.synthesis_rationale
@@ -65,6 +67,7 @@ class TicketSpec:
 ## Meta
 - goals: {goals}
 - size: {self.size}
+- practice_ids: {practices}
 """
 
     def all_labels(self) -> list[str]:

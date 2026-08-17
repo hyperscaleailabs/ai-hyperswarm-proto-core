@@ -5,13 +5,16 @@ copied from one project, a heavy model:
 
 1. receives a context pack built from a rotating subset of the reference set
    (README, recent commit subjects, CI workflow inventory - fetched via `gh`),
+   plus the :mod:`hsai.practices` registry of what this loop has already
+   adopted from that set, rendered as ground it must not re-propose,
 2. generates ~``ideas_target`` candidate improvements, each required to COMBINE
    practices from >= ``min_projects_combined`` different reference projects,
 3. runs a reflection pass - critiques its own candidates for feasibility,
    originality, and fit with the goals in core.yaml,
 4. prioritizes by impact x effort and emits the top ``file_top`` as fully
-   structured tickets (schema in :mod:`hsai.tickets`), which are filed on
-   GitHub for the cheaper implementation agents to pick up.
+   structured tickets (schema in :mod:`hsai.tickets`, each naming the
+   practice(s) it adds or extends), which are filed on GitHub for the cheaper
+   implementation agents to pick up.
 
 The model call goes through :mod:`hsai.ai`, so it stays subscription-only.
 """
@@ -27,6 +30,7 @@ from .ai import run_agent
 from .config import CoreConfig
 from .knowledge import KnowledgeBase
 from .models import ModelChoice
+from .practices import ADOPTED_HEADING, Practice, render_adopted_section
 from .proc import Runner, run
 from .tickets import TicketSpec
 
@@ -265,7 +269,12 @@ def is_duplicate(
     return False, ""
 
 
-def build_prompt(cfg: CoreConfig, pack: ContextPack, memory: MemoryPack | None = None) -> str:
+def build_prompt(
+    cfg: CoreConfig,
+    pack: ContextPack,
+    memory: MemoryPack | None = None,
+    practices: list[Practice] | None = None,
+) -> str:
     goals = "\n".join(f"- {g.get('id')}: {g.get('title')} - {g.get('description', '')}"
                       for g in cfg.goals)
     ideas = int(cfg.synthesis.get("ideas_target", 10))
@@ -274,6 +283,7 @@ def build_prompt(cfg: CoreConfig, pack: ContextPack, memory: MemoryPack | None =
     memory = memory or MemoryPack()
     max_chars = int(cfg.synthesis.get("memory_max_chars", DEFAULT_MEMORY_MAX_CHARS))
     memory_section = memory.render(max_chars=max_chars)
+    practices_section = render_adopted_section(practices or [])
     return f"""You are the SYNTHESIS planner for ai-hyperswarm-proto-core, an
 autonomous self-improving AI-swarm harness. Your job is NOT to copy one idea
 from one project, but to COMBINE practices across projects into substantial,
@@ -288,6 +298,12 @@ that substantially overlaps anything listed below must be DROPPED in PHASE 2
 (reflect) and its slot refilled with a genuinely new idea. Never duplicate the
 title of a ticket that is still open or already closed; build on them instead:
 {memory_section}
+
+{ADOPTED_HEADING} - the registry of practices this loop has already pulled
+from the reference set, each cited to its source project and evidence. Do NOT
+propose a candidate that just re-adopts one of these; if a candidate genuinely
+EXTENDS one, name its id in "practice_ids" instead of restating it as new:
+{practices_section}
 
 Study digest of reference projects for this cycle:
 {pack.render()}
@@ -310,7 +326,10 @@ block: a JSON array where each element has exactly these keys:
   "verification_plan" (array of 2-4 concrete check strings),
   "size" ("M" or "L" - substantial work, never "S"),
   "goal_ids" (array like ["G1","G4"]),
-  "synthesis_rationale" (string naming the >= {combine} projects combined and how).
+  "synthesis_rationale" (string naming the >= {combine} projects combined and how),
+  "practice_ids" (array of strings - ids from the "{ADOPTED_HEADING}" section
+    above that this ticket EXTENDS, or new slug-style ids it INTRODUCES for the
+    practice(s) it adds to the registry; empty array if none apply).
 
 The JSON block must be the LAST fenced block in your reply."""
 
@@ -337,6 +356,7 @@ def parse_ticket_specs(output: str) -> list[TicketSpec]:
                     size=str(item.get("size", "M")),
                     goal_ids=tuple(str(g) for g in item.get("goal_ids", [])),
                     synthesis_rationale=str(item.get("synthesis_rationale", "")),
+                    practice_ids=tuple(str(p) for p in item.get("practice_ids", [])),
                     labels=("self-improve", "hsai", "priority:P2"),
                 )
             )
@@ -388,6 +408,10 @@ def synthesize(
     repos = pick_rotation(cfg, cycle_index)
     pack = build_context_pack(repos, runner=runner)
     memory = MemoryPack.gather(cfg, root=root, runner=runner)
+    try:
+        practices = KnowledgeBase.from_config(cfg, root).read_practices()
+    except OSError:
+        practices = []
     tier = cfg.synthesis.get("tier", "heavy")
     model = cfg.tiers[tier].model if tier in cfg.tiers else cfg.tiers[cfg.default_tier].model
     choice = ModelChoice(
@@ -396,7 +420,7 @@ def synthesize(
         strategy="synthesis-v1",
     )
     ares = run_agent(
-        build_prompt(cfg, pack, memory), choice, cfg,
+        build_prompt(cfg, pack, memory, practices), choice, cfg,
         timeout=float(cfg.synthesis.get("timeout_seconds", 2400)),
         runner=ai_runner,
     )
