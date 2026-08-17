@@ -9,7 +9,7 @@ updated: 2026-08-16
 
 Up: [[Knowledge Base MOC]]
 
-Every hsai iteration leaves a lesson here - pass or fail. Total: **31**.
+Every hsai iteration leaves a lesson here - pass or fail. Total: **32**.
 
 - [[2026-07-25-bootstrap-the-hsai-loop]]
 - [[2026-07-26-architect-steering-quality-over-throughput]]
@@ -42,3 +42,4 @@ Every hsai iteration leaves a lesson here - pass or fail. Total: **31**.
 - [[2026-08-14-implement-feat-verifiable-subscription-only-execution-and-real-agent-telemetry]]
 - [[2026-08-14-implement-chore-governance-artifacts-for-block-41357]]
 - [[2026-08-16-implement-chore-governance-artifacts-for-block-41361]]
+- [[2026-08-16-implement-chore-governance-artifacts-for-block-41363]]
