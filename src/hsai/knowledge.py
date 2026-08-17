@@ -20,6 +20,7 @@ _TAG_RE = re.compile(r"^\s*-\s+(\S.*)$", re.MULTILINE)
 _FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
 _TITLE_RE = re.compile(r"^# (.+)$", re.MULTILINE)
 _SECTION_RE = re.compile(r"^## (.+)$", re.MULTILINE)
+_UPDATED_LINE_RE = re.compile(r"^updated: .*$", re.MULTILINE)
 _WORD_RE = re.compile(r"[a-zA-Z][a-zA-Z-]{3,}")
 _STOPWORDS = {
     "this", "that", "with", "from", "have", "been", "were", "will", "which",
@@ -36,6 +37,11 @@ _STOPWORDS = {
 
 def slugify(text: str) -> str:
     return _SLUG_RE.sub("-", text.lower()).strip("-") or "untitled"
+
+
+def _normalize_moc(text: str) -> str:
+    """Strip the ``updated:`` timestamp so a freshness diff ignores it."""
+    return _UPDATED_LINE_RE.sub("updated: <normalized>", text)
 
 
 def _today() -> str:
@@ -165,14 +171,16 @@ class KnowledgeBase:
         lessons_dir: str = "knowledge/lessons",
         whitepapers_dir: str = "knowledge/whitepapers",
         mocs_dir: str = "knowledge/MOCs",
+        articles_dir: str = "knowledge/articles",
         whitepaper_every: int = 10,
     ) -> None:
         self.root = Path(root)
         self.lessons_dir = self.root / lessons_dir
         self.whitepapers_dir = self.root / whitepapers_dir
         self.mocs_dir = self.root / mocs_dir
+        self.articles_dir = self.root / articles_dir
         self.whitepaper_every = whitepaper_every
-        for d in (self.lessons_dir, self.whitepapers_dir, self.mocs_dir):
+        for d in (self.lessons_dir, self.whitepapers_dir, self.mocs_dir, self.articles_dir):
             d.mkdir(parents=True, exist_ok=True)
 
     @classmethod
@@ -183,6 +191,7 @@ class KnowledgeBase:
             lessons_dir=k.get("lessons_dir", "knowledge/lessons"),
             whitepapers_dir=k.get("whitepapers_dir", "knowledge/whitepapers"),
             mocs_dir=k.get("mocs_dir", "knowledge/MOCs"),
+            articles_dir=k.get("articles_dir", "knowledge/articles"),
             whitepaper_every=int(k.get("whitepaper_every_lessons", 10)),
         )
 
@@ -203,6 +212,9 @@ class KnowledgeBase:
 
     def whitepaper_notes(self) -> list[str]:
         return sorted(p.stem for p in self.whitepapers_dir.glob("*.md"))
+
+    def article_notes(self) -> list[str]:
+        return sorted(p.stem for p in self.articles_dir.glob("*.md"))
 
     def should_write_whitepaper(self) -> bool:
         n = len(self.lesson_notes())
@@ -286,13 +298,41 @@ class KnowledgeBase:
         )
 
     # --- indexing -------------------------------------------------------------
+    def moc_documents(self) -> dict[Path, str]:
+        """Every MOC's path -> the content it *should* have right now.
+
+        Pure and read-only (no writes) so both ``reindex_mocs`` and
+        ``check_freshness`` - and the audit's MOC-freshness check - compute the
+        same thing from the same source of truth.
+        """
+        return {
+            self.mocs_dir / "Lessons MOC.md": self._lessons_moc_content(),
+            self.mocs_dir / "Whitepapers MOC.md": self._whitepapers_moc_content(),
+            self.mocs_dir / "Articles MOC.md": self._articles_moc_content(),
+            self.mocs_dir / "Knowledge Base MOC.md": self._root_moc_content(),
+        }
+
+    def check_freshness(self) -> list[str]:
+        """Names of MOC files that would change if reindexed right now.
+
+        The ``updated:`` frontmatter line is expected to move on every real
+        run and is not itself drift, so it is normalized out of the
+        comparison; only a genuine content difference (a lesson/whitepaper/
+        article added or removed without a matching reindex) counts.
+        """
+        stale: list[str] = []
+        for path, fresh in self.moc_documents().items():
+            current = path.read_text() if path.exists() else None
+            if current is None or _normalize_moc(current) != _normalize_moc(fresh):
+                stale.append(path.name)
+        return stale
+
     def reindex_mocs(self) -> list[Path]:
         """Rebuild the MOC files from what is currently on disk."""
-        written = [
-            self._write_lessons_moc(),
-            self._write_whitepapers_moc(),
-            self._write_root_moc(),
-        ]
+        written = []
+        for path, content in self.moc_documents().items():
+            path.write_text(content)
+            written.append(path)
         return written
 
     # --- rendering ------------------------------------------------------------
@@ -386,11 +426,11 @@ class KnowledgeBase:
 {covered}
 """
 
-    def _write_lessons_moc(self) -> Path:
+    def _lessons_moc_content(self) -> str:
         notes = self.lesson_notes()
         fm = self._frontmatter(("moc", "lessons"), {"updated": _today()})
         links = "\n".join(f"- [[{n}]]" for n in notes) or "- _No lessons recorded yet._"
-        content = f"""{fm}
+        return f"""{fm}
 
 # Lessons MOC
 
@@ -400,15 +440,12 @@ Every hsai iteration leaves a lesson here - pass or fail. Total: **{len(notes)}*
 
 {links}
 """
-        path = self.mocs_dir / "Lessons MOC.md"
-        path.write_text(content)
-        return path
 
-    def _write_whitepapers_moc(self) -> Path:
+    def _whitepapers_moc_content(self) -> str:
         notes = self.whitepaper_notes()
         fm = self._frontmatter(("moc", "whitepapers"), {"updated": _today()})
         links = "\n".join(f"- [[{n}]]" for n in notes) or "- _No whitepapers yet._"
-        content = f"""{fm}
+        return f"""{fm}
 
 # Whitepapers MOC
 
@@ -418,15 +455,29 @@ Periodic syntheses of accumulated lessons. Total: **{len(notes)}**.
 
 {links}
 """
-        path = self.mocs_dir / "Whitepapers MOC.md"
-        path.write_text(content)
-        return path
 
-    def _write_root_moc(self) -> Path:
+    def _articles_moc_content(self) -> str:
+        notes = self.article_notes()
+        fm = self._frontmatter(("moc", "articles"), {"updated": _today()})
+        links = "\n".join(f"- [[{n}]]" for n in notes) or "- _No persona articles yet._"
+        return f"""{fm}
+
+# Articles MOC
+
+Up: [[Knowledge Base MOC]]
+
+Each whitepaper is rewritten as one article per persona (see `personas` in
+core.yaml). Total: **{len(notes)}**.
+
+{links}
+"""
+
+    def _root_moc_content(self) -> str:
         fm = self._frontmatter(("moc", "index"), {"updated": _today()})
         n_lessons = len(self.lesson_notes())
         n_papers = len(self.whitepaper_notes())
-        content = f"""{fm}
+        n_articles = len(self.article_notes())
+        return f"""{fm}
 
 # Knowledge Base MOC
 
@@ -436,15 +487,15 @@ vault and use the graph view to explore how lessons connect.
 ## Maps
 - [[Lessons MOC]] - {n_lessons} lesson(s)
 - [[Whitepapers MOC]] - {n_papers} whitepaper(s)
+- [[Articles MOC]] - {n_articles} article(s)
 
 ## How this is maintained
 - Each PR the [[hsai]] loop opens contributes exactly one lesson.
 - Every {self.whitepaper_every} lessons, a whitepaper synthesizes the themes.
-- These MOCs are regenerated by `hsai reindex` after each iteration.
+- Each whitepaper is rewritten as one article per persona - see [[Articles MOC]].
+- These MOCs are regenerated by `hsai reindex` after each iteration, and
+  `hsai audit` fails loudly if they ever drift from what is on disk.
 """
-        path = self.mocs_dir / "Knowledge Base MOC.md"
-        path.write_text(content)
-        return path
 
 
 def now_iso() -> str:

@@ -170,6 +170,16 @@ review:
   max_diff_chars: 20000        # hard ceiling on the diff handed to the reviewer
   timeout_seconds: 900         # cap per reviewer run so the gate cannot hang the loop
 
+# End-to-end traceability + vault integrity audit (see src/hsai/audit.py). The
+# vault-local checks (wikilinks, orphans, MOC freshness, frontmatter) need no
+# network and run on every PR; the GitHub-dependent checks (lesson<->ticket<->PR
+# closure, model-tier consistency) run on the daily scheduled workflow.
+audit:
+  known_exceptions_file: .ai-swarm/audit_known_exceptions.yaml
+  since_pr: 0                        # only audit tickets/PRs numbered above this (0 = all)
+  drift_label: audit-drift           # label used to find/update the single drift ticket
+  drift_priority_label: priority:P1
+
 personas:                      # article targets generated from each whitepaper
   - id: cto
     audience: CTO level - business impact, risk posture, strategic direction
@@ -197,6 +207,7 @@ knowledge:
   lessons_dir: knowledge/lessons
   whitepapers_dir: knowledge/whitepapers
   mocs_dir: knowledge/MOCs
+  articles_dir: knowledge/articles
   templates_dir: knowledge/templates
   whitepaper_every_lessons: 10       # synthesize a whitepaper every N new lessons
   obsidian_ready: true               # wikilinks + committed .obsidian config

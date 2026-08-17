@@ -58,6 +58,7 @@ class CoreConfig:
     budget: dict[str, Any]
     review: dict[str, Any]
     personas: tuple[dict[str, Any], ...]
+    audit: dict[str, Any]
 
     # --- convenience accessors -------------------------------------------------
     @property
@@ -150,6 +151,7 @@ def load_config(path: str | Path | None = None) -> CoreConfig:
         budget=data.get("budget", {}),
         review=data.get("review", {}),
         personas=tuple(data.get("personas", [])),
+        audit=data.get("audit", {}),
     )
 
 

@@ -5,7 +5,8 @@ Commands:
   hsai run-once [--dry-run]                                    a single iteration
   hsai status                                                  config + backlog snapshot
   hsai cycle [--cycle-index N] [--resume] [--dry-run]          one governance block
-  hsai reindex                                                 rebuild knowledge MOCs
+  hsai reindex [--check]                                       rebuild knowledge MOCs
+  hsai audit [--since N] [--json] [--strict] [--offline]       traceability + vault audit
   hsai recall "<query>" [--k N] [--kind K]                     rank prior lessons/ADRs
   hsai doctor                                                  verify environment + invariants
   hsai traj <iteration> [--json]                               print a stored agent run
@@ -74,15 +75,46 @@ def cmd_reindex(args: argparse.Namespace) -> int:
     """Serialized knowledge maintenance: whitepaper cadence + MOC rebuild.
 
     Kept out of the parallel workers so PRs never collide on derived index files.
+    ``--check`` fails loudly on drift instead of silently rewriting - the
+    non-destructive counterpart the audit's `moc_freshness` check also uses.
     """
     cfg = _load(args)
     kb = KnowledgeBase.from_config(cfg, ".")
+    if args.check:
+        stale = kb.check_freshness()
+        for name in stale:
+            print(f"stale: {name}")
+        if stale:
+            print(f"reindex --check: {len(stale)} MOC(s) out of date; run `hsai reindex` to fix")
+            return 1
+        print("reindex --check: MOCs are fresh")
+        return 0
     if kb.should_write_whitepaper():
         p = kb.write_whitepaper(kb.synthesize_whitepaper())
         print(f"wrote whitepaper {p}")
     written = kb.reindex_mocs()
     for p in written:
         print(f"reindexed {p}")
+    return 0
+
+
+def cmd_audit(args: argparse.Namespace) -> int:
+    """End-to-end traceability + vault-integrity audit (see :mod:`hsai.audit`)."""
+    from . import audit as audit_mod
+
+    cfg = _load(args)
+    report = audit_mod.run_audit(cfg, args.root, since=args.since, offline=args.offline)
+    print(report.to_json() if args.json else report.human())
+
+    if args.file_drift_ticket:
+        if report.ok:
+            print("audit-drift: no drift, nothing filed")
+        else:
+            number = audit_mod.file_or_update_drift_ticket(cfg, report)
+            print(f"audit-drift: ticket #{number} filed/updated")
+
+    if args.strict and not report.ok:
+        return 1
     return 0
 
 
@@ -239,7 +271,24 @@ def build_parser() -> argparse.ArgumentParser:
     dr.set_defaults(func=cmd_doctor)
 
     ri = sub.add_parser("reindex", help="rebuild knowledge-base MOCs")
+    ri.add_argument("--check", action="store_true",
+                    help="exit non-zero on MOC drift; write nothing")
     ri.set_defaults(func=cmd_reindex)
+
+    au = sub.add_parser("audit", help="end-to-end traceability + vault-integrity audit")
+    au.add_argument("--since", type=int, default=None,
+                    help="only check tickets/PRs numbered above this (default: "
+                         "audit.since_pr in core.yaml, else 0 = all)")
+    au.add_argument("--json", action="store_true", help="machine-readable report")
+    au.add_argument("--strict", action="store_true",
+                    help="exit non-zero when any check fails (default: report only)")
+    au.add_argument("--offline", action="store_true",
+                    help="skip GitHub-dependent checks (lesson<->ticket<->PR closure, "
+                         "model-tier consistency); vault-local checks only")
+    au.add_argument("--file-drift-ticket", action="store_true",
+                    help="on failure, file or update the single open audit-drift ticket")
+    au.add_argument("--root", default=".", help="repo root holding knowledge/ and .ai-swarm/")
+    au.set_defaults(func=cmd_audit)
 
     rl = sub.add_parser("recall", help="rank prior lessons/whitepapers/ADRs for a query")
     rl.add_argument("query", help="what the task is about, in plain words")

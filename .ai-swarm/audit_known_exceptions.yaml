@@ -1,0 +1,18 @@
+# Documented exceptions to `hsai audit` (see src/hsai/audit.py and the
+# "Post-merge audit" phase in docs/SDLC.md).
+#
+# Every entry here silences ONE specific, already-verified finding - it must
+# name the check it applies to and a substring that matches the offending
+# finding line exactly, plus WHY it is exempt (almost always: it predates the
+# invariant the check now enforces). New entries require architect sign-off
+# in a review issue; nothing here should ever be used to hide a *new*
+# violation, and this list is expected to shrink toward empty as
+# `audit.since_pr` in core.yaml moves forward past the history it covers.
+#
+# Schema, one entry per line item:
+#   - check:  the CheckResult name (wikilinks | orphans | moc_freshness |
+#             frontmatter | lesson_ticket_pr_closure | model_record_consistency)
+#     match:  a substring of the exact finding line it silences
+#     reason: why this is pre-invariant history, not a live defect
+
+known_exceptions: []

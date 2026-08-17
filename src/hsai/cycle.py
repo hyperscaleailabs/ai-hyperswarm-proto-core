@@ -19,11 +19,11 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import github, gitops, journal, ledger, trajectory
+from . import audit, github, gitops, journal, ledger, trajectory
 from .ai import run_agent
 from .config import CoreConfig
 from .governance import BlockReport, open_review_issue, write_direction
-from .knowledge import KnowledgeBase
+from .knowledge import KnowledgeBase, today
 from .ledger import BudgetDecision
 from .models import ModelChoice
 from .orchestrator import IterationResult, run_once
@@ -86,8 +86,12 @@ def _persona_articles(
         if ares.ok and ares.output.strip():
             out = articles_dir / f"{whitepaper_note}-{pid}.md"
             out.write_text(
-                f"---\ntags:\n  - article\n  - persona/{pid}\n---\n\n"
-                + ares.output.strip() + "\n"
+                f"---\ntags:\n  - article\n  - persona/{pid}\ncreated: {today().isoformat()}\n---\n\n"
+                + ares.output.strip()
+                # Forward-linked from [[Articles MOC]] on reindex; this backlink
+                # is what makes an article's place in the vault graph visible
+                # from the note itself, not just from the MOC listing it.
+                + "\n\n> Part of [[Articles MOC]] - [[Knowledge Base MOC]]\n"
             )
             written.append(str(out.relative_to(repo_root)))
     return written
@@ -282,10 +286,11 @@ def run_cycle(
             cfg, kb, report.whitepaper, repo_root=repo_root, ai_runner=ai_runner
         )},
     )["paths"]
-    journal.once(
+    direction = journal.once(
         jr, "direction", "block",
         lambda: _direction_step(cfg, kb, repo_root=repo_root, runner=runner),
     )
+    report.audit_summary = direction.get("audit", "")
 
     # A resumed block says so in the brief, in one line, before it is rendered.
     if jr.replayed:
@@ -340,10 +345,16 @@ def _whitepaper_step(cfg: CoreConfig, kb: KnowledgeBase) -> dict:
 def _direction_step(
     cfg: CoreConfig, kb: KnowledgeBase, *, repo_root: Path, runner: Runner
 ) -> dict:
-    """Rebuild the derived indexes: knowledge MOCs, then the steering doc."""
+    """Rebuild the derived indexes: knowledge MOCs, then the steering doc.
+
+    The vault-local audit runs here too (after the MOCs are freshly written)
+    so the block review brief always carries a current verdict, not a stale
+    one from before this block's own knowledge landed.
+    """
     mocs = [str(p) for p in kb.reindex_mocs()]
     path = write_direction(cfg, repo_root=repo_root, runner=runner)
-    return {"path": str(path), "mocs": mocs}
+    audit_summary = audit.offline_one_liner(cfg, repo_root)
+    return {"path": str(path), "mocs": mocs, "audit": audit_summary}
 
 
 def _governance_pr(

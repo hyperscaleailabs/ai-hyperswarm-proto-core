@@ -22,6 +22,7 @@ STANDARD_LABELS = {
     "blocked": ("000000", "Exhausted auto-retries; needs a human"),
     "review": ("e99695", "Block review brief for the architect"),
     "needs-refinement": ("f9d0c4", "Ticket lacks acceptance criteria / verification plan"),
+    "audit-drift": ("e11d21", "hsai audit found traceability/vault drift (see src/hsai/audit.py)"),
     "size:S": ("c5def5", "Small, mechanical change"),
     "size:M": ("76c7f0", "Substantial feature or refactor"),
     "size:L": ("1f77b4", "Large, multi-step change"),
@@ -38,6 +39,7 @@ class Issue:
     labels: tuple[str, ...]
     assignees: tuple[str, ...]
     body: str = ""
+    state: str = ""  # OPEN | CLOSED; only populated by get_issue (single-issue lookup)
 
     def priority_rank(self) -> int:
         for i, lbl in enumerate(PRIORITY_LABELS):
@@ -213,7 +215,7 @@ def get_issue(repo: str, number: int, *, runner: Runner = run) -> Issue | None:
     p = _gh(
         [
             "issue", "view", str(number), "--repo", repo,
-            "--json", "number,title,labels,assignees,body",
+            "--json", "number,title,labels,assignees,body,state",
         ],
         runner=runner,
     )
@@ -229,6 +231,14 @@ def get_issue(repo: str, number: int, *, runner: Runner = run) -> Issue | None:
         labels=tuple(lb["name"] for lb in item.get("labels", [])),
         assignees=tuple(a["login"] for a in item.get("assignees", [])),
         body=item.get("body", "") or "",
+        state=item.get("state", "") or "",
+    )
+
+
+def edit_issue_body(repo: str, number: int, body: str, *, runner: Runner = run) -> Proc:
+    """Rewrite an issue's body in place (the idempotent half of file-or-update)."""
+    return _gh(
+        ["issue", "edit", str(number), "--repo", repo, "--body", body], runner=runner
     )
 
 
@@ -263,6 +273,65 @@ def list_open_prs(repo: str, *, runner: Runner = run) -> list[Pr]:
         )
         for item in data
     ]
+
+
+def list_merged_prs(repo: str, *, limit: int = 200, runner: Runner = run) -> list[Pr]:
+    """List merged PRs (used by the audit's lesson<->ticket<->PR closure check)."""
+    p = _gh(
+        [
+            "pr", "list", "--repo", repo, "--state", "merged",
+            "--limit", str(limit),
+            "--json", "number,title,body,headRefName",
+        ],
+        runner=runner,
+    )
+    try:
+        data = json.loads(p.stdout or "[]")
+    except json.JSONDecodeError:
+        return []
+    return [
+        Pr(
+            number=item["number"],
+            title=item.get("title", ""),
+            body=item.get("body", "") or "",
+            head_ref=item.get("headRefName", ""),
+        )
+        for item in data
+    ]
+
+
+@dataclass
+class PrDetail:
+    """A single PR's merge status - richer than :class:`Pr`, one lookup at a time."""
+
+    number: int
+    title: str
+    body: str
+    state: str  # OPEN | CLOSED | MERGED
+    merged: bool
+
+
+def get_pr(repo: str, number: int, *, runner: Runner = run) -> PrDetail | None:
+    p = _gh(
+        [
+            "pr", "view", str(number), "--repo", repo,
+            "--json", "number,title,body,state,merged",
+        ],
+        runner=runner,
+    )
+    try:
+        item = json.loads(p.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    if not item:
+        return None
+    return PrDetail(
+        number=item["number"],
+        title=item.get("title", ""),
+        body=item.get("body", "") or "",
+        state=item.get("state", "") or "",
+        merged=bool(item.get("merged", False)),
+    )
 
 
 def close_pr(
