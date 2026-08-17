@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from uuid import uuid4
 
-from . import ai, ci, github, gitops, ledger, recall, repro, review, trajectory
+from . import ai, ci, github, gitops, ledger, recall, repro, review, trace, trajectory
 from .config import CoreConfig
 from .knowledge import KnowledgeBase, Lesson
 from .models import ModelChoice, Task, select
@@ -55,6 +55,21 @@ def _format_error_with_context(
         context_parts.append(f"ticket=#{ticket}")
     context = ", ".join(context_parts)
     return f"[{context}] {error}"
+
+
+def _write_trace(traj: trace.Trajectory | None, outcome: str, repo_dir: str) -> str:
+    """Finalize and persist the iteration trajectory, if one is being kept.
+
+    A no-op (returns ``""``) for a dry run, where ``traj`` is always ``None``.
+    Called at every ``run_once`` return point - including the early guard
+    aborts - so exactly one trajectory JSON exists per non-dry-run iteration,
+    the same discipline :mod:`hsai.trajectory` already applies to per-agent
+    runs.
+    """
+    if traj is None:
+        return ""
+    traj.outcome = outcome
+    return str(trace.write(traj, repo_dir))
 
 
 def _phase_artifacts(kind: str) -> str:
@@ -107,6 +122,7 @@ def build_pr_body(
     kind: str = "",
     references: tuple[str, ...] = (),
     trajectory_digest: str = "",
+    trace_path: str = "",
     recalled: tuple[str, ...] = (),
     review_verdict: str = "",
 ) -> str:
@@ -126,10 +142,15 @@ def build_pr_body(
         f"\n## Prior lessons consulted\n{recalled_links}\n" if recalled else ""
     )
     # What the run cost and how it ended, visible on the PR itself - the full
-    # record stays in the local (gitignored) trajectory store.
-    traj_section = (
-        f"\n## Trajectory\n{trajectory_digest}\n" if trajectory_digest else ""
-    )
+    # per-agent record stays in the local (gitignored) trajectory store; the
+    # iteration's decision sequence (this run's model choice, guard verdicts,
+    # CI results) is committed under knowledge/trajectories/ and linked here so
+    # it stays traceable and replayable (`hsai replay`).
+    traj_lines = [line for line in (
+        trajectory_digest,
+        f"- iteration trace: `{trace_path}`" if trace_path else "",
+    ) if line]
+    traj_section = "\n## Trajectory\n" + "\n".join(traj_lines) + "\n" if traj_lines else ""
     # Who checked the work, not just who wrote it: always rendered, so a PR that
     # skipped the gate says so out loud instead of staying silent about it.
     verdict = review_verdict or "_(no independent review recorded)_"
@@ -171,6 +192,7 @@ class IterationResult:
     recovered: bool = False
     review: str = ""  # approve | blocked | skipped (independent review gate)
     lesson_path: str = ""
+    trace_path: str = ""  # this iteration's committed decision-sequence record
     recalled: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
@@ -259,6 +281,7 @@ def run_once(
     iteration: int = 0,
     block: int | None = None,
     demote_tier: bool = False,
+    branch: str | None = None,
 ) -> IterationResult:
     """Execute a single iteration of the loop.
 
@@ -275,14 +298,19 @@ def run_once(
     polluting) a real cycle 0. When omitted entirely, this falls back to the
     historical ``iteration // 100`` derivation, so a bare, direct call (as
     every pre-existing test makes) keeps its exact prior behavior.
+
+    ``branch`` is normally generated (unique per worker, even within the same
+    second); ``hsai replay`` passes the exact branch a recorded cassette used,
+    so every git/gh command run_once issues has the argv the cassette recorded
+    it under - a regenerated branch would never match.
     """
     repo = cfg.repo_slug
     login = github.current_login(runner=runner) if not dry_run else "hsai-bot"
     started = time.time()
+    block = iteration // 100 if block is None else block
 
     # 1. sync main + fresh worktree (serialized: touches shared .git)
-    # Branch name is unique per worker even within the same second.
-    branch = f"hsai/iter-{int(time.time())}-{iteration}-{uuid4().hex[:6]}"
+    branch = branch or f"hsai/iter-{int(time.time())}-{iteration}-{uuid4().hex[:6]}"
     if not dry_run:
         with _SERIAL:
             gitops.sync_main(cfg.default_branch, cwd=repo_dir, runner=runner)
@@ -293,12 +321,28 @@ def run_once(
     else:
         wt = repo_dir
 
+    # Iteration trajectory (hsai.trace): the ordered decision record for THIS
+    # run, distinct from the per-agent record in hsai.trajectory. None for a
+    # dry run - a dry run makes no real decision worth replaying.
+    trace_traj: trace.Trajectory | None = None
+    if not dry_run:
+        trace_traj = trace.Trajectory(iteration=iteration, branch=branch, block=block)
+        trace_traj.add_event(
+            trace.WORKTREE_CREATED, elapsed_seconds=time.time() - started,
+            branch=branch, worktree=wt,
+        )
+
     # 2. CI check (skipped in dry-run so we never recurse into a real build)
     ci_before = (
         ci.run_local(cwd=wt, runner=runner)
         if not dry_run
         else ci.CIResult(ok=True, steps={}, log="dry-run")
     )
+    if trace_traj is not None:
+        trace_traj.add_event(
+            trace.CI_LOCAL, elapsed_seconds=time.time() - started,
+            phase="before", ok=ci_before.ok, summary=ci_before.summary(),
+        )
 
     # 3. choose work + claim a ticket (serialized so workers never collide)
     ticket_num: int | None = None
@@ -367,9 +411,19 @@ def run_once(
                         assignee=login, runner=runner,
                     )
 
+    if trace_traj is not None:
+        trace_traj.kind = kind
+        trace_traj.ticket = ticket_num
+        trace_traj.add_event(
+            trace.TICKET_CLAIMED, elapsed_seconds=time.time() - started,
+            kind=kind, ticket=ticket_num, title=ticket_title,
+            idle=bool(idle_reason), idle_reason=idle_reason,
+        )
+
     if idle_reason:
         res = IterationResult(kind=kind, ci_before=ci_before.ok)
         res.notes.append(idle_reason)
+        res.trace_path = _write_trace(trace_traj, "idle", repo_dir)
         gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
         return res
 
@@ -379,6 +433,12 @@ def run_once(
         tuple(claimed_issue.labels) if claimed_issue else ()
     ))
     choice = select(task, cfg, demote=demote_tier)
+    if trace_traj is not None:
+        trace_traj.add_event(
+            trace.MODEL_SELECTED, elapsed_seconds=time.time() - started,
+            model=choice.model, tier=choice.tier, rationale=choice.rationale,
+            strategy=choice.strategy,
+        )
 
     # Read side of the knowledge base: pull the most relevant prior notes for
     # this ticket out of the vault in the worktree. Computed before the agent
@@ -399,7 +459,6 @@ def run_once(
     # aggregate and budget gate can read across iterations; the governance PR
     # later commits it so the economics stay auditable.
     attempts = (claimed_issue.attempts() if claimed_issue else 0) + 1
-    block = iteration // 100 if block is None else block
     tokens: tuple[int, int] | None = None
     traj: trajectory.Trajectory | None = None
 
@@ -454,6 +513,12 @@ def run_once(
         tokens = ledger.parse_tokens(ares.payload)
         if agent_err:
             agent_err = _format_error_with_context(agent_err, kind, ticket_num)
+        if trace_traj is not None:
+            trace_traj.add_event(
+                trace.AGENT_INVOKED, elapsed_seconds=time.time() - started,
+                ok=agent_ok, model=choice.model, tier=choice.tier,
+                trajectory=traj.identifier,
+            )
 
         # Guard: a task must not change the CI checks, or local and remote CI
         # would diverge (as happened once when a worker added mypy). Revert any
@@ -465,6 +530,12 @@ def run_once(
         if reverted_workflows:
             gitops.restore_pathspec(".github/workflows", cwd=wt, runner=runner)
             result.notes.append(f"reverted workflow edits: {reverted_workflows}")
+        if trace_traj is not None:
+            trace_traj.add_event(
+                trace.GUARD_VERDICT, elapsed_seconds=time.time() - started,
+                guard="workflow_guard", ok=not bool(reverted_workflows),
+                detail=", ".join(reverted_workflows) or "no workflow edits",
+            )
 
         # Completeness guard: a code ticket (feat/skill/refactor/fix) cannot be
         # satisfied by a knowledge-only diff. PR #17 once "closed" a feature
@@ -472,6 +543,12 @@ def run_once(
         if _requires_code(ticket_title):
             touched = gitops.changed_paths(cwd=wt, runner=runner)
             code_files = [p for p in touched if not p.startswith("knowledge/")]
+            if trace_traj is not None:
+                trace_traj.add_event(
+                    trace.GUARD_VERDICT, elapsed_seconds=time.time() - started,
+                    guard="completeness_guard", ok=bool(code_files),
+                    detail="code files touched" if code_files else "knowledge-only diff",
+                )
             if not code_files:
                 result.notes.append("completeness guard: knowledge-only diff on a code ticket")
                 _recover_failed(
@@ -480,6 +557,12 @@ def run_once(
                     remote="INCOMPLETE", runner=runner,
                 )
                 result.recovered = True
+                if trace_traj is not None:
+                    trace_traj.add_event(
+                        trace.RECOVERED, elapsed_seconds=time.time() - started,
+                        reason="incomplete",
+                    )
+                result.trace_path = _write_trace(trace_traj, "incomplete", repo_dir)
                 _record_cost("incomplete")
                 gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
                 return result
@@ -500,6 +583,11 @@ def run_once(
                 test_files=test_files, worktrees_dir=cfg.worktrees_dir, runner=runner,
             )
             result.notes.append(f"repro guard: {repro_result.reason}")
+            if trace_traj is not None:
+                trace_traj.add_event(
+                    trace.GUARD_VERDICT, elapsed_seconds=time.time() - started,
+                    guard="repro_guard", ok=repro_result.ok, detail=repro_result.reason,
+                )
             if not repro_result.ok:
                 _recover_failed(
                     cfg, repo, 0, kind=kind, ticket_num=ticket_num,
@@ -507,6 +595,12 @@ def run_once(
                     remote="NO_REPRO", runner=runner,
                 )
                 result.recovered = True
+                if trace_traj is not None:
+                    trace_traj.add_event(
+                        trace.RECOVERED, elapsed_seconds=time.time() - started,
+                        reason="no_repro",
+                    )
+                result.trace_path = _write_trace(trace_traj, "no_repro", repo_dir)
                 _record_cost("no_repro")
                 gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
                 return result
@@ -514,6 +608,11 @@ def run_once(
     # 6. re-check CI
     ci_after = ci.run_local(cwd=wt, runner=runner) if not dry_run else ci_before
     result.ci_after = ci_after.ok
+    if trace_traj is not None:
+        trace_traj.add_event(
+            trace.CI_LOCAL, elapsed_seconds=time.time() - started,
+            phase="after", ok=ci_after.ok, summary=ci_after.summary(),
+        )
 
     # 6b. Independent review gate: a SECOND opinion, from a different tier than
     # the author, on whether the diff actually satisfies the ticket. Every other
@@ -542,9 +641,20 @@ def run_once(
             )
     result.review = verdict.status
     result.notes.append(f"independent review: {verdict.summary()}")
+    if trace_traj is not None:
+        trace_traj.add_event(
+            trace.GUARD_VERDICT, elapsed_seconds=time.time() - started,
+            guard="review_gate", ok=verdict.approve, status=verdict.status,
+            blocking=len(verdict.blocking),
+        )
 
     # 7. lesson (ALWAYS, pass or fail)
     outcome = "pass" if (agent_ok and ci_after.ok) else "fail"
+    # The iteration trajectory is written here too (mirroring the per-agent
+    # trajectory's own outcome/`_record_cost` pattern below): every return
+    # path from here on can reuse `result.trace_path`, and the lesson/PR body
+    # assembled just below can link to it.
+    result.trace_path = _write_trace(trace_traj, outcome, repo_dir)
     if traj is not None:
         # The digest quoted below should state what is known now; `_record_cost`
         # refines it to the merge outcome once that is settled.
@@ -587,6 +697,7 @@ def run_once(
         recalled=recalled.note_names,
         review_verdict=verdict.render(),
         execution_trace=traj.execution_trace() if traj else "",
+        trace_path=result.trace_path,
     )
     # Each PR commits ONLY its own uniquely-named lesson file. The MOC indexes
     # and whitepapers are regenerated by the serialized `hsai reindex`
@@ -615,6 +726,12 @@ def run_once(
         # The lesson was written into a worktree that is about to be discarded
         # unpushed; the durable record of this run is its ledger + trajectory.
         result.lesson_path = ""
+        if trace_traj is not None:
+            trace_traj.add_event(
+                trace.RECOVERED, elapsed_seconds=time.time() - started,
+                reason="review_blocked",
+            )
+        result.trace_path = _write_trace(trace_traj, "review_blocked", repo_dir)
         _record_cost("review_blocked")
         gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
         return result
@@ -634,6 +751,7 @@ def run_once(
         kind=kind,
         references=references,
         trajectory_digest=traj.digest() if traj else "",
+        trace_path=result.trace_path,
         recalled=recalled.note_names,
         review_verdict=verdict.render(),
     )
@@ -642,6 +760,10 @@ def run_once(
         base=cfg.default_branch, runner=runner,
     )
     result.pr = pr_num
+    if trace_traj is not None:
+        trace_traj.add_event(
+            trace.PR_OPENED, elapsed_seconds=time.time() - started, pr=pr_num,
+        )
 
     # 12. Poll the REAL (remote) CI to conclusion BEFORE relying on auto-merge -
     # it is the source of truth for whether the change may merge, and arming
@@ -653,6 +775,10 @@ def run_once(
     )
     result.remote = remote
     result.notes.append(f"remote CI={remote}")
+    if trace_traj is not None:
+        trace_traj.add_event(
+            trace.CI_REMOTE, elapsed_seconds=time.time() - started, result=remote,
+        )
 
     # Record the true remote outcome in the lesson itself, then push that
     # update so it lands in the knowledge base once the PR merges.
@@ -667,6 +793,10 @@ def run_once(
     if remote == ci.SUCCESS:
         github.merge_pr(repo, pr_num, auto=True, runner=runner)
         result.merged = True
+        if trace_traj is not None:
+            trace_traj.add_event(
+                trace.MERGED, elapsed_seconds=time.time() - started, pr=pr_num,
+            )
     else:
         result.merged = False
         _recover_failed(
@@ -675,7 +805,14 @@ def run_once(
         )
         result.recovered = True
         result.notes.append("recovered: closed PR, returned ticket to backlog")
+        if trace_traj is not None:
+            trace_traj.add_event(
+                trace.RECOVERED, elapsed_seconds=time.time() - started, reason=remote,
+            )
 
+    result.trace_path = _write_trace(
+        trace_traj, "merged" if result.merged else "recovered", repo_dir
+    )
     _record_cost("merged" if result.merged else "recovered")
 
     # 13. cleanup worktree

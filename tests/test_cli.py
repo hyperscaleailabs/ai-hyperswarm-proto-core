@@ -1,7 +1,7 @@
 import json
 
 from hsai import cli as cli_module
-from hsai import trajectory
+from hsai import trace, trajectory
 from hsai.cli import build_parser, main
 from hsai.repro import ReproResult
 from hsai.trajectory import Step, Trajectory
@@ -221,49 +221,59 @@ def test_traj_unknown_iteration_exits_nonzero(tmp_path, monkeypatch, capsys):
     assert "no trajectory" in capsys.readouterr().err
 
 
-def test_replay_prints_a_human_reconstruction(tmp_path, monkeypatch, capsys):
-    _seed_trajectory(tmp_path)
-    spy = _no_subprocess(monkeypatch)
+def test_parser_replay_args():
+    parser = build_parser()
+    args = parser.parse_args(["replay", "c.json", "--assert-trajectory", "g.json"])
+    assert args.command == "replay"
+    assert args.cassette == "c.json"
+    assert args.assert_trajectory == "g.json"
+    assert args.repo_dir == "."
 
-    rc = main(["replay", "12", "--root", str(tmp_path)])
+    bare = parser.parse_args(["replay", "c.json"])
+    assert bare.assert_trajectory is None
+
+
+def test_replay_command_wires_run_once_under_a_replay_runner(tmp_path, monkeypatch, capsys):
+    """`hsai replay` never spawns a real subprocess: the cassette answers
+    every call through :class:`hsai.cassette.ReplayRunner`."""
+    from hsai import cassette as cassette_module
+    from hsai import orchestrator as orchestrator_module
+
+    seen = {}
+    traj_path = trace.write(
+        trace.Trajectory(iteration=1, branch="hsai/iter-1", outcome="merged"), tmp_path
+    )
+
+    def fake_run_once(cfg, **kwargs):
+        seen.update(kwargs)
+        assert isinstance(kwargs["runner"], cassette_module.ReplayRunner)
+        result = orchestrator_module.IterationResult(kind="implement", pr=1, merged=True)
+        result.trace_path = str(traj_path)
+        return result
+
+    monkeypatch.setattr(cli_module, "run_once", fake_run_once)
+    tape = cassette_module.Cassette(iteration=1, branch="hsai/iter-1", block=0, entries=[])
+    cassette_path = tmp_path / "c.json"
+    cassette_module.save(tape, cassette_path)
+
+    rc = main(["replay", str(cassette_path), "--repo-dir", str(tmp_path)])
     out = capsys.readouterr().out
-
     assert rc == 0
-    assert "trajectory 12" in out
-    assert "Implement the widget END TO END." in out      # prompt
-    assert "tool_use(Read)" in out and "Widget implemented." in out  # step stream
-    assert "input_tokens=1500" in out and "output_tokens=320" in out  # usage
-    assert "outcome: merged" in out
-    assert spy.calls == []                                 # no `claude`, no network
+    assert seen["iteration"] == 1 and seen["branch"] == "hsai/iter-1"
+    assert "iteration(kind=implement" in out
 
 
-def test_replay_json_flag_round_trips(tmp_path, monkeypatch, capsys):
-    traj = _seed_trajectory(tmp_path)
-    spy = _no_subprocess(monkeypatch)
+def test_replay_command_exits_nonzero_on_a_replay_error(tmp_path, monkeypatch, capsys):
+    from hsai import cassette as cassette_module
 
-    rc = main(["replay", "12", "--root", str(tmp_path), "--json"])
-    out = capsys.readouterr().out
+    def raising_run_once(cfg, **kwargs):
+        raise cassette_module.ReplayError("no cassette entry for command: ['git', 'push']")
 
-    assert rc == 0
-    payload = json.loads(out)
-    assert payload["iteration"] == 12 and payload["ticket"] == 7
-    assert payload["usage"]["output_tokens"] == 320
-    assert [s["kind"] for s in payload["steps"]] == ["tool_use", "result"]
-    assert payload == json.loads(traj.to_json())
-    assert spy.calls == []
+    monkeypatch.setattr(cli_module, "run_once", raising_run_once)
+    tape = cassette_module.Cassette(iteration=1, branch="hsai/iter-1", block=0, entries=[])
+    cassette_path = tmp_path / "c.json"
+    cassette_module.save(tape, cassette_path)
 
-
-def test_replay_accepts_a_file_path(tmp_path, monkeypatch, capsys):
-    _seed_trajectory(tmp_path)
-    _no_subprocess(monkeypatch)
-    path = trajectory.path_for(tmp_path, "12", 0)
-
-    assert main(["replay", str(path)]) == 0
-    assert "trajectory 12" in capsys.readouterr().out
-
-
-def test_replay_unknown_id_exits_nonzero(tmp_path, monkeypatch, capsys):
-    _no_subprocess(monkeypatch)
-    rc = main(["replay", "999", "--root", str(tmp_path)])
+    rc = main(["replay", str(cassette_path)])
     assert rc == 1
-    assert "no trajectory" in capsys.readouterr().err
+    assert "no cassette entry" in capsys.readouterr().err

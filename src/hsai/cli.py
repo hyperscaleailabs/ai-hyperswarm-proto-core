@@ -9,7 +9,9 @@ Commands:
   hsai recall "<query>" [--k N] [--kind K]                     rank prior lessons/ADRs
   hsai doctor                                                  verify environment + invariants
   hsai traj <iteration> [--json]                               print a stored agent run
-  hsai replay <iteration> [--json]                             alias of `hsai traj`
+  hsai replay <cassette> [--assert-trajectory <file>]          re-run run_once from a
+                                                                 recorded cassette (no
+                                                                 quota, no GitHub)
 """
 from __future__ import annotations
 
@@ -17,10 +19,10 @@ import argparse
 import os
 import sys
 
-from . import __version__, ai, recall, repro, trajectory
+from . import __version__, ai, cassette, recall, repro, trace, trajectory
 from .config import CoreConfig, load_config, validate
 from .knowledge import KnowledgeBase
-from .orchestrator import run_loop
+from .orchestrator import run_loop, run_once
 from .swarm import run_parallel
 
 
@@ -173,14 +175,54 @@ def _print_trajectory(args: argparse.Namespace, label: str) -> int:
     return 0
 
 
-def cmd_replay(args: argparse.Namespace) -> int:
-    """Reconstruct a stored agent run (alias of ``hsai traj``)."""
-    return _print_trajectory(args, "replay")
-
-
 def cmd_traj(args: argparse.Namespace) -> int:
     """Print one iteration's stored trajectory for a post-mortem."""
     return _print_trajectory(args, "traj")
+
+
+def cmd_replay(args: argparse.Namespace) -> int:
+    """Re-run ``run_once`` from a recorded cassette: no quota, no GitHub.
+
+    Answers every git/gh/claude call from the cassette via
+    :class:`hsai.cassette.ReplayRunner` (which refuses anything not
+    recorded, and any GitHub-mutating command that is not an exact recorded
+    entry), then compares the trajectory the replay produced against
+    ``--assert-trajectory`` if one was given. A divergence - or a refused
+    command - is a non-zero exit, so a real recorded run becomes a
+    regression test for future changes to the orchestrator.
+    """
+    cfg = _load(args)
+    tape = cassette.load(args.cassette)
+    replay_runner = cassette.ReplayRunner(tape.entries)
+    try:
+        result = run_once(
+            cfg, repo_dir=args.repo_dir, dry_run=False,
+            runner=replay_runner, ai_runner=replay_runner,
+            iteration=tape.iteration, block=tape.block, branch=tape.branch,
+        )
+    except cassette.ReplayError as exc:
+        print(f"replay: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"replay: {result.describe()}")
+    if not result.trace_path:
+        print("replay: run_once produced no trajectory (unexpected)", file=sys.stderr)
+        return 1
+    produced = trace.read(result.trace_path)
+
+    if not args.assert_trajectory:
+        print(f"replay: trajectory written to {result.trace_path}")
+        return 0
+
+    golden = trace.read(args.assert_trajectory)
+    diffs = produced.diff(golden)
+    if diffs:
+        print("replay: trajectory diverged from the golden trajectory:", file=sys.stderr)
+        for d in diffs:
+            print(f"  - {d}", file=sys.stderr)
+        return 1
+    print(f"replay: trajectory matches {args.assert_trajectory}")
+    return 0
 
 
 def cmd_brief(args: argparse.Namespace) -> int:
@@ -265,16 +307,29 @@ def build_parser() -> argparse.ArgumentParser:
     br = sub.add_parser("brief", help="refresh governance/DIRECTION.md")
     br.set_defaults(func=cmd_brief)
 
-    for name, help_text, func in (
-        ("traj", "print a stored trajectory for a post-mortem", cmd_traj),
-        ("replay", "reconstruct a stored agent run (alias of `traj`)", cmd_replay),
-    ):
-        tp = sub.add_parser(name, help=f"{help_text} (spends no quota)")
-        tp.add_argument("trajectory_id", metavar="iteration",
-                        help="iteration number, or a path to a trajectory file")
-        tp.add_argument("--root", default=".", help="repo root holding .hsai/traj")
-        tp.add_argument("--json", action="store_true", help="print the raw trajectory JSON")
-        tp.set_defaults(func=func)
+    tp = sub.add_parser(
+        "traj", help="print a stored trajectory for a post-mortem (spends no quota)"
+    )
+    tp.add_argument("trajectory_id", metavar="iteration",
+                    help="iteration number, or a path to a trajectory file")
+    tp.add_argument("--root", default=".", help="repo root holding .hsai/traj")
+    tp.add_argument("--json", action="store_true", help="print the raw trajectory JSON")
+    tp.set_defaults(func=cmd_traj)
+
+    rp = sub.add_parser(
+        "replay",
+        help="re-run run_once from a recorded cassette (spends no quota, touches no GitHub)",
+    )
+    rp.add_argument("cassette", help="path to a recorded cassette JSON file")
+    rp.add_argument(
+        "--assert-trajectory", dest="assert_trajectory", default=None,
+        help="golden trajectory JSON; exit non-zero if the replay diverges from it",
+    )
+    rp.add_argument(
+        "--repo-dir", dest="repo_dir", default=".",
+        help="repo root the replay writes its lesson/ledger/trace into",
+    )
+    rp.set_defaults(func=cmd_replay)
 
     rc = sub.add_parser(
         "repro-check", help="reproduce-before-fix guard for heal/bugfix PRs (CI gate)"

@@ -62,6 +62,7 @@ class Lesson:
     recalled: tuple[str, ...] = ()  # prior notes injected into this run's prompt
     review_verdict: str = ""  # the independent reviewer's verdict, verbatim
     execution_trace: str = ""  # turns/tools/tokens/exit/duration - the committed digest
+    trace_path: str = ""  # this iteration's decision-sequence record (hsai.trace)
 
     def note_name(self) -> str:
         return f"{self.created}-{slugify(self.title)}"
@@ -322,6 +323,11 @@ class KnowledgeBase:
         # disabled renders byte-for-byte as it did before recall existed.
         if lesson.recalled:
             extra["recalled"] = lesson.recalled
+        # Only present when the iteration trajectory (hsai.trace) was actually
+        # written (a dry run leaves none), so the frontmatter stays unchanged
+        # for every pre-existing note and every dry-run lesson.
+        if lesson.trace_path:
+            extra["trace"] = lesson.trace_path
         fm = self._frontmatter(tags, extra)
         refs = "\n".join(f"- `{r}`" for r in lesson.references) or "- _(none cited)_"
         ticket = f"#{lesson.ticket}" if lesson.ticket else "_(none)_"
