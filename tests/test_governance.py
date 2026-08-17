@@ -99,3 +99,34 @@ def test_brief_says_when_tokens_per_merged_pr_is_unavailable():
     cost = BlockAggregate(block=7, iterations=2, total_seconds=10.0)
     body = render_brief(cfg, BlockReport(cycle_index=7, cost=cost))
     assert "tokens per merged PR: _not available_" in body
+
+
+# --- practices adopted this block --------------------------------------------
+
+def test_brief_reports_practices_adopted_this_block():
+    cfg = load_config()
+    report = BlockReport(
+        cycle_index=7,
+        practices_adopted=[
+            {
+                "id": "openbmb-chatdev--session-durability",
+                "title": "session durability",
+                "source_project": "OpenBMB/ChatDev",
+                "source_artifact": "harness_design",
+                "status": "adopted",
+                "evidence": "PR #104",
+            }
+        ],
+    )
+    body = render_brief(cfg, report)
+    assert "## Practices adopted this block" in body
+    assert "session durability" in body
+    assert "OpenBMB/ChatDev" in body
+    assert "PR #104" in body
+
+
+def test_brief_reports_no_practices_adopted_when_none():
+    cfg = load_config()
+    body = render_brief(cfg, BlockReport(cycle_index=7))
+    assert "## Practices adopted this block" in body
+    assert "_none this block_" in body

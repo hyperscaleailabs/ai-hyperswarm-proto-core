@@ -7,6 +7,8 @@ Commands:
   hsai cycle [--cycle-index N] [--resume] [--dry-run]          one governance block
   hsai reindex                                                 rebuild knowledge MOCs
   hsai recall "<query>" [--k N] [--kind K]                     rank prior lessons/ADRs
+  hsai practices list                                          show the adopted-practice registry
+  hsai practices add --title T --source-project P ...          record a new adopted practice
   hsai doctor                                                  verify environment + invariants
   hsai traj <iteration> [--json]                               print a stored agent run
   hsai replay <iteration> [--json]                             alias of `hsai traj`
@@ -17,7 +19,7 @@ import argparse
 import os
 import sys
 
-from . import __version__, ai, recall, repro, trajectory
+from . import __version__, ai, practices, recall, repro, trajectory
 from .config import CoreConfig, load_config, validate
 from .knowledge import KnowledgeBase
 from .orchestrator import run_loop
@@ -103,6 +105,41 @@ def cmd_recall(args: argparse.Namespace) -> int:
         return 1
     for note in notes:
         print(f"{note.score:8.3f}  {note.note_name}  ({note.label()})")
+    return 0
+
+
+def cmd_practices_list(args: argparse.Namespace) -> int:
+    """Print the adopted-practice registry (pure reading, no quota spent)."""
+    cfg = _load(args)
+    records = practices.load(args.root, cfg)
+    if not records:
+        print("practices: registry is empty")
+        return 0
+    for p in records:
+        pr = f"#{p.adopted_pr}" if p.adopted_pr else "-"
+        print(f"{p.id}  [{p.status}]  {p.title}  <- {p.source_project} ({p.source_artifact})  PR {pr}")
+    return 0
+
+
+def cmd_practices_add(args: argparse.Namespace) -> int:
+    """Record a new adopted practice - refuses a (source_project, title) duplicate."""
+    cfg = _load(args)
+    practice = practices.build_practice(
+        title=args.title,
+        source_project=args.source_project,
+        source_artifact=args.source_artifact,
+        evidence=args.evidence,
+        status=args.status,
+        adopted_pr=args.adopted_pr,
+        adopted_date=args.adopted_date or "",
+        notes=args.notes or "",
+    )
+    try:
+        path = practices.append(args.root, practice, cfg=cfg)
+    except practices.DuplicatePracticeError as exc:
+        print(f"practices add: refused - {exc}", file=sys.stderr)
+        return 1
+    print(f"wrote {path}")
     return 0
 
 
@@ -247,6 +284,29 @@ def build_parser() -> argparse.ArgumentParser:
     rl.add_argument("--kind", default="", help="bias toward this task kind (heal/implement/improve)")
     rl.add_argument("--root", default=".", help="repo root holding knowledge/ and docs/adr")
     rl.set_defaults(func=cmd_recall)
+
+    pr = sub.add_parser("practices", help="the adopted-practice registry (see hsai.practices)")
+    pr_sub = pr.add_subparsers(dest="practices_command", required=True)
+
+    pr_list = pr_sub.add_parser("list", help="print every registered practice")
+    pr_list.add_argument("--root", default=".", help="repo root holding knowledge/practices")
+    pr_list.set_defaults(func=cmd_practices_list)
+
+    pr_add = pr_sub.add_parser("add", help="record a new adopted practice")
+    pr_add.add_argument("--root", default=".", help="repo root holding knowledge/practices")
+    pr_add.add_argument("--title", required=True)
+    pr_add.add_argument("--source-project", required=True, help="e.g. langchain-ai/langchain")
+    pr_add.add_argument(
+        "--source-artifact", required=True,
+        help="one of core.yaml reference_set.learn_from "
+        "(source_code, commit_history, ci_cd, issue_history, harness_design, readme)",
+    )
+    pr_add.add_argument("--evidence", required=True, help="URL or commit/PR reference")
+    pr_add.add_argument("--status", default="adopted", choices=list(practices.STATUSES))
+    pr_add.add_argument("--adopted-pr", type=int, default=None)
+    pr_add.add_argument("--adopted-date", default="", help="YYYY-MM-DD (default: today)")
+    pr_add.add_argument("--notes", default="")
+    pr_add.set_defaults(func=cmd_practices_add)
 
     cy = sub.add_parser("cycle", help="run one half-day governance block")
     cy.add_argument("--index", "--cycle-index", dest="index", type=int, default=None,

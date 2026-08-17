@@ -228,6 +228,17 @@ def run_cycle(
     jr = journal.open_journal(repo_root, idx, dry_run=dry_run)
     report = BlockReport(cycle_index=idx)
 
+    # 0. Snapshot the practices registry before this block touches anything, so
+    # "adopted this block" can be computed as a set difference after main is
+    # synced. Journaled so a resumed run compares against the SAME baseline
+    # the original run captured, not whatever the disk holds mid-resume.
+    practices_baseline = journal.once(
+        jr, "practices_baseline", "block",
+        lambda: {"ids": sorted(
+            p.id for p in KnowledgeBase.from_config(cfg, repo_root).read_practices()
+        )},
+    )["ids"]
+
     # 1. Synthesize substantial tickets when the well-formed backlog is thin.
     synth = journal.once(
         jr, "synthesis", "block",
@@ -273,6 +284,18 @@ def run_cycle(
 
     # 4. Block whitepaper + persona articles + MOCs + DIRECTION refresh.
     kb = KnowledgeBase.from_config(cfg, repo_root)
+    baseline_ids = set(practices_baseline)
+    report.practices_adopted = journal.once(
+        jr, "practices_adopted", "block",
+        lambda: {"items": [
+            {
+                "id": p.id, "title": p.title, "source_project": p.source_project,
+                "source_artifact": p.source_artifact, "status": p.status,
+                "evidence": p.evidence, "adopted_pr": p.adopted_pr,
+            }
+            for p in kb.read_practices() if p.id not in baseline_ids
+        ]},
+    )["items"]
     report.whitepaper = journal.once(
         jr, "whitepaper", "block", lambda: _whitepaper_step(cfg, kb),
     )["note"]

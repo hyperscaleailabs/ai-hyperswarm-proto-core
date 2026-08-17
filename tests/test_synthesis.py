@@ -3,6 +3,7 @@ import json
 from hsai import ai
 from hsai.config import load_config
 from hsai.models import ModelChoice
+from hsai.practices import ADOPTED_HEADING, build_practice
 from hsai.proc import Proc
 from hsai.synthesis import (
     DEFAULT_MEMORY_MAX_CHARS,
@@ -65,6 +66,76 @@ PHASE 3:
 def test_parse_handles_garbage():
     assert parse_ticket_specs("no json here") == []
     assert parse_ticket_specs("```json\nnot json\n```") == []
+
+
+def test_parse_ticket_specs_reads_practice_ids():
+    output = """PHASE 3:
+```json
+[{"title": "feat: adaptive budget", "problem": "p", "proposal": "pp",
+  "acceptance_criteria": ["a", "b", "c"], "verification_plan": ["v1", "v2"],
+  "size": "L", "goal_ids": ["G4"], "synthesis_rationale": "combines x+y+z",
+  "practice_ids": ["openbmb-chatdev--session-durability"]}]
+```"""
+    specs = parse_ticket_specs(output)
+    assert specs[0].practice_ids == ("openbmb-chatdev--session-durability",)
+    assert "openbmb-chatdev--session-durability" in specs[0].render()
+
+
+def test_parse_ticket_specs_omitting_practice_ids_still_parses():
+    """Existing (pre-practices-registry) synthesis output must not break."""
+    output = """PHASE 3:
+```json
+[{"title": "feat: adaptive budget", "problem": "p", "proposal": "pp",
+  "acceptance_criteria": ["a", "b", "c"], "verification_plan": ["v1", "v2"],
+  "size": "L", "goal_ids": ["G4"], "synthesis_rationale": "combines x+y+z"}]
+```"""
+    specs = parse_ticket_specs(output)
+    assert specs[0].practice_ids == ()
+    assert "practice_ids: -" in specs[0].render()
+
+
+# --- adopted-practice registry in the prompt ----------------------------------
+
+def test_prompt_includes_adopted_practices_and_do_not_repropose_instruction():
+    cfg = _cfg()
+    pack = ContextPack(repos=["a/b"], sections={"a/b": "digest"})
+    practice = build_practice(
+        title="session durability", source_project="OpenBMB/ChatDev",
+        source_artifact="harness_design", evidence="PR #104",
+    )
+    prompt = build_prompt(cfg, pack, practices=[practice])
+    assert ADOPTED_HEADING in prompt
+    assert "session durability" in prompt and "OpenBMB/ChatDev" in prompt
+    assert "do not" in ADOPTED_HEADING.lower() or "not re-propose" in prompt.lower()
+    assert "practice_ids" in prompt
+
+    # the heading survives with no practices recorded yet
+    empty_prompt = build_prompt(cfg, pack)
+    assert ADOPTED_HEADING in empty_prompt
+    assert "no practices recorded yet" in empty_prompt.lower()
+
+
+def test_synthesize_feeds_the_practices_registry_to_the_model(tmp_path):
+    from hsai.knowledge import KnowledgeBase
+    from hsai.practices import append
+
+    cfg = _cfg()
+    kb = KnowledgeBase.from_config(cfg, tmp_path)
+    append(
+        tmp_path,
+        build_practice(
+            title="cost accounting", source_project="assafelovic/gpt-researcher",
+            source_artifact="source_code", evidence="PR #47",
+        ),
+        cfg=cfg,
+    )
+    assert kb.read_practices()  # sanity: the note is visible through the KB too
+
+    runner = _plain_text_runner()
+    synthesize(cfg, cycle_index=0, root=str(tmp_path), runner=runner, ai_runner=runner)
+    claude_call = next(c for c in runner.calls if c[:1] == ["claude"])
+    assert "cost accounting" in claude_call[2]
+    assert ADOPTED_HEADING in claude_call[2]
 
 
 # --- plain-text (non-JSON) CLI output must never break synthesis -------------

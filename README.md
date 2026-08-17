@@ -52,13 +52,29 @@ Clone the repo and **open the folder as an Obsidian vault** - the committed
 
 ```
 knowledge/
-├── MOCs/          # Maps of Content: Knowledge Base / Lessons / Whitepapers
+├── MOCs/          # Maps of Content: Knowledge Base / Lessons / Whitepapers / Practices
 ├── lessons/       # one article per iteration (pass or fail)
 ├── whitepapers/   # periodic syntheses (every N lessons)
+├── practices/     # adopted-practice registry (see hsai.practices)
 └── templates/     # note templates
 ```
 
 `hsai reindex` rebuilds the MOCs from what is on disk.
+
+**The synthesis planner has a memory of what it already adopted.** Every
+practice this loop has pulled from the reference set - cited to its source
+project, the kind of artifact that taught it (`source_code`, `commit_history`,
+`ci_cd`, `issue_history`, `harness_design`, `readme`), and the PR or commit
+that shipped it - lives as one frontmatter-bearing note under
+`knowledge/practices/`. `build_prompt` renders the whole registry into an
+*Already adopted - do NOT re-propose* section, and a synthesized ticket names
+which practice it adds or extends via `practice_ids`. This is G1's
+traceability claim made durable and indexed, not just prose in a PR body.
+
+```bash
+hsai practices list                                  # what has this loop already adopted?
+hsai practices add --title "..." --source-project o/r --source-artifact source_code --evidence "PR #1"
+```
 
 **The loop reads the vault back.** Before an agent starts, `hsai.recall` builds
 a BM25 index over `knowledge/lessons`, `knowledge/whitepapers` and `docs/adr`

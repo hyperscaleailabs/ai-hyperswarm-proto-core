@@ -60,9 +60,9 @@ TERMINAL_STATUSES = (HALTED, COMPLETE)
 # Steps the cycle journals. Not enforced - a new step must not need a schema
 # change to become durable - but named so the file is self-describing.
 STEPS = (
-    "synthesis", "budget", "budget_halt", "iteration", "prune", "sync",
-    "whitepaper", "articles", "direction", "governance_ticket", "governance_pr",
-    "review_issue", "block",
+    "practices_baseline", "synthesis", "budget", "budget_halt", "iteration", "prune", "sync",
+    "practices_adopted", "whitepaper", "articles", "direction", "governance_ticket",
+    "governance_pr", "review_issue", "block",
 )
 
 # Serializes appends so a step running under a worker thread cannot interleave

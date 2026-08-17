@@ -133,6 +133,76 @@ def test_recall_command_reports_a_miss(tmp_path, capsys):
     assert "no match" in capsys.readouterr().err
 
 
+def test_parser_practices_subcommands():
+    parser = build_parser()
+    args = parser.parse_args(["practices", "list", "--root", "/tmp/x"])
+    assert args.command == "practices"
+    assert args.practices_command == "list"
+    assert args.root == "/tmp/x"
+
+    add_args = parser.parse_args([
+        "practices", "add", "--title", "t", "--source-project", "o/r",
+        "--source-artifact", "source_code", "--evidence", "PR #1",
+    ])
+    assert add_args.practices_command == "add"
+    assert add_args.status == "adopted"
+    assert add_args.adopted_pr is None
+
+
+def test_practices_list_prints_the_registry(tmp_path, capsys):
+    from hsai.practices import append, build_practice
+
+    append(
+        tmp_path,
+        build_practice(
+            title="session durability", source_project="OpenBMB/ChatDev",
+            source_artifact="harness_design", evidence="PR #104", adopted_pr=104,
+        ),
+    )
+    rc = main(["practices", "list", "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "session durability" in out
+    assert "OpenBMB/ChatDev" in out
+    assert "PR #104" in out
+
+
+def test_practices_list_reports_an_empty_registry(tmp_path, capsys):
+    rc = main(["practices", "list", "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "empty" in out.lower()
+
+
+def test_practices_add_writes_a_note(tmp_path, capsys):
+    rc = main([
+        "practices", "add", "--root", str(tmp_path),
+        "--title", "cost accounting", "--source-project", "assafelovic/gpt-researcher",
+        "--source-artifact", "source_code", "--evidence", "PR #47",
+    ])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "wrote" in out
+    notes = list((tmp_path / "knowledge" / "practices").glob("*.md"))
+    assert len(notes) == 1
+    assert "cost accounting" in notes[0].read_text()
+
+
+def test_practices_add_refuses_a_duplicate(tmp_path, capsys):
+    args = [
+        "practices", "add", "--root", str(tmp_path),
+        "--title", "cost accounting", "--source-project", "assafelovic/gpt-researcher",
+        "--source-artifact", "source_code", "--evidence", "PR #47",
+    ]
+    assert main(args) == 0
+    rc = main(args)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "refused" in err
+    notes = list((tmp_path / "knowledge" / "practices").glob("*.md"))
+    assert len(notes) == 1  # the duplicate attempt never wrote a second note
+
+
 def test_parser_repro_check_defaults():
     parser = build_parser()
     args = parser.parse_args(["repro-check"])

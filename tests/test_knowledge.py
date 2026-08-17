@@ -1,3 +1,4 @@
+from hsai import practices as practices_mod
 from hsai.knowledge import (
     KnowledgeBase,
     Lesson,
@@ -114,7 +115,9 @@ def test_write_lesson_and_reindex(tmp_path):
 
     written = kb.reindex_mocs()
     names = {p.name for p in written}
-    assert names == {"Lessons MOC.md", "Whitepapers MOC.md", "Knowledge Base MOC.md"}
+    assert names == {
+        "Lessons MOC.md", "Whitepapers MOC.md", "Practices MOC.md", "Knowledge Base MOC.md",
+    }
     lessons_moc = (kb.mocs_dir / "Lessons MOC.md").read_text()
     assert f"[[{lesson.note_name()}]]" in lessons_moc
 
@@ -246,3 +249,70 @@ def test_synthesize_whitepaper_groups_outcomes_and_surfaces_recurring_failures(t
 
     path = kb.write_whitepaper(paper)
     assert "[[Whitepapers MOC]]" in path.read_text()
+
+
+# --- Practices MOC: grouped by source project, linked from the root MOC ------
+
+def test_practices_moc_groups_by_source_project(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    practices_mod.append(
+        tmp_path,
+        practices_mod.build_practice(
+            title="session durability", source_project="OpenBMB/ChatDev",
+            source_artifact="harness_design", evidence="PR #104", adopted_pr=104,
+        ),
+    )
+    practices_mod.append(
+        tmp_path,
+        practices_mod.build_practice(
+            title="reconciliation discipline", source_project="OpenBMB/ChatDev",
+            source_artifact="harness_design", evidence="PR #104", adopted_pr=104,
+        ),
+    )
+    practices_mod.append(
+        tmp_path,
+        practices_mod.build_practice(
+            title="cost accounting", source_project="assafelovic/gpt-researcher",
+            source_artifact="source_code", evidence="PR #47", adopted_pr=47,
+        ),
+    )
+
+    written = kb.reindex_mocs()
+    names = {p.name for p in written}
+    assert "Practices MOC.md" in names
+
+    text = (kb.mocs_dir / "Practices MOC.md").read_text()
+    assert "### `OpenBMB/ChatDev`" in text
+    assert "### `assafelovic/gpt-researcher`" in text
+    assert "session durability" in text and "reconciliation discipline" in text
+    assert "Total: **3**" in text
+    # OpenBMB/ChatDev's two entries both sit under its own heading, not split
+    assert text.index("### `OpenBMB/ChatDev`") < text.index("### `assafelovic/gpt-researcher`")
+
+    root_moc = (kb.mocs_dir / "Knowledge Base MOC.md").read_text()
+    assert "[[Practices MOC]] - 3 practice(s)" in root_moc
+
+
+def test_practices_moc_reindex_is_deterministic(tmp_path):
+    """`hsai reindex` run twice on an unchanged registry must not diff."""
+    kb = KnowledgeBase(tmp_path)
+    practices_mod.append(
+        tmp_path,
+        practices_mod.build_practice(
+            title="hard numeric CI gate", source_project="run-llama/llama_index",
+            source_artifact="ci_cd", evidence="PR #47",
+        ),
+    )
+    kb.reindex_mocs()
+    first = (kb.mocs_dir / "Practices MOC.md").read_text()
+    kb.reindex_mocs()
+    second = (kb.mocs_dir / "Practices MOC.md").read_text()
+    assert first == second
+
+
+def test_practices_moc_placeholder_when_empty(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    kb.reindex_mocs()
+    text = (kb.mocs_dir / "Practices MOC.md").read_text()
+    assert "No practices recorded yet" in text
+    assert "Total: **0**" in text

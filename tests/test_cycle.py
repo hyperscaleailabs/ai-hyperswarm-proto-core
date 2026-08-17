@@ -167,6 +167,76 @@ def test_synthesis_duplicate_rejections_surface_in_block_notes(tmp_path, monkeyp
     assert note in runner.review_bodies[-1]
 
 
+# --- practices adopted this block reach the review brief ---------------------
+
+def test_practices_adopted_this_block_is_empty_when_the_registry_is_unchanged(
+    tmp_path, monkeypatch
+):
+    from hsai.practices import append, build_practice
+
+    cfg = load_config()
+    cfg.budget.clear()
+    cfg.cycle["block_size"] = 0  # isolate: no implementation iterations needed
+
+    # A practice that already existed BEFORE this block ran.
+    append(
+        tmp_path,
+        build_practice(
+            title="pre-existing practice", source_project="openai/swarm",
+            source_artifact="source_code", evidence="PR #1",
+        ),
+    )
+
+    runner = _Runner()
+    monkeypatch.setattr(cycle, "_well_formed_backlog", lambda cfg, *, runner: 999)
+    monkeypatch.setattr(cycle, "_governance_pr", lambda *a, **k: 0)
+
+    res = cycle.run_cycle(cfg, repo_dir=str(tmp_path), cycle_index=1, runner=runner)
+
+    assert res.report.practices_adopted == []
+    assert runner.review_bodies, "a review issue should have been opened"
+    assert "## Practices adopted this block" in runner.review_bodies[-1]
+    assert "_none this block_" in runner.review_bodies[-1]
+
+
+def test_practices_adopted_this_block_surfaces_new_registry_entries(tmp_path, monkeypatch):
+    from hsai.practices import append, build_practice
+
+    cfg = load_config()
+    cfg.budget.clear()
+    cfg.cycle["block_size"] = 0
+
+    runner = _Runner()
+    monkeypatch.setattr(cycle, "_well_formed_backlog", lambda cfg, *, runner: 999)
+    monkeypatch.setattr(cycle, "_governance_pr", lambda *a, **k: 0)
+
+    # A merged PR (simulated by the sync step) brings in a new practice note.
+    def fake_sync_main(cfg, *, repo_root, runner):
+        append(
+            repo_root,
+            build_practice(
+                title="session durability", source_project="OpenBMB/ChatDev",
+                source_artifact="harness_design", evidence="PR #104", adopted_pr=104,
+            ),
+        )
+        return cfg.default_branch
+
+    monkeypatch.setattr(cycle, "_sync_main", fake_sync_main)
+
+    res = cycle.run_cycle(cfg, repo_dir=str(tmp_path), cycle_index=1, runner=runner)
+
+    assert len(res.report.practices_adopted) == 1
+    item = res.report.practices_adopted[0]
+    assert item["title"] == "session durability"
+    assert item["source_project"] == "OpenBMB/ChatDev"
+    assert item["adopted_pr"] == 104
+
+    brief = runner.review_bodies[-1]
+    assert "## Practices adopted this block" in brief
+    assert "session durability" in brief
+    assert "OpenBMB/ChatDev" in brief
+
+
 # --- plain-text agent output must not break article generation --------------
 
 def test_persona_articles_survive_output_without_a_json_envelope(tmp_path):
