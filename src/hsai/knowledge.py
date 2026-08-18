@@ -85,6 +85,7 @@ class LessonRecord:
     what_happened: str = ""
     body: str = ""  # everything after the frontmatter; what the recall index reads
     failure_class: str = ""  # "" when absent (pass, or a note predating this field)
+    created: str = ""  # frontmatter `created:`, "" for notes that carry no date
 
 
 def split_sections(text: str) -> dict[str, str]:
@@ -117,6 +118,20 @@ def _frontmatter_tags(fm: str) -> tuple[str, ...]:
     return tuple(tags)
 
 
+def _frontmatter_scalar(fm: str, key: str) -> str:
+    """The value of a top-level scalar frontmatter key ("" when absent).
+
+    Deliberately not a YAML parse: frontmatter here is machine-written by
+    :meth:`KnowledgeBase._frontmatter`, and a one-line reader cannot fail on a
+    hand-edited note the way a strict parser would.
+    """
+    prefix = f"{key}:"
+    for line in fm.splitlines():
+        if line.startswith(prefix):
+            return line[len(prefix):].strip()
+    return ""
+
+
 def parse_note(path: str | Path) -> LessonRecord:
     """Parse any Obsidian note in the vault into a :class:`LessonRecord`.
 
@@ -147,6 +162,7 @@ def parse_note(path: str | Path) -> LessonRecord:
         what_happened=sections.get("what happened", ""),
         body=body.strip(),
         failure_class=failure_class,
+        created=_frontmatter_scalar(fm, "created"),
     )
 
 

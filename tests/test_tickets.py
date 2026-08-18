@@ -1,4 +1,5 @@
-from hsai.tickets import TicketSpec, check_well_formed
+from hsai.github import Issue
+from hsai.tickets import NO_PRIOR_ART, TicketSpec, check_well_formed, issue_well_formed
 
 
 def test_spec_renders_all_required_sections():
@@ -71,3 +72,51 @@ def test_docs_and_chores_are_exempt():
     assert check_well_formed("docs: fix typo", "tiny").ok
     assert check_well_formed("chore: bump dep", "routine").ok
     assert check_well_formed("ci: main is red - auto-heal", "incident").ok
+
+
+# --- prior art ----------------------------------------------------------------
+
+def _spec(**kwargs) -> TicketSpec:
+    base = dict(
+        title="feat: thing",
+        problem="p",
+        proposal="pp",
+        acceptance_criteria=("a", "b"),
+        verification_plan=("v",),
+    )
+    return TicketSpec(**{**base, **kwargs})
+
+
+def test_spec_renders_prior_art_as_wikilinks():
+    body = _spec(prior_art=("[[2026-01-01-a]] (fail) - feat: a", "[[2026-01-02-b]] (pass) - b")).render()
+    assert "## Prior art\n- [[2026-01-01-a]] (fail) - feat: a\n- [[2026-01-02-b]] (pass) - b" in body
+    assert check_well_formed("feat: thing", body, require_prior_art=True).ok
+
+
+def test_spec_with_no_prior_art_states_it_explicitly():
+    """"Nobody looked" and "we looked and found none" must not render alike."""
+    body = _spec().render()
+    assert f"## Prior art\n{NO_PRIOR_ART}" in body
+    assert check_well_formed("feat: thing", body, require_prior_art=True).ok
+
+
+def test_prior_art_is_accepted_but_not_required_by_default():
+    """The open backlog predates the section and must stay claimable."""
+    legacy = "## Acceptance criteria\n- [ ] a\n- [ ] b\n\n## Verification plan\n- [ ] pytest"
+    assert check_well_formed("feat: thing", legacy).ok
+    assert issue_well_formed(Issue(7, "feat: thing", ("hsai",), (), legacy)).ok
+
+    strict = check_well_formed("feat: thing", legacy, require_prior_art=True)
+    assert not strict.ok
+    assert any("Prior art" in r for r in strict.reasons)
+
+
+def test_exempt_kinds_still_answer_the_prior_art_question():
+    """An exemption from the schema is not an exemption from provenance."""
+    assert check_well_formed("chore: bump dep", "routine").ok
+    strict = check_well_formed("chore: bump dep", "routine", require_prior_art=True)
+    assert not strict.ok
+    assert strict.reasons == ["missing '## Prior art' section"]
+    assert check_well_formed(
+        "chore: bump dep", f"## Prior art\n{NO_PRIOR_ART}", require_prior_art=True
+    ).ok

@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import github, gitops, journal, ledger, postmortem, trajectory
+from . import github, gitops, journal, ledger, postmortem, retrieval, trajectory
 from .ai import run_agent
 from .config import CoreConfig
 from .governance import BlockReport, open_review_issue, write_direction
@@ -127,11 +127,15 @@ def _synthesis_step(
     """Synthesize tickets when the well-formed backlog is thin (journaled once)."""
     low_water = int(cfg.cycle.get("backlog_low_watermark", 4))
     if dry_run or _well_formed_backlog(cfg, runner=runner) >= low_water:
-        return {"ran": False, "filed": [], "error": "", "rejected": 0, "rejected_titles": []}
+        return {
+            "ran": False, "filed": [], "error": "", "rejected": 0, "rejected_titles": [],
+            "risk_flags": [], "risk_dropped": 0,
+        }
     sres = synthesize(cfg, cycle_index=idx, runner=runner, ai_runner=ai_runner)
     return {
         "ran": True, "filed": list(sres.filed), "error": sres.error,
         "rejected": sres.rejected, "rejected_titles": list(sres.rejected_titles),
+        "risk_flags": list(sres.risk_flags), "risk_dropped": sres.risk_dropped,
     }
 
 
@@ -255,6 +259,10 @@ def run_cycle(
             f"synthesis: {synth['rejected']} duplicate(s) rejected (matched: {matched}) - "
             f"filed {len(report.synthesized)} survivor(s), no back-fill"
         )
+    # `.get`, not `[...]`: a journal written before prior-art grounding existed
+    # must still replay. Every verdict is recorded, kept and dropped alike.
+    for flag in synth.get("risk_flags") or []:
+        report.notes.append(f"synthesis duplicate-risk: {flag}")
 
     # 2. Sequential implementation block, under the quota budget gate.
     ledger_file = ledger.ledger_path(cfg, repo_root)
@@ -384,10 +392,17 @@ def _whitepaper_step(cfg: CoreConfig, kb: KnowledgeBase) -> dict:
 def _direction_step(
     cfg: CoreConfig, kb: KnowledgeBase, *, repo_root: Path, runner: Runner
 ) -> dict:
-    """Rebuild the derived indexes: knowledge MOCs, then the steering doc."""
+    """Rebuild the derived indexes: knowledge MOCs, the retrieval index, then
+    the steering doc.
+
+    All three are shared derived files, so they are rebuilt here - once, at the
+    end of the block - rather than by the parallel workers, which would collide
+    on them in concurrent PRs.
+    """
     mocs = [str(p) for p in kb.reindex_mocs()]
+    notes_index = str(retrieval.write_index(repo_root, cfg))
     path = write_direction(cfg, repo_root=repo_root, runner=runner)
-    return {"path": str(path), "mocs": mocs}
+    return {"path": str(path), "mocs": mocs, "notes_index": notes_index}
 
 
 def _governance_pr(

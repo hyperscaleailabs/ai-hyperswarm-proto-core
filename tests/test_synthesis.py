@@ -1,10 +1,13 @@
 import json
+import re
+from pathlib import Path
 
-from hsai import ai
+from hsai import ai, retrieval
 from hsai.config import load_config
 from hsai.models import ModelChoice
 from hsai.practices import ADOPTED_HEADING, build_practice
 from hsai.proc import Proc
+from hsai.retrieval import PRIOR_ART_HEADING, PriorArt
 from hsai.synthesis import (
     DEFAULT_MEMORY_MAX_CHARS,
     DUPLICATE_JACCARD_THRESHOLD,
@@ -12,12 +15,16 @@ from hsai.synthesis import (
     ContextPack,
     MemoryPack,
     build_prompt,
+    gather_prior_art,
+    goal_queries,
     is_duplicate,
     parse_ticket_specs,
     pick_rotation,
     synthesize,
 )
-from hsai.tickets import TicketSpec
+from hsai.tickets import NO_PRIOR_ART, TicketSpec
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _cfg():
@@ -456,3 +463,191 @@ def test_synthesize_never_backfills_a_thin_block():
     res = synthesize(cfg, cycle_index=0, root=".", runner=runner, ai_runner=runner)
     assert len(res.filed) < int(cfg.synthesis.get("file_top", 3))
     assert len(res.filed) == 2
+
+
+# --- prior art: the planner reads its own knowledge base ----------------------
+
+def _prior_art(note_name: str, title: str, outcome: str = "pass") -> PriorArt:
+    return PriorArt(note_name=note_name, title=title, outcome=outcome, score=1.0)
+
+
+def test_prompt_carries_a_prior_art_section_with_note_names_and_outcomes():
+    cfg = _cfg()
+    pack = ContextPack(
+        repos=["a/b"],
+        sections={"a/b": "digest of a/b"},
+        prior_art=(
+            _prior_art("2026-01-01-budget", "feat: adaptive budget", outcome="fail"),
+            _prior_art("2026-01-02-recall", "feat: lesson recall"),
+        ),
+    )
+    prompt = build_prompt(cfg, pack)
+
+    assert PRIOR_ART_HEADING in prompt
+    assert "[[2026-01-01-budget]] (fail) - feat: adaptive budget" in prompt
+    assert "[[2026-01-02-recall]] (pass) - feat: lesson recall" in prompt
+    # The planner is told to USE it, not just shown it.
+    assert "CHECK IT AGAINST THE PRIOR ART" in prompt
+    assert "duplicate-risk verdict" in prompt
+    assert '"prior_art"' in prompt
+    assert prompt.index(PRIOR_ART_HEADING) < prompt.index("Study digest of reference projects")
+
+
+def test_prompt_prior_art_section_survives_an_empty_knowledge_base():
+    prompt = build_prompt(_cfg(), ContextPack(repos=["a/b"], sections={"a/b": "d"}))
+    assert PRIOR_ART_HEADING in prompt
+    assert "No prior art found" in prompt
+
+
+def test_goal_queries_cover_every_goal_in_core_yaml():
+    cfg = _cfg()
+    queries = goal_queries(cfg)
+    assert len(queries) == len(cfg.goals)
+    assert any("knowledge base" in q.lower() for q in queries)
+
+
+def test_gather_prior_art_grounds_the_cycle_in_the_real_vault():
+    """The committed knowledge base must produce citations for our own goals."""
+    cfg = _cfg()
+    art = gather_prior_art(cfg, retrieval.load_index(REPO_ROOT, cfg))
+    assert art, "the real vault must yield prior art for the core goals"
+    assert all(p.note_name for p in art)
+    rendered = ContextPack(repos=[], sections={}, prior_art=art).render_prior_art()
+    assert rendered.startswith("- [[")
+
+
+def test_synthesize_feeds_prior_art_citations_from_the_real_vault_to_the_model():
+    """The captured prompt cites this repo's own notes, by name and outcome."""
+    cfg = _cfg()
+    runner = _plain_text_runner()
+    synthesize(cfg, cycle_index=0, root=str(REPO_ROOT), runner=runner, ai_runner=runner)
+
+    prompt = next(c for c in runner.calls if c[:1] == ["claude"])[2]
+    assert PRIOR_ART_HEADING in prompt
+    section = prompt.split(PRIOR_ART_HEADING, 1)[1].split("Study digest", 1)[0]
+    labels = re.findall(r"\[\[[^\]]+\]\] \(([^)]+)\)", section)
+    assert labels, section
+    # Every citation carries what the note recorded - an outcome for a lesson,
+    # otherwise what kind of note it is.
+    assert all(lbl.split("/")[0] in {"pass", "fail", "whitepaper", "adr"} for lbl in labels)
+
+
+# --- filed tickets cite their prior art ---------------------------------------
+
+FAILED_IDEA = (
+    "Give every worker its own persistent vector memory of past runs so it can "
+    "look up similar situations before acting, backed by an embedding store "
+    "refreshed on every iteration."
+)
+
+RESTATED_AND_NOVEL_OUTPUT = """PHASE 1 ... PHASE 2 ... PHASE 3:
+```json
+[
+  {"title": "feat: agent situation store", "problem": "PROBLEM",
+   "proposal": "PROPOSAL",
+   "acceptance_criteria": ["a", "b", "c"], "verification_plan": ["v1", "v2"],
+   "size": "L", "goal_ids": ["G4"], "synthesis_rationale": "combines x+y+z",
+   "prior_art": ["2026-01-04-vector-memory", "2099-12-31-invented"]},
+  {"title": "feat: signed provenance attestation per merged pull request",
+   "problem": "Downstream consumers cannot verify which model produced a diff.",
+   "proposal": "Publish a signed attestation naming the model, ticket and PR.",
+   "acceptance_criteria": ["a", "b", "c"], "verification_plan": ["v1", "v2"],
+   "size": "M", "goal_ids": ["G2"], "synthesis_rationale": "combines a+b+c",
+   "prior_art": []}
+]
+```""".replace("PROBLEM", FAILED_IDEA).replace("PROPOSAL", FAILED_IDEA)
+
+
+def _prior_art_runner(output: str):
+    calls: list[list[str]] = []
+    issue_numbers = iter(range(700, 800))
+
+    def runner(cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None):
+        calls.append(list(cmd))
+        if cmd[:1] == ["claude"]:
+            return Proc(cmd, 0, output, "")
+        if cmd[:3] == ["gh", "issue", "create"]:
+            return Proc(cmd, 0, f"https://github.com/o/r/issues/{next(issue_numbers)}\n", "")
+        return Proc(cmd, 0, "", "")
+
+    runner.calls = calls  # type: ignore[attr-defined]
+    return runner
+
+
+def _seed_vault(root) -> None:
+    """A failed lesson plus an unrelated one - the smallest honest corpus."""
+    directory = root / "knowledge" / "lessons"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "2026-01-04-vector-memory.md").write_text(
+        "---\ntags:\n  - lesson\n  - outcome/fail\n  - kind/implement\n"
+        "created: 2026-01-04\n---\n\n"
+        "# feat: per-worker persistent vector memory of past runs\n\n"
+        f"## Lesson learned\n{FAILED_IDEA} It was abandoned: the store never stayed fresh.\n"
+    )
+    (directory / "2026-01-05-quota.md").write_text(
+        "---\ntags:\n  - lesson\n  - outcome/pass\n  - kind/implement\n"
+        "created: 2026-01-05\n---\n\n# feat: quota ledger\n\n## Lesson learned\nCost telemetry.\n"
+    )
+
+
+def _created_bodies(runner) -> list[str]:
+    return [
+        c[c.index("--body") + 1] for c in runner.calls if c[:3] == ["gh", "issue", "create"]
+    ]
+
+
+def test_every_filed_ticket_carries_a_prior_art_section(tmp_path):
+    _seed_vault(tmp_path)
+    runner = _prior_art_runner(RESTATED_AND_NOVEL_OUTPUT)
+
+    res = synthesize(_cfg(), cycle_index=0, root=str(tmp_path), runner=runner, ai_runner=runner)
+
+    assert res.filed
+    bodies = _created_bodies(runner)
+    assert bodies and all("## Prior art" in b for b in bodies)
+    for body in bodies:
+        assert "[[" in body or NO_PRIOR_ART in body
+
+
+def test_filed_wikilinks_resolve_to_notes_that_exist(tmp_path):
+    """An invented citation would be a dead link in the Obsidian graph."""
+    _seed_vault(tmp_path)
+    runner = _prior_art_runner(RESTATED_AND_NOVEL_OUTPUT)
+    synthesize(_cfg(), cycle_index=0, root=str(tmp_path), runner=runner, ai_runner=runner)
+
+    on_disk = {p.stem for p in (tmp_path / "knowledge" / "lessons").glob("*.md")}
+    for body in _created_bodies(runner):
+        for name in re.findall(r"\[\[([^\]]+)\]\]", body):
+            assert name in on_disk
+    assert "2099-12-31-invented" not in "\n".join(_created_bodies(runner))
+
+
+def test_a_ticket_with_no_prior_art_says_so_explicitly(tmp_path):
+    """Empty vault: "we looked and found none" must be stated, not implied."""
+    runner = _prior_art_runner(RESTATED_AND_NOVEL_OUTPUT)
+    synthesize(_cfg(), cycle_index=0, root=str(tmp_path), runner=runner, ai_runner=runner)
+
+    bodies = _created_bodies(runner)
+    assert bodies
+    assert all(f"## Prior art\n{NO_PRIOR_ART}" in b for b in bodies)
+
+
+def test_synthesis_drops_a_candidate_that_restates_a_failed_lesson(tmp_path):
+    _seed_vault(tmp_path)
+    runner = _prior_art_runner(RESTATED_AND_NOVEL_OUTPUT)
+
+    res = synthesize(_cfg(), cycle_index=0, root=str(tmp_path), runner=runner, ai_runner=runner)
+
+    titles = [
+        c[c.index("--title") + 1] for c in runner.calls if c[:3] == ["gh", "issue", "create"]
+    ]
+    assert "feat: agent situation store" not in titles
+    assert "feat: signed provenance attestation per merged pull request" in titles
+    assert res.risk_dropped == 1
+
+    # Both halves of the verdict are recorded: the flag AND the decision.
+    dropped = next(f for f in res.risk_flags if f.startswith("feat: agent situation store"))
+    assert "drop" in dropped
+    assert "[[2026-01-04-vector-memory]]" in dropped
+    kept = next(f for f in res.risk_flags if f.startswith("feat: signed provenance"))
+    assert "keep" in kept
