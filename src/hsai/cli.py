@@ -10,6 +10,7 @@ Commands:
   hsai practices list                                          show the adopted-practice registry
   hsai practices add --title T --source-project P ...          record a new adopted practice
   hsai postmortem [--block N]                                  print the failure-class Pareto for a block
+  hsai janitor [--dry-run] [--ttl-hours N]                      reclaim stranded tickets/worktrees/branches
   hsai doctor                                                  verify environment + invariants
   hsai traj <iteration> [--json]                               print a stored agent run
   hsai replay <iteration> [--json]                              alias of `hsai traj`
@@ -21,7 +22,7 @@ import os
 import sys
 import time
 
-from . import __version__, ai, ledger, postmortem, practices, recall, repro, trajectory
+from . import __version__, ai, janitor, ledger, postmortem, practices, recall, repro, trajectory
 from .config import CoreConfig, load_config, validate
 from .knowledge import KnowledgeBase
 from .orchestrator import run_loop
@@ -71,6 +72,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         ok = False
     print(f"  constraints: subscription_only={cfg.subscription_only}, "
           f"require_ticket_per_pr={cfg.constraints.get('require_ticket_per_pr')}")
+    # Loop-hygiene health signal (see hsai.janitor) - advisory only: a count
+    # above zero means `hsai janitor` has something to reclaim, but it never
+    # fails `doctor` on its own (that is `hsai janitor`'s own exit code).
+    health = janitor.health_counts(cfg, repo_root=".")
+    print(f"  janitor: {health.summary()}")
     return 0 if ok else 1
 
 
@@ -169,6 +175,20 @@ def cmd_postmortem(args: argparse.Namespace) -> int:
     else:
         print(f"no class clears the postmortem trigger (ratio>={ratio:g}, count>={min_count})")
     return 0
+
+
+def cmd_janitor(args: argparse.Namespace) -> int:
+    """Print the reclaim plan and, unless ``--dry-run``, execute it."""
+    cfg = _load(args)
+    ttl_seconds = args.ttl_hours * 3600 if args.ttl_hours is not None else None
+    result = janitor.run_janitor(
+        cfg, repo_root=".", dry_run=args.dry_run, ttl_seconds=ttl_seconds,
+    )
+    print(janitor.render_plan(result.plan))
+    if not result.dry_run:
+        print("\nreclaimed:")
+        print(janitor.render_reclaimed(result.report))
+    return janitor.exit_code(result.plan)
 
 
 def cmd_cycle(args: argparse.Namespace) -> int:
@@ -344,6 +364,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pm.add_argument("--root", default=".", help="repo root holding knowledge/ledger")
     pm.set_defaults(func=cmd_postmortem)
+
+    jn = sub.add_parser(
+        "janitor", help="reclaim stranded tickets, orphaned worktrees, and dead branches"
+    )
+    jn.add_argument("--dry-run", action="store_true",
+                    help="print the reclaim plan; perform zero side effects")
+    jn.add_argument("--ttl-hours", type=float, default=None,
+                    help="override the derived claim TTL, in hours")
+    jn.set_defaults(func=cmd_janitor)
 
     cy = sub.add_parser("cycle", help="run one half-day governance block")
     cy.add_argument("--index", "--cycle-index", dest="index", type=int, default=None,

@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from hsai import cycle, github, journal, ledger, trajectory
+from hsai import cycle, github, governance, journal, ledger, trajectory
 from hsai.config import load_config
 from hsai.knowledge import KnowledgeBase, Lesson
 from hsai.orchestrator import IterationResult
@@ -286,6 +286,120 @@ def test_cycle_prunes_trajectory_blocks_beyond_retention(tmp_path, monkeypatch):
     kept = sorted(p.name for p in trajectory.trajectory_dir(tmp_path).iterdir())
     assert kept == ["3", "4"]              # only the newest `retention_blocks`
     assert any("pruned trajectories" in n for n in res.report.notes)
+
+
+# --- janitor: pre-block reclaim step ------------------------------------------
+
+class _StatefulGhRunner:
+    """A single mutable issue: proves a stranded claim's `unassign` is visible
+    to the very next `gh issue list` read, exactly like the real GitHub API."""
+
+    def __init__(self, *, issue: dict):
+        self.issue = issue
+        self.calls: list[list[str]] = []
+
+    def __call__(self, cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None):
+        cmd = list(cmd)
+        self.calls.append(cmd)
+        if cmd[:3] == ["gh", "issue", "list"]:
+            return Proc(cmd, 0, json.dumps([self.issue]), "")
+        if cmd[:3] == ["gh", "pr", "list"]:
+            return Proc(cmd, 0, "[]", "")
+        if cmd[:3] == ["git", "worktree", "list"]:
+            return Proc(cmd, 0, "", "")
+        if cmd[:3] == ["gh", "api", "user"]:
+            return Proc(cmd, 0, "hsai-bot\n", "")
+        if cmd[:3] == ["gh", "issue", "edit"]:
+            if "--remove-assignee" in cmd:
+                self.issue["assignees"] = []
+            if "--add-label" in cmd:
+                lbl = cmd[cmd.index("--add-label") + 1]
+                self.issue["labels"].append({"name": lbl})
+            if "--remove-label" in cmd:
+                lbl = cmd[cmd.index("--remove-label") + 1]
+                self.issue["labels"] = [
+                    entry for entry in self.issue["labels"] if entry["name"] != lbl
+                ]
+            return Proc(cmd, 0, "", "")
+        return Proc(cmd, 0, "", "")
+
+
+def _stranded_issue(number=50) -> dict:
+    # "docs:" is exempt from the well-formed-body gate (see hsai.tickets), so
+    # this stays a minimal fixture instead of a full acceptance-criteria body.
+    return {
+        "number": number, "title": "docs: recovered doc", "labels": [],
+        "assignees": [{"login": "hsai-bot"}], "body": "",
+        "updatedAt": "1970-01-01T00:00:00+00:00",  # decades past any TTL
+    }
+
+
+def test_janitor_step_reclaim_runs_before_synthesis_decides_the_backlog_is_thin():
+    """A stranded claim the janitor unassigns must count toward the backlog
+    BEFORE `_well_formed_backlog` decides whether to trigger re-synthesis -
+    otherwise the loop would re-synthesize a duplicate of an idea that already
+    exists as a reclaimed ticket."""
+    cfg = load_config()
+    runner = _StatefulGhRunner(issue=_stranded_issue())
+
+    assert cycle._well_formed_backlog(cfg, runner=runner) == 0  # still claimed
+
+    cycle._janitor_step(cfg, repo_root=Path("/repo"), runner=runner, dry_run=False)
+
+    assert cycle._well_formed_backlog(cfg, runner=runner) == 1  # now back in the backlog
+
+
+def test_janitor_step_reclaims_flow_into_the_block_report_and_rendered_brief(
+    tmp_path, monkeypatch
+):
+    """Verification: `hsai cycle --dry-run` and the BlockReport's reclaim counts
+    reach the rendered review brief. The janitor step itself is stubbed here -
+    its own dry-run/zero-side-effects contract is proven in test_janitor.py."""
+    cfg = load_config()
+    cfg.cycle["block_size"] = 0  # isolate: no implementation iterations needed
+
+    def fake_janitor_step(cfg, *, repo_root, runner, dry_run):
+        return {
+            "worktrees_removed": ["/repo/.hsai/worktrees/hsai/iter-old"],
+            "branches_deleted": ["hsai/iter-old"],
+            "tickets_reopened": [50],
+            "tickets_blocked": [51],
+        }
+
+    runner = _Runner()
+    monkeypatch.setattr(cycle, "_janitor_step", fake_janitor_step)
+    monkeypatch.setattr(cycle, "_well_formed_backlog", lambda cfg, *, runner: 999)
+    monkeypatch.setattr(cycle, "_governance_pr", lambda *a, **k: 0)
+
+    res = cycle.run_cycle(
+        cfg, repo_dir=str(tmp_path), cycle_index=1, dry_run=True, runner=runner,
+    )
+
+    assert res.report.reclaimed_worktrees == ["/repo/.hsai/worktrees/hsai/iter-old"]
+    assert res.report.reclaimed_branches == ["hsai/iter-old"]
+    assert res.report.reclaimed_tickets == [50]
+    assert res.report.reclaimed_blocked == [51]
+    assert any("janitor: reclaimed 1 worktree(s)" in n for n in res.report.notes)
+
+    brief = governance.render_brief(cfg, res.report)
+    assert "## Reclaimed" in brief
+    assert "/repo/.hsai/worktrees/hsai/iter-old" in brief
+    assert "hsai/iter-old" in brief
+    assert "#50" in brief and "#51" in brief
+
+
+def test_janitor_step_reclaims_nothing_renders_none_this_block(tmp_path, monkeypatch):
+    cfg = load_config()
+    cfg.cycle["block_size"] = 0
+    runner = _Runner()
+    monkeypatch.setattr(cycle, "_well_formed_backlog", lambda cfg, *, runner: 999)
+    monkeypatch.setattr(cycle, "_governance_pr", lambda *a, **k: 0)
+
+    res = cycle.run_cycle(cfg, repo_dir=str(tmp_path), cycle_index=1, runner=runner)
+
+    assert res.report.reclaimed_worktrees == []
+    assert not any(n.startswith("janitor:") for n in res.report.notes)
+    assert "_none this block_" in governance.render_brief(cfg, res.report)
 
 
 # --- crash + resume: the cycle journal --------------------------------------

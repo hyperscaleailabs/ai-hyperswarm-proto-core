@@ -54,6 +54,40 @@ def remove_worktree(wt_path: str, *, cwd: str | None = None, runner: Runner = ru
     return _git(["worktree", "remove", "--force", wt_path], cwd=cwd, runner=runner)
 
 
+def list_worktrees_porcelain(*, cwd: str | None = None, runner: Runner = run) -> str:
+    """Raw ``git worktree list --porcelain`` output, for :mod:`hsai.janitor` to parse.
+
+    Worktree metadata is shared across every linked worktree of a repository
+    (it lives in the shared ``.git`` admin dir), so this reflects the FULL
+    registered set - not just the worktree the caller happens to be in.
+    """
+    return _git(["worktree", "list", "--porcelain"], cwd=cwd, runner=runner).stdout
+
+
+def prune_worktrees(*, cwd: str | None = None, runner: Runner = run) -> Proc:
+    """Drop git's worktree admin entries whose working directory is already gone."""
+    return _git(["worktree", "prune"], cwd=cwd, runner=runner)
+
+
+def commits_ahead(
+    branch: str, base: str, *, cwd: str | None = None, runner: Runner = run
+) -> int | None:
+    """How many commits ``branch`` has that ``base`` lacks.
+
+    ``None`` when it could not be determined (unknown ref, detached branch,
+    etc.) - the caller must never treat that as "zero ahead".
+    """
+    p = _git(["rev-list", "--count", f"{base}..{branch}"], cwd=cwd, runner=runner)
+    text = p.stdout.strip()
+    return int(text) if p.ok and text.isdigit() else None
+
+
+def delete_remote_branch(
+    branch: str, *, cwd: str | None = None, runner: Runner = run
+) -> Proc:
+    return _git(["push", "origin", "--delete", branch], cwd=cwd, runner=runner)
+
+
 def create_detached_worktree(
     worktrees_dir: str,
     name: str,

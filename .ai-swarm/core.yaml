@@ -180,6 +180,14 @@ postmortem:
   ratio_threshold: 0.4   # a class must be >= this share of the block's failures
   min_count: 3            # AND at least this many occurrences, before filing a ticket
 
+# Loop janitor (see src/hsai/janitor.py): reclaims worktrees/branches/claims a
+# killed iteration left behind. A claim's TTL is derived from
+# execution.agent_timeout_seconds + execution.ci_remote_timeout_seconds,
+# multiplied by safety_multiplier, so it always tracks the two timeouts a
+# healthy iteration is already bounded by instead of drifting out of sync.
+janitor:
+  safety_multiplier: 3.0   # TTL = (agent_timeout + ci_remote_timeout) * this
+
 personas:                      # article targets generated from each whitepaper
   - id: cto
     audience: CTO level - business impact, risk posture, strategic direction

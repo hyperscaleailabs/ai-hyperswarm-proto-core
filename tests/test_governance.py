@@ -130,3 +130,28 @@ def test_brief_reports_no_practices_adopted_when_none():
     body = render_brief(cfg, BlockReport(cycle_index=7))
     assert "## Practices adopted this block" in body
     assert "_none this block_" in body
+
+
+# --- 'Reclaimed' section: what the pre-block janitor step recovered ----------
+
+def test_brief_reports_what_the_janitor_reclaimed_this_block():
+    cfg = load_config()
+    report = BlockReport(
+        cycle_index=7,
+        reclaimed_worktrees=["/repo/.hsai/worktrees/hsai/iter-old"],
+        reclaimed_branches=["hsai/iter-old"],
+        reclaimed_tickets=[50],
+        reclaimed_blocked=[51],
+    )
+    body = render_brief(cfg, report)
+    assert "## Reclaimed" in body
+    assert "/repo/.hsai/worktrees/hsai/iter-old" in body
+    assert "hsai/iter-old" in body
+    assert "#50" in body and "#51" in body
+
+
+def test_brief_reports_nothing_reclaimed_when_the_janitor_found_no_debris():
+    cfg = load_config()
+    body = render_brief(cfg, BlockReport(cycle_index=7))
+    assert "## Reclaimed" in body
+    assert "_none this block_" in body

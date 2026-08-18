@@ -60,8 +60,8 @@ TERMINAL_STATUSES = (HALTED, COMPLETE)
 # Steps the cycle journals. Not enforced - a new step must not need a schema
 # change to become durable - but named so the file is self-describing.
 STEPS = (
-    "practices_baseline", "synthesis", "budget", "budget_halt", "iteration", "prune", "sync",
-    "practices_adopted", "whitepaper", "articles", "direction", "governance_ticket",
+    "practices_baseline", "janitor", "synthesis", "budget", "budget_halt", "iteration", "prune",
+    "sync", "practices_adopted", "whitepaper", "articles", "direction", "governance_ticket",
     "governance_pr", "review_issue", "block",
 )
 

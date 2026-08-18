@@ -3,8 +3,19 @@ import json
 from hsai import cli as cli_module
 from hsai import trajectory
 from hsai.cli import build_parser, main
+from hsai.janitor import JanitorHealth
 from hsai.repro import ReproResult
 from hsai.trajectory import Step, Trajectory
+
+# doctor's janitor health line is advisory and orthogonal to the guards under
+# test below - stub it to a known-clean reading so those tests stay hermetic
+# (no real `git`/`gh` subprocess) and unaffected by whatever debris happens to
+# sit on the machine running the suite.
+_CLEAN_JANITOR_HEALTH = JanitorHealth(orphaned_worktrees=0, ambiguous_worktrees=0, stranded_claims=0)
+
+
+def _stub_janitor_health(monkeypatch, health=_CLEAN_JANITOR_HEALTH):
+    monkeypatch.setattr(cli_module.janitor, "health_counts", lambda cfg, **kw: health)
 
 
 def test_parser_loop_args():
@@ -33,6 +44,7 @@ def test_status_command_returns_zero(capsys):
 
 def test_doctor_reports_the_live_child_env_check_and_exits_zero_on_pass(monkeypatch, capsys):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy")
+    _stub_janitor_health(monkeypatch)
     rc = main(["doctor"])
     out = capsys.readouterr().out
     assert rc == 0
@@ -47,11 +59,115 @@ def test_doctor_exits_nonzero_when_the_live_check_reports_a_leak(monkeypatch, ca
         cli_module.ai, "check_child_env",
         lambda cfg: (False, "leaked into a real spawned child process: ANTHROPIC_API_KEY"),
     )
+    _stub_janitor_health(monkeypatch)
     rc = main(["doctor"])
     out = capsys.readouterr().out
     assert rc == 1
     assert "child-environment guard: FAIL" in out
     assert "ANTHROPIC_API_KEY" in out
+
+
+def test_doctor_reports_the_janitor_health_signal_without_failing_the_guard(monkeypatch, capsys):
+    """Orphaned worktrees/stranded claims are advisory - they never fail `doctor`."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy")
+    _stub_janitor_health(
+        monkeypatch, JanitorHealth(orphaned_worktrees=3, ambiguous_worktrees=1, stranded_claims=2)
+    )
+    rc = main(["doctor"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "janitor: orphaned_worktrees=3 ambiguous_worktrees=1 stranded_claims=2" in out
+
+
+# --- janitor: parser + dry-run zero side effects + reclaimed reporting ------
+
+def test_parser_janitor_args():
+    parser = build_parser()
+    args = parser.parse_args(["janitor", "--dry-run", "--ttl-hours", "6"])
+    assert args.command == "janitor"
+    assert args.dry_run is True
+    assert args.ttl_hours == 6.0
+
+    plain = parser.parse_args(["janitor"])
+    assert plain.dry_run is False and plain.ttl_hours is None
+
+
+def _fake_janitor_run(*, dry_run: bool, seen: dict):
+    from hsai import github
+    from hsai.janitor import (
+        ORPHANED,
+        STRANDED,
+        ClaimClassification,
+        JanitorRun,
+        ReclaimPlan,
+        ReclaimReport,
+        WorktreeClassification,
+        WorktreeEntry,
+    )
+
+    def fake(cfg, *, repo_root, dry_run=dry_run, ttl_seconds=None, **kw):
+        seen.update(repo_root=repo_root, dry_run=dry_run, ttl_seconds=ttl_seconds)
+        plan = ReclaimPlan(
+            worktrees=[WorktreeClassification(
+                WorktreeEntry(path="/repo/.hsai/worktrees/hsai/x", branch="hsai/iter-x"),
+                ORPHANED, "no open PR and no commits ahead of origin/main",
+            )],
+            claims=[ClaimClassification(
+                github.Issue(number=9, title="feat: x", labels=(), assignees=("hsai-bot",)),
+                STRANDED, "past the TTL",
+            )],
+        )
+        report = (
+            ReclaimReport()
+            if dry_run
+            else ReclaimReport(
+                worktrees_removed=["/repo/.hsai/worktrees/hsai/x"],
+                branches_deleted=["hsai/iter-x"], tickets_reopened=[9],
+            )
+        )
+        return JanitorRun(plan=plan, report=report, dry_run=dry_run)
+
+    return fake
+
+
+def test_janitor_dry_run_prints_a_plan_and_never_a_reclaimed_section(monkeypatch, capsys):
+    seen: dict = {}
+    monkeypatch.setattr(cli_module.janitor, "run_janitor", _fake_janitor_run(dry_run=True, seen=seen))
+
+    rc = main(["janitor", "--dry-run", "--ttl-hours", "2"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert seen == {"repo_root": ".", "dry_run": True, "ttl_seconds": 7200.0}
+    assert "reclaim plan" in out
+    assert "[reap] /repo/.hsai/worktrees/hsai/x" in out
+    assert "reclaimed:" not in out  # dry-run performs (and reports) zero side effects
+
+
+def test_janitor_live_run_prints_the_reclaimed_section(monkeypatch, capsys):
+    seen: dict = {}
+    monkeypatch.setattr(cli_module.janitor, "run_janitor", _fake_janitor_run(dry_run=False, seen=seen))
+
+    rc = main(["janitor"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert seen["dry_run"] is False and seen["ttl_seconds"] is None
+    assert "reclaimed:" in out
+    assert "hsai/iter-x" in out and "#9" in out
+
+
+def test_janitor_exits_nonzero_when_nothing_can_be_safely_decided(monkeypatch):
+    from hsai.janitor import AMBIGUOUS, JanitorRun, ReclaimPlan, ReclaimReport, WorktreeClassification, WorktreeEntry
+
+    def fake(cfg, *, repo_root, dry_run, ttl_seconds=None, **kw):
+        plan = ReclaimPlan(worktrees=[WorktreeClassification(
+            WorktreeEntry(path="/repo/.hsai/worktrees/hsai/x"), AMBIGUOUS, "detached HEAD",
+        )])
+        return JanitorRun(plan=plan, report=ReclaimReport(), dry_run=dry_run)
+
+    monkeypatch.setattr(cli_module.janitor, "run_janitor", fake)
+    assert main(["janitor", "--dry-run"]) == 1
 
 
 def test_parser_cycle_resume_args():

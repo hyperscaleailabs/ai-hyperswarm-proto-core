@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import github, gitops, journal, ledger, postmortem, trajectory
+from . import github, gitops, janitor, journal, ledger, postmortem, trajectory
 from .ai import run_agent
 from .config import CoreConfig
 from .governance import BlockReport, open_review_issue, write_direction
@@ -118,6 +118,25 @@ def _iteration_payload(res: IterationResult) -> dict:
         "pr": res.pr,
         "merged": bool(res.merged),
         "recovered": bool(res.recovered),
+    }
+
+
+def _janitor_step(cfg: CoreConfig, *, repo_root: Path, runner: Runner, dry_run: bool) -> dict:
+    """Reclaim stranded claims/worktrees/branches BEFORE the backlog-thin check.
+
+    Order matters: a stranded ticket returned to the backlog here should count
+    toward `_well_formed_backlog` below, not trigger a redundant re-synthesis
+    of an idea that already exists as a ticket. Read-only scanning always
+    happens (like `_well_formed_backlog`'s own `list_open_issues` call); only
+    the reap side effects are gated on `dry_run`.
+    """
+    result = janitor.run_janitor(cfg, repo_root=str(repo_root), dry_run=dry_run, runner=runner)
+    report = result.report
+    return {
+        "worktrees_removed": list(report.worktrees_removed),
+        "branches_deleted": list(report.branches_deleted),
+        "tickets_reopened": list(report.tickets_reopened),
+        "tickets_blocked": list(report.tickets_blocked),
     }
 
 
@@ -238,6 +257,25 @@ def run_cycle(
             p.id for p in KnowledgeBase.from_config(cfg, repo_root).read_practices()
         )},
     )["ids"]
+
+    # 0b. Loop janitor: reclaim worktrees/branches/claims a killed prior
+    # iteration left behind, serialized before anything else so a reclaimed
+    # ticket counts toward the well-formed-backlog check synthesis runs next.
+    reclaimed = journal.once(
+        jr, "janitor", "block",
+        lambda: _janitor_step(cfg, repo_root=repo_root, runner=runner, dry_run=dry_run),
+    )
+    report.reclaimed_worktrees = list(reclaimed["worktrees_removed"])
+    report.reclaimed_branches = list(reclaimed["branches_deleted"])
+    report.reclaimed_tickets = list(reclaimed["tickets_reopened"])
+    report.reclaimed_blocked = list(reclaimed["tickets_blocked"])
+    if any(reclaimed.values()):
+        report.notes.append(
+            f"janitor: reclaimed {len(reclaimed['worktrees_removed'])} worktree(s), "
+            f"{len(reclaimed['branches_deleted'])} branch(es), "
+            f"{len(reclaimed['tickets_reopened'])} ticket(s) "
+            f"(+{len(reclaimed['tickets_blocked'])} blocked)"
+        )
 
     # 1. Synthesize substantial tickets when the well-formed backlog is thin.
     synth = journal.once(

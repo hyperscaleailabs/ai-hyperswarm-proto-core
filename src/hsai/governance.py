@@ -16,6 +16,7 @@ from pathlib import Path
 
 from . import github
 from .config import CoreConfig
+from .janitor import ReclaimReport, render_reclaimed
 from .knowledge import KnowledgeBase
 from .ledger import BlockAggregate
 from .postmortem import ParetoRow, render_pareto_table
@@ -53,6 +54,12 @@ class BlockReport:
     # during this block - each a plain dict (JSON-serializable for the journal):
     # {"id", "title", "source_project", "source_artifact", "status", "evidence"}.
     practices_adopted: list[dict] = field(default_factory=list)
+    # What the pre-block janitor step (see hsai.janitor) reclaimed - plain
+    # lists so the journal can serialize them like every other step payload.
+    reclaimed_worktrees: list[str] = field(default_factory=list)
+    reclaimed_branches: list[str] = field(default_factory=list)
+    reclaimed_tickets: list[int] = field(default_factory=list)   # attempts incremented
+    reclaimed_blocked: list[int] = field(default_factory=list)   # attempts exhausted
 
 
 def preserved_notes(direction_path: Path) -> str:
@@ -187,11 +194,23 @@ def render_brief(cfg: CoreConfig, report: BlockReport) -> str:
         f"[id: `{p.get('id')}`] - {p.get('evidence') or 'no evidence recorded'}"
         for p in report.practices_adopted
     ) or "_none this block_"
+    reclaimed = render_reclaimed(ReclaimReport(
+        worktrees_removed=report.reclaimed_worktrees,
+        branches_deleted=report.reclaimed_branches,
+        tickets_reopened=report.reclaimed_tickets,
+        tickets_blocked=report.reclaimed_blocked,
+    ))
     return f"""# Block review - cycle {report.cycle_index}
 
 One block of the twice-daily governance rhythm. Review here, then run
 `/review-next` in a Claude Code session: it walks un-reviewed lessons
 sequentially, records your feedback as ADRs, and ends with a merged PR.
+
+## Reclaimed
+Debris the pre-block `hsai janitor` step recovered from a killed prior
+iteration (stranded claim, orphaned worktree, or dead branch) - see
+`hsai janitor --dry-run` to preview what the next block would find.
+{reclaimed}
 
 ## Tickets synthesized (heavy model)
 {synth}
@@ -249,9 +268,6 @@ def open_review_issue(
 # `max_ticket_attempts` without ever being labelled `blocked`. Both sit in the
 # Issues Map forever unless something reads the backlog on a schedule.
 
-_TICKET_REF_RE = re.compile(r"(?:closes|fixes|resolves|refs)\s+#(\d+)", re.IGNORECASE)
-
-
 @dataclass(frozen=True)
 class BacklogFinding:
     kind: str  # "claimed-abandoned" | "attempts-exhausted"
@@ -263,14 +279,6 @@ class BacklogFinding:
         return f"[{self.kind}] #{self.number} {self.title}: {self.detail}"
 
 
-def _referenced_tickets(prs: list[github.Pr]) -> set[int]:
-    """Ticket numbers any open PR body references (``Closes #N`` etc.)."""
-    refs: set[int] = set()
-    for pr in prs:
-        refs.update(int(n) for n in _TICKET_REF_RE.findall(pr.body))
-    return refs
-
-
 def backlog_findings(cfg: CoreConfig, *, runner: Runner = run) -> list[BacklogFinding]:
     """Backlog decay invisible to the current gates - read-only, reuses
     ``github.list_open_issues``/``list_open_prs``. Never edits anything; the
@@ -278,7 +286,7 @@ def backlog_findings(cfg: CoreConfig, *, runner: Runner = run) -> list[BacklogFi
     """
     repo = cfg.repo_slug
     issues = github.list_open_issues(repo, runner=runner)
-    referenced = _referenced_tickets(github.list_open_prs(repo, runner=runner))
+    referenced = github.referenced_tickets(github.list_open_prs(repo, runner=runner))
 
     findings: list[BacklogFinding] = []
     for issue in issues:
