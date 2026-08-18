@@ -130,3 +130,32 @@ def test_brief_reports_no_practices_adopted_when_none():
     body = render_brief(cfg, BlockReport(cycle_index=7))
     assert "## Practices adopted this block" in body
     assert "_none this block_" in body
+
+
+# --- what the janitor reclaimed this block (see hsai.janitor) ---------------
+
+def test_brief_reclaimed_section_defaults_to_none():
+    cfg = load_config()
+    body = render_brief(cfg, BlockReport(cycle_index=7))
+    assert "## Reclaimed" in body
+    # The generic "_none this block_" phrase appears in both this section and
+    # the practices section - assert the reclaimed section itself is empty.
+    reclaimed = body.split("## Reclaimed", 1)[1].split("## Cost this block", 1)[0]
+    assert "_none this block_" in reclaimed
+
+
+def test_brief_reclaimed_section_lists_worktrees_branches_and_tickets():
+    cfg = load_config()
+    report = BlockReport(
+        cycle_index=7,
+        reclaimed_worktrees=[".hsai/worktrees/hsai/iter-1-1-abc"],
+        reclaimed_branches=["hsai/iter-1-1-abc"],
+        reclaimed_tickets=[42],
+        reclaimed_blocked_tickets=[43],
+    )
+    body = render_brief(cfg, report)
+    reclaimed = body.split("## Reclaimed", 1)[1].split("## Cost this block", 1)[0]
+    assert ".hsai/worktrees/hsai/iter-1-1-abc" in reclaimed
+    assert "hsai/iter-1-1-abc" in reclaimed
+    assert "#42" in reclaimed and "returned to backlog" in reclaimed
+    assert "#43" in reclaimed and "blocked" in reclaimed

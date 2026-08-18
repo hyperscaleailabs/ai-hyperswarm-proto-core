@@ -53,6 +53,13 @@ class BlockReport:
     # during this block - each a plain dict (JSON-serializable for the journal):
     # {"id", "title", "source_project", "source_artifact", "status", "evidence"}.
     practices_adopted: list[dict] = field(default_factory=list)
+    # What the janitor (see hsai.janitor) reclaimed as a pre-block step: debris
+    # from a killed prior iteration (machine sleep, launchd kill, crash, hard
+    # budget halt) - never touched if it was ambiguous or human-assigned.
+    reclaimed_worktrees: list[str] = field(default_factory=list)
+    reclaimed_branches: list[str] = field(default_factory=list)
+    reclaimed_tickets: list[int] = field(default_factory=list)          # returned to backlog
+    reclaimed_blocked_tickets: list[int] = field(default_factory=list)  # attempts exhausted
 
 
 def preserved_notes(direction_path: Path) -> str:
@@ -181,6 +188,16 @@ def render_brief(cfg: CoreConfig, report: BlockReport) -> str:
         if report.postmortem_ticket
         else "No failure class crossed the postmortem trigger this block."
     )
+    reclaimed_lines = (
+        [f"- worktree `{p}` removed" for p in report.reclaimed_worktrees]
+        + [f"- branch `{b}` deleted" for b in report.reclaimed_branches]
+        + [f"- ticket #{n} returned to backlog (attempts incremented)" for n in report.reclaimed_tickets]
+        + [
+            f"- ticket #{n} labelled `blocked` (max attempts reached)"
+            for n in report.reclaimed_blocked_tickets
+        ]
+    )
+    reclaimed = "\n".join(reclaimed_lines) or "_none this block_"
     extra = "\n".join(f"- {n}" for n in report.notes)
     practices = "\n".join(
         f"- **{p.get('title')}** (from `{p.get('source_project')}`, {p.get('status')}) "
@@ -204,6 +221,11 @@ sequentially, records your feedback as ADRs, and ends with a merged PR.
 
 ## PRs recovered (failed the gate)
 {recovered}
+
+## Reclaimed
+Debris the janitor (`hsai janitor`) recovered from a killed prior iteration
+before this block started - ambiguous or human-assigned state is left alone.
+{reclaimed}
 
 ## Cost this block (quota ledger)
 {cost}
@@ -247,9 +269,9 @@ def open_review_issue(
 # Two classes of decay a PR's own lifetime can never surface: a ticket left
 # `claimed` by a worker that crashed mid-run, and a ticket that has exhausted
 # `max_ticket_attempts` without ever being labelled `blocked`. Both sit in the
-# Issues Map forever unless something reads the backlog on a schedule.
-
-_TICKET_REF_RE = re.compile(r"(?:closes|fixes|resolves|refs)\s+#(\d+)", re.IGNORECASE)
+# Issues Map forever unless something reads the backlog on a schedule. (The
+# janitor - see hsai.janitor - now actively reclaims the first class instead of
+# only flagging it here.)
 
 
 @dataclass(frozen=True)
@@ -263,14 +285,6 @@ class BacklogFinding:
         return f"[{self.kind}] #{self.number} {self.title}: {self.detail}"
 
 
-def _referenced_tickets(prs: list[github.Pr]) -> set[int]:
-    """Ticket numbers any open PR body references (``Closes #N`` etc.)."""
-    refs: set[int] = set()
-    for pr in prs:
-        refs.update(int(n) for n in _TICKET_REF_RE.findall(pr.body))
-    return refs
-
-
 def backlog_findings(cfg: CoreConfig, *, runner: Runner = run) -> list[BacklogFinding]:
     """Backlog decay invisible to the current gates - read-only, reuses
     ``github.list_open_issues``/``list_open_prs``. Never edits anything; the
@@ -278,7 +292,7 @@ def backlog_findings(cfg: CoreConfig, *, runner: Runner = run) -> list[BacklogFi
     """
     repo = cfg.repo_slug
     issues = github.list_open_issues(repo, runner=runner)
-    referenced = _referenced_tickets(github.list_open_prs(repo, runner=runner))
+    referenced = github.referenced_tickets(github.list_open_prs(repo, runner=runner))
 
     findings: list[BacklogFinding] = []
     for issue in issues:

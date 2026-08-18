@@ -54,6 +54,30 @@ def remove_worktree(wt_path: str, *, cwd: str | None = None, runner: Runner = ru
     return _git(["worktree", "remove", "--force", wt_path], cwd=cwd, runner=runner)
 
 
+def list_worktrees_porcelain(*, cwd: str | None = None, runner: Runner = run) -> str:
+    """Raw ``git worktree list --porcelain`` output (see hsai.janitor for parsing)."""
+    return _git(["worktree", "list", "--porcelain"], cwd=cwd, runner=runner).stdout
+
+
+def prune_worktrees(*, cwd: str | None = None, runner: Runner = run) -> Proc:
+    """Sweep worktree administrative metadata left behind after manual cleanup."""
+    return _git(["worktree", "prune"], cwd=cwd, runner=runner)
+
+
+def rev_list_count(range_spec: str, *, cwd: str | None = None, runner: Runner = run) -> int:
+    """How many commits are in ``range_spec`` (e.g. ``origin/main..branch``)."""
+    p = _git(["rev-list", "--count", range_spec], cwd=cwd, runner=runner)
+    try:
+        return int((p.stdout or "0").strip() or "0")
+    except ValueError:
+        return 0
+
+
+def delete_remote_branch(branch: str, *, cwd: str | None = None, runner: Runner = run) -> Proc:
+    """Delete ``branch`` on ``origin``. Fails harmlessly if it was never pushed."""
+    return _git(["push", "origin", "--delete", branch], cwd=cwd, runner=runner)
+
+
 def create_detached_worktree(
     worktrees_dir: str,
     name: str,

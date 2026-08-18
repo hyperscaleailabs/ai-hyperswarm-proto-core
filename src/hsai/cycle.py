@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import github, gitops, journal, ledger, postmortem, retrieval, trajectory
+from . import github, gitops, janitor, journal, ledger, postmortem, retrieval, trajectory
 from .ai import run_agent
 from .config import CoreConfig
 from .governance import BlockReport, open_review_issue, write_direction
@@ -118,6 +118,30 @@ def _iteration_payload(res: IterationResult) -> dict:
         "pr": res.pr,
         "merged": bool(res.merged),
         "recovered": bool(res.recovered),
+    }
+
+
+def _janitor_step(cfg: CoreConfig, *, repo_root: Path, runner: Runner, dry_run: bool) -> dict:
+    """Reclaim debris from a killed prior iteration before this block starts.
+
+    Skipped entirely under ``dry_run`` (no git/gh calls at all), mirroring
+    ``_synthesis_step``: a rehearsal must stay hermetic and never depend on
+    live GitHub/git state.
+    """
+    if dry_run:
+        return {
+            "worktrees_removed": [], "branches_deleted": [], "tickets_returned": [],
+            "tickets_blocked": [], "ambiguous_worktrees": 0, "ambiguous_claims": 0,
+        }
+    plan = janitor.build_plan(cfg, now=time.time(), repo_dir=str(repo_root), runner=runner)
+    janitor.reap(cfg, plan, repo_dir=str(repo_root), dry_run=False, runner=runner)
+    return {
+        "worktrees_removed": list(plan.removed_worktrees),
+        "branches_deleted": list(plan.deleted_branches),
+        "tickets_returned": list(plan.returned_tickets),
+        "tickets_blocked": list(plan.blocked_tickets),
+        "ambiguous_worktrees": len(plan.ambiguous_worktrees),
+        "ambiguous_claims": len(plan.ambiguous_claims),
     }
 
 
@@ -232,7 +256,33 @@ def run_cycle(
     jr = journal.open_journal(repo_root, idx, dry_run=dry_run)
     report = BlockReport(cycle_index=idx)
 
-    # 0. Snapshot the practices registry before this block touches anything, so
+    # 0. Janitor: reclaim debris from a killed prior iteration (stranded
+    # claims, orphaned worktrees, dead branches) as a serialized pre-block
+    # step, so synthesis's backlog-thin check and the implementation block's
+    # ticket selection both see a clean backlog.
+    reclaimed = journal.once(
+        jr, "janitor", "block",
+        lambda: _janitor_step(cfg, repo_root=repo_root, runner=runner, dry_run=dry_run),
+    )
+    report.reclaimed_worktrees = reclaimed["worktrees_removed"]
+    report.reclaimed_branches = reclaimed["branches_deleted"]
+    report.reclaimed_tickets = reclaimed["tickets_returned"]
+    report.reclaimed_blocked_tickets = reclaimed["tickets_blocked"]
+    if (reclaimed["worktrees_removed"] or reclaimed["branches_deleted"]
+            or reclaimed["tickets_returned"] or reclaimed["tickets_blocked"]):
+        report.notes.append(
+            f"janitor: reclaimed {len(reclaimed['worktrees_removed'])} worktree(s), "
+            f"{len(reclaimed['branches_deleted'])} branch(es), "
+            f"{len(reclaimed['tickets_returned'])} ticket(s) returned, "
+            f"{len(reclaimed['tickets_blocked'])} ticket(s) blocked"
+        )
+    if reclaimed["ambiguous_worktrees"] or reclaimed["ambiguous_claims"]:
+        report.notes.append(
+            f"janitor: {reclaimed['ambiguous_worktrees']} ambiguous worktree(s), "
+            f"{reclaimed['ambiguous_claims']} ambiguous claim(s) left for a human"
+        )
+
+    # 0b. Snapshot the practices registry before this block touches anything, so
     # "adopted this block" can be computed as a set difference after main is
     # synced. Journaled so a resumed run compares against the SAME baseline
     # the original run captured, not whatever the disk holds mid-resume.

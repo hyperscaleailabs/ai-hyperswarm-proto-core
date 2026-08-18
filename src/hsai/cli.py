@@ -11,6 +11,7 @@ Commands:
   hsai practices add --title T --source-project P ...          record a new adopted practice
   hsai postmortem [--block N]                                  print the failure-class Pareto for a block
   hsai doctor                                                  verify environment + invariants
+  hsai janitor [--dry-run] [--ttl-hours N]                     reclaim stranded tickets/worktrees/branches
   hsai traj <iteration> [--json]                               print a stored agent run
   hsai replay <iteration> [--json]                              alias of `hsai traj`
 """
@@ -24,6 +25,7 @@ import time
 from . import (
     __version__,
     ai,
+    janitor,
     ledger,
     postmortem,
     practices,
@@ -81,7 +83,41 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         ok = False
     print(f"  constraints: subscription_only={cfg.subscription_only}, "
           f"require_ticket_per_pr={cfg.constraints.get('require_ticket_per_pr')}")
+    # Loop hygiene health signal (see hsai.janitor): informational only - a
+    # nonzero count means `hsai janitor` has something to reclaim, not that
+    # doctor itself has failed. Defensive: doctor must never crash just
+    # because git/gh are unavailable in the current environment.
+    try:
+        plan = janitor.build_plan(cfg, now=time.time(), repo_dir=".")
+        print(
+            f"  janitor: {len(plan.orphaned_worktrees)} orphaned worktree(s), "
+            f"{len(plan.stranded_claims)} stranded claim(s) "
+            f"(ttl={plan.ttl_seconds / 3600:.1f}h; see `hsai janitor --dry-run`)"
+        )
+        if plan.ambiguous_worktrees or plan.ambiguous_claims:
+            print(
+                f"  janitor: {len(plan.ambiguous_worktrees)} ambiguous worktree(s), "
+                f"{len(plan.ambiguous_claims)} ambiguous claim(s) - needs a human"
+            )
+    except Exception as exc:  # doctor reports environment problems, never crashes on one
+        print(f"  janitor: could not scan - {exc}")
     return 0 if ok else 1
+
+
+def cmd_janitor(args: argparse.Namespace) -> int:
+    cfg = _load(args)
+    ttl_seconds = args.ttl_hours * 3600.0 if args.ttl_hours is not None else None
+    plan = janitor.build_plan(cfg, now=time.time(), repo_dir=".", ttl_seconds=ttl_seconds)
+    if not args.dry_run:
+        janitor.reap(cfg, plan, repo_dir=".", dry_run=False)
+    print(plan.render())
+    if not plan.has_decision() and plan.has_ambiguous():
+        print(
+            "janitor: nothing could be safely decided - see the ambiguous entries above",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
 
 
 def cmd_reindex(args: argparse.Namespace) -> int:
@@ -318,6 +354,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     dr = sub.add_parser("doctor", help="verify environment and safety invariants")
     dr.set_defaults(func=cmd_doctor)
+
+    jn = sub.add_parser(
+        "janitor", help="reclaim stranded tickets, orphaned worktrees, and dead branches"
+    )
+    jn.add_argument("--dry-run", action="store_true", help="print the plan; no side effects")
+    jn.add_argument(
+        "--ttl-hours", type=float, default=None,
+        help="override the derived TTL (default: from execution timeouts, see hsai.janitor)",
+    )
+    jn.set_defaults(func=cmd_janitor)
 
     ri = sub.add_parser("reindex", help="rebuild knowledge-base MOCs + the retrieval index")
     ri.add_argument("--root", default=".", help="repo root holding knowledge/ and docs/adr")

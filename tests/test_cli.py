@@ -31,7 +31,19 @@ def test_status_command_returns_zero(capsys):
     assert "hyperscaleailabs/ai-hyperswarm-proto-core" in out
 
 
+def _stub_janitor_scan(monkeypatch) -> None:
+    """Doctor's janitor health signal is exercised in its own tests below - here
+    it must stay hermetic (no real git/gh subprocess, no network)."""
+    from hsai import janitor as janitor_module
+
+    monkeypatch.setattr(
+        cli_module.janitor, "build_plan",
+        lambda cfg, **k: janitor_module.ReapPlan(ttl_seconds=0, loop_login=""),
+    )
+
+
 def test_doctor_reports_the_live_child_env_check_and_exits_zero_on_pass(monkeypatch, capsys):
+    _stub_janitor_scan(monkeypatch)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy")
     rc = main(["doctor"])
     out = capsys.readouterr().out
@@ -41,6 +53,7 @@ def test_doctor_reports_the_live_child_env_check_and_exits_zero_on_pass(monkeypa
 
 
 def test_doctor_exits_nonzero_when_the_live_check_reports_a_leak(monkeypatch, capsys):
+    _stub_janitor_scan(monkeypatch)
     # Isolate the live-check failure from the (separate) preflight guard.
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.setattr(
@@ -52,6 +65,118 @@ def test_doctor_exits_nonzero_when_the_live_check_reports_a_leak(monkeypatch, ca
     assert rc == 1
     assert "child-environment guard: FAIL" in out
     assert "ANTHROPIC_API_KEY" in out
+
+
+def test_parser_janitor_args():
+    parser = build_parser()
+    args = parser.parse_args(["janitor", "--dry-run", "--ttl-hours", "2.5"])
+    assert args.command == "janitor"
+    assert args.dry_run is True
+    assert args.ttl_hours == 2.5
+
+    defaults = parser.parse_args(["janitor"])
+    assert defaults.dry_run is False
+    assert defaults.ttl_hours is None
+
+
+def test_janitor_command_prints_the_plan_and_exits_zero_on_a_clean_repo(monkeypatch, capsys):
+    from hsai import janitor as janitor_module
+
+    plan = janitor_module.ReapPlan(ttl_seconds=4500, loop_login="hsai-bot")
+    seen = {}
+
+    def fake_build_plan(cfg, **kwargs):
+        seen.update(kwargs)
+        return plan
+
+    monkeypatch.setattr(cli_module.janitor, "build_plan", fake_build_plan)
+    monkeypatch.setattr(
+        cli_module.janitor, "reap",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("reap must not run under --dry-run")),
+    )
+
+    rc = main(["janitor", "--dry-run"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "janitor: ttl=4500s" in out
+    assert seen.get("ttl_seconds") is None
+
+
+def test_janitor_command_passes_ttl_hours_through_as_seconds(monkeypatch, capsys):
+    seen = {}
+
+    def fake_build_plan(cfg, **kwargs):
+        seen.update(kwargs)
+        return cli_module.janitor.ReapPlan(ttl_seconds=kwargs.get("ttl_seconds") or 0, loop_login="x")
+
+    monkeypatch.setattr(cli_module.janitor, "build_plan", fake_build_plan)
+    monkeypatch.setattr(cli_module.janitor, "reap", lambda cfg, plan, **k: plan)
+
+    rc = main(["janitor", "--ttl-hours", "1"])
+    assert rc == 0
+    assert seen["ttl_seconds"] == 3600.0
+
+
+def test_janitor_command_exits_nonzero_when_nothing_can_be_safely_decided(monkeypatch, capsys):
+    from hsai import github, janitor as janitor_module
+
+    ambiguous_issue = github.Issue(
+        number=9, title="feat: x", labels=(), assignees=("hsai-bot",),
+        updated_at="not-a-timestamp",
+    )
+    plan = janitor_module.ReapPlan(
+        ttl_seconds=4500, loop_login="hsai-bot",
+        claims=[janitor_module.ClaimVerdict(ambiguous_issue, janitor_module.AMBIGUOUS, "no age")],
+    )
+    monkeypatch.setattr(cli_module.janitor, "build_plan", lambda cfg, **k: plan)
+
+    rc = main(["janitor", "--dry-run"])
+    err = capsys.readouterr().err
+
+    assert rc == 1
+    assert "nothing could be safely decided" in err
+
+
+def test_janitor_command_reaps_for_real_when_not_a_dry_run(monkeypatch, capsys):
+    from hsai import janitor as janitor_module
+
+    plan = janitor_module.ReapPlan(ttl_seconds=4500, loop_login="hsai-bot")
+    reaped = {"called": False}
+
+    def fake_reap(cfg, p, **kwargs):
+        reaped["called"] = True
+        assert kwargs.get("dry_run") is False
+        return p
+
+    monkeypatch.setattr(cli_module.janitor, "build_plan", lambda cfg, **k: plan)
+    monkeypatch.setattr(cli_module.janitor, "reap", fake_reap)
+
+    rc = main(["janitor"])
+    assert rc == 0
+    assert reaped["called"] is True
+
+
+def test_doctor_reports_janitor_health_counts(monkeypatch, capsys):
+    from hsai import janitor as janitor_module
+
+    plan = janitor_module.ReapPlan(
+        ttl_seconds=4500, loop_login="hsai-bot",
+        worktrees=[
+            janitor_module.WorktreeVerdict(
+                janitor_module.WorktreeEntry(path="/repo/.hsai/worktrees/x", branch="x"),
+                janitor_module.ORPHANED, "stale",
+            )
+        ],
+    )
+    monkeypatch.setattr(cli_module.janitor, "build_plan", lambda cfg, **k: plan)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy")
+
+    rc = main(["doctor"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "janitor: 1 orphaned worktree(s), 0 stranded claim(s)" in out
 
 
 def test_parser_cycle_resume_args():

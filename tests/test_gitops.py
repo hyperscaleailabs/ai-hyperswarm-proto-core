@@ -34,6 +34,39 @@ def test_diff_text_returns_the_branch_diff_verbatim():
     assert runner.calls[0][0] == ["git", "diff", "deadbeef...HEAD"]
 
 
+def test_list_worktrees_porcelain_returns_raw_stdout():
+    runner = _fake("worktree /repo\nHEAD deadbeef\nbranch refs/heads/main\n")
+    out = gitops.list_worktrees_porcelain(cwd="/repo", runner=runner)
+    assert "worktree /repo" in out
+    assert runner.calls[0][0] == ["git", "worktree", "list", "--porcelain"]
+
+
+def test_prune_worktrees_issues_the_prune_command():
+    runner = _fake()
+    proc = gitops.prune_worktrees(cwd="/repo", runner=runner)
+    assert proc.ok
+    assert runner.calls[0][0] == ["git", "worktree", "prune"]
+
+
+def test_rev_list_count_parses_the_count():
+    runner = _fake("3\n")
+    n = gitops.rev_list_count("origin/main..hsai/iter-1-1-abc", cwd="/repo", runner=runner)
+    assert n == 3
+    assert runner.calls[0][0] == ["git", "rev-list", "--count", "origin/main..hsai/iter-1-1-abc"]
+
+
+def test_rev_list_count_defaults_to_zero_on_unparseable_output():
+    runner = _fake("not-a-number\n")
+    assert gitops.rev_list_count("origin/main..x", cwd="/repo", runner=runner) == 0
+
+
+def test_delete_remote_branch_issues_a_push_delete():
+    runner = _fake()
+    proc = gitops.delete_remote_branch("hsai/iter-1-1-abc", cwd="/repo", runner=runner)
+    assert proc.ok
+    assert runner.calls[0][0] == ["git", "push", "origin", "--delete", "hsai/iter-1-1-abc"]
+
+
 def test_create_detached_worktree_builds_expected_path():
     def runner(cmd, **kwargs):
         cmd = list(cmd)

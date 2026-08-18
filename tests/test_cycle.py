@@ -237,6 +237,79 @@ def test_practices_adopted_this_block_surfaces_new_registry_entries(tmp_path, mo
     assert "OpenBMB/ChatDev" in brief
 
 
+# --- the janitor runs as a serialized pre-block step -------------------------
+
+def test_cycle_reclaims_via_the_janitor_before_synthesis_and_it_reaches_the_brief(
+    tmp_path, monkeypatch
+):
+    from hsai import janitor
+
+    cfg = load_config()
+    cfg.budget.clear()
+    cfg.cycle["block_size"] = 0  # isolate: no implementation iterations needed
+
+    fake_plan = janitor.ReapPlan(
+        ttl_seconds=4500, loop_login="hsai-bot",
+        removed_worktrees=[".hsai/worktrees/hsai/iter-1-1-abc"],
+        deleted_branches=["hsai/iter-1-1-abc"],
+        returned_tickets=[42],
+        blocked_tickets=[43],
+    )
+
+    def fake_build_plan(cfg, **kwargs):
+        return fake_plan
+
+    reap_calls = []
+
+    def fake_reap(cfg, plan, **kwargs):
+        reap_calls.append(kwargs)
+        return plan
+
+    monkeypatch.setattr(janitor, "build_plan", fake_build_plan)
+    monkeypatch.setattr(janitor, "reap", fake_reap)
+    runner = _Runner()
+    monkeypatch.setattr(cycle, "_well_formed_backlog", lambda cfg, *, runner: 999)
+    monkeypatch.setattr(cycle, "_governance_pr", lambda *a, **k: 0)
+
+    res = cycle.run_cycle(cfg, repo_dir=str(tmp_path), cycle_index=1, runner=runner)
+
+    assert reap_calls and reap_calls[0]["dry_run"] is False
+    assert res.report.reclaimed_worktrees == [".hsai/worktrees/hsai/iter-1-1-abc"]
+    assert res.report.reclaimed_branches == ["hsai/iter-1-1-abc"]
+    assert res.report.reclaimed_tickets == [42]
+    assert res.report.reclaimed_blocked_tickets == [43]
+    note = next(n for n in res.report.notes if n.startswith("janitor: reclaimed"))
+    assert "1 worktree(s)" in note and "1 branch(es)" in note
+
+    brief = runner.review_bodies[-1]
+    assert "## Reclaimed" in brief
+    assert ".hsai/worktrees/hsai/iter-1-1-abc" in brief
+    assert "#42" in brief and "#43" in brief
+
+
+def test_cycle_dry_run_skips_the_janitor_entirely(tmp_path, monkeypatch):
+    """dry_run stays hermetic: no git/gh calls for the janitor, zero counts."""
+    from hsai import janitor
+
+    cfg = load_config()
+    cfg.budget.clear()
+    cfg.cycle["block_size"] = 0
+
+    def _boom(*a, **k):
+        raise AssertionError("janitor must not scan real state under --dry-run")
+
+    monkeypatch.setattr(janitor, "build_plan", _boom)
+    monkeypatch.setattr(janitor, "reap", _boom)
+
+    res = cycle.run_cycle(
+        cfg, repo_dir=str(tmp_path), cycle_index=1, dry_run=True, runner=_Runner()
+    )
+
+    assert res.report.reclaimed_worktrees == []
+    assert res.report.reclaimed_tickets == []
+    assert not any(n.startswith("janitor:") for n in res.report.notes)
+
+
 # --- plain-text agent output must not break article generation --------------
 
 def test_persona_articles_survive_output_without_a_json_envelope(tmp_path):

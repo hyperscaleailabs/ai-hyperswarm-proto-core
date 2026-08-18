@@ -31,6 +31,22 @@ def test_execution_telemetry_defaults_when_keys_absent(tmp_path):
     assert cfg.trajectory_retention_blocks == 8
 
 
+def test_janitor_config_is_present_and_defaults_when_the_block_is_absent(tmp_path):
+    """The janitor TTL safety multiplier is config, not code - see hsai.janitor."""
+    cfg = load_config()
+    assert cfg.janitor.get("ttl_safety_multiplier") == 3.0
+
+    core = tmp_path / ".ai-swarm"
+    core.mkdir()
+    (core / "core.yaml").write_text(
+        "identity:\n  owner: someone\n"
+        "models:\n  tiers:\n    standard:\n      model: sonnet\n"
+        "  default_tier: standard\n"
+    )
+    blank_cfg = load_config(core / "core.yaml")
+    assert blank_cfg.janitor == {}
+
+
 def test_review_gate_is_configured_and_enabled():
     """The independent review gate is config, not code."""
     cfg = load_config()

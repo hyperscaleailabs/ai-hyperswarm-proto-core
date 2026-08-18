@@ -5,6 +5,7 @@ Priority is expressed with labels ``priority:P0`` .. ``priority:P3`` (P0 highest
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 
 from .proc import Proc, Runner, run
@@ -39,6 +40,9 @@ class Issue:
     labels: tuple[str, ...]
     assignees: tuple[str, ...]
     body: str = ""
+    # ISO-8601 (GitHub's `updatedAt`). The janitor's only proxy for "how long
+    # has this claim sat here" - see hsai.janitor.classify_claim.
+    updated_at: str = ""
 
     def priority_rank(self) -> int:
         for i, lbl in enumerate(PRIORITY_LABELS):
@@ -118,7 +122,7 @@ def list_open_issues(repo: str, *, runner: Runner = run) -> list[Issue]:
         [
             "issue", "list", "--repo", repo, "--state", "open",
             "--limit", "100",
-            "--json", "number,title,labels,assignees,body",
+            "--json", "number,title,labels,assignees,body,updatedAt",
         ],
         runner=runner,
     )
@@ -133,6 +137,7 @@ def list_open_issues(repo: str, *, runner: Runner = run) -> list[Issue]:
             labels=tuple(lb["name"] for lb in item.get("labels", [])),
             assignees=tuple(a["login"] for a in item.get("assignees", [])),
             body=item.get("body", "") or "",
+            updated_at=item.get("updatedAt", "") or "",
         )
         for item in data
     ]
@@ -214,7 +219,7 @@ def get_issue(repo: str, number: int, *, runner: Runner = run) -> Issue | None:
     p = _gh(
         [
             "issue", "view", str(number), "--repo", repo,
-            "--json", "number,title,labels,assignees,body",
+            "--json", "number,title,labels,assignees,body,updatedAt",
         ],
         runner=runner,
     )
@@ -230,6 +235,7 @@ def get_issue(repo: str, number: int, *, runner: Runner = run) -> Issue | None:
         labels=tuple(lb["name"] for lb in item.get("labels", [])),
         assignees=tuple(a["login"] for a in item.get("assignees", [])),
         body=item.get("body", "") or "",
+        updated_at=item.get("updatedAt", "") or "",
     )
 
 
@@ -264,6 +270,22 @@ def list_open_prs(repo: str, *, runner: Runner = run) -> list[Pr]:
         )
         for item in data
     ]
+
+
+_TICKET_REF_RE = re.compile(r"(?:closes|fixes|resolves|refs)\s+#(\d+)", re.IGNORECASE)
+
+
+def referenced_tickets(prs: list[Pr]) -> set[int]:
+    """Ticket numbers any of ``prs``' bodies reference (``Closes #N`` etc.).
+
+    Shared by :mod:`hsai.governance` (backlog hygiene findings) and
+    :mod:`hsai.janitor` (stranded-claim detection): both need to know which
+    open tickets already have live work in flight.
+    """
+    refs: set[int] = set()
+    for pr in prs:
+        refs.update(int(n) for n in _TICKET_REF_RE.findall(pr.body))
+    return refs
 
 
 def close_pr(

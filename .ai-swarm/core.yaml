@@ -129,6 +129,16 @@ cycle:
   backlog_low_watermark: 4     # run synthesis when fewer well-formed tickets than this
   whitepaper_per_block: true   # one whitepaper per block => two per day
 
+# Loop janitor (see src/hsai/janitor.py). Reclaims worktrees, dead branches and
+# stranded ticket claims left behind by a killed iteration (machine sleep,
+# launchd kill, crash, hard budget halt). A claim/worktree is "stranded" once
+# its age exceeds (execution.agent_timeout_seconds + ci_remote_timeout_seconds)
+# * ttl_safety_multiplier, so one slow-but-legitimate run is never mistaken for
+# an abandoned one. Ambiguous cases (commits ahead with no PR, an unparseable
+# age, ...) are always left alone and reported for a human - never reclaimed.
+janitor:
+  ttl_safety_multiplier: 3.0
+
 synthesis:
   tier: heavy                  # substantial cross-project synthesis needs the big model
   timeout_seconds: 2400
