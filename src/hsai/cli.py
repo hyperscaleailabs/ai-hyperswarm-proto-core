@@ -5,7 +5,7 @@ Commands:
   hsai run-once [--dry-run]                                    a single iteration
   hsai status                                                  config + backlog snapshot
   hsai cycle [--cycle-index N] [--resume] [--dry-run]          one governance block
-  hsai reindex                                                 rebuild knowledge MOCs
+  hsai reindex [--root DIR]                                    rebuild knowledge MOCs + notes.json
   hsai recall "<query>" [--k N] [--kind K]                     rank prior lessons/ADRs
   hsai practices list                                          show the adopted-practice registry
   hsai practices add --title T --source-project P ...          record a new adopted practice
@@ -21,7 +21,17 @@ import os
 import sys
 import time
 
-from . import __version__, ai, ledger, postmortem, practices, recall, repro, trajectory
+from . import (
+    __version__,
+    ai,
+    ledger,
+    postmortem,
+    practices,
+    recall,
+    repro,
+    retrieval,
+    trajectory,
+)
 from .config import CoreConfig, load_config, validate
 from .knowledge import KnowledgeBase
 from .orchestrator import run_loop
@@ -75,18 +85,22 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def cmd_reindex(args: argparse.Namespace) -> int:
-    """Serialized knowledge maintenance: whitepaper cadence + MOC rebuild.
+    """Serialized knowledge maintenance: whitepaper cadence, MOC rebuild, and
+    the retrieval index the planner reads (`knowledge/index/notes.json`).
 
     Kept out of the parallel workers so PRs never collide on derived index files.
     """
     cfg = _load(args)
-    kb = KnowledgeBase.from_config(cfg, ".")
+    root = getattr(args, "root", ".")
+    kb = KnowledgeBase.from_config(cfg, root)
     if kb.should_write_whitepaper():
         p = kb.write_whitepaper(kb.synthesize_whitepaper())
         print(f"wrote whitepaper {p}")
     written = kb.reindex_mocs()
     for p in written:
         print(f"reindexed {p}")
+    index = retrieval.write_index(root, cfg)
+    print(f"reindexed {index} ({len(retrieval.note_paths(root, cfg))} note(s))")
     return 0
 
 
@@ -199,6 +213,8 @@ def cmd_synthesize(args: argparse.Namespace) -> int:
     print(f"filed tickets: {res.filed or 'none'}")
     if res.rejected:
         print(f"duplicates rejected: {res.rejected} (matched: {', '.join(res.rejected_titles)})")
+    for flag in res.risk_flags:
+        print(f"duplicate-risk: {flag}")
     if res.error:
         print(f"error: {res.error}")
     return 0 if res.ok else 1
@@ -303,7 +319,8 @@ def build_parser() -> argparse.ArgumentParser:
     dr = sub.add_parser("doctor", help="verify environment and safety invariants")
     dr.set_defaults(func=cmd_doctor)
 
-    ri = sub.add_parser("reindex", help="rebuild knowledge-base MOCs")
+    ri = sub.add_parser("reindex", help="rebuild knowledge-base MOCs + the retrieval index")
+    ri.add_argument("--root", default=".", help="repo root holding knowledge/ and docs/adr")
     ri.set_defaults(func=cmd_reindex)
 
     rl = sub.add_parser("recall", help="rank prior lessons/whitepapers/ADRs for a query")

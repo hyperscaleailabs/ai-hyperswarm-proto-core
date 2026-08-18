@@ -118,6 +118,32 @@ def test_recall_command_prints_ranked_notes_with_scores(tmp_path, capsys):
     assert float(first[0]) > 0 and first[1] == "2026-01-01-remote-ci-gate"
 
 
+def test_reindex_rebuilds_the_mocs_and_the_retrieval_index(tmp_path, capsys):
+    lessons = tmp_path / "knowledge" / "lessons"
+    lessons.mkdir(parents=True)
+    (lessons / "2026-01-01-remote-ci-gate.md").write_text(
+        "---\ntags:\n  - lesson\n  - outcome/fail\n  - kind/implement\ncreated: 2026-01-01\n---\n\n"
+        "# Remote CI gate\n\n## Lesson learned\nPoll the rollup before merging.\n"
+    )
+
+    rc = main(["reindex", "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Lessons MOC" in out
+
+    index = tmp_path / "knowledge" / "index" / "notes.json"
+    assert index.is_file()
+    assert str(index) in out and "1 note(s)" in out
+    payload = json.loads(index.read_text())
+    assert [n["id_"] for n in payload["nodes"]] == ["2026-01-01-remote-ci-gate"]
+    assert payload["nodes"][0]["metadata"]["outcome"] == "fail"
+
+    # Idempotent: a second run on an unchanged vault produces no diff.
+    before = index.read_bytes()
+    assert main(["reindex", "--root", str(tmp_path)]) == 0
+    assert index.read_bytes() == before
+
+
 def test_recall_command_reports_an_empty_vault_without_crashing(tmp_path, capsys):
     rc = main(["recall", "anything", "--root", str(tmp_path)])
     assert rc == 1

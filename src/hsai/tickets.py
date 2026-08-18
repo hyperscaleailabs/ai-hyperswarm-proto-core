@@ -17,7 +17,13 @@ ACCEPTANCE_HEADING = re.compile(r"^#{2,3}\s*acceptance criteria\s*$", re.IGNOREC
 VERIFICATION_HEADING = re.compile(
     r"^#{2,3}\s*verification plan\s*$", re.IGNORECASE | re.MULTILINE
 )
+PRIOR_ART_HEADING = re.compile(r"^#{2,3}\s*prior art\s*$", re.IGNORECASE | re.MULTILINE)
 CHECKBOX = re.compile(r"^\s*-\s*\[[ xX]?\]\s+\S", re.MULTILINE)
+
+# What a ticket says when retrieval found nothing. An explicit sentence, not an
+# empty section: "we looked and there is none" and "nobody looked" must not
+# render identically.
+NO_PRIOR_ART = "No prior art found"
 
 NEEDS_REFINEMENT = "needs-refinement"
 SIZE_LABELS = ("size:S", "size:M", "size:L")
@@ -40,6 +46,9 @@ class TicketSpec:
     goal_ids: tuple[str, ...] = ()
     synthesis_rationale: str = ""  # which reference projects were combined, and how
     practice_ids: tuple[str, ...] = ()  # new/extended entries in the practices registry
+    # Citations into this repo's own knowledge base, one rendered line each
+    # (``[[note-name]] (outcome) - title``); see :mod:`hsai.retrieval`.
+    prior_art: tuple[str, ...] = ()
     labels: tuple[str, ...] = ()
 
     def render(self) -> str:
@@ -47,6 +56,7 @@ class TicketSpec:
         vp = "\n".join(f"- [ ] {v}" for v in self.verification_plan)
         goals = ", ".join(self.goal_ids) or "-"
         practices = ", ".join(self.practice_ids) or "-"
+        prior = "\n".join(f"- {p}" for p in self.prior_art) or NO_PRIOR_ART
         synth = (
             f"\n## Synthesis rationale\n{self.synthesis_rationale}\n"
             if self.synthesis_rationale
@@ -57,6 +67,9 @@ class TicketSpec:
 
 ## Proposal
 {self.proposal}
+
+## Prior art
+{prior}
 
 ## Acceptance criteria
 {ac}
@@ -81,13 +94,23 @@ class WellFormedness:
     reasons: list[str] = field(default_factory=list)
 
 
-def check_well_formed(title: str, body: str) -> WellFormedness:
-    """Is this ticket substantial enough to hand to an implementation agent?"""
+def check_well_formed(
+    title: str, body: str, *, require_prior_art: bool = False
+) -> WellFormedness:
+    """Is this ticket substantial enough to hand to an implementation agent?
+
+    ``require_prior_art`` is opt-in on purpose: every ticket the planner files is
+    grounded in the knowledge base and must carry its citations, but the open
+    backlog predates the section, and those tickets stay claimable.
+    """
+    reasons: list[str] = []
+    if require_prior_art and not PRIOR_ART_HEADING.search(body):
+        reasons.append("missing '## Prior art' section")
+
     lowered = title.strip().lower()
     if any(lowered.startswith(p) for p in _EXEMPT_PREFIXES):
-        return WellFormedness(ok=True, reasons=["exempt kind (docs/chore/heal)"])
+        return WellFormedness(ok=not reasons, reasons=reasons or ["exempt kind (docs/chore/heal)"])
 
-    reasons: list[str] = []
     if not ACCEPTANCE_HEADING.search(body):
         reasons.append("missing '## Acceptance criteria' section")
     checkboxes = CHECKBOX.findall(body)

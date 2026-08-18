@@ -6,15 +6,19 @@ copied from one project, a heavy model:
 1. receives a context pack built from a rotating subset of the reference set
    (README, recent commit subjects, CI workflow inventory - fetched via `gh`),
    plus the :mod:`hsai.practices` registry of what this loop has already
-   adopted from that set, rendered as ground it must not re-propose,
+   adopted from that set, rendered as ground it must not re-propose, plus the
+   prior art :mod:`hsai.retrieval` finds in this repo's OWN lessons,
+   whitepapers and ADRs for the goals being planned against,
 2. generates ~``ideas_target`` candidate improvements, each required to COMBINE
    practices from >= ``min_projects_combined`` different reference projects,
 3. runs a reflection pass - critiques its own candidates for feasibility,
-   originality, and fit with the goals in core.yaml,
+   originality, and fit with the goals in core.yaml; candidates that restate a
+   lesson recorded as a failure are dropped here, and every keep/drop verdict
+   is recorded (:func:`_screen_duplicate_risk`),
 4. prioritizes by impact x effort and emits the top ``file_top`` as fully
    structured tickets (schema in :mod:`hsai.tickets`, each naming the
-   practice(s) it adds or extends), which are filed on GitHub for the cheaper
-   implementation agents to pick up.
+   practice(s) it adds or extends and citing the prior art it builds on),
+   which are filed on GitHub for the cheaper implementation agents to pick up.
 
 The model call goes through :mod:`hsai.ai`, so it stays subscription-only.
 """
@@ -23,16 +27,17 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
-from . import github
+from . import github, retrieval
 from .ai import run_agent
 from .config import CoreConfig
 from .knowledge import KnowledgeBase
 from .models import ModelChoice
 from .practices import ADOPTED_HEADING, Practice, render_adopted_section
 from .proc import Runner, run
-from .tickets import TicketSpec
+from .retrieval import PRIOR_ART_HEADING, NoteIndex, PriorArt
+from .tickets import TicketSpec, check_well_formed
 
 _logger = logging.getLogger(__name__)
 
@@ -41,14 +46,24 @@ _JSON_BLOCK = re.compile(r"```(?:json)?\s*(\[.*?\])\s*```", re.DOTALL)
 
 @dataclass
 class ContextPack:
-    """What the synthesizer knows about the reference projects this cycle."""
+    """What the synthesizer knows this cycle: other projects, and our own notes.
+
+    ``prior_art`` is the read path back into the knowledge base - the top notes
+    this repo has already written about the goals it is planning against, each
+    carrying the outcome it recorded, so the planner can tell new ground from
+    ground it already walked.
+    """
 
     repos: list[str]
     sections: dict[str, str]  # repo -> digest text
+    prior_art: tuple[PriorArt, ...] = ()
 
     def render(self) -> str:
         parts = [f"### {repo}\n{text}" for repo, text in self.sections.items()]
         return "\n\n".join(parts)
+
+    def render_prior_art(self) -> str:
+        return retrieval.render_prior_art(self.prior_art)
 
 
 def pick_rotation(cfg: CoreConfig, cycle_index: int) -> list[str]:
@@ -63,9 +78,17 @@ def pick_rotation(cfg: CoreConfig, cycle_index: int) -> list[str]:
 
 
 def build_context_pack(
-    repos: list[str], *, runner: Runner = run, commits: int = 30
+    repos: list[str],
+    *,
+    runner: Runner = run,
+    commits: int = 30,
+    prior_art: tuple[PriorArt, ...] = (),
 ) -> ContextPack:
-    """Fetch a compact study digest for each repo via the GitHub API."""
+    """Fetch a compact study digest for each repo via the GitHub API.
+
+    ``prior_art`` is retrieved separately (:func:`gather_prior_art`) and passed
+    in: everything here talks to the network, everything there is pure.
+    """
     sections: dict[str, str] = {}
     for repo in repos:
         parts: list[str] = []
@@ -91,7 +114,21 @@ def build_context_pack(
         if workflows.ok and workflows.stdout.strip():
             parts.append("CI workflows:\n" + workflows.stdout[:500])
         sections[repo] = "\n\n".join(parts) or "(no data fetched)"
-    return ContextPack(repos=repos, sections=sections)
+    return ContextPack(repos=repos, sections=sections, prior_art=prior_art)
+
+
+def goal_queries(cfg: CoreConfig) -> list[str]:
+    """One retrieval query per goal - what this cycle is planning against."""
+    return [
+        f"{g.get('title', '')} {g.get('description', '')}".strip()
+        for g in cfg.goals
+        if g.get("title") or g.get("description")
+    ]
+
+
+def gather_prior_art(cfg: CoreConfig, index: NoteIndex) -> tuple[PriorArt, ...]:
+    """The repo's own notes most relevant to this cycle's goals, deduped."""
+    return retrieval.for_queries(index, goal_queries(cfg))
 
 
 MEMORY_HEADING = "What this loop has already tried"
@@ -284,6 +321,7 @@ def build_prompt(
     max_chars = int(cfg.synthesis.get("memory_max_chars", DEFAULT_MEMORY_MAX_CHARS))
     memory_section = memory.render(max_chars=max_chars)
     practices_section = render_adopted_section(practices or [])
+    prior_art_section = pack.render_prior_art()
     return f"""You are the SYNTHESIS planner for ai-hyperswarm-proto-core, an
 autonomous self-improving AI-swarm harness. Your job is NOT to copy one idea
 from one project, but to COMBINE practices across projects into substantial,
@@ -305,6 +343,14 @@ propose a candidate that just re-adopts one of these; if a candidate genuinely
 EXTENDS one, name its id in "practice_ids" instead of restating it as new:
 {practices_section}
 
+{PRIOR_ART_HEADING} - notes retrieved from OUR OWN knowledge base (lessons,
+whitepapers, ADRs) for the goals above, each shown as an Obsidian wikilink with
+the outcome it recorded. A note marked `fail` is an idea this repo already
+tried and that did not work; a note marked `pass` is a shipped capability. Cite
+these by name - they are the evidence trail behind every claim you make about
+what this repo has already done:
+{prior_art_section}
+
 Study digest of reference projects for this cycle:
 {pack.render()}
 
@@ -312,11 +358,16 @@ Work in three explicit phases and show them all in your output:
 
 PHASE 1 - DIVERGE: generate {ideas} candidate improvements. Each MUST combine
 practices from at least {combine} different reference projects (name them), be
-implementable inside this repo, and advance a named goal.
+implementable inside this repo, and advance a named goal. For EACH candidate,
+CHECK IT AGAINST THE PRIOR ART above and say either which note(s) it builds on
+(cite them as [[note-name]]) or that no prior note covers it.
 
 PHASE 2 - REFLECT: critique every candidate honestly - feasibility in a small
 codebase, real value vs novelty theater, risk to the loop's invariants
-(ticket-linked PRs, green-gated merges, subscription-only models).
+(ticket-linked PRs, green-gated merges, subscription-only models). State a
+duplicate-risk verdict per candidate: the closest prior-art note, and keep or
+drop. A candidate that restates a note whose outcome is `fail` must be DROPPED
+here - re-running a recorded failure is the one thing this loop must not do.
 
 PHASE 3 - CONVERGE: pick the best {top} and emit them as a fenced ```json code
 block: a JSON array where each element has exactly these keys:
@@ -329,7 +380,10 @@ block: a JSON array where each element has exactly these keys:
   "synthesis_rationale" (string naming the >= {combine} projects combined and how),
   "practice_ids" (array of strings - ids from the "{ADOPTED_HEADING}" section
     above that this ticket EXTENDS, or new slug-style ids it INTRODUCES for the
-    practice(s) it adds to the registry; empty array if none apply).
+    practice(s) it adds to the registry; empty array if none apply),
+  "prior_art" (array of strings - note names from the "{PRIOR_ART_HEADING}"
+    section above that this ticket builds on, WITHOUT the [[ ]] brackets;
+    empty array when no prior note covers it).
 
 The JSON block must be the LAST fenced block in your reply."""
 
@@ -357,6 +411,7 @@ def parse_ticket_specs(output: str) -> list[TicketSpec]:
                     goal_ids=tuple(str(g) for g in item.get("goal_ids", [])),
                     synthesis_rationale=str(item.get("synthesis_rationale", "")),
                     practice_ids=tuple(str(p) for p in item.get("practice_ids", [])),
+                    prior_art=tuple(str(p) for p in item.get("prior_art", [])),
                     labels=("self-improve", "hsai", "priority:P2"),
                 )
             )
@@ -373,6 +428,10 @@ class SynthesisResult:
     error: str = ""
     rejected: int = 0                              # duplicate specs dropped before filing
     rejected_titles: list[str] = field(default_factory=list)  # matched prior title, one per drop
+    # One line per surviving candidate: its closest prior-art note and the
+    # keep/drop decision that followed - the reflection phase's audit trail.
+    risk_flags: list[str] = field(default_factory=list)
+    risk_dropped: int = 0                          # candidates dropped as restated failures
 
 
 def _filter_duplicates(
@@ -396,6 +455,47 @@ def _filter_duplicates(
     return survivors, rejected_titles
 
 
+def _query_for(spec: TicketSpec) -> str:
+    """What a candidate is "about", for retrieval - title, problem, proposal."""
+    return f"{spec.title}\n{spec.problem}\n{spec.proposal}"
+
+
+def ground_prior_art(specs: list[TicketSpec], index: NoteIndex) -> list[TicketSpec]:
+    """Attach citation-grade prior art to every spec before it is filed.
+
+    Retrieval - not the model - is the authority here: a cited note either
+    exists in the index or is dropped, so every ``[[wikilink]]`` in a filed
+    ticket resolves in the Obsidian graph.
+    """
+    return [
+        replace(spec, prior_art=retrieval.resolve_citations(index, spec.prior_art, _query_for(spec)))
+        for spec in specs
+    ]
+
+
+def _screen_duplicate_risk(
+    specs: list[TicketSpec], index: NoteIndex
+) -> tuple[list[TicketSpec], list[str]]:
+    """Drop candidates that restate a recorded failure, and record every verdict.
+
+    Both halves matter for the audit trail: a dropped candidate names the failed
+    note it restates, and a kept one names the closest note it did NOT restate.
+    """
+    survivors: list[TicketSpec] = []
+    flags: list[str] = []
+    for spec in specs:
+        risk = retrieval.duplicate_risk(index, _query_for(spec))
+        flags.append(risk.render(spec.title))
+        if risk.flagged:
+            _logger.info(
+                "synthesis: dropping %r - restates failed note %s (coverage %.2f)",
+                spec.title, risk.note_name, risk.coverage,
+            )
+        else:
+            survivors.append(spec)
+    return survivors, flags
+
+
 def synthesize(
     cfg: CoreConfig,
     *,
@@ -404,9 +504,15 @@ def synthesize(
     runner: Runner = run,
     ai_runner: Runner = run,
 ) -> SynthesisResult:
-    """Run one synthesis pass, drop duplicates of prior work, and file the rest."""
+    """Run one synthesis pass, drop duplicates of prior work, and file the rest.
+
+    Grounded in the repo's own knowledge base at both ends: prior art goes INTO
+    the prompt, and the citations of what each filed ticket builds on come back
+    OUT of it (deterministically, from the same index).
+    """
     repos = pick_rotation(cfg, cycle_index)
-    pack = build_context_pack(repos, runner=runner)
+    index = retrieval.load_index(root, cfg)
+    pack = build_context_pack(repos, runner=runner, prior_art=gather_prior_art(cfg, index))
     memory = MemoryPack.gather(cfg, root=root, runner=runner)
     try:
         practices = KnowledgeBase.from_config(cfg, root).read_practices()
@@ -430,11 +536,21 @@ def synthesize(
     specs = parse_ticket_specs(ares.output)
     threshold = float(cfg.synthesis.get("duplicate_threshold", DUPLICATE_JACCARD_THRESHOLD))
     survivors, rejected_titles = _filter_duplicates(specs, memory, threshold=threshold)
+    grounded = ground_prior_art(survivors, index)
+    survivors, risk_flags = _screen_duplicate_risk(grounded, index)
+    risk_dropped = len(grounded) - len(survivors)
 
     filed: list[int] = []
     for spec in survivors:
+        body = spec.render()
+        # Belt and braces: a synthesis-filed ticket without its citations would
+        # break the provenance chain the prompt just spent a phase building.
+        wf = check_well_formed(spec.title, body, require_prior_art=True)
+        if not wf.ok:
+            _logger.warning("synthesis: not filing %r - %s", spec.title, "; ".join(wf.reasons))
+            continue
         num = github.create_issue(
-            cfg.repo_slug, spec.title, spec.render(), spec.all_labels(), runner=runner
+            cfg.repo_slug, spec.title, body, spec.all_labels(), runner=runner
         )
         if num:
             filed.append(num)
@@ -442,10 +558,14 @@ def synthesize(
     if not specs:
         error = "no parseable ticket specs in output"
     elif not survivors:
-        error = f"all {len(specs)} candidate(s) rejected as duplicates of prior work"
+        error = (
+            f"all {len(specs)} candidate(s) rejected as duplicates of prior work "
+            f"({len(rejected_titles)} by title, {risk_dropped} restating a recorded failure)"
+        )
     else:
         error = ""
     return SynthesisResult(
         ok=bool(filed), studied=repos, filed=filed, error=error,
         rejected=len(rejected_titles), rejected_titles=rejected_titles,
+        risk_flags=risk_flags, risk_dropped=risk_dropped,
     )

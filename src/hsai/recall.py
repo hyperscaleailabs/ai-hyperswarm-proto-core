@@ -138,8 +138,25 @@ def tokenize(text: str) -> list[str]:
     ]
 
 
-def _is_indexable(path: Path) -> bool:
+def is_indexable(path: Path) -> bool:
+    """Is this note worth retrieving? Templates and MOCs teach nothing."""
     return path.stem not in _SKIP_STEMS and not path.stem.endswith(_SKIP_SUFFIXES)
+
+
+def note_sources(cfg: CoreConfig | None) -> tuple[tuple[str, str], ...]:
+    """``(source kind, directory)`` pairs that make up the repo's own corpus.
+
+    One definition shared with :mod:`hsai.retrieval`, so the recall index a
+    worker reads and the prior-art index the planner reads can never drift onto
+    different halves of the vault.
+    """
+    knowledge = (cfg.knowledge if cfg else None) or {}
+    governance = (cfg.governance if cfg else None) or {}
+    return (
+        ("lesson", knowledge.get("lessons_dir", "knowledge/lessons")),
+        ("whitepaper", knowledge.get("whitepapers_dir", "knowledge/whitepapers")),
+        ("adr", governance.get("adr_dir", "docs/adr")),
+    )
 
 
 def _snippet(record: LessonRecord, limit: int = 160) -> str:
@@ -204,20 +221,13 @@ class Corpus:
         tmp_path in a test) yields an empty corpus rather than an error.
         """
         root = Path(root)
-        knowledge = (cfg.knowledge if cfg else None) or {}
-        governance = (cfg.governance if cfg else None) or {}
-        sources = (
-            ("lesson", knowledge.get("lessons_dir", "knowledge/lessons")),
-            ("whitepaper", knowledge.get("whitepapers_dir", "knowledge/whitepapers")),
-            ("adr", governance.get("adr_dir", "docs/adr")),
-        )
         documents: list[Document] = []
-        for source, rel in sources:
+        for source, rel in note_sources(cfg):
             directory = root / rel
             if not directory.is_dir():
                 continue
             for path in sorted(directory.glob("*.md")):
-                if _is_indexable(path):
+                if is_indexable(path):
                     documents.append(_to_document(path, source))
         return cls(documents, RecallConfig.from_core(cfg))
 

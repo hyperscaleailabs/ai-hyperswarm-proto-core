@@ -221,6 +221,19 @@ knowledge:
     max_chars: 1200                  # hard ceiling on the injected text
     fail_weight: 1.6                 # score multiplier for outcome/fail notes
     kind_weight: 1.25                # score multiplier when kind/ matches the task
+  # Retrieval-grounded planning (see src/hsai/retrieval.py): the read half of
+  # the knowledge base for the PLANNER. `hsai reindex` regenerates
+  # knowledge/index/notes.json from every lesson, whitepaper and ADR; synthesis
+  # queries it for prior art, cites it in each filed ticket's '## Prior art'
+  # section, and drops candidates that restate a lesson recorded as a failure.
+  index:
+    dir: knowledge/index             # where notes.json is regenerated
+    k: 3                             # prior-art notes retrieved per query
+    title_boost: 3.0                 # a title hit counts for this many body hits
+    tag_boost: 2.0                   # ditto for a frontmatter tag hit
+    half_life_days: 180              # recency decay, measured against the newest note
+    duplicate_threshold: 0.55        # coverage of a FAILED note above which a candidate is dropped
+    min_query_terms: 8               # below this many distinct words, coverage is noise - never flag
 
 # Ranked snapshot pinned on 2026-07-25. Criteria: >= 10k stars, permissive
 # license (MIT or Apache-2.0), quality README, relevance to swarm / multi-agent.
