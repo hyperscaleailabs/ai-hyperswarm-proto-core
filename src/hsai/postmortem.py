@@ -37,21 +37,30 @@ from .proc import Runner, run
 from .tickets import TicketSpec
 
 # --- the closed vocabulary ---------------------------------------------------
+# Shared with the span trace bus (see hsai.trace.classify_failure), which
+# classifies the SAME iteration one phase at a time. One vocabulary, two
+# viewpoints: a ledger row says how a run ended, a span says where it broke -
+# and because both name the cause identically, they join on `run_id`.
 AGENT_TIMEOUT = "agent_timeout"
 AGENT_ERROR = "agent_error"
 INCOMPLETE_DIFF = "incomplete_diff"
 NO_REPRO = "no_repro"
 LINT_FAIL = "lint_fail"
 TEST_FAIL = "test_fail"
+PUSH_CONFLICT = "push_conflict"
 REMOTE_CI_FAIL = "remote_ci_fail"
 REMOTE_CI_TIMEOUT = "remote_ci_timeout"
 MERGE_CONFLICT = "merge_conflict"
 BUDGET_HALT = "budget_halt"
+# The trace bus's documented default for a failure no rule maps: the harness
+# itself broke (a git/gh command, a filesystem error), not the work.
+INFRA_ERROR = "infra_error"
 UNKNOWN = "unknown"
 
 FAILURE_CLASSES = (
     AGENT_TIMEOUT, AGENT_ERROR, INCOMPLETE_DIFF, NO_REPRO, LINT_FAIL, TEST_FAIL,
-    REMOTE_CI_FAIL, REMOTE_CI_TIMEOUT, MERGE_CONFLICT, BUDGET_HALT, UNKNOWN,
+    PUSH_CONFLICT, REMOTE_CI_FAIL, REMOTE_CI_TIMEOUT, MERGE_CONFLICT, BUDGET_HALT,
+    INFRA_ERROR, UNKNOWN,
 )
 
 # `hsai.proc.run` stamps a timed-out subprocess's stderr with exactly this
@@ -145,10 +154,14 @@ def default_detail(failure_class: str, evidence: FailureEvidence) -> str:
         return f"remote CI concluded {evidence.remote_ci or 'FAILURE'}"
     if failure_class == REMOTE_CI_TIMEOUT:
         return "remote CI did not conclude before the poll timeout"
+    if failure_class == PUSH_CONFLICT:
+        return "branch could not be pushed (rejected by the remote)"
     if failure_class == MERGE_CONFLICT:
         return "branch could not be merged onto the default branch"
     if failure_class == BUDGET_HALT:
         return "block budget ceiling breached before this iteration started"
+    if failure_class == INFRA_ERROR:
+        return "the harness itself failed (git, gh, or the filesystem)"
     return "no classifier rule matched this iteration's evidence"
 
 
