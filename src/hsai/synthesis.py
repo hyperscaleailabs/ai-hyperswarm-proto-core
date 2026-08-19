@@ -533,7 +533,10 @@ def synthesize(
     if not ares.ok:
         return SynthesisResult(ok=False, studied=repos, filed=[], error=ares.error[:500])
 
-    specs = parse_ticket_specs(ares.output)
+    # `.text` unwraps the envelope; the raw `.output` under `--output-format
+    # stream-json` is a JSONL event log whose fenced ticket blocks are buried
+    # (and JSON-escaped) inside a `result` event, where the parser cannot see them.
+    specs = parse_ticket_specs(ares.text)
     threshold = float(cfg.synthesis.get("duplicate_threshold", DUPLICATE_JACCARD_THRESHOLD))
     survivors, rejected_titles = _filter_duplicates(specs, memory, threshold=threshold)
     grounded = ground_prior_art(survivors, index)

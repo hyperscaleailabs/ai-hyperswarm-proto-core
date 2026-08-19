@@ -363,3 +363,101 @@ def test_replay_unknown_id_exits_nonzero(tmp_path, monkeypatch, capsys):
     rc = main(["replay", "999", "--root", str(tmp_path)])
     assert rc == 1
     assert "no trajectory" in capsys.readouterr().err
+
+
+# --- replay <branch> (the raw stream-json event stream) ---------------------
+
+BRANCH = "hsai/iter-1787-4-abc123"
+
+STREAM = "\n".join([
+    json.dumps({"type": "system", "subtype": "init", "session_id": "s-77"}),
+    json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
+        {"type": "tool_use", "name": "Read", "input": {"file_path": "src/hsai/cli.py"}},
+    ]}}),
+    json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
+        {"type": "tool_use", "name": "Edit", "input": {"file_path": "src/hsai/cli.py"}},
+        {"type": "tool_use", "name": "Bash", "input": {"command": "pytest -q"}},
+    ]}}),
+    json.dumps({"type": "result", "subtype": "success", "num_turns": 3,
+                "session_id": "s-77", "result": "Added the replay command.",
+                "usage": {"input_tokens": 900, "output_tokens": 210}}),
+])
+
+
+def _seed_stream(root, branch: str = BRANCH, raw: str = STREAM):
+    path = trajectory.stream_path(root, branch)
+    return trajectory.write_stream(path, raw)
+
+
+def test_replay_by_branch_reproduces_the_tool_call_sequence(tmp_path, monkeypatch, capsys):
+    """`hsai replay <branch>` is the forensic entrance for a stored run."""
+    _seed_stream(tmp_path)
+    spy = _no_subprocess(monkeypatch)
+
+    rc = main(["replay", BRANCH, "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "Read: 1" in out and "Edit: 1" in out and "Bash: 1" in out
+    assert "src/hsai/cli.py" in out
+    assert "turns: 3" in out
+    assert "900 in / 210 out" in out
+    assert "Added the replay command." in out
+    assert spy.calls == []                  # reading disk spends no quota
+
+
+def test_replay_by_branch_json_flag_emits_the_summary(tmp_path, monkeypatch, capsys):
+    _seed_stream(tmp_path)
+    _no_subprocess(monkeypatch)
+
+    assert main(["replay", BRANCH, "--root", str(tmp_path), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["tool_calls"] == {"Read": 1, "Edit": 1, "Bash": 1}
+    assert payload["turns"] == 3
+    assert payload["usage"]["input_tokens"] == 900
+
+
+def test_replay_of_an_absent_branch_exits_nonzero_with_both_stores_named(
+    tmp_path, monkeypatch, capsys
+):
+    _no_subprocess(monkeypatch)
+    rc = main(["replay", "hsai/never-ran", "--root", str(tmp_path)])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "hsai/never-ran" in err
+    assert ".hsai/trajectories" in err       # says where it looked
+
+
+def test_replay_of_an_unparseable_branch_stream_still_exits_zero(
+    tmp_path, monkeypatch, capsys
+):
+    """A stored-but-garbage stream is a degraded report, not a crash."""
+    _seed_stream(tmp_path, raw="not json at all\n")
+    _no_subprocess(monkeypatch)
+
+    assert main(["replay", BRANCH, "--root", str(tmp_path)]) == 0
+    assert "no parseable events" in capsys.readouterr().out
+
+
+def test_replay_honors_a_custom_trajectories_dir(tmp_path, monkeypatch, capsys):
+    path = trajectory.stream_path(tmp_path, BRANCH, ".hsai/elsewhere")
+    trajectory.write_stream(path, STREAM)
+    _no_subprocess(monkeypatch)
+
+    rc = main([
+        "replay", BRANCH, "--root", str(tmp_path), "--trajectories-dir", ".hsai/elsewhere"
+    ])
+    assert rc == 0
+    assert "Read: 1" in capsys.readouterr().out
+
+
+def test_traj_by_iteration_still_reads_the_per_run_record(tmp_path, monkeypatch, capsys):
+    """Two stores, one entrance: a number still resolves to the parsed record."""
+    _seed_trajectory(tmp_path)
+    _seed_stream(tmp_path)
+    _no_subprocess(monkeypatch)
+
+    assert main(["traj", "12", "--root", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert "trajectory 12" in out and "Implement the widget END TO END." in out

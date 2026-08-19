@@ -245,6 +245,77 @@ def test_parse_tokens_accepts_an_already_parsed_payload():
     assert parse_tokens(None) is None
 
 
+# A realistic `claude -p --output-format stream-json --verbose` stdout: JSONL,
+# terminated by a `result` event carrying the run's cumulative usage. This is
+# the shape a real iteration produces once trajectories are enabled - and the
+# shape `parse_tokens` used to reject, which is why the ledger's token columns
+# were empty on every real run.
+REAL_CLAUDE_STREAM = "\n".join([
+    json.dumps({"type": "system", "subtype": "init", "session_id": "s-9"}),
+    json.dumps({"type": "assistant", "message": {
+        "role": "assistant",
+        "content": [{"type": "tool_use", "name": "Edit",
+                     "input": {"file_path": "src/hsai/ledger.py"}}],
+        "usage": {"input_tokens": 4, "output_tokens": 1},
+    }}),
+    json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                "num_turns": 6, "session_id": "s-9", "result": "Done.",
+                "usage": {"input_tokens": 1512, "cache_creation_input_tokens": 8241,
+                          "cache_read_input_tokens": 130422, "output_tokens": 3987}}),
+])
+
+
+def test_parse_tokens_reads_the_stream_json_shape():
+    """Acceptance criterion: the previously-dead stream-json path now fires."""
+    assert parse_tokens(REAL_CLAUDE_STREAM) == (1512, 3987)
+
+
+def test_parse_tokens_reads_both_cli_shapes_identically():
+    """Legacy single object and stream-json agree - one ledger, two shapes."""
+    assert parse_tokens(REAL_CLAUDE_STDOUT) == parse_tokens(REAL_CLAUDE_STREAM)
+
+
+def test_parse_tokens_prefers_the_result_events_cumulative_usage():
+    """A per-message usage must not shadow the run total."""
+    assert parse_tokens(REAL_CLAUDE_STREAM) != (4, 1)
+
+
+def test_parse_tokens_falls_back_to_a_truncated_streams_last_usage():
+    """A stream cut off before its `result` event still yields a cost signal."""
+    truncated = "\n".join(REAL_CLAUDE_STREAM.splitlines()[:-1])
+    assert parse_tokens(truncated) == (4, 1)
+
+
+def test_parse_tokens_none_for_a_stream_without_any_usage():
+    stream = "\n".join([
+        json.dumps({"type": "system", "session_id": "s-9"}),
+        json.dumps({"type": "result", "result": "Done."}),
+    ])
+    assert parse_tokens(stream) is None
+
+
+def test_ledger_record_carries_tool_calls_and_turns(tmp_path):
+    """Behaviour columns, not just cost - what a model-selection heuristic needs."""
+    path = tmp_path / "ledger.jsonl"
+    append_record(path, _rec(tool_calls=17, turns=6))
+    stored = read_records(path)[0]
+    assert stored.tool_calls == 17 and stored.turns == 6
+    # Absent on an older record: "not recorded", which is not the same fact as 0.
+    append_record(path, _rec())
+    assert read_records(path)[1].tool_calls is None
+
+
+def test_ledger_reads_records_written_before_the_trajectory_columns(tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    legacy = {
+        "iteration": 101, "block": 1, "ticket": 7, "kind": "implement",
+        "tier": "standard", "model": "sonnet", "wall_clock_seconds": 10.0,
+        "attempts": 1, "outcome": "merged", "created": "2026-01-01T00:00:00+00:00",
+    }
+    path.write_text(json.dumps(legacy) + "\n")
+    assert read_records(path)[0].tool_calls is None
+
+
 def test_run_agent_output_populates_the_ledger_record(tmp_path):
     """End to end: `claude -p` stdout -> run_agent -> parse_tokens -> ledger.
 

@@ -47,27 +47,53 @@ def _cfg(**overrides):
     return replace(cfg, **overrides)
 
 
-def test_build_command_requests_json_output():
+def _traj(**overrides):
+    """The real config with `execution.trajectories.*` overrides applied."""
+    cfg = load_config()
+    return replace(cfg, trajectories=replace(cfg.trajectories, **overrides))
+
+
+def test_build_command_requests_a_structured_envelope():
     cfg = load_config()
     cmd = ai.build_command("do the thing", CHOICE, cfg)
     # The structured envelope is what makes usage + trajectories possible.
     assert "--output-format" in cmd
-    assert cmd[cmd.index("--output-format") + 1] == "json"
     assert cmd[:3] == ["claude", "-p", "do the thing"]
     assert cmd[cmd.index("--model") + 1] == "sonnet"
 
 
-def test_output_format_flag_is_config_driven():
-    # The shipped config asks for json...
-    assert load_config().output_format == "json"
-
-    # ...and the flag follows the key rather than a hardcoded literal, so a
-    # `claude` CLI change is a YAML edit, not a code change.
-    cmd = ai.build_command("x", CHOICE, _cfg(output_format="stream-json"))
+def test_build_command_streams_json_when_trajectories_are_enabled():
+    """Acceptance criterion: the enabled branch asks for the event stream."""
+    cmd = ai.build_command("x", CHOICE, _traj(enabled=True))
     assert cmd[cmd.index("--output-format") + 1] == "stream-json"
     # `-p` + stream-json is rejected by the CLI unless --verbose is passed.
     assert "--verbose" in cmd
-    assert "--verbose" not in ai.build_command("x", CHOICE, _cfg(output_format="json"))
+
+
+def test_build_command_omits_stream_flags_when_trajectories_are_disabled():
+    """...and the disabled branch falls back to the single-object envelope."""
+    cmd = ai.build_command("x", CHOICE, _traj(enabled=False))
+    assert cmd[cmd.index("--output-format") + 1] == "json"
+    assert "stream-json" not in cmd
+    assert "--verbose" not in cmd
+
+
+def test_output_format_flag_is_config_driven():
+    # The shipped config asks for json, upgraded to stream-json by the
+    # trajectory recorder...
+    cfg = load_config()
+    assert cfg.output_format == "json"
+    assert cfg.trajectories.enabled is True
+    assert ai.resolve_output_format(cfg) == "stream-json"
+
+    # ...and with trajectories off the flag follows the key rather than a
+    # hardcoded literal, so a `claude` CLI change is a YAML edit, not a code
+    # change.
+    off = replace(cfg, trajectories=replace(cfg.trajectories, enabled=False))
+    cmd = ai.build_command("x", CHOICE, replace(off, output_format="stream-json"))
+    assert cmd[cmd.index("--output-format") + 1] == "stream-json"
+    assert "--verbose" in cmd
+    assert "--verbose" not in ai.build_command("x", CHOICE, off)
 
 
 def test_build_command_drops_the_flag_for_plain_text():
@@ -117,6 +143,95 @@ def test_run_agent_plain_text_fallback():
     assert result.payload is None and result.usage is None
     assert result.session_id == ""
     assert result.text == "plain output\n"  # falls back to the raw stdout
+
+
+# --- stream-json: the shape a real (trajectory-enabled) iteration prints ----
+
+CLAUDE_STREAM_PAYLOAD = "\n".join([
+    json.dumps({"type": "system", "subtype": "init", "session_id": "b2f0e1d4"}),
+    json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
+        {"type": "tool_use", "name": "Edit", "input": {"file_path": "src/hsai/widget.py"}},
+    ]}}),
+    json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                "num_turns": 3, "session_id": "b2f0e1d4",
+                "result": "Added the widget and a test for it.",
+                "usage": {"input_tokens": 1200, "output_tokens": 345}}),
+])
+
+
+def test_parse_output_lifts_the_result_event_out_of_a_stream():
+    """stream-json is JSONL, so the whole-text parse fails - lift `result` out."""
+    raw, usage = ai.parse_output(CLAUDE_STREAM_PAYLOAD)
+    assert raw is not None and raw["result"].startswith("Added the widget")
+    assert raw["session_id"] == "b2f0e1d4"
+    assert usage == {"input_tokens": 1200, "output_tokens": 345}
+
+
+def test_parse_output_degrades_on_a_stream_without_a_result_event():
+    partial = "\n".join(CLAUDE_STREAM_PAYLOAD.splitlines()[:-1])
+    assert ai.parse_output(partial) == (None, None)
+
+
+def test_run_agent_summarizes_the_stream():
+    result = ai.run_agent("prompt", CHOICE, load_config(),
+                          runner=_runner(CLAUDE_STREAM_PAYLOAD))
+    assert result.summary is not None
+    assert result.summary.tool_calls == {"Edit": 1}
+    assert result.summary.files == ["src/hsai/widget.py"]
+    assert result.summary.turns == 3
+    # Every downstream consumer keeps working on the stream shape.
+    assert result.text == "Added the widget and a test for it."
+    assert result.session_id == "b2f0e1d4"
+    assert result.usage == {"input_tokens": 1200, "output_tokens": 345}
+
+
+def test_run_agent_stores_the_raw_stream_for_a_branch(tmp_path):
+    result = ai.run_agent(
+        "prompt", CHOICE, load_config(), runner=_runner(CLAUDE_STREAM_PAYLOAD),
+        branch="hsai/iter-1-2-abc", repo_root=str(tmp_path),
+    )
+    path = tmp_path / ".hsai/trajectories/hsai/iter-1-2-abc.jsonl"
+    assert path.is_file()
+    assert result.trajectory_path == str(path)
+    assert path.read_text() == CLAUDE_STREAM_PAYLOAD   # verbatim, nothing to redact
+
+
+def test_run_agent_stores_nothing_without_a_branch(tmp_path):
+    result = ai.run_agent(
+        "prompt", CHOICE, load_config(), runner=_runner(CLAUDE_STREAM_PAYLOAD),
+        repo_root=str(tmp_path),
+    )
+    assert result.trajectory_path == ""
+    assert not (tmp_path / ".hsai").exists()
+
+
+def test_run_agent_skips_the_stream_when_trajectories_are_disabled(tmp_path):
+    result = ai.run_agent(
+        "prompt", CHOICE, _traj(enabled=False), runner=_runner(CLAUDE_STREAM_PAYLOAD),
+        branch="hsai/iter-1-2-abc", repo_root=str(tmp_path),
+    )
+    assert result.summary is None and result.trajectory_path == ""
+    assert not (tmp_path / ".hsai").exists()
+
+
+def test_run_agent_survives_an_unwritable_trajectory_store(tmp_path, monkeypatch):
+    """Observability is additive: a full disk costs a trajectory, not a run."""
+    def boom(*a, **kw):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr("hsai.trajectory.write_stream", boom)
+    result = ai.run_agent(
+        "prompt", CHOICE, load_config(), runner=_runner(CLAUDE_STREAM_PAYLOAD),
+        branch="hsai/iter-1-2-abc", repo_root=str(tmp_path),
+    )
+    assert result.ok is True and result.trajectory_path == ""
+    assert result.summary is not None and result.summary.turns == 3
+
+
+def test_run_agent_summary_is_empty_not_none_on_garbage(tmp_path):
+    """Callers branch on `.empty`, so a broken CLI must not hand them None."""
+    result = ai.run_agent("prompt", CHOICE, load_config(), runner=_runner("<<< junk"))
+    assert result.summary is not None and result.summary.empty is True
 
 
 def test_run_agent_strips_billing_env(monkeypatch):

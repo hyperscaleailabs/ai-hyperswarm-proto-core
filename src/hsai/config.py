@@ -18,6 +18,22 @@ class ModelTier:
 
 
 @dataclass(frozen=True)
+class TrajectoriesConfig:
+    """``execution.trajectories``: raw agent-stream capture.
+
+    Keeping this config-driven rather than hardcoded is the same escape hatch
+    ``execution.output_format`` provides: if a ``claude`` CLI change ever breaks
+    the stream-json contract, ``enabled: false`` restores the single-object
+    envelope without a code change.
+    """
+
+    enabled: bool = True
+    dir: str = ".hsai/trajectories"
+    max_bytes: int = 2_000_000
+    redact_prompt: bool = True
+
+
+@dataclass(frozen=True)
 class ReferenceRepo:
     rank: int
     repo: str
@@ -43,6 +59,7 @@ class CoreConfig:
     permission_mode: str
     output_format: str
     trajectory_retention_blocks: int
+    trajectories: TrajectoriesConfig
     agent_timeout: float | None
     ci_remote_timeout: float
     ci_poll_interval: float
@@ -85,6 +102,18 @@ def _find_core(start: str | Path | None = None) -> Path:
         if candidate.is_file():
             return candidate
     raise FileNotFoundError(f"Could not locate {CORE_PATH} from {here}")
+
+
+def _trajectories(raw: Any) -> TrajectoriesConfig:
+    """Parse ``execution.trajectories``; an absent block keeps the defaults."""
+    data = raw if isinstance(raw, dict) else {}
+    defaults = TrajectoriesConfig()
+    return TrajectoriesConfig(
+        enabled=bool(data.get("enabled", defaults.enabled)),
+        dir=str(data.get("dir") or defaults.dir),
+        max_bytes=int(data.get("max_bytes", defaults.max_bytes)),
+        redact_prompt=bool(data.get("redact_prompt", defaults.redact_prompt)),
+    )
 
 
 def load_config(path: str | Path | None = None) -> CoreConfig:
@@ -136,6 +165,7 @@ def load_config(path: str | Path | None = None) -> CoreConfig:
         # YAML instead of shipping code: "text" (or empty) drops the flag entirely.
         output_format=str(execution.get("output_format", "json") or ""),
         trajectory_retention_blocks=int(execution.get("trajectory_retention_blocks", 8)),
+        trajectories=_trajectories(execution.get("trajectories")),
         agent_timeout=execution.get("agent_timeout_seconds"),
         ci_remote_timeout=float(execution.get("ci_remote_timeout_seconds", 300)),
         ci_poll_interval=float(execution.get("ci_poll_interval_seconds", 10)),
