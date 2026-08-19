@@ -86,6 +86,9 @@ class LessonRecord:
     body: str = ""  # everything after the frontmatter; what the recall index reads
     failure_class: str = ""  # "" when absent (pass, or a note predating this field)
     created: str = ""  # frontmatter `created:`, "" for notes that carry no date
+    # Note names this iteration was shown before it started (frontmatter
+    # `recalled:`); the read side of the backlinks `hsai.recall` writes.
+    recalled: tuple[str, ...] = ()
 
 
 def split_sections(text: str) -> dict[str, str]:
@@ -100,22 +103,24 @@ def split_sections(text: str) -> dict[str, str]:
     return sections
 
 
-def _frontmatter_tags(fm: str) -> tuple[str, ...]:
-    """List items under the ``tags:`` key only.
+def _frontmatter_list(fm: str, key: str) -> tuple[str, ...]:
+    """List items nested under one top-level frontmatter key.
 
-    Frontmatter now holds a second list (``recalled:``), so a blanket "every
-    ``- item`` line is a tag" scan would file recalled note names as tags.
+    Frontmatter holds more than one list (``tags:`` and ``recalled:``), so a
+    blanket "every ``- item`` line is mine" scan would file recalled note names
+    as tags and vice versa. Membership is decided by the last top-level key
+    seen, which is exactly how :meth:`KnowledgeBase._frontmatter` writes them.
     """
-    tags: list[str] = []
-    in_tags = False
+    items: list[str] = []
+    inside = False
     for line in fm.splitlines():
         if line.strip() and not line.startswith((" ", "\t", "-")):
-            in_tags = line.strip() == "tags:"
+            inside = line.strip() == f"{key}:"
             continue
         match = _TAG_RE.match(line)
-        if in_tags and match:
-            tags.append(match.group(1).strip())
-    return tuple(tags)
+        if inside and match:
+            items.append(match.group(1).strip())
+    return tuple(items)
 
 
 def _frontmatter_scalar(fm: str, key: str) -> str:
@@ -145,7 +150,7 @@ def parse_note(path: str | Path) -> LessonRecord:
     fm_match = _FRONTMATTER_RE.match(text)
     fm = fm_match.group(1) if fm_match else ""
     body = text[fm_match.end():] if fm_match else text
-    tags = _frontmatter_tags(fm)
+    tags = _frontmatter_list(fm, "tags")
     outcome = next((t.split("/", 1)[1] for t in tags if t.startswith("outcome/")), "unknown")
     kind = next((t.split("/", 1)[1] for t in tags if t.startswith("kind/")), "unknown")
     failure_class = next((t.split("/", 1)[1] for t in tags if t.startswith("failure/")), "")
@@ -163,7 +168,14 @@ def parse_note(path: str | Path) -> LessonRecord:
         body=body.strip(),
         failure_class=failure_class,
         created=_frontmatter_scalar(fm, "created"),
+        recalled=_frontmatter_list(fm, "recalled"),
     )
+
+
+def _pass_rate(records: list[LessonRecord]) -> str:
+    """``n/total passed (pct)`` for a non-empty group of lessons."""
+    passed = sum(1 for r in records if r.outcome == "pass")
+    return f"{passed}/{len(records)} passed ({100.0 * passed / len(records):.0f}%)"
 
 
 @dataclass
@@ -253,6 +265,31 @@ class KnowledgeBase:
     def _parse_lesson(self, note_name: str) -> LessonRecord:
         return parse_note(self.lessons_dir / f"{note_name}.md")
 
+    def most_recalled(self, limit: int = 5) -> list[tuple[str, int]]:
+        """Lessons most often retrieved into a later iteration's prompt, best first.
+
+        Counted from the ``recalled:`` frontmatter each iteration writes, so the
+        tally is derived from the notes themselves and cannot drift from them
+        the way a side-car counter would.
+
+        Two deliberate restrictions:
+
+        * only names that still resolve to a lesson on disk are counted - this
+          feeds a MOC, and a MOC must never emit an unresolved ``[[wikilink]]``;
+        * only lessons - recall also indexes whitepapers and ADRs, but this is
+          the *Lessons* MOC and says so.
+
+        Ties break on note name, so `hsai reindex` is byte-stable across runs.
+        """
+        existing = set(self.lesson_notes())
+        counts = Counter(
+            name
+            for record in self.read_lessons()
+            for name in record.recalled
+            if name in existing
+        )
+        return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
+
     def synthesize_whitepaper(self, n: int | None = None) -> Whitepaper:
         """Synthesize a whitepaper by grouping the last `n` lessons by outcome/kind
         and surfacing themes that recur across more than one of them.
@@ -294,6 +331,21 @@ class KnowledgeBase:
         else:
             theme_lines = "_Not enough repeated vocabulary yet to call out a theme._"
 
+        # Did retrieval pay for its prompt budget? Read straight off the
+        # `recalled:` frontmatter, so the whitepaper states the comparison from
+        # the same notes it summarizes rather than trusting a separate ledger.
+        packed = [r for r in covered if r.recalled]
+        cold = [r for r in covered if not r.recalled]
+        recall_lines = "\n".join(
+            f"- {label}: {_pass_rate(group) if group else '_none in this window_'}"
+            for label, group in (
+                ("with prior lessons recalled into the prompt", packed),
+                ("without (cold start)", cold),
+            )
+        )
+        if not (packed and cold):
+            recall_lines += "\n\n_One arm is empty, so this is not yet a comparison._"
+
         body = f"""## Outcomes in this window
 | outcome | count |
 | --- | --- |
@@ -308,7 +360,13 @@ class KnowledgeBase:
 {failure_lines}
 
 ## Recurring themes
-{theme_lines}"""
+{theme_lines}
+
+## Effect of lesson recall
+Pass rate of the lessons in this window, split by whether retrieval put prior
+notes in the worker's prompt (see `src/hsai/recall.py`).
+
+{recall_lines}"""
 
         summary = (
             f"Synthesis of the last {len(covered)} lesson(s): "
@@ -439,6 +497,11 @@ class KnowledgeBase:
         notes = self.lesson_notes()
         fm = self._frontmatter(("moc", "lessons"), {"updated": _today()})
         links = "\n".join(f"- [[{n}]]" for n in notes) or "- _No lessons recorded yet._"
+        top = self.most_recalled()
+        recalled_lines = "\n".join(
+            f"- [[{name}]] - retrieved into **{count}** later prompt(s)"
+            for name, count in top
+        ) or "_Nothing retrieved yet - the corpus is younger than lesson recall._"
         content = f"""{fm}
 
 # Lessons MOC
@@ -446,6 +509,16 @@ class KnowledgeBase:
 Up: [[Knowledge Base MOC]]
 
 Every hsai iteration leaves a lesson here - pass or fail. Total: **{len(notes)}**.
+
+## Most-recalled lessons
+
+Which notes retrieval actually put in front of a worker (see
+`src/hsai/recall.py`), counted from each lesson's `recalled:` frontmatter. This
+is the knowledge earning its keep - the rest of the vault is still an archive.
+
+{recalled_lines}
+
+## All lessons
 
 {links}
 """

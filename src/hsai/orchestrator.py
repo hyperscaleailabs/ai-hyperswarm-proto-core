@@ -425,6 +425,7 @@ def run_once(
                 output_tokens=tokens[1] if tokens else None,
                 failure_class=failure_class,
                 failure_detail=failure_detail[:200],
+                recalled_count=len(recalled.notes),
             ),
         )
 

@@ -1358,3 +1358,29 @@ def test_dry_run_still_records_what_it_recalled(tmp_path):
     assert result.kind == IMPROVE
     assert result.recalled                       # retrieval runs without an agent
     assert "recalled:" in Path(result.lesson_path).read_text().split("---\n")[1]
+
+
+def test_the_ledger_measures_how_many_notes_the_iteration_was_given(
+    tmp_path, monkeypatch
+):
+    """Recall costs prompt budget every run, so the ledger has to be able to
+    show whether it bought anything - see BlockAggregate.recall_effect."""
+    cfg = load_config()
+    _, _, result = _implement_run(cfg, tmp_path, monkeypatch, 1)
+
+    record = ledger.read_records(ledger.ledger_path(cfg, tmp_path))[-1]
+    assert record.recalled_count == len(result.recalled) > 0
+    # ...and that iteration lands in the "with a pack" arm of the A/B.
+    agg = ledger.aggregate_block([record], block=record.block)
+    assert (agg.recalled_iterations, agg.cold_iterations) == (1, 0)
+
+
+def test_an_iteration_with_recall_off_is_recorded_as_a_cold_run(tmp_path, monkeypatch):
+    """The control group: 0 recalled notes is the signal, not missing data."""
+    off = _with_recall(enabled=False)
+    _implement_run(off, tmp_path, monkeypatch, 2)
+
+    record = ledger.read_records(ledger.ledger_path(off, tmp_path))[-1]
+    assert record.recalled_count == 0
+    agg = ledger.aggregate_block([record], block=record.block)
+    assert (agg.recalled_iterations, agg.cold_iterations) == (0, 1)
