@@ -101,6 +101,19 @@ def test_brief_says_when_tokens_per_merged_pr_is_unavailable():
     assert "tokens per merged PR: _not available_" in body
 
 
+def test_brief_states_the_lesson_recall_comparison_explicitly():
+    """Retrieval must justify its prompt budget in the block's own numbers."""
+    cfg = load_config()
+    cost = BlockAggregate(
+        block=7, iterations=4, merged_iterations=3, total_seconds=180.0,
+        recalled_iterations=2, recalled_merged=2, cold_iterations=2, cold_merged=1,
+    )
+    body = render_brief(cfg, BlockReport(cycle_index=7, cost=cost))
+    assert "**Recall:**" in body
+    assert "with a pack: 2/2 merged (100%)" in body
+    assert "without: 1/2 merged (50%)" in body
+
+
 # --- practices adopted this block --------------------------------------------
 
 def test_brief_reports_practices_adopted_this_block():

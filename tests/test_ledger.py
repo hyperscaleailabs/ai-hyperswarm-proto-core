@@ -85,6 +85,69 @@ def test_read_records_parses_pre_existing_records_lacking_failure_fields(tmp_pat
     assert records[0].outcome == "merged"
 
 
+# --- lesson-recall measurement (see hsai.recall) -----------------------------
+
+def test_ledger_record_carries_how_many_notes_were_recalled(tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    append_record(path, _rec(recalled_count=3))
+    assert read_records(path)[0].recalled_count == 3
+
+
+def test_read_records_parses_records_written_before_recall_existed(tmp_path):
+    """Backward compatibility: `recalled_count` defaults to 0, i.e. "cold"."""
+    path = tmp_path / "ledger.jsonl"
+    legacy = {
+        "iteration": 101, "block": 1, "ticket": 7, "kind": "implement",
+        "tier": "standard", "model": "sonnet", "wall_clock_seconds": 12.0,
+        "attempts": 1, "outcome": "merged", "created": "2026-01-01T00:00:00+00:00",
+    }
+    path.write_text(json.dumps(legacy) + "\n")
+    assert read_records(path)[0].recalled_count == 0
+
+
+def test_recall_effect_splits_merge_rate_by_whether_a_pack_was_injected():
+    # 2 of 3 packed iterations merged; 1 of 3 cold ones did.
+    records = [
+        _rec(outcome="merged", recalled_count=3),
+        _rec(outcome="merged", recalled_count=2),
+        _rec(outcome="recovered", recalled_count=3),
+        _rec(outcome="merged", recalled_count=0),
+        _rec(outcome="recovered", recalled_count=0),
+        _rec(outcome="recovered", recalled_count=0),
+    ]
+    agg = aggregate_block(records, block=1)
+    assert (agg.recalled_iterations, agg.recalled_merged) == (3, 2)
+    assert (agg.cold_iterations, agg.cold_merged) == (3, 1)
+    effect = agg.recall_effect()
+    assert "with a pack: 2/3 merged (67%)" in effect
+    assert "without: 1/3 merged (33%)" in effect
+    # Both sides are populated, so this IS a comparison and must not disclaim.
+    assert "not yet a comparison" not in effect
+
+
+def test_review_iterations_are_excluded_from_the_recall_ab():
+    """Reviews never receive a pack; counting them would stuff the control group."""
+    review = LedgerRecord(
+        iteration=101, block=1, ticket=7, kind="review", tier="light", model="haiku",
+        wall_clock_seconds=8.0, attempts=1, outcome="approve",
+    )
+    agg = aggregate_block(
+        [_rec(outcome="merged", recalled_count=2), review, review], block=1
+    )
+    assert agg.review_iterations == 2
+    # One authored iteration, and it had a pack - the cold bucket stays empty
+    # instead of being filled with two reviews that could never have had one.
+    assert (agg.recalled_iterations, agg.cold_iterations) == (1, 0)
+
+
+def test_recall_effect_declines_to_compare_without_a_control_group():
+    one_sided = aggregate_block([_rec(outcome="merged", recalled_count=2)], block=1)
+    assert "not yet a comparison" in one_sided.recall_effect()
+
+    empty = aggregate_block([], block=1)
+    assert empty.recall_effect() == "_no authored iterations in this block_"
+
+
 def test_ledger_path_from_config(tmp_path):
     cfg = load_config()
     path = ledger_path(cfg, tmp_path)

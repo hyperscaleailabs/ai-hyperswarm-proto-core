@@ -1,3 +1,5 @@
+import re
+
 from hsai import practices as practices_mod
 from hsai.knowledge import (
     KnowledgeBase,
@@ -362,3 +364,141 @@ def test_practices_moc_placeholder_when_empty(tmp_path):
     text = (kb.mocs_dir / "Practices MOC.md").read_text()
     assert "No practices recorded yet" in text
     assert "Total: **0**" in text
+
+
+# --- most-recalled lessons: which knowledge is earning its keep --------------
+
+
+def _recalling_lesson(kb: KnowledgeBase, title: str, recalled: tuple[str, ...]) -> str:
+    """Write a lesson that records `recalled` as the notes it was shown."""
+    lesson = Lesson(
+        title=title, outcome="pass", kind="implement", context="ctx",
+        what_happened="did the thing", lesson="a lesson", recalled=recalled,
+    )
+    kb.write_lesson(lesson)
+    return lesson.note_name()
+
+
+def test_recalled_frontmatter_round_trips_without_polluting_tags(tmp_path):
+    """`recalled:` and `tags:` are both YAML lists; neither may absorb the other."""
+    kb = KnowledgeBase(tmp_path)
+    lesson = Lesson(
+        title="implement: retrieval", outcome="fail", kind="implement", context="c",
+        what_happened="w", lesson="l", tags=("area/recall",),
+        recalled=("2026-01-01-a", "2026-01-02-b"), failure_class="remote_ci_fail",
+    )
+    record = parse_note(kb.write_lesson(lesson))
+
+    assert record.recalled == ("2026-01-01-a", "2026-01-02-b")
+    # the recalled note names must NOT have been filed as tags...
+    assert "2026-01-01-a" not in record.tags
+    # ...and the real tags are all still there
+    assert "area/recall" in record.tags
+    assert record.outcome == "fail" and record.failure_class == "remote_ci_fail"
+
+
+def test_a_lesson_with_no_recall_records_no_backlinks(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    record = parse_note(kb.write_lesson(Lesson(
+        title="implement: cold start", outcome="pass", kind="implement",
+        context="c", what_happened="w", lesson="l",
+    )))
+    assert record.recalled == ()
+    assert kb.most_recalled() == []
+
+
+def test_most_recalled_ranks_by_how_often_a_lesson_was_retrieved(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    popular = _recalling_lesson(kb, "implement: popular", ())
+    niche = _recalling_lesson(kb, "implement: niche", ())
+    # three later iterations cite `popular`, one cites `niche`
+    _recalling_lesson(kb, "implement: one", (popular,))
+    _recalling_lesson(kb, "implement: two", (popular, niche))
+    _recalling_lesson(kb, "implement: three", (popular,))
+
+    assert kb.most_recalled() == [(popular, 3), (niche, 1)]
+    assert kb.most_recalled(limit=1) == [(popular, 3)]
+
+
+def test_most_recalled_drops_names_that_no_longer_resolve(tmp_path):
+    """A MOC must never emit an unresolved [[wikilink]] (acceptance criterion)."""
+    kb = KnowledgeBase(tmp_path)
+    real = _recalling_lesson(kb, "implement: real", ())
+    _recalling_lesson(kb, "implement: citing", (real, "2020-01-01-deleted-note"))
+
+    assert kb.most_recalled() == [(real, 1)]
+
+
+def test_lessons_moc_surfaces_the_most_recalled_and_every_link_resolves(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    popular = _recalling_lesson(kb, "implement: popular", ())
+    citing = _recalling_lesson(kb, "implement: citing", (popular,))
+    kb.reindex_mocs()
+
+    text = (kb.mocs_dir / "Lessons MOC.md").read_text()
+    assert "## Most-recalled lessons" in text
+    assert f"- [[{popular}]] - retrieved into **1** later prompt(s)" in text
+    # the full listing survives alongside the new section
+    assert "## All lessons" in text
+    assert f"[[{citing}]]" in text
+
+    # Every wikilink in the MOC resolves to a note that exists in the vault.
+    on_disk = set(kb.lesson_notes()) | {"Knowledge Base MOC"}
+    assert set(re.findall(r"\[\[([^\]]+)\]\]", text)) <= on_disk
+
+
+def test_lessons_moc_says_so_when_nothing_has_been_recalled_yet(tmp_path):
+    """A fresh clone: the section exists but claims nothing."""
+    kb = KnowledgeBase(tmp_path)
+    kb.reindex_mocs()
+    text = (kb.mocs_dir / "Lessons MOC.md").read_text()
+    assert "## Most-recalled lessons" in text
+    assert "Nothing retrieved yet" in text
+    assert "No lessons recorded yet" in text
+
+
+def test_whitepaper_states_the_recall_comparison_explicitly(tmp_path):
+    """The block whitepaper must say whether recall changed the pass rate."""
+    kb = KnowledgeBase(tmp_path)
+    prior = _recalling_lesson(kb, "implement: prior", ())
+    # two iterations ran with a pack (one passed), one ran cold (and passed)
+    kb.write_lesson(Lesson(
+        title="implement: packed pass", outcome="pass", kind="implement",
+        context="c", what_happened="w", lesson="l", recalled=(prior,),
+    ))
+    kb.write_lesson(Lesson(
+        title="implement: packed fail", outcome="fail", kind="implement",
+        context="c", what_happened="w", lesson="l", recalled=(prior,),
+    ))
+
+    body = kb.synthesize_whitepaper().body
+    assert "## Effect of lesson recall" in body
+    assert "with prior lessons recalled into the prompt: 1/2 passed (50%)" in body
+    # `prior` itself recalled nothing, so it is the cold arm
+    assert "without (cold start): 1/1 passed (100%)" in body
+    assert "not yet a comparison" not in body
+
+
+def test_whitepaper_declines_to_compare_recall_with_only_one_arm(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    _recalling_lesson(kb, "implement: cold", ())
+
+    body = kb.synthesize_whitepaper().body
+    assert "with prior lessons recalled into the prompt: _none in this window_" in body
+    assert "without (cold start): 1/1 passed (100%)" in body
+    assert "not yet a comparison" in body
+
+
+def test_lessons_moc_reindex_is_deterministic(tmp_path):
+    """Ties break on note name, so `hsai reindex` twice must not diff."""
+    kb = KnowledgeBase(tmp_path)
+    a = _recalling_lesson(kb, "implement: a", ())
+    b = _recalling_lesson(kb, "implement: b", ())
+    # a and b are recalled equally often - only the tie-break orders them
+    _recalling_lesson(kb, "implement: citing", (a, b))
+
+    kb.reindex_mocs()
+    first = (kb.mocs_dir / "Lessons MOC.md").read_text()
+    kb.reindex_mocs()
+    assert (kb.mocs_dir / "Lessons MOC.md").read_text() == first
+    assert kb.most_recalled() == [(a, 1), (b, 1)]

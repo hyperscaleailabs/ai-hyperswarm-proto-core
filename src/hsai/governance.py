@@ -154,7 +154,13 @@ def _cost_summary(cost: BlockAggregate | None) -> str:
         else "tokens per merged PR: _not available_ "
         "(nothing merged, or the CLI reported no token counts)"
     )
-    return f"{cost.summary()}\n\n**Efficiency:** {efficiency}"
+    # Whether the prompt budget spent on lesson recall bought anything - stated
+    # every block, so the architect reads the A/B instead of taking on trust
+    # that retrieval helps.
+    recall_line = cost.recall_effect()
+    return (
+        f"{cost.summary()}\n\n**Efficiency:** {efficiency}\n\n**Recall:** {recall_line}"
+    )
 
 
 def render_brief(cfg: CoreConfig, report: BlockReport) -> str:

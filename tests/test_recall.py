@@ -14,6 +14,7 @@ from hsai.recall import (
     RecallConfig,
     for_task,
     render,
+    strip_boilerplate,
     tokenize,
 )
 
@@ -169,6 +170,79 @@ def test_matching_kind_is_up_weighted(tmp_path):
     assert [h.note_name for h in corpus.search("widget", 2, kind="heal")] == [
         "b-fail-heal", "a-pass-improve",
     ]
+
+
+# --- template boilerplate must not score -------------------------------------
+
+
+def test_strip_boilerplate_keeps_prose_and_drops_scaffolding():
+    note = (
+        "# Remote CI rollup is the only merge gate\n"
+        "\n"
+        "> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n"
+        "\n"
+        "| field | value |\n"
+        "| --- | --- |\n"
+        "| remote CI | SUCCESS |\n"
+        "\n"
+        "## Lesson learned\n"
+        "Local green is not remote green.\n"
+        "\n"
+        "## Reproduction evidence\n"
+        "_(not applicable: not a heal/bugfix ticket)_\n"
+        "\n"
+        "## References (reference-set evidence)\n"
+        "- _(none cited)_\n"
+    )
+    assert strip_boilerplate(note) == "Local green is not remote green."
+
+
+def test_strip_boilerplate_keeps_real_bulleted_content():
+    """Only placeholder bullets go; a cited reference is evidence, not scaffolding."""
+    assert strip_boilerplate(
+        "## References (reference-set evidence)\n- `openai/swarm`\n- _(none cited)_\n"
+    ) == "- `openai/swarm`"
+
+
+def test_shared_template_scaffolding_contributes_no_score(tmp_path):
+    """Two real-shaped lessons differing ONLY in their `Lesson learned` section.
+
+    Everything else - the breadcrumb, the metadata table, every heading - is
+    byte-identical, exactly as `_render_lesson` emits it. If that scaffolding
+    scored, the two notes would tie and the ranking would fall back to the
+    alphabetical tie-break, putting the IRRELEVANT note first.
+    """
+    def _templated(name: str, conclusion: str) -> None:
+        (tmp_path / "knowledge" / "lessons").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "knowledge" / "lessons" / f"{name}.md").write_text(
+            "---\ntags:\n  - lesson\n  - outcome/pass\n  - kind/implement\n"
+            "created: 2026-01-01\n---\n\n"
+            "# Iteration note\n\n"
+            "> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n"
+            "| field | value |\n| --- | --- |\n"
+            "| outcome | **pass** |\n| kind | implement |\n"
+            "| remote CI | SUCCESS |\n\n"
+            "## Context\nAn hsai iteration.\n\n"
+            "## What happened\nThe worker ran.\n\n"
+            f"## Lesson learned\n{conclusion}\n\n"
+            "## Reproduction evidence\n_(not applicable: not a heal/bugfix ticket)_\n\n"
+            "## References (reference-set evidence)\n- _(none cited)_\n"
+        )
+
+    # `a-` sorts first, so it wins any tie - it must NOT win on merit.
+    _templated("a-irrelevant", "Wikilinks up to a MOC make the graph view useful.")
+    _templated("b-relevant", "Poll the rollup; a stranded worktree blocks it.")
+    corpus = Corpus.load(tmp_path, _cfg())
+
+    # The shared Context/What-happened prose keeps BOTH notes in the results,
+    # so this is a genuine ranking comparison rather than one note surviving.
+    hits = corpus.search("the worker iteration hit a stranded worktree and the rollup", 2)
+    assert [h.note_name for h in hits] == ["b-relevant", "a-irrelevant"]
+    assert hits[0].score > hits[1].score
+
+    # ...and a query made only of scaffolding words scores nothing at all:
+    # `field` and `value` appear solely in the template's table header.
+    assert corpus.search("field value", 2) == []
 
 
 # --- what gets indexed -------------------------------------------------------
