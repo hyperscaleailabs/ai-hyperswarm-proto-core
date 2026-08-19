@@ -107,6 +107,7 @@ def build_pr_body(
     kind: str = "",
     references: tuple[str, ...] = (),
     trajectory_digest: str = "",
+    trajectory_summary: trajectory.TrajectorySummary | None = None,
     recalled: tuple[str, ...] = (),
     review_verdict: str = "",
 ) -> str:
@@ -125,11 +126,19 @@ def build_pr_body(
     recalled_section = (
         f"\n## Prior lessons consulted\n{recalled_links}\n" if recalled else ""
     )
-    # What the run cost and how it ended, visible on the PR itself - the full
-    # record stays in the local (gitignored) trajectory store.
-    traj_section = (
-        f"\n## Trajectory\n{trajectory_digest}\n" if trajectory_digest else ""
-    )
+    # What the run cost, what it did, and how it ended - visible on the PR
+    # itself, so a failure is diagnosable from the PR alone. The full event
+    # stream stays in the local (gitignored) trajectory store; only these
+    # counters are committed. Collapsed so the behavioural detail never buries
+    # the traceability invariants above it.
+    traj_parts = [trajectory_digest] if trajectory_digest else []
+    if trajectory_summary is not None:
+        traj_parts.append(
+            "<details>\n<summary>tool calls, files touched, turns, token usage"
+            f"</summary>\n\n{trajectory.digest(trajectory_summary)}\n\n</details>"
+        )
+    traj_body = "\n".join(traj_parts)
+    traj_section = f"\n## Trajectory\n{traj_body}\n" if traj_body else ""
     # Who checked the work, not just who wrote it: always rendered, so a PR that
     # skipped the gate says so out loud instead of staying silent about it.
     verdict = review_verdict or "_(no independent review recorded)_"
@@ -402,6 +411,7 @@ def run_once(
     block = iteration // 100 if block is None else block
     tokens: tuple[int, int] | None = None
     traj: trajectory.Trajectory | None = None
+    traj_summary: trajectory.TrajectorySummary | None = None
 
     def _record_cost(outcome: str, *, failure_class: str = "", failure_detail: str = "") -> None:
         # Every terminal path passes through here, so it is also where the
@@ -423,6 +433,10 @@ def run_once(
                 outcome=outcome,
                 input_tokens=tokens[0] if tokens else None,
                 output_tokens=tokens[1] if tokens else None,
+                # Behaviour, not just cost: what ticket #42's model-selection
+                # heuristic needs to calibrate against.
+                tool_calls=traj_summary.total_tool_calls if traj_summary else None,
+                turns=traj_summary.turns if traj_summary else None,
                 failure_class=failure_class,
                 failure_detail=failure_detail[:200],
             ),
@@ -437,8 +451,18 @@ def run_once(
         prompt = _task_prompt(kind, cfg, ticket_title, ticket_body, recalled.section)
         agent_started = time.time()
         ares = ai.run_agent(
-            prompt, choice, cfg, cwd=wt, runner=ai_runner, timeout=cfg.agent_timeout
+            prompt, choice, cfg, cwd=wt, runner=ai_runner, timeout=cfg.agent_timeout,
+            # The raw event stream is keyed by branch and stored in the repo
+            # root, not the ephemeral worktree, so it survives the worktree's
+            # removal and `hsai replay <branch>` can still read it.
+            branch=branch, repo_root=repo_dir,
         )
+        traj_summary = ares.summary
+        if ares.trajectory_path:
+            # The branch, not the absolute path: it is what `hsai replay` takes,
+            # and notes can reach committed artifacts where a host path leaks
+            # the machine the loop ran on.
+            result.notes.append(f"trajectory stream={branch}")
         # Persist the trajectory FIRST: a guard below can return early, and the
         # run that gets aborted is exactly the one worth being able to replay.
         # It lands in the repo root (not the ephemeral worktree) and stays
@@ -451,9 +475,10 @@ def run_once(
         )
         result.notes.append(f"trajectory={traj.identifier}")
         agent_ok, agent_err = ares.ok, ares.error
-        # Fed from the parsed envelope, not re-parsed from stdout: this is the
-        # path that finally populates the ledger's token columns.
-        tokens = ledger.parse_tokens(ares.payload)
+        # Fed from the parsed envelope, falling back to the raw stdout when the
+        # CLI printed a shape `parse_output` could not lift a payload out of.
+        # This is the path that populates the ledger's token columns.
+        tokens = ledger.parse_tokens(ares.payload) or ledger.parse_tokens(ares.output)
         if agent_err:
             agent_err = _format_error_with_context(agent_err, kind, ticket_num)
 
@@ -593,6 +618,13 @@ def run_once(
                 f"\n\nRedacted tail:\n```\n{traj.excerpt()}\n```"
                 if traj else ""
             )
+            # What the run DID, from the raw event stream: the tool calls and
+            # file edits a truncated stderr snippet used to throw away.
+            + (
+                f"\n\nStream digest (`hsai replay {branch}`):\n\n"
+                f"{trajectory.digest(traj_summary)}"
+                if traj_summary else ""
+            )
         ),
         lesson=(
             "Change merged cleanly under a green build."
@@ -664,6 +696,7 @@ def run_once(
         kind=kind,
         references=references,
         trajectory_digest=traj.digest() if traj else "",
+        trajectory_summary=traj_summary,
         recalled=recalled.note_names,
         review_verdict=verdict.render(),
     )

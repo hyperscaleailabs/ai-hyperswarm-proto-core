@@ -119,6 +119,7 @@ hsai loop --dry-run   # a full iteration with no side effects
 hsai loop          # one real iteration (opens & merges a PR on green)
 hsai loop --max-parallel 3 -n 1   # ramp to the swarm (after proving one iteration)
 hsai traj 12       # print what agent run (iteration) 12 did (spends no quota)
+hsai replay hsai/iter-1787-4-abc123   # replay a branch's raw tool-call sequence
 hsai recall "knowledge-only diff on a code ticket"   # rank prior lessons for a task
 hsai cycle --resume   # finish an interrupted governance block, replaying what completed
 ```
@@ -131,6 +132,20 @@ committed lesson and the PR body carry only a digest line (tokens, duration,
 exit status) plus a redacted tail. `hsai traj <iteration> [--json]` reads one
 back without invoking `claude`; older blocks are pruned per
 `execution.trajectory_retention_blocks`.
+
+Alongside it, the worker is driven with `--output-format stream-json --verbose`
+and its **raw event stream** is kept verbatim at
+`.hsai/trajectories/<branch>.jsonl` (gitignored, redacted, capped at
+`execution.trajectories.max_bytes` with head/tail truncation). That stream is
+what makes the ledger's `input_tokens`/`output_tokens`/`tool_calls`/`turns`
+columns non-null, and it renders as a collapsed `## Trajectory` table on the PR
+- tool-call counts, files touched, turns, token usage. `hsai replay <branch>`
+prints the tool-call sequence back. A CLI format change degrades to an empty
+summary rather than failing the iteration; `execution.trajectories.enabled:
+false` turns the whole thing off. Adapted from SWE-agent (the `.traj` file as
+the primary artifact of a run), microsoft/JARVIS (`/results` exposing per-stage
+intermediate results) and openai/swarm (`run()` returning the full message
+list).
 
 ## Learning targets (top-10, pinned snapshot)
 

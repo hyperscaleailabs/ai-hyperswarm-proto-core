@@ -932,9 +932,13 @@ def test_one_trajectory_file_per_agent_invocation(tmp_path):
     # ledger, not replayed as authored work.
     assert len(_worker_prompts(runner)) == len(_trajectory_files(tmp_path)) == 2
     assert [p.name for p in _trajectory_files(tmp_path)] == ["1.json", "2.json"]
-    # Every invocation asked the CLI for the structured envelope.
+    # Every invocation asked the CLI for the structured envelope - the event
+    # stream, since the shipped config enables trajectories.
     claude_calls = [c for c in runner.calls if c[:1] == ["claude"]]
-    assert all("--output-format" in c and "json" in c for c in claude_calls)
+    assert all(
+        c[c.index("--output-format") + 1] == "stream-json" and "--verbose" in c
+        for c in claude_calls
+    )
 
 
 def test_dry_run_writes_no_trajectory(tmp_path):
@@ -942,7 +946,178 @@ def test_dry_run_writes_no_trajectory(tmp_path):
     # A dry run makes no model call, so it must leave no artifact behind.
     run_once(cfg, repo_dir=str(tmp_path), dry_run=True, iteration=1)
     assert not (tmp_path / ".hsai" / "traj").exists()
+    assert not (tmp_path / ".hsai" / "trajectories").exists()
     assert _trajectory_files(tmp_path) == []
+    assert _stream_files(tmp_path) == []
+
+
+# --- raw stream capture (`.hsai/trajectories/<branch>.jsonl`) ---------------
+
+def _stream_files(root: Path) -> list[Path]:
+    return sorted((root / ".hsai" / "trajectories").rglob("*.jsonl"))
+
+
+def _pr_body(runner: "FakeRunner") -> str:
+    create = next(c for c in runner.calls if c[:3] == ["gh", "pr", "create"])
+    return "\n".join(create)
+
+
+def _stream_output(*, tool_calls: int = 3, num_turns: int = 5) -> str:
+    """A stream-json stdout with `tool_calls` Edit events and a result event."""
+    lines = [json.dumps({"type": "system", "subtype": "init", "session_id": "s-1"})]
+    for i in range(tool_calls):
+        lines.append(json.dumps({"type": "assistant", "message": {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "name": "Edit",
+                         "input": {"file_path": f"src/hsai/widget{i}.py"}}],
+        }}))
+    lines.append(json.dumps({
+        "type": "result", "subtype": "success", "is_error": False,
+        "num_turns": num_turns, "session_id": "s-1", "result": "Implemented the widget.",
+        "usage": {"input_tokens": 1500, "output_tokens": 320},
+    }))
+    return "\n".join(lines)
+
+
+def test_an_iteration_stores_the_raw_stream_under_its_branch(tmp_path):
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[dict(WIDGET_ISSUE)], agent_output=_stream_output(),
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=4,
+    )
+
+    assert result.merged is True
+    stored = _stream_files(tmp_path)
+    # One file per authored run, keyed by branch, nested under the branch prefix.
+    assert len(stored) == 1
+    assert stored[0].parent.name == "hsai"
+    assert stored[0].stat().st_size <= cfg.trajectories.max_bytes
+    assert any(n.startswith("trajectory stream=") for n in result.notes)
+
+    # It survived the worktree's removal: the store lives in the repo root.
+    summary = trajectory.parse_stream(trajectory.read_stream(stored[0]))
+    assert summary.tool_calls == {"Edit": 3}
+    assert summary.turns == 5
+
+
+def test_the_stream_feeds_the_ledgers_token_and_behaviour_columns(tmp_path):
+    """The whole point: stream-json runs stop leaving the ledger's columns null."""
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[dict(WIDGET_ISSUE)],
+        agent_output=_stream_output(tool_calls=3, num_turns=5),
+    )
+
+    run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=4,
+    )
+
+    authored = _iteration_records(cfg, tmp_path)[0]
+    assert authored.input_tokens == 1500 and authored.output_tokens == 320
+    assert authored.tool_calls == 3 and authored.turns == 5
+
+
+def test_the_pr_body_carries_the_trajectory_section(tmp_path):
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[dict(WIDGET_ISSUE)], agent_output=_stream_output(),
+    )
+
+    run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=4,
+    )
+
+    body = _pr_body(runner)
+    assert "## Trajectory" in body
+    assert "<details>" in body                      # collapsed, never in the way
+    assert "| turns | 5 |" in body
+    assert "`Edit`x3" in body
+    assert "`src/hsai/widget0.py`" in body
+    assert "| tokens | 1500 in / 320 out |" in body
+    # The three traceability invariants the CI SDLC-evidence step greps for.
+    assert "Closes #7" in body
+    assert "## Model used" in body and "## Lesson learned" in body
+
+
+def test_a_malformed_stream_still_completes_the_iteration(tmp_path):
+    """Acceptance criterion: a CLI format change degrades, never raises."""
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[dict(WIDGET_ISSUE)],
+        agent_output="{{{ not json at all\nquantum handshake failed\n",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=4,
+    )
+
+    # The iteration ran to completion: PR opened, merged, lesson written.
+    assert result.merged is True and result.pr is not None
+    assert result.lesson_path
+
+    # The trajectory degraded to an empty summary rather than taking the run down.
+    authored = _iteration_records(cfg, tmp_path)[0]
+    assert authored.input_tokens is None          # nothing to report, honestly
+    assert authored.tool_calls == 0 and authored.turns == 0
+    assert "no parseable stream" in _pr_body(runner)
+
+
+def test_an_unknown_event_stream_degrades_to_an_empty_summary(tmp_path):
+    cfg = load_config()
+    stream = "\n".join([
+        json.dumps({"kind": "v3-event", "payload": {"renamed": "everything"}}),
+        json.dumps({"kind": "v3-event", "payload": {"still": "unknown"}}),
+    ])
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[dict(WIDGET_ISSUE)], agent_output=stream,
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=4,
+    )
+
+    assert result.merged is True
+    authored = _iteration_records(cfg, tmp_path)[0]
+    assert authored.tool_calls == 0 and authored.turns == 0
+    assert authored.input_tokens is None
+
+
+def test_disabling_trajectories_skips_the_stream_entirely(tmp_path):
+    cfg = replace(load_config(), trajectories=replace(
+        load_config().trajectories, enabled=False
+    ))
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[dict(WIDGET_ISSUE)],
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=4,
+    )
+
+    assert result.merged is True
+    assert _stream_files(tmp_path) == []
+    assert "## Trajectory" in _pr_body(runner)     # the per-run digest remains
+    assert "<details>" not in _pr_body(runner)
+    # Not recorded is not the same fact as zero.
+    authored = _iteration_records(cfg, tmp_path)[0]
+    assert authored.tool_calls is None and authored.turns is None
+    # ...and the legacy single-object envelope still lands the token columns.
+    assert authored.input_tokens == 1500
 
 
 def test_token_counts_reach_the_ledger_and_the_block_aggregate(tmp_path):

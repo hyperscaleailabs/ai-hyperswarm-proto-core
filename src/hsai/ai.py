@@ -14,6 +14,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from . import trajectory
 from .config import CoreConfig
 from .models import ModelChoice
 from .proc import Proc, Runner, run
@@ -32,6 +33,12 @@ class AIResult:
     cmd: Sequence[str]
     usage: dict[str, Any] | None = None  # token counts, when the CLI exposes them
     payload: dict[str, Any] | None = None  # parsed JSON envelope (None = plain text)
+    # What the run actually did, folded out of its event stream (openai/swarm's
+    # `run()` returning the full message list, in dataclass form). Never None
+    # once trajectories are enabled: an unparseable stream yields an EMPTY
+    # summary so callers branch on `.empty`, not on `is None`.
+    summary: trajectory.TrajectorySummary | None = None
+    trajectory_path: str = ""  # where the raw stream was stored ("" = not stored)
 
     @property
     def text(self) -> str:
@@ -48,11 +55,37 @@ class AIResult:
         return ""
 
 
-def parse_output(stdout: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    """Split a ``claude -p --output-format json`` stdout into ``(payload, usage)``.
+def _stream_result_event(text: str) -> dict[str, Any] | None:
+    """The terminal ``result`` event of a stream-json payload, if there is one.
 
-    A pure parse of text the CLI already printed - never a metered call. Any
-    output that is not a JSON object (an older ``claude`` binary, or a crash
+    ``--output-format stream-json`` prints one JSON object per line rather than
+    a single envelope, so ``json.loads`` on the whole thing fails. The final
+    ``result`` event carries the same fields the single-object envelope does
+    (``result``, ``session_id``, ``num_turns``, cumulative ``usage``), so
+    lifting it out lets every downstream consumer keep working unchanged.
+    """
+    found: dict[str, Any] | None = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(event, dict) and event.get("type") == "result":
+            found = event
+    return found
+
+
+def parse_output(stdout: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Split a ``claude -p`` stdout into ``(payload, usage)``.
+
+    Handles both shapes the CLI can print: the single JSON envelope
+    (``--output-format json``) and the JSONL event stream
+    (``--output-format stream-json``), whose terminal ``result`` event is
+    lifted out as the payload. A pure parse of text the CLI already printed -
+    never a metered call. Anything else (an older ``claude`` binary, or a crash
     that printed plain text) degrades to ``(None, None)`` so the loop keeps
     running on the plain-text path instead of breaking.
     """
@@ -60,9 +93,9 @@ def parse_output(stdout: str) -> tuple[dict[str, Any] | None, dict[str, Any] | N
     if not text.startswith("{"):
         return None, None
     try:
-        data = json.loads(text)
+        data: Any = json.loads(text)
     except (ValueError, TypeError):
-        return None, None
+        data = _stream_result_event(text)
     if not isinstance(data, dict):
         return None, None
     usage = data.get("usage")
@@ -94,6 +127,22 @@ def _sanitized_env(cfg: CoreConfig) -> tuple[dict[str, str], tuple[str, ...]]:
     return overrides, tuple(sorted(removals))
 
 
+def resolve_output_format(cfg: CoreConfig) -> str:
+    """Which ``--output-format`` this config asks for (``""`` = omit the flag).
+
+    Two knobs, one precedence rule. ``execution.output_format`` set to ``text``
+    (or empty) is the escape hatch and always wins: a CLI flag change must be
+    survivable by editing YAML. Otherwise ``execution.trajectories.enabled``
+    upgrades the format to ``stream-json``, because only the event stream
+    exposes the per-tool-call detail a trajectory is made of - the single-object
+    envelope reports the outcome and nothing about the path taken to it.
+    """
+    fmt = (cfg.output_format or "").strip()
+    if not fmt or fmt == "text":
+        return ""
+    return "stream-json" if cfg.trajectories.enabled else fmt
+
+
 def build_command(
     prompt: str,
     choice: ModelChoice,
@@ -104,12 +153,9 @@ def build_command(
     """Construct the ``claude -p`` argument vector (no execution).
 
     The structured envelope is what makes a run auditable afterwards (token
-    usage for the quota ledger, the step stream for the trajectory store; see
-    :mod:`hsai.trajectory`), so ``execution.output_format`` defaults to
-    ``json``. It stays config-driven rather than hardcoded because the loop
-    must not be brickable by a CLI flag change: setting it to ``text`` (or
-    empty) drops the flag and falls back to the plain-text path, which every
-    consumer already tolerates.
+    usage for the quota ledger, the event stream for the trajectory store; see
+    :mod:`hsai.trajectory`), so the format is resolved by
+    :func:`resolve_output_format` rather than hardcoded.
     """
     mode = permission_mode or cfg.permission_mode
     cmd = [
@@ -121,8 +167,8 @@ def build_command(
         "--permission-mode",
         mode,
     ]
-    fmt = (cfg.output_format or "").strip()
-    if fmt and fmt != "text":
+    fmt = resolve_output_format(cfg)
+    if fmt:
         cmd += ["--output-format", fmt]
         # The CLI refuses `stream-json` under `-p` unless `--verbose` is set.
         if fmt == "stream-json":
@@ -169,6 +215,37 @@ def check_child_env(cfg: CoreConfig, *, runner: Runner = run) -> tuple[bool, str
     return True, f"{', '.join(removals)} confirmed absent from a real spawned child process"
 
 
+def _capture_trajectory(
+    cfg: CoreConfig, stdout: str, *, branch: str | None, repo_root: str | None
+) -> tuple[trajectory.TrajectorySummary | None, str]:
+    """Fold (and, given a branch, store) one run's raw event stream.
+
+    Wrapped in a blanket ``except``: observability is strictly additive, so a
+    full disk or an unrecognised CLI payload costs the loop its trajectory and
+    nothing else. Callers see an empty summary, never an exception.
+    """
+    if not cfg.trajectories.enabled:
+        return None, ""
+    try:
+        summary = trajectory.parse_stream(stdout)
+    except Exception:  # pragma: no cover - parse_stream is already total
+        summary = trajectory.TrajectorySummary()
+    stored = ""
+    if branch and repo_root:
+        try:
+            path = trajectory.stream_path(repo_root, branch, cfg.trajectories.dir)
+            if path is not None:
+                trajectory.write_stream(
+                    path, stdout,
+                    max_bytes=cfg.trajectories.max_bytes,
+                    redact_text=cfg.trajectories.redact_prompt,
+                )
+                stored = str(path)
+        except OSError:
+            stored = ""
+    return summary, stored
+
+
 def run_agent(
     prompt: str,
     choice: ModelChoice,
@@ -178,13 +255,24 @@ def run_agent(
     permission_mode: str | None = None,
     timeout: float | None = None,
     runner: Runner = run,
+    branch: str | None = None,
+    repo_root: str | None = None,
 ) -> AIResult:
-    """Run a headless Claude Code agent for one task."""
+    """Run a headless Claude Code agent for one task.
+
+    Passing ``branch`` and ``repo_root`` additionally stores the raw event
+    stream at ``<execution.trajectories.dir>/<branch>.jsonl`` - the run record
+    SWE-agent keeps as its primary artifact. It stays local (gitignored); only
+    :func:`hsai.trajectory.digest` of it is ever committed.
+    """
     preflight(cfg)
     cmd = build_command(prompt, choice, cfg, permission_mode=permission_mode)
     env, env_remove = _sanitized_env(cfg)
     proc: Proc = runner(cmd, cwd=cwd, env=env, env_remove=env_remove, timeout=timeout)
     payload, usage = parse_output(proc.stdout)
+    summary, stored = _capture_trajectory(
+        cfg, proc.stdout, branch=branch, repo_root=repo_root
+    )
     return AIResult(
         ok=proc.ok,
         model=choice.model,
@@ -193,4 +281,6 @@ def run_agent(
         cmd=cmd,
         usage=usage,
         payload=payload,
+        summary=summary,
+        trajectory_path=stored,
     )
