@@ -1283,20 +1283,20 @@ def test_task_prompt_renders_recalled_lessons_only_when_there_are_some():
         assert with_lessons.endswith(section)   # the ticket stays the instruction
 
 
-def test_build_pr_body_renders_prior_lessons_consulted():
+def test_build_pr_body_renders_prior_lessons_applied():
     choice = ModelChoice(tier="standard", model="sonnet", rationale="x")
     kwargs = dict(
         ticket=42, choice=choice, lesson_note="2026-01-03-note",
         lesson_summary="s", ci_summary="green", kind=IMPLEMENT,
     )
     body = build_pr_body(**kwargs, recalled=("2026-01-01-a", "2026-01-02-b"))
-    assert "## Prior lessons consulted" in body
+    assert "## Prior lessons applied" in body
     assert "- [[2026-01-01-a]]" in body and "- [[2026-01-02-b]]" in body
 
     # with nothing recalled the section vanishes and the surrounding text is
     # exactly what it was before recall existed
     plain = build_pr_body(**kwargs)
-    assert "## Prior lessons consulted" not in plain
+    assert "## Prior lessons applied" not in plain
     assert plain == build_pr_body(**kwargs, recalled=())
     assert (
         "See [[2026-01-03-note]] in the knowledge base.\n\n## Reference-set evidence"
@@ -1327,12 +1327,20 @@ def test_recalled_lessons_reach_the_prompt_the_lesson_and_the_pr_body(
     frontmatter = Path(result.lesson_path).read_text().split("---\n")[1]
     assert "recalled:" in frontmatter
     for name in result.recalled:
-        assert f"  - {name}" in frontmatter
+        # a real wikilink, so the Obsidian graph links the lesson that taught
+        # this iteration to the lesson this iteration wrote
+        assert f'  - "[[{name}]]"' in frontmatter
+        assert (Path(result.lesson_path).parent / f"{name}.md").exists()
 
     # 4. ...and rendered on the PR for after-the-fact audit
-    assert "## Prior lessons consulted" in pr_body
+    assert "## Prior lessons applied" in pr_body
     for name in result.recalled:
         assert f"- [[{name}]]" in pr_body
+
+    # 5. ...and counted on the ledger, so a later block can ask whether being
+    # shown prior lessons actually changed the outcome
+    record = ledger.read_records(ledger.ledger_path(cfg, tmp_path))[-1]
+    assert record.recalled_count == len(result.recalled)
 
 
 def test_disabling_recall_restores_the_pre_change_prompt_and_pr_body(
@@ -1344,9 +1352,11 @@ def test_disabling_recall_restores_the_pre_change_prompt_and_pr_body(
     # byte-identical to what _task_prompt produced before recall existed
     assert prompt == _task_prompt(IMPLEMENT, off, RECALL_TICKET_TITLE, WELL_FORMED_BODY)
     assert recall.HEADING not in prompt
-    assert "## Prior lessons consulted" not in pr_body
+    assert "## Prior lessons applied" not in pr_body
     assert result.recalled == []
     assert "recalled:" not in Path(result.lesson_path).read_text().split("---\n")[1]
+    # nothing recalled is recorded as nothing, not as missing data
+    assert ledger.read_records(ledger.ledger_path(off, tmp_path))[-1].recalled_count == 0
 
 
 def test_dry_run_still_records_what_it_recalled(tmp_path):

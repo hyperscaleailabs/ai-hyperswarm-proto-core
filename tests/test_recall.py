@@ -8,12 +8,17 @@ from dataclasses import replace
 from pathlib import Path
 
 from hsai.config import load_config
+from hsai.knowledge import KnowledgeBase, Lesson
 from hsai.recall import (
     HEADING,
     Corpus,
     RecallConfig,
     for_task,
+    index_lessons,
     render,
+    render_pack,
+    select,
+    strip_boilerplate,
     tokenize,
 )
 
@@ -304,6 +309,155 @@ def test_recall_config_reads_core_yaml_and_documents_its_defaults():
     bare = RecallConfig.from_core(replace(load_config(), knowledge={}))
     assert bare == RecallConfig()
     assert RecallConfig.from_core(None) == RecallConfig()
+
+
+# --- the lessons-only API: index_lessons -> select -> render_pack ------------
+
+
+def _kb_with_lessons(root: Path, *lessons: Lesson) -> KnowledgeBase:
+    """A real knowledge base, written through the real lesson template."""
+    kb = KnowledgeBase(root)
+    for lesson in lessons:
+        kb.write_lesson(lesson)
+    return kb
+
+
+def _twin_lessons() -> tuple[Lesson, Lesson]:
+    """Two lessons identical in EVERY field except the lesson section itself.
+
+    Same title, so even the note title cannot separate them - only their
+    conclusions differ, and only the dates make the note names unique. Their
+    shared prose deliberately avoids the template's own vocabulary, so any
+    similarity between them is scaffolding and nothing else.
+    """
+    shared = dict(
+        title="Widget pipeline hardening",
+        outcome="pass",
+        kind="implement",
+        context="Another pass through the automated widget pipeline.",
+        what_happened="A branch was opened, changed and closed.",
+        references=("run-llama/llama_index",),
+    )
+    return (
+        Lesson(
+            created="2026-03-01",
+            lesson="Stranded worktrees keep a branch claimed forever after a crash.",
+            **shared,
+        ),
+        Lesson(
+            created="2026-03-02",
+            lesson="Poll the rollup before merging: a green local build can still be red upstream.",
+            **shared,
+        ),
+    )
+
+
+def test_shared_template_boilerplate_does_not_decide_the_ranking(tmp_path):
+    """Two lessons differing ONLY in their conclusion: the relevant one wins."""
+    stranded, rollup = _twin_lessons()
+    kb = _kb_with_lessons(tmp_path, stranded, rollup)
+    records = index_lessons(kb)
+    assert len(records) == 2
+
+    hits = select(records, "the rollup was still red upstream when we merged", 2, 4000)
+    assert hits[0].note_name == rollup.note_name()
+
+    # ...and the reverse query flips the ranking, so this is the lesson text
+    # talking and not a stable accident of note order.
+    flipped = select(records, "a crash stranded the worktree and claimed the branch", 2, 4000)
+    assert flipped[0].note_name == stranded.note_name()
+
+
+def test_a_query_made_of_pure_template_words_matches_nothing(tmp_path):
+    """The scaffolding every lesson shares contributes exactly zero score."""
+    kb = _kb_with_lessons(tmp_path, *_twin_lessons())
+    corpus = Corpus.from_records(index_lessons(kb))
+    assert len(corpus) == 2
+
+    # every word here comes from the lesson template - the breadcrumb, the
+    # metadata table's labels, the seven section headings, the placeholders
+    boilerplate = (
+        "Part of Lessons MOC Knowledge Base outcome kind iteration ticket "
+        "pull request model remote CI Context What happened Lesson learned "
+        "Execution trace Independent review Reproduction evidence References"
+    )
+    assert corpus.search(boilerplate, 5) == []
+    # a real conclusion from inside the very same notes still matches
+    assert corpus.search("stranded worktrees", 5)
+
+
+def test_strip_boilerplate_keeps_prose_and_drops_scaffolding():
+    kept = strip_boilerplate(
+        "# A title\n"
+        "> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n"
+        "| field | value |\n"
+        "| --- | --- |\n"
+        "| model | `sonnet` |\n"
+        "## Lesson learned\n"
+        "Poll the rollup before merging.\n"
+        "_(none cited)_\n"
+        "- goals: G3, G1, G4\n"
+        "- a real bullet survives\n"
+    )
+    assert kept == "Poll the rollup before merging.\n- a real bullet survives"
+
+
+def test_select_ranks_a_same_kind_failure_above_an_unrelated_success(tmp_path):
+    _lesson(
+        tmp_path, "2026-02-01-flaky-retry-loop",
+        title="Flaky retry loop leaves the build red", outcome="fail", kind="heal",
+        body="The heal path retried without a backoff and the build stayed red.",
+    )
+    _lesson(
+        tmp_path, "2026-02-02-retry-in-the-vault-index",
+        title="Retry helper reused by the vault index", outcome="pass", kind="improve",
+        body="The retry helper was reused when rebuilding the vault index.",
+    )
+    records = index_lessons(KnowledgeBase(tmp_path))
+
+    names = [n.note_name for n in select(
+        records, "heal the flaky retry loop that keeps the build red", 3, 4000, kind="heal",
+    )]
+    # both match the query; the failing, same-kind note is the one that leads
+    assert names[0] == "2026-02-01-flaky-retry-loop"
+    assert "2026-02-02-retry-in-the-vault-index" in names
+
+
+def test_select_honours_k_and_the_character_budget(tmp_path):
+    _oversized_corpus(tmp_path)
+    records = index_lessons(KnowledgeBase(tmp_path))
+    assert len(records) == 40
+
+    assert len(select(records, "budget", 2, 10_000)) == 2
+    assert len(select(records, "budget", 40, 10_000)) <= 40
+    for budget in (0, 40, 120, 200, 400, 1200):
+        notes = select(records, "budget", 10, budget)
+        pack = render_pack(notes)
+        assert len(pack) <= budget
+        assert pack.count("- [[") == len(notes)
+
+
+def test_render_pack_leads_with_the_heading_and_renders_every_note_given(tmp_path):
+    _oversized_corpus(tmp_path)
+    notes = select(index_lessons(KnowledgeBase(tmp_path)), "budget", 3, 4000)
+    pack = render_pack(notes)
+    assert pack.startswith(HEADING)
+    assert len(notes) == 3
+    for note in notes:
+        assert f"[[{note.note_name}]]" in pack
+
+
+def test_index_lessons_skips_scaffolding_and_survives_an_empty_vault(tmp_path):
+    # a fresh clone: no lessons at all -> an empty pack, never an error
+    assert index_lessons(KnowledgeBase(tmp_path)) == []
+    assert select([], "anything at all", 3, 1200) == []
+    assert render_pack([]) == ""
+
+    _lesson(tmp_path, "2026-04-01-a-real-lesson", title="A real lesson", body="content")
+    _lesson(tmp_path, "TEMPLATE", title="Lesson template", body="content")
+    assert [r.note_name for r in index_lessons(KnowledgeBase(tmp_path))] == [
+        "2026-04-01-a-real-lesson",
+    ]
 
 
 def test_the_real_repo_corpus_is_searchable():

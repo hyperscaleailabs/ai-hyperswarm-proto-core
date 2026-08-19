@@ -383,6 +383,9 @@ def _make_run_once(ledger_file, *, crash_at: int | None = None):
                 iteration=iteration, block=iteration // 100, ticket=iteration,
                 kind="implement", tier="standard", model="sonnet",
                 wall_clock_seconds=5.0, attempts=1, outcome="merged",
+                # Derived from the position, never from a call counter: the
+                # first worker of a block starts cold, the rest inherit a pack.
+                recalled_count=0 if position == 1 else 2,
             ),
         )
         return IterationResult(
@@ -430,6 +433,19 @@ def _brief_fields(report) -> tuple:
         report.synthesized, report.iterations, report.merged_prs,
         report.whitepaper, report.articles,
     )
+
+
+def test_the_block_whitepaper_states_whether_recall_helped(tmp_path, monkeypatch):
+    """Step 6 of retrieval: the loop measures its own memory, in writing."""
+    _seed_lesson(tmp_path)
+    cfg = _block_cfg()
+    res, _gh, _state = _drive(tmp_path, cfg, monkeypatch)
+
+    kb = KnowledgeBase.from_config(cfg, tmp_path)
+    paper = (kb.whitepapers_dir / f"{res.report.whitepaper}.md").read_text()
+    assert "## Recall effectiveness" in paper
+    # two of the block's three iterations were given a pack; all three merged
+    assert "2/2 (100%)" in paper and "1/1 (100%)" in paper
 
 
 def test_resume_after_a_crash_replays_and_writes_nothing_to_github_twice(

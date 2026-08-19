@@ -339,3 +339,43 @@ def test_tokens_per_merged_pr_is_undefined_without_merges_or_tokens():
 
     no_tokens = aggregate_block([_rec(block=1, outcome="merged")], block=1)
     assert no_tokens.tokens_per_merged_pr() is None
+
+
+# --- did recall help? (see hsai.recall) --------------------------------------
+
+def test_recalled_count_is_recorded_and_survives_a_round_trip(tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    append_record(path, _rec(recalled_count=3))
+    append_record(path, _rec(iteration=102))          # started cold
+
+    records = read_records(path)
+    assert [r.recalled_count for r in records] == [3, 0]
+
+
+def test_a_block_compares_merge_rates_with_and_without_a_recall_pack():
+    records = [
+        _rec(iteration=101, recalled_count=3, outcome="merged"),
+        _rec(iteration=102, recalled_count=2, outcome="merged"),
+        _rec(iteration=103, recalled_count=1, outcome="recovered"),
+        _rec(iteration=104, outcome="merged"),
+        _rec(iteration=105, outcome="recovered"),
+    ]
+    agg = aggregate_block(records, block=1)
+
+    assert agg.recalled_iterations == 3 and agg.cold_iterations == 2
+    assert agg.merged_with_recall == 2 and agg.merged_without_recall == 1
+    # every merge is counted exactly once by one side or the other
+    assert agg.merged_with_recall + agg.merged_without_recall == agg.merged_iterations
+
+    effect = agg.recall_effect()
+    assert "2/3 (67%)" in effect and "1/2 (50%)" in effect
+    # the sample is tiny; the sentence must say so rather than imply a result
+    assert "conclusive" in effect
+
+
+def test_recall_effect_names_an_empty_side_instead_of_dividing_by_zero():
+    all_cold = aggregate_block([_rec(iteration=101, outcome="merged")], block=1)
+    assert "0/0 (none ran)" in all_cold.recall_effect()
+    assert "1/1 (100%)" in all_cold.recall_effect()
+
+    assert "No iterations recorded" in aggregate_block([], block=1).recall_effect()

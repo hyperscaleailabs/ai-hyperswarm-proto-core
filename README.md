@@ -84,16 +84,24 @@ planner gets the same treatment: a *What this loop has already tried* memory
 section (open tickets, recently closed tickets, lesson outcomes) so it stops
 re-proposing ideas that are already queued, shipped, or recorded as a
 failure, and `synthesis.is_duplicate` drops any candidate the model proposes
-anyway before it is filed. Retrieval is deterministic, costs no quota, and
-adds no dependency; what it returned - and what was rejected as a duplicate -
-is recorded in the lesson's `recalled:` frontmatter, on the PR, and in the
-block review brief, so it stays auditable. Tune it under `knowledge.recall`
+anyway before it is filed. Ranking compares prose, not template: the
+scaffolding every note and every ticket shares is stripped from both sides
+before scoring, so notes compete on what they concluded rather than on having
+been written by the same generator. Retrieval is deterministic, costs no quota,
+and adds no dependency; what it returned - and what was rejected as a duplicate
+- is recorded in the lesson's `recalled:` frontmatter, on the PR, on the
+iteration's ledger record, and in the block review brief, so it stays
+auditable. Because the ledger counts it, each block whitepaper states whether
+iterations given prior lessons merged at a different rate than those that
+started cold, and `hsai reindex` lists the most-recalled lessons in the Lessons
+MOC. Tune it under `knowledge.recall`
 and `synthesis` in `.ai-swarm/core.yaml` (`enabled`, `k`, `max_chars`,
 `fail_weight`, `kind_weight`, `memory_max_chars`, `duplicate_threshold`), or
 set `enabled: false` to restore the previous prompt exactly.
 
 ```bash
-hsai recall "remote CI gate"       # what would a worker be shown for this task?
+hsai recall "remote CI gate"          # rank the prior notes for this task
+hsai recall "remote CI gate" --pack   # the exact block a worker would be handed
 ```
 
 **Nothing merges on the author's word alone.** Once local CI is green and the

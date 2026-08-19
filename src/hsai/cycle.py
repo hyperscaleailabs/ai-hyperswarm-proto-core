@@ -326,7 +326,7 @@ def run_cycle(
         ]},
     )["items"]
     report.whitepaper = journal.once(
-        jr, "whitepaper", "block", lambda: _whitepaper_step(cfg, kb),
+        jr, "whitepaper", "block", lambda: _whitepaper_step(cfg, kb, report.cost),
     )["note"]
     report.articles = journal.once(
         jr, "articles", "block",
@@ -375,16 +375,25 @@ def _sync_main(cfg: CoreConfig, *, repo_root: Path, runner: Runner) -> str:
     return cfg.default_branch
 
 
-def _whitepaper_step(cfg: CoreConfig, kb: KnowledgeBase) -> dict:
+def _whitepaper_step(
+    cfg: CoreConfig, kb: KnowledgeBase, cost: ledger.BlockAggregate | None = None
+) -> dict:
     """Write the block whitepaper, or record that this block has none.
 
     The "is there anything to write about" test lives inside the step so a
     resumed run reconstructs the answer from the journal rather than re-deriving
     it from a knowledge base that has moved on.
+
+    ``cost`` carries the block's ledger fold, which is where the evidence for
+    "did recall help?" lives - stated in the paper rather than left implicit in
+    a JSONL file nobody opens.
     """
     if not (cfg.cycle.get("whitepaper_per_block", True) and kb.lesson_notes()):
         return {"note": ""}
-    paper = kb.synthesize_whitepaper(n=int(cfg.cycle.get("block_size", 5)))
+    paper = kb.synthesize_whitepaper(
+        n=int(cfg.cycle.get("block_size", 5)),
+        recall_effect=cost.recall_effect() if cost else "",
+    )
     kb.write_whitepaper(paper)
     return {"note": paper.note_name()}
 

@@ -22,6 +22,7 @@ _FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
 _TITLE_RE = re.compile(r"^# (.+)$", re.MULTILINE)
 _SECTION_RE = re.compile(r"^## (.+)$", re.MULTILINE)
 _WORD_RE = re.compile(r"[a-zA-Z][a-zA-Z-]{3,}")
+_FRONTMATTER_LINK_RE = re.compile(r'^"?\[\[(.+?)\]\]"?$')
 _STOPWORDS = {
     "this", "that", "with", "from", "have", "been", "were", "will", "which",
     "their", "there", "these", "those", "about", "would", "could", "should",
@@ -86,6 +87,10 @@ class LessonRecord:
     body: str = ""  # everything after the frontmatter; what the recall index reads
     failure_class: str = ""  # "" when absent (pass, or a note predating this field)
     created: str = ""  # frontmatter `created:`, "" for notes that carry no date
+    # Note names this iteration was shown before it started (frontmatter
+    # `recalled:`). Empty for a note written with recall off or disabled - the
+    # citation trail that makes "which lesson taught which iteration" answerable.
+    recalled: tuple[str, ...] = ()
 
 
 def split_sections(text: str) -> dict[str, str]:
@@ -100,22 +105,33 @@ def split_sections(text: str) -> dict[str, str]:
     return sections
 
 
-def _frontmatter_tags(fm: str) -> tuple[str, ...]:
-    """List items under the ``tags:`` key only.
+def _frontmatter_list(fm: str, key: str) -> tuple[str, ...]:
+    """List items nested under one top-level frontmatter ``key:``.
 
-    Frontmatter now holds a second list (``recalled:``), so a blanket "every
-    ``- item`` line is a tag" scan would file recalled note names as tags.
+    Frontmatter holds more than one list (``tags:`` and ``recalled:``), so a
+    blanket "every ``- item`` line belongs to me" scan would file recalled note
+    names as tags and vice versa - each key is read on its own.
     """
-    tags: list[str] = []
-    in_tags = False
+    items: list[str] = []
+    in_key = False
     for line in fm.splitlines():
         if line.strip() and not line.startswith((" ", "\t", "-")):
-            in_tags = line.strip() == "tags:"
+            in_key = line.strip() == f"{key}:"
             continue
         match = _TAG_RE.match(line)
-        if in_tags and match:
-            tags.append(match.group(1).strip())
-    return tuple(tags)
+        if in_key and match:
+            items.append(match.group(1).strip())
+    return tuple(items)
+
+
+def _unwrap_link(value: str) -> str:
+    """``'"[[a-note]]"'`` -> ``'a-note'``; anything else is returned as-is.
+
+    Frontmatter links are written quoted (valid YAML, and what Obsidian resolves
+    into a real graph edge), but every consumer here wants the note name.
+    """
+    match = _FRONTMATTER_LINK_RE.match(value.strip())
+    return match.group(1).strip() if match else value.strip()
 
 
 def _frontmatter_scalar(fm: str, key: str) -> str:
@@ -145,7 +161,7 @@ def parse_note(path: str | Path) -> LessonRecord:
     fm_match = _FRONTMATTER_RE.match(text)
     fm = fm_match.group(1) if fm_match else ""
     body = text[fm_match.end():] if fm_match else text
-    tags = _frontmatter_tags(fm)
+    tags = _frontmatter_list(fm, "tags")
     outcome = next((t.split("/", 1)[1] for t in tags if t.startswith("outcome/")), "unknown")
     kind = next((t.split("/", 1)[1] for t in tags if t.startswith("kind/")), "unknown")
     failure_class = next((t.split("/", 1)[1] for t in tags if t.startswith("failure/")), "")
@@ -163,7 +179,26 @@ def parse_note(path: str | Path) -> LessonRecord:
         body=body.strip(),
         failure_class=failure_class,
         created=_frontmatter_scalar(fm, "created"),
+        recalled=tuple(_unwrap_link(v) for v in _frontmatter_list(fm, "recalled")),
     )
+
+
+def most_recalled(records: list[LessonRecord], top: int = 5) -> list[tuple[str, int]]:
+    """The most-cited prior notes across ``records``, best first.
+
+    Counts every ``recalled:`` frontmatter entry, then keeps only citations that
+    point at a note that is actually present. A dangling name would render as an
+    unresolved wikilink and break the "no broken links" property of the vault -
+    and lessons do get renamed or pruned, so this is not hypothetical.
+
+    Ties break on note name so ``hsai reindex`` is byte-stable across runs.
+    """
+    present = {r.note_name for r in records}
+    counts = Counter(
+        name for r in records for name in r.recalled if name in present
+    )
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return ranked[:top] if top else ranked
 
 
 @dataclass
@@ -253,9 +288,18 @@ class KnowledgeBase:
     def _parse_lesson(self, note_name: str) -> LessonRecord:
         return parse_note(self.lessons_dir / f"{note_name}.md")
 
-    def synthesize_whitepaper(self, n: int | None = None) -> Whitepaper:
+    def synthesize_whitepaper(
+        self, n: int | None = None, *, recall_effect: str = ""
+    ) -> Whitepaper:
         """Synthesize a whitepaper by grouping the last `n` lessons by outcome/kind
         and surfacing themes that recur across more than one of them.
+
+        ``recall_effect`` is the block's measured answer to "did injecting prior
+        lessons help?" (see :meth:`hsai.ledger.BlockAggregate.recall_effect`).
+        Passed in rather than derived here, because the evidence lives in the
+        quota ledger and the knowledge base must not reach into it. Omitted ->
+        the section is not rendered at all, so a whitepaper synthesized outside a
+        block is byte-for-byte what it was before recall was measured.
         """
         window = n if n is not None else self.whitepaper_every
         all_lessons = self.read_lessons()
@@ -294,6 +338,10 @@ class KnowledgeBase:
         else:
             theme_lines = "_Not enough repeated vocabulary yet to call out a theme._"
 
+        recall_section = (
+            f"\n\n## Recall effectiveness\n{recall_effect}" if recall_effect else ""
+        )
+
         body = f"""## Outcomes in this window
 | outcome | count |
 | --- | --- |
@@ -308,7 +356,7 @@ class KnowledgeBase:
 {failure_lines}
 
 ## Recurring themes
-{theme_lines}"""
+{theme_lines}{recall_section}"""
 
         summary = (
             f"Synthesis of the last {len(covered)} lesson(s): "
@@ -362,8 +410,11 @@ class KnowledgeBase:
         }
         # Only present when retrieval actually fired, so a run with recall
         # disabled renders byte-for-byte as it did before recall existed.
+        # Written as quoted wikilinks: a bare name is just a string to Obsidian,
+        # while "[[note]]" is a real edge in the graph - which is the whole
+        # point of recording what taught this iteration.
         if lesson.recalled:
-            extra["recalled"] = lesson.recalled
+            extra["recalled"] = tuple(f'"[[{n}]]"' for n in lesson.recalled)
         fm = self._frontmatter(tags, extra)
         refs = "\n".join(f"- `{r}`" for r in lesson.references) or "- _(none cited)_"
         ticket = f"#{lesson.ticket}" if lesson.ticket else "_(none)_"
@@ -439,6 +490,16 @@ class KnowledgeBase:
         notes = self.lesson_notes()
         fm = self._frontmatter(("moc", "lessons"), {"updated": _today()})
         links = "\n".join(f"- [[{n}]]" for n in notes) or "- _No lessons recorded yet._"
+        # Which lessons the loop keeps handing back to its own workers: the
+        # highest-leverage knowledge in the vault, and the first thing an
+        # architect should read (or rewrite).
+        ranked = most_recalled(self.read_lessons()) if notes else []
+        if ranked:
+            recalled_lines = "\n".join(
+                f"- [[{name}]] - recalled by {n} iteration(s)" for name, n in ranked
+            )
+        else:
+            recalled_lines = "_No lesson has been recalled into a worker prompt yet._"
         content = f"""{fm}
 
 # Lessons MOC
@@ -446,6 +507,15 @@ class KnowledgeBase:
 Up: [[Knowledge Base MOC]]
 
 Every hsai iteration leaves a lesson here - pass or fail. Total: **{len(notes)}**.
+
+## Most-recalled lessons
+
+Lessons that recall injected into later worker prompts, most-cited first
+(see `src/hsai/recall.py`).
+
+{recalled_lines}
+
+## All lessons
 
 {links}
 """

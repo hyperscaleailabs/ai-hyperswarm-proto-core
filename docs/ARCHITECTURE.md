@@ -80,10 +80,18 @@ closes the loop.
   `knowledge.recall.fail_weight`; notes whose `kind/` matches the current task
   are up-weighted by `kind_weight`. Failures are the expensive knowledge, and a
   heal worker should see heal history.
-- **Inject.** `orchestrator._task_prompt` appends a *Prior lessons from this
-  repo* section of at most `k` wikilinked notes, hard-capped at `max_chars`;
-  whole notes are dropped to fit, never truncated mid-line. An empty corpus or
-  `enabled: false` renders nothing at all.
+- **Prose, not template.** `recall.strip_boilerplate` removes the scaffolding
+  every note and every ticket shares - the MOC breadcrumb, the metadata table,
+  the fixed section headings, the `_(none)_` placeholders, the ticket Meta
+  block - from *both* sides before either is tokenized, and frontmatter tags are
+  not indexed at all. Otherwise the strongest signal in the corpus is that one
+  generator wrote all of it, and every note looks equally relevant to every
+  ticket.
+- **Inject.** `orchestrator._task_prompt` appends a *Known pitfalls from prior
+  iterations* section of at most `k` wikilinked notes, hard-capped at
+  `max_chars`; whole notes are dropped to fit, never truncated mid-line
+  (`recall.fit` decides the budget, `recall.render_pack` renders it). An empty
+  corpus or `enabled: false` renders nothing at all.
 - **Plan.** `synthesis.build_prompt` carries a *What this loop has already
   tried* section (`synthesis.MemoryPack`) - open tickets, recently closed
   tickets, and lesson outcomes, titles only and hard-capped - ahead of the
@@ -93,10 +101,18 @@ closes the loop.
   with a prior title clears the configured Jaccard threshold, is dropped and
   its slot is never back-filled - `SynthesisResult.rejected` and
   `.rejected_titles` carry the count and matches into `BlockReport.notes`.
-- **Audit.** What was retrieved is recorded three times: on `IterationResult`,
-  as a `recalled:` list in the lesson's frontmatter, and as a
-  *Prior lessons consulted* section on the PR. `hsai recall "<query>"` prints
-  the same ranking by hand.
+- **Audit.** What was retrieved is recorded four times: on `IterationResult`,
+  as a `recalled:` list of `[[wikilinks]]` in the lesson's frontmatter (so the
+  Obsidian graph shows which lesson informed which iteration), as a
+  *Prior lessons applied* section on the PR, and as `recalled_count` on the
+  iteration's ledger record. `hsai recall "<query>"` prints the same ranking by
+  hand; `--pack` prints the block a worker would actually be handed.
+- **Measure.** Because the count is on the ledger, `BlockAggregate` can compare
+  merge rates for iterations that were given a pack against those that started
+  cold, and `recall_effect()` states that comparison - sample sizes included -
+  in every block whitepaper. `hsai reindex` surfaces the other half of the
+  picture: the Lessons MOC lists the most-recalled lessons, so the knowledge the
+  loop actually leans on is visible to the architect.
 
 Reference-set lineage: retrieval-before-planning from `assafelovic/gpt-researcher`,
 index-then-retrieve with metadata preserved from `run-llama/llama_index`, and

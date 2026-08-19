@@ -6,7 +6,7 @@ Commands:
   hsai status                                                  config + backlog snapshot
   hsai cycle [--cycle-index N] [--resume] [--dry-run]          one governance block
   hsai reindex [--root DIR]                                    rebuild knowledge MOCs + notes.json
-  hsai recall "<query>" [--k N] [--kind K]                     rank prior lessons/ADRs
+  hsai recall "<query>" [--k N] [--kind K] [--pack]            rank prior lessons/ADRs
   hsai practices list                                          show the adopted-practice registry
   hsai practices add --title T --source-project P ...          record a new adopted practice
   hsai postmortem [--block N]                                  print the failure-class Pareto for a block
@@ -119,6 +119,11 @@ def cmd_recall(args: argparse.Namespace) -> int:
     if not notes:
         print(f"recall: no match for {args.query!r} in {len(corpus)} note(s)", file=sys.stderr)
         return 1
+    if args.pack:
+        # Exactly the block a worker would be handed, budget included - the
+        # cheapest way to see what retrieval is actually teaching the loop.
+        print(recall.render(notes, recall.RecallConfig.from_core(cfg).max_chars).section)
+        return 0
     for note in notes:
         print(f"{note.score:8.3f}  {note.note_name}  ({note.label()})")
     return 0
@@ -328,6 +333,10 @@ def build_parser() -> argparse.ArgumentParser:
     rl.add_argument("--k", type=int, default=5, help="how many notes to print")
     rl.add_argument("--kind", default="", help="bias toward this task kind (heal/implement/improve)")
     rl.add_argument("--root", default=".", help="repo root holding knowledge/ and docs/adr")
+    rl.add_argument(
+        "--pack", action="store_true",
+        help="print the pitfalls block a worker would be given, not the ranking",
+    )
     rl.set_defaults(func=cmd_recall)
 
     pr = sub.add_parser("practices", help="the adopted-practice registry (see hsai.practices)")

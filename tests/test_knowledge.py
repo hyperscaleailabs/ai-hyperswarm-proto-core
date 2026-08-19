@@ -1,9 +1,12 @@
+import re
+
 from hsai import practices as practices_mod
 from hsai.knowledge import (
     KnowledgeBase,
     Lesson,
     LessonRecord,
     Whitepaper,
+    most_recalled,
     parse_note,
     slugify,
     split_sections,
@@ -213,6 +216,12 @@ def test_read_lessons_round_trips_written_lessons(tmp_path):
     assert r.what_happened == "did the thing"
 
 
+def _write_raw(path, frontmatter_block: str):
+    """A hand-written note, to prove the parser survives older/edited notes."""
+    path.write_text(f"---\ntags:\n  - lesson\n{frontmatter_block}\n---\n\n# A note\n")
+    return path
+
+
 def test_recalled_notes_are_written_as_a_frontmatter_list(tmp_path):
     kb = KnowledgeBase(tmp_path)
     lesson = Lesson(
@@ -226,17 +235,78 @@ def test_recalled_notes_are_written_as_a_frontmatter_list(tmp_path):
     )
     path = kb.write_lesson(lesson)
     frontmatter = path.read_text().split("---\n")[1]
-    assert "recalled:\n  - 2026-01-01-a\n  - 2026-01-02-b\n" in frontmatter
+    # written as quoted wikilinks: Obsidian turns these into real graph edges,
+    # so the vault shows which lesson informed which iteration
+    assert 'recalled:\n  - "[[2026-01-01-a]]"\n  - "[[2026-01-02-b]]"\n' in frontmatter
 
     # the recalled list is a SEPARATE key: it must not leak back in as a tag
     record = parse_note(path)
     assert record.tags == ("lesson", "outcome/pass", "kind/implement")
     assert record.outcome == "pass" and record.kind == "implement"
 
+    # ...and read back off disk as plain note names, links unwrapped
+    assert record.recalled == ("2026-01-01-a", "2026-01-02-b")
+    # a note written before links were quoted still parses
+    assert parse_note(
+        _write_raw(tmp_path / "old.md", "recalled:\n  - 2026-01-01-a")
+    ).recalled == ("2026-01-01-a",)
+
     # nothing recalled -> the key is absent entirely, so a run with recall
     # disabled renders exactly as it did before recall existed
     lesson.recalled = ()
-    assert "recalled" not in kb.write_lesson(lesson).read_text().split("---\n")[1]
+    rewritten = kb.write_lesson(lesson)
+    assert "recalled" not in rewritten.read_text().split("---\n")[1]
+    assert parse_note(rewritten).recalled == ()
+
+
+def _recalling_lesson(title: str, recalled: tuple[str, ...] = ()) -> Lesson:
+    return Lesson(
+        title=title, outcome="pass", kind="implement",
+        context="c", what_happened="w", lesson="l", recalled=recalled,
+    )
+
+
+def test_most_recalled_counts_citations_and_ignores_dangling_ones(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    taught = kb.write_lesson(_recalling_lesson("gate on remote CI")).stem
+    also = kb.write_lesson(_recalling_lesson("keep worktrees clean")).stem
+    kb.write_lesson(_recalling_lesson("a later iteration", recalled=(taught,)))
+    kb.write_lesson(_recalling_lesson("a later iteration still", recalled=(taught, also)))
+    # a note that cites something no longer in the vault
+    kb.write_lesson(_recalling_lesson("a stale citation", recalled=("2020-01-01-deleted",)))
+
+    assert most_recalled(kb.read_lessons()) == [(taught, 2), (also, 1)]
+    assert most_recalled(kb.read_lessons(), top=1) == [(taught, 2)]
+
+
+def test_lessons_moc_surfaces_the_most_recalled_lessons_with_resolvable_links(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    taught = kb.write_lesson(_recalling_lesson("gate on remote CI")).stem
+    kb.write_lesson(_recalling_lesson("a later iteration", recalled=(taught,)))
+    kb.reindex_mocs()
+
+    moc = (kb.mocs_dir / "Lessons MOC.md").read_text()
+    assert "## Most-recalled lessons" in moc
+    assert f"- [[{taught}]] - recalled by 1 iteration(s)" in moc
+
+    # every wikilink in the MOC resolves to a note that exists in the vault
+    linked = set(re.findall(r"\[\[([^\]]+)\]\]", moc))
+    on_disk = set(kb.lesson_notes()) | {p.stem for p in kb.mocs_dir.glob("*.md")}
+    assert linked <= on_disk
+
+    # regenerating an unchanged vault is byte-stable
+    kb.reindex_mocs()
+    assert (kb.mocs_dir / "Lessons MOC.md").read_text() == moc
+
+
+def test_lessons_moc_says_so_when_nothing_has_been_recalled_yet(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    kb.write_lesson(_recalling_lesson("a lonely first lesson"))
+    kb.reindex_mocs()
+
+    moc = (kb.mocs_dir / "Lessons MOC.md").read_text()
+    assert "## Most-recalled lessons" in moc
+    assert "No lesson has been recalled into a worker prompt yet." in moc
 
 
 def test_parse_note_reads_any_vault_note_not_just_lessons(tmp_path):
@@ -295,6 +365,20 @@ def test_synthesize_whitepaper_groups_outcomes_and_surfaces_recurring_failures(t
 
     path = kb.write_whitepaper(paper)
     assert "[[Whitepapers MOC]]" in path.read_text()
+
+
+def test_whitepaper_states_the_recall_comparison_only_when_measured(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    kb.write_lesson(_recalling_lesson("implement: something"))
+
+    # a block hands in its ledger fold; the paper states the comparison
+    measured = kb.synthesize_whitepaper(recall_effect="With a pack 2/3 (67%); cold 1/2 (50%).")
+    assert "## Recall effectiveness" in measured.body
+    assert "With a pack 2/3 (67%)" in measured.body
+
+    # synthesized outside a block there is nothing to compare, and the paper is
+    # byte-for-byte what it was before recall was measured
+    assert "Recall effectiveness" not in kb.synthesize_whitepaper().body
 
 
 # --- Practices MOC: grouped by source project, linked from the root MOC ------

@@ -69,6 +69,11 @@ class LedgerRecord:
     # to "" so read_records() parses pre-existing records that lack them.
     failure_class: str = ""
     failure_detail: str = ""
+    # How many prior notes recall injected into this iteration's prompt (see
+    # hsai.recall). 0 means the worker started cold - either recall was
+    # disabled, or nothing in the vault matched. Defaults to 0 so read_records()
+    # parses records written before retrieval was measured.
+    recalled_count: int = 0
     created: str = field(default_factory=_now)
 
     def to_json(self) -> str:
@@ -137,6 +142,13 @@ def parse_tokens(output: str | dict | None) -> tuple[int, int] | None:
     return int(inp or 0), int(out or 0)
 
 
+def _rate(part: int, whole: int) -> str:
+    """``"3/4 (75%)"``, or an explicit "none ran" when the denominator is zero."""
+    if not whole:
+        return "0/0 (none ran)"
+    return f"{part}/{whole} ({100 * part / whole:.0f}%)"
+
+
 @dataclass
 class BlockAggregate:
     """Folded cost of one half-day block (input to the brief + budget gate)."""
@@ -154,10 +166,39 @@ class BlockAggregate:
     # Per-class failure counts this block (see hsai.postmortem.pareto_table for
     # the richer share/exemplar breakdown the review brief renders).
     failure_histogram: dict[str, int] = field(default_factory=dict)
+    # Did being shown prior lessons help? Merge rates for the iterations that
+    # got a recall pack vs the ones that started cold (see hsai.recall).
+    recalled_iterations: int = 0
+    merged_with_recall: int = 0
+    merged_without_recall: int = 0
 
     @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
+
+    @property
+    def cold_iterations(self) -> int:
+        """Iterations that ran with no prior lessons in their prompt."""
+        return self.iterations - self.recalled_iterations
+
+    def recall_effect(self) -> str:
+        """One sentence comparing merge rates with and without a recall pack.
+
+        Deliberately states the sample sizes rather than the rates alone: at a
+        block size of five, "100% vs 0%" is one iteration each way and reads as
+        proof when it is barely evidence. Whichever side is empty is named as
+        such, so the comparison is never silently one-sided.
+        """
+        if not self.iterations:
+            return "_No iterations recorded for this block._"
+        return (
+            f"Iterations given a recall pack merged "
+            f"{_rate(self.merged_with_recall, self.recalled_iterations)}; "
+            f"iterations that started cold merged "
+            f"{_rate(self.merged_without_recall, self.cold_iterations)}. "
+            "Too few iterations per block to be conclusive on its own - the "
+            "comparison is cumulative across blocks via `knowledge/ledger/`."
+        )
 
     def tokens_per_merged_pr(self) -> float | None:
         """Quota spent per unit of delivered work - the block's efficiency.
@@ -200,6 +241,12 @@ def aggregate_block(records: list[LedgerRecord], block: int) -> BlockAggregate:
             agg.heavy_iterations += 1
         if r.outcome == "merged":
             agg.merged_iterations += 1
+        if r.recalled_count:
+            agg.recalled_iterations += 1
+            if r.outcome == "merged":
+                agg.merged_with_recall += 1
+        elif r.outcome == "merged":
+            agg.merged_without_recall += 1
         if r.kind == "review":
             agg.review_iterations += 1
         if r.failure_class:

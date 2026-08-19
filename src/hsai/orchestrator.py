@@ -123,7 +123,7 @@ def build_pr_body(
     # it is auditable after the fact.
     recalled_links = "\n".join(f"- [[{n}]]" for n in recalled)
     recalled_section = (
-        f"\n## Prior lessons consulted\n{recalled_links}\n" if recalled else ""
+        f"\n## Prior lessons applied\n{recalled_links}\n" if recalled else ""
     )
     # What the run cost and how it ended, visible on the PR itself - the full
     # record stays in the local (gitignored) trajectory store.
@@ -425,6 +425,10 @@ def run_once(
                 output_tokens=tokens[1] if tokens else None,
                 failure_class=failure_class,
                 failure_detail=failure_detail[:200],
+                # How much memory this iteration was given, so a later block can
+                # compare outcomes with and without a pack (see
+                # ledger.BlockAggregate.recall_effect).
+                recalled_count=len(recalled.notes),
             ),
         )
 

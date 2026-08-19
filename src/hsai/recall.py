@@ -8,6 +8,15 @@ circle with a small, dependency-free BM25 index built on demand:
     corpus = Corpus.load(repo_root, cfg)
     notes = corpus.search("remote CI gate", k=3)
 
+or, over the lessons a :class:`~hsai.knowledge.KnowledgeBase` holds:
+
+    pack = render_pack(select(index_lessons(kb), ticket_body, k=3, max_chars=1200))
+
+Scoring compares prose, not template: :func:`strip_boilerplate` removes the
+scaffolding every note and every ticket shares before either side is tokenized,
+so notes are ranked on what they concluded rather than on the fact that they
+were all written by the same generator.
+
 Two deliberate biases, both configurable under ``knowledge.recall``:
 
 * **failures outrank successes** - a lesson tagged ``outcome/fail`` is the
@@ -23,11 +32,12 @@ from __future__ import annotations
 import math
 import re
 from collections import Counter
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 from .config import CoreConfig
-from .knowledge import LessonRecord, parse_note, split_sections
+from .knowledge import KnowledgeBase, LessonRecord, parse_note, split_sections
 
 # BM25 free parameters - the standard defaults; term saturation (k1) and
 # length normalisation (b).
@@ -47,6 +57,25 @@ _STOPWORDS = frozenset(
 # Notes that are pure indexes or scaffolding: retrieving them teaches nothing.
 _SKIP_STEMS = frozenset({"TEMPLATE"})
 _SKIP_SUFFIXES = (" MOC",)
+
+# Lines that are template, not content. Every lesson this loop writes carries
+# the same breadcrumb, the same metadata table, the same seven section
+# headings and the same "_(none)_" placeholders; every synthesized ticket
+# carries the same `- goals:`/`- size:` meta block. Scored as-is, that shared
+# scaffolding is the strongest signal in the corpus and every note looks
+# equally similar to every ticket. Removed before scoring, similarity is
+# decided by what a note actually says.
+_TEMPLATE_LINE_RE = re.compile(
+    r"""^\s*(?:
+        \#{1,6}\s          # section headings - the same seven in every lesson
+      | >                  # the "> Part of [[Lessons MOC]]" breadcrumb
+      | \|                 # metadata tables - fixed labels, values modelled as fields
+      | -{3,}\s*$          # rules and frontmatter fences
+      | _\(.*\)_\s*$       # "_(none cited)_", "_(pending)_", ... placeholders
+      | -\s*(?:goals|size)\s*:   # a ticket's Meta block, shared by every ticket
+    )""",
+    re.VERBOSE,
+)
 
 # Where a note states its conclusion, best first.
 _SNIPPET_SECTIONS = ("lesson learned", "summary", "decision", "what happened", "context")
@@ -138,9 +167,27 @@ def tokenize(text: str) -> list[str]:
     ]
 
 
-def is_indexable(path: Path) -> bool:
-    """Is this note worth retrieving? Templates and MOCs teach nothing."""
-    return path.stem not in _SKIP_STEMS and not path.stem.endswith(_SKIP_SUFFIXES)
+def strip_boilerplate(text: str) -> str:
+    """Drop the scaffolding a note (or a ticket) shares with all the others.
+
+    Applied to BOTH sides of the comparison - the indexed note and the query -
+    because the ticket a worker is handed is templated too. What survives is
+    prose: the context, what happened, and the lesson itself.
+    """
+    return "\n".join(
+        line for line in text.splitlines()
+        if line.strip() and not _TEMPLATE_LINE_RE.match(line)
+    )
+
+
+def is_indexable(path: Path | str) -> bool:
+    """Is this note worth retrieving? Templates and MOCs teach nothing.
+
+    Accepts a path or a bare note name, so the same rule applies whether notes
+    are walked off disk or arrive already parsed.
+    """
+    stem = Path(path).stem
+    return stem not in _SKIP_STEMS and not stem.endswith(_SKIP_SUFFIXES)
 
 
 def note_sources(cfg: CoreConfig | None) -> tuple[tuple[str, str], ...]:
@@ -186,8 +233,15 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: max(0, limit - 3)].rstrip() + "..."
 
 
-def _to_document(path: Path, source: str) -> Document:
-    record = parse_note(path)
+def to_document(record: LessonRecord, source: str = "lesson") -> Document:
+    """Index one parsed note: metadata for weighting, prose tokens for scoring.
+
+    The whole note is indexed, minus its template - a lesson's value is often in
+    what happened, not only in its one-line conclusion. Frontmatter tags are
+    deliberately NOT indexed: ``lesson``, ``outcome/*`` and ``kind/*`` are on
+    every note (so they discriminate nothing) and already steer ranking as
+    weights rather than as terms.
+    """
     return Document(
         note_name=record.note_name,
         title=record.title,
@@ -195,9 +249,7 @@ def _to_document(path: Path, source: str) -> Document:
         kind=record.kind,
         source=source,
         snippet=_snippet(record),
-        # The whole note is indexed - a lesson's value is often in what
-        # happened, not only in its one-line conclusion.
-        tokens=tuple(tokenize(f"{record.title}\n{' '.join(record.tags)}\n{record.body}")),
+        tokens=tuple(tokenize(f"{record.title}\n{strip_boilerplate(record.body)}")),
     )
 
 
@@ -214,6 +266,17 @@ class Corpus:
         self._avgdl = (sum(lengths) / len(lengths)) if lengths else 0.0
 
     @classmethod
+    def from_records(
+        cls,
+        records: Iterable[LessonRecord],
+        cfg: CoreConfig | None = None,
+        *,
+        source: str = "lesson",
+    ) -> Corpus:
+        """Index records already parsed off disk (see :func:`index_lessons`)."""
+        return cls([to_document(r, source) for r in records], RecallConfig.from_core(cfg))
+
+    @classmethod
     def load(cls, root: str | Path, cfg: CoreConfig | None = None) -> Corpus:
         """Build the index from what is on disk under ``root``.
 
@@ -228,7 +291,7 @@ class Corpus:
                 continue
             for path in sorted(directory.glob("*.md")):
                 if is_indexable(path):
-                    documents.append(_to_document(path, source))
+                    documents.append(to_document(parse_note(path), source))
         return cls(documents, RecallConfig.from_core(cfg))
 
     def __len__(self) -> int:
@@ -267,7 +330,7 @@ class Corpus:
         Ties break on ``note_name`` so the ordering is total and reproducible.
         """
         limit = self.recall.k if k is None else k
-        query_terms = set(tokenize(query))
+        query_terms = set(tokenize(strip_boilerplate(query)))
         if not query_terms or limit <= 0:
             return []
         scored: list[RecalledNote] = []
@@ -296,42 +359,89 @@ class Corpus:
         return scored[:limit]
 
 
-HEADING = "Prior lessons from this repo"
+HEADING = "Known pitfalls from prior iterations"
 _PREAMBLE = (
-    f"{HEADING} (retrieved from the knowledge base - failures first). "
+    f"{HEADING} (retrieved from this repo's knowledge base - failures first). "
     "Read them before you start; do not repeat what already failed:"
 )
 
 
-def render(notes: list[RecalledNote] | tuple[RecalledNote, ...], max_chars: int) -> Recall:
-    """Render at most ``max_chars`` of prompt text, dropping whole notes to fit.
+def fit(notes: Sequence[RecalledNote], max_chars: int) -> list[RecalledNote]:
+    """The longest prefix of ``notes`` that still renders within ``max_chars``.
 
-    The returned :class:`Recall` reports only the notes that survived the
-    budget, so the audit trail can never claim more than was actually injected.
+    Whole notes are dropped rather than one truncated: half a lesson is worse
+    than no lesson, and a clipped ``[[wikilink]]`` would not resolve.
     """
-    if not notes or max_chars <= 0:
-        return Recall()
-    if len(_PREAMBLE) > max_chars:
-        return Recall()
+    if not notes or max_chars <= 0 or len(_PREAMBLE) > max_chars:
+        return []
     kept: list[RecalledNote] = []
-    lines = [_PREAMBLE]
     used = len(_PREAMBLE)
     for note in notes:
         line = note.render()
         if used + 1 + len(line) > max_chars:
             break
-        lines.append(line)
         used += 1 + len(line)
         kept.append(note)
-    if not kept:
-        return Recall()
-    return Recall(notes=tuple(kept), section="\n".join(lines))
+    return kept
+
+
+def render_pack(notes: Sequence[RecalledNote]) -> str:
+    """The bounded pitfalls block a worker sees, or "" for nothing to say.
+
+    Size is decided by :func:`fit`, never here: this renders exactly the notes
+    it is given, so what a caller records as injected is what was injected.
+    """
+    if not notes:
+        return ""
+    return "\n".join([_PREAMBLE, *(n.render() for n in notes)])
+
+
+def render(notes: Sequence[RecalledNote], max_chars: int) -> Recall:
+    """Fit ``notes`` to the budget and render them, with the audit trail attached.
+
+    The returned :class:`Recall` reports only the notes that survived the
+    budget, so the audit trail can never claim more than was actually injected.
+    """
+    kept = fit(notes, max_chars)
+    return Recall(notes=tuple(kept), section=render_pack(kept))
+
+
+def index_lessons(kb: KnowledgeBase) -> list[LessonRecord]:
+    """Every lesson in ``kb`` that is worth retrieving, oldest first.
+
+    The read half of the knowledge base, expressed against the same
+    :class:`~hsai.knowledge.KnowledgeBase` the loop writes through - so the
+    corpus a worker recalls from is by construction the corpus the loop wrote.
+    """
+    return [r for r in kb.read_lessons() if is_indexable(r.note_name)]
+
+
+def select(
+    records: Iterable[LessonRecord],
+    task: str,
+    k: int = RecallConfig.k,
+    max_chars: int = RecallConfig.max_chars,
+    *,
+    kind: str = "",
+    cfg: CoreConfig | None = None,
+) -> list[RecalledNote]:
+    """Rank ``records`` against ``task`` and keep what fits the character budget.
+
+    Returns at most ``k`` notes, and never more than :func:`render_pack` can
+    render inside ``max_chars`` - the two limits a prompt budget actually cares
+    about, enforced in one place.
+    """
+    corpus = Corpus.from_records(records, cfg)
+    return fit(corpus.search(task, k, kind=kind), max_chars)
 
 
 def for_task(
     root: str | Path, cfg: CoreConfig, *, title: str, body: str = "", kind: str = ""
 ) -> Recall:
     """Retrieve prior notes relevant to one task, ready to paste into a prompt.
+
+    Indexes lessons, whitepapers and ADRs alike (see :func:`note_sources`) -
+    broader than :func:`select`, which ranks a lessons-only record list.
 
     Returns an empty :class:`Recall` when recall is disabled or the corpus is
     empty - callers then render nothing at all.

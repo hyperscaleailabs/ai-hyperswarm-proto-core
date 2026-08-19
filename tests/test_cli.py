@@ -1,8 +1,9 @@
 import json
 
 from hsai import cli as cli_module
-from hsai import trajectory
+from hsai import recall, trajectory
 from hsai.cli import build_parser, main
+from hsai.config import load_config
 from hsai.repro import ReproResult
 from hsai.trajectory import Step, Trajectory
 
@@ -116,6 +117,24 @@ def test_recall_command_prints_ranked_notes_with_scores(tmp_path, capsys):
     # a score is printed alongside every name
     first = out.splitlines()[0].split()
     assert float(first[0]) > 0 and first[1] == "2026-01-01-remote-ci-gate"
+
+
+def test_recall_pack_prints_the_block_a_worker_would_be_handed(tmp_path, capsys):
+    lessons = tmp_path / "knowledge" / "lessons"
+    lessons.mkdir(parents=True)
+    (lessons / "2026-01-01-remote-ci-gate.md").write_text(
+        "---\ntags:\n  - lesson\n  - outcome/fail\n  - kind/implement\n---\n\n"
+        "# Remote CI gate\n\n## Lesson learned\nPoll the rollup before merging.\n"
+    )
+
+    rc = main(["recall", "remote CI gate", "--pack", "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert out.startswith(recall.HEADING)
+    assert "- [[2026-01-01-remote-ci-gate]] (fail/implement) - Poll the rollup" in out
+    # the printed block obeys the same budget a real prompt does
+    assert len(out.strip()) <= recall.RecallConfig.from_core(load_config()).max_chars
 
 
 def test_reindex_rebuilds_the_mocs_and_the_retrieval_index(tmp_path, capsys):
