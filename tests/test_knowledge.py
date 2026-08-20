@@ -162,7 +162,8 @@ def test_write_lesson_and_reindex(tmp_path):
     written = kb.reindex_mocs()
     names = {p.name for p in written}
     assert names == {
-        "Lessons MOC.md", "Whitepapers MOC.md", "Practices MOC.md", "Knowledge Base MOC.md",
+        "Lessons MOC.md", "Whitepapers MOC.md", "Practices MOC.md",
+        "Reference Set MOC.md", "Knowledge Base MOC.md",
     }
     lessons_moc = (kb.mocs_dir / "Lessons MOC.md").read_text()
     assert f"[[{lesson.note_name()}]]" in lessons_moc

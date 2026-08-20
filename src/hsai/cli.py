@@ -6,6 +6,7 @@ Commands:
   hsai status                                                  config + backlog snapshot
   hsai cycle [--cycle-index N] [--resume] [--dry-run]          one governance block
   hsai reindex [--root DIR]                                    rebuild knowledge MOCs + notes.json
+  hsai observe [--refresh]                                     refresh reference digests + dossiers
   hsai recall "<query>" [--k N] [--kind K]                     rank prior lessons/ADRs
   hsai practices list                                          show the adopted-practice registry
   hsai practices add --title T --source-project P ...          record a new adopted practice
@@ -25,6 +26,7 @@ from . import (
     __version__,
     ai,
     ledger,
+    observatory,
     postmortem,
     practices,
     recall,
@@ -35,6 +37,7 @@ from . import (
 from .config import CoreConfig, load_config, validate
 from .knowledge import KnowledgeBase
 from .orchestrator import run_loop
+from .proc import run
 from .swarm import run_parallel
 
 
@@ -101,6 +104,27 @@ def cmd_reindex(args: argparse.Namespace) -> int:
         print(f"reindexed {p}")
     index = retrieval.write_index(root, cfg)
     print(f"reindexed {index} ({len(retrieval.note_paths(root, cfg))} note(s))")
+    return 0
+
+
+def cmd_observe(args: argparse.Namespace) -> int:
+    """Refresh the reference-set digests and dossiers without running a cycle.
+
+    Writes nothing outside the observatory directory: the digest cache and the
+    per-project dossiers are the only artifacts this command owns. The MOCs and
+    the retrieval index stay with `hsai reindex`, so `observe` can be run at any
+    time - including on a dirty tree - without touching another tracked file.
+    """
+    cfg = _load(args)
+    observations = observatory.observe(
+        cfg, args.root, runner=run, force=args.refresh
+    )
+    for obs in observations:
+        state = "refreshed" if obs.refreshed else "cached"
+        print(f"{obs.repo}: {state} - {obs.delta.summary()}")
+    for path in KnowledgeBase.from_config(cfg, args.root).write_reference_dossiers():
+        print(f"wrote {path}")
+    print(observatory.staleness_line(cfg, args.root))
     return 0
 
 
@@ -322,6 +346,16 @@ def build_parser() -> argparse.ArgumentParser:
     ri = sub.add_parser("reindex", help="rebuild knowledge-base MOCs + the retrieval index")
     ri.add_argument("--root", default=".", help="repo root holding knowledge/ and docs/adr")
     ri.set_defaults(func=cmd_reindex)
+
+    ob = sub.add_parser(
+        "observe", help="refresh the reference-set digest cache and dossiers"
+    )
+    ob.add_argument("--root", default=".", help="repo root holding knowledge/reference")
+    ob.add_argument(
+        "--refresh", action="store_true",
+        help="re-fetch every project, not only the ones that have gone stale",
+    )
+    ob.set_defaults(func=cmd_observe)
 
     rl = sub.add_parser("recall", help="rank prior lessons/whitepapers/ADRs for a query")
     rl.add_argument("query", help="what the task is about, in plain words")

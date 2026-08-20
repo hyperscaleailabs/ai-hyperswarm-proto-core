@@ -2,7 +2,7 @@ import json
 import re
 from pathlib import Path
 
-from hsai import ai, retrieval
+from hsai import ai, observatory, retrieval
 from hsai.config import load_config
 from hsai.models import ModelChoice
 from hsai.practices import ADOPTED_HEADING, build_practice
@@ -14,6 +14,7 @@ from hsai.synthesis import (
     MEMORY_HEADING,
     ContextPack,
     MemoryPack,
+    build_context_pack,
     build_prompt,
     gather_prior_art,
     goal_queries,
@@ -651,3 +652,119 @@ def test_synthesis_drops_a_candidate_that_restates_a_failed_lesson(tmp_path):
     assert "[[2026-01-04-vector-memory]]" in dropped
     kept = next(f for f in res.risk_flags if f.startswith("feat: signed provenance"))
     assert "keep" in kept
+
+
+# --- the observatory: the pack studies what CHANGED, not what is merely present ---
+
+STUDIED_REPO = "openai/swarm"
+JSON_BLOCK_INSTRUCTION = "The JSON block must be the LAST fenced block in your reply."
+
+
+def _digest_runner(*, commits, workflows=("ci.yml",), readme="# swarm\n\ntiny core"):
+    """A fake `gh api` serving one reference project's digest."""
+
+    def runner(cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None):
+        target = cmd[2] if len(cmd) > 2 else ""
+        if target.endswith("/readme"):
+            return Proc(cmd, 0, readme, "")
+        if "/commits" in target:
+            return Proc(cmd, 0, "".join(f"{sha}\t{s}\n" for sha, s in commits), "")
+        if "/contents/.github/workflows" in target:
+            return Proc(cmd, 0, "".join(f"{w}\n" for w in workflows), "")
+        return Proc(cmd, 0, "main\n", "")
+
+    return runner
+
+
+def _seed_citing_lesson(root) -> str:
+    directory = root / "knowledge" / "lessons"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "2026-01-01-handoffs.md").write_text(
+        "---\ntags:\n  - lesson\n  - outcome/pass\n  - kind/implement\ncreated: 2026-01-01\n---\n\n"
+        "# feat: worker handoffs\n\n## Lesson learned\nKeep the core tiny.\n\n"
+        "## References (reference-set evidence)\n- `openai/swarm`\n"
+    )
+    return "2026-01-01-handoffs"
+
+
+def test_context_pack_renders_the_delta_and_the_already_adopted_section(tmp_path):
+    """Per rotated repo: what changed, the baseline, and what we already took."""
+    cfg = _cfg()
+    note = _seed_citing_lesson(tmp_path)
+
+    first = build_context_pack(
+        [STUDIED_REPO], cfg=cfg, root=str(tmp_path),
+        runner=_digest_runner(commits=[("aaa111", "feat: add handoffs")]),
+    )
+    text = first.render()
+    assert observatory.DELTA_HEADING in text
+    assert observatory.ADOPTED_FROM_PROJECT_HEADING in text
+    assert "Baseline observation" in text                  # nothing to diff against yet
+    assert f"[[{note}]] - feat: worker handoffs" in text    # derived from knowledge/lessons
+
+    # Second cycle: the digest is cached, so the pack leads with what MOVED.
+    second = build_context_pack(
+        [STUDIED_REPO], cfg=cfg, root=str(tmp_path),
+        runner=_digest_runner(
+            commits=[("ccc333", "fix: retry the tool loop"), ("aaa111", "feat: add handoffs")],
+            workflows=("ci.yml", "stale.yml"),
+        ),
+    )
+    delta_section = second.sections[STUDIED_REPO]
+    assert "fix: retry the tool loop" in delta_section
+    assert delta_section.index(observatory.DELTA_HEADING) < delta_section.index(
+        observatory.DIGEST_HEADING
+    )
+    assert "`stale.yml`" in delta_section
+    assert observatory.ADOPTED_FROM_PROJECT_HEADING in delta_section
+
+
+def test_the_prompt_carries_the_delta_and_still_ends_with_the_json_instruction(tmp_path):
+    """New sections must not displace the contract parse_ticket_specs relies on."""
+    cfg = _cfg()
+    _seed_citing_lesson(tmp_path)
+    pack = build_context_pack(
+        [STUDIED_REPO], cfg=cfg, root=str(tmp_path),
+        runner=_digest_runner(commits=[("aaa111", "feat: add handoffs")]),
+    )
+    prompt = build_prompt(cfg, pack)
+
+    assert observatory.DELTA_HEADING in prompt
+    assert observatory.ADOPTED_FROM_PROJECT_HEADING in prompt
+    assert "PREFER THE DELTA" in prompt
+    assert prompt.rstrip().endswith(JSON_BLOCK_INSTRUCTION)
+    # and the parser still reads output that obeys that instruction
+    assert parse_ticket_specs(PLAIN_TEXT_OUTPUT)[0].title == "feat: adaptive budget"
+
+
+def test_context_pack_degrades_to_a_placeholder_when_gh_is_unavailable(tmp_path):
+    def broken(cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None):
+        return Proc(cmd, 127, "", "gh: command not found")
+
+    pack = build_context_pack([STUDIED_REPO], cfg=_cfg(), root=str(tmp_path), runner=broken)
+    section = pack.sections[STUDIED_REPO]
+    assert observatory.NO_DATA in section
+    assert observatory.DELTA_HEADING in section          # the structure survives
+    assert list((tmp_path / "knowledge" / "reference").glob("*.json")) == []
+
+
+def test_synthesize_caches_the_digests_it_studied(tmp_path):
+    """The trace G1 asks for: after a cycle, what was studied is on disk."""
+    cfg = _cfg()
+    ai_runner = _plain_text_runner()
+    gh = _digest_runner(commits=[("aaa111", "feat: add handoffs")])
+
+    def runner(cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None):
+        if cmd[:3] == ["gh", "issue", "create"]:
+            return Proc(cmd, 0, "https://github.com/o/r/issues/901\n", "")
+        if cmd[:2] == ["gh", "api"]:
+            return gh(cmd)
+        return Proc(cmd, 0, "", "")
+
+    res = synthesize(cfg, cycle_index=0, root=str(tmp_path), runner=runner, ai_runner=ai_runner)
+
+    cached = sorted(p.name for p in (tmp_path / "knowledge" / "reference").glob("*.json"))
+    assert cached == sorted(
+        observatory.digest_filename(repo) for repo in res.studied
+    )
+    assert cached, "a cycle must leave a record of what it observed"

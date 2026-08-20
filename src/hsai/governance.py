@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import github
+from . import github, observatory
 from .config import CoreConfig
 from .knowledge import KnowledgeBase
 from .ledger import BlockAggregate
@@ -112,6 +112,7 @@ def render_direction(
   implementation agents), sequential blocks of {cfg.cycle.get('block_size', 5)},
   {cfg.governance.get('reviews_per_day', 2)} reviews/day.
 - Knowledge: {len(lessons)} lessons, {len(papers)} whitepapers ([[Knowledge Base MOC]]).
+- {observatory.staleness_line(cfg, repo_root)}
 - Invariants: ticket-linked PRs, model recorded, lesson per PR, green-gated
   merges (remote CI is truth), subscription-only models, SDLC evidence per PR.
 

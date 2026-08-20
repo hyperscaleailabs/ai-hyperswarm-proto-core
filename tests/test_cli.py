@@ -3,6 +3,7 @@ import json
 from hsai import cli as cli_module
 from hsai import trajectory
 from hsai.cli import build_parser, main
+from hsai.proc import Proc
 from hsai.repro import ReproResult
 from hsai.trajectory import Step, Trajectory
 
@@ -142,6 +143,55 @@ def test_reindex_rebuilds_the_mocs_and_the_retrieval_index(tmp_path, capsys):
     before = index.read_bytes()
     assert main(["reindex", "--root", str(tmp_path)]) == 0
     assert index.read_bytes() == before
+
+
+def test_parser_observe_defaults():
+    parser = build_parser()
+    args = parser.parse_args(["observe"])
+    assert args.command == "observe"
+    assert args.root == "." and args.refresh is False
+    assert parser.parse_args(["observe", "--refresh"]).refresh is True
+
+
+def _gh_api_runner(cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None):
+    """A fake `gh api` serving the same canned digest for every project."""
+    target = cmd[2] if len(cmd) > 2 else ""
+    if target.endswith("/readme"):
+        return Proc(cmd, 0, "# a reference project\n", "")
+    if "/commits" in target:
+        return Proc(cmd, 0, "aaa111\tfeat: something\n", "")
+    if "/contents/.github/workflows" in target:
+        return Proc(cmd, 0, "ci.yml\n", "")
+    return Proc(cmd, 0, "main\n", "")
+
+
+def test_observe_refreshes_digests_and_dossiers_only(tmp_path, monkeypatch, capsys):
+    """`hsai observe` owns knowledge/reference and touches nothing else."""
+    from hsai.config import load_config
+
+    cfg = load_config()
+    monkeypatch.setattr(cli_module, "run", _gh_api_runner)
+
+    rc = main(["observe", "--refresh", "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    reference = tmp_path / "knowledge" / "reference"
+    assert len(list(reference.glob("*.json"))) == len(cfg.reference_top10)
+    assert len(list(reference.glob("*.md"))) == len(cfg.reference_top10)
+    assert "refreshed - baseline recorded (first observation)" in out
+    assert "Reference set:" in out
+    # the MOCs and the retrieval index stay with `hsai reindex`
+    assert not (tmp_path / "knowledge" / "MOCs" / "Lessons MOC.md").exists()
+    assert not (tmp_path / "knowledge" / "index").exists()
+
+    # A second run without --refresh serves the cache instead of re-fetching.
+    def refuse(cmd, **kwargs):
+        raise AssertionError(f"a fresh cache must not re-fetch: {cmd!r}")
+
+    monkeypatch.setattr(cli_module, "run", refuse)
+    assert main(["observe", "--root", str(tmp_path)]) == 0
+    assert "cached - baseline recorded (first observation)" in capsys.readouterr().out
 
 
 def test_recall_command_reports_an_empty_vault_without_crashing(tmp_path, capsys):

@@ -52,14 +52,31 @@ Clone the repo and **open the folder as an Obsidian vault** - the committed
 
 ```
 knowledge/
-├── MOCs/          # Maps of Content: Knowledge Base / Lessons / Whitepapers / Practices
+├── MOCs/          # Maps of Content: Knowledge Base / Lessons / Whitepapers / Practices / Reference Set
 ├── lessons/       # one article per iteration (pass or fail)
 ├── whitepapers/   # periodic syntheses (every N lessons)
 ├── practices/     # adopted-practice registry (see hsai.practices)
+├── reference/     # per-project digest cache + dossiers (see hsai.observatory)
 └── templates/     # note templates
 ```
 
-`hsai reindex` rebuilds the MOCs from what is on disk.
+`hsai reindex` rebuilds the MOCs and the reference dossiers from what is on disk.
+
+**Each cycle studies what CHANGED, not what is merely present.** The
+observatory (`hsai.observatory`) caches one digest per reference project -
+default-branch head sha, README hash plus a capped excerpt, the recent
+commit stream and the CI workflow inventory - under
+`knowledge/reference/<owner>__<repo>.json`. The next cycle diffs against it, so
+the planner is handed the delta first (new commits, added/removed workflows,
+whether the README moved), then the baseline, then the lessons this repo has
+already written citing that project. Each project also gets an Obsidian
+dossier indexed by [[Reference Set MOC]], and `governance/DIRECTION.md` reports
+how many projects have gone unobserved past `observatory.stale_days`.
+
+```bash
+hsai observe              # refresh the projects that have gone stale
+hsai observe --refresh    # re-fetch every project, then rewrite the dossiers
+```
 
 **The synthesis planner has a memory of what it already adopted.** Every
 practice this loop has pulled from the reference set - cited to its source
@@ -120,6 +137,7 @@ hsai loop          # one real iteration (opens & merges a PR on green)
 hsai loop --max-parallel 3 -n 1   # ramp to the swarm (after proving one iteration)
 hsai traj 12       # print what agent run (iteration) 12 did (spends no quota)
 hsai recall "knowledge-only diff on a code ticket"   # rank prior lessons for a task
+hsai observe       # refresh the reference-set digests + dossiers (no cycle, no quota)
 hsai cycle --resume   # finish an interrupted governance block, replaying what completed
 ```
 

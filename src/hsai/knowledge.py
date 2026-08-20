@@ -13,8 +13,10 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+from . import observatory as observatory_mod
 from . import practices as practices_mod
-from .config import CoreConfig
+from .config import CoreConfig, ReferenceRepo
+from .observatory import ObservatoryConfig
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _TAG_RE = re.compile(r"^\s*-\s+(\S.*)$", re.MULTILINE)
@@ -191,6 +193,8 @@ class KnowledgeBase:
         mocs_dir: str = "knowledge/MOCs",
         practices_dir: str = practices_mod.PRACTICES_DIR_DEFAULT,
         whitepaper_every: int = 10,
+        reference_repos: tuple[ReferenceRepo, ...] = (),
+        observatory: ObservatoryConfig | None = None,
     ) -> None:
         self.root = Path(root)
         self.lessons_dir = self.root / lessons_dir
@@ -198,7 +202,13 @@ class KnowledgeBase:
         self.mocs_dir = self.root / mocs_dir
         self.practices_dir = self.root / practices_dir
         self.whitepaper_every = whitepaper_every
-        for d in (self.lessons_dir, self.whitepapers_dir, self.mocs_dir, self.practices_dir):
+        self.reference_repos = reference_repos
+        self.observatory = observatory or ObservatoryConfig()
+        self.reference_dir = self.root / self.observatory.dir
+        for d in (
+            self.lessons_dir, self.whitepapers_dir, self.mocs_dir,
+            self.practices_dir, self.reference_dir,
+        ):
             d.mkdir(parents=True, exist_ok=True)
 
     @classmethod
@@ -211,6 +221,8 @@ class KnowledgeBase:
             mocs_dir=k.get("mocs_dir", "knowledge/MOCs"),
             practices_dir=k.get("practices_dir", practices_mod.PRACTICES_DIR_DEFAULT),
             whitepaper_every=int(k.get("whitepaper_every_lessons", 10)),
+            reference_repos=cfg.reference_top10,
+            observatory=ObservatoryConfig.from_core(cfg),
         )
 
     # --- writing --------------------------------------------------------------
@@ -324,14 +336,173 @@ class KnowledgeBase:
 
     # --- indexing -------------------------------------------------------------
     def reindex_mocs(self) -> list[Path]:
-        """Rebuild the MOC files from what is currently on disk."""
-        written = [
+        """Rebuild every derived note from what is currently on disk.
+
+        Reference dossiers are regenerated here, alongside the MOCs and for the
+        same reason: they are shared derived files, so rebuilding them once in
+        the serialized maintenance step is what keeps parallel PRs from
+        colliding on them.
+        """
+        adopted = self.adopted_index()
+        return [
             self._write_lessons_moc(),
             self._write_whitepapers_moc(),
             self._write_practices_moc(),
+            *self.write_reference_dossiers(adopted=adopted),
+            self._write_reference_moc(adopted),
             self._write_root_moc(),
         ]
-        return written
+
+    # --- reference dossiers ---------------------------------------------------
+    def adopted_index(self) -> dict[str, tuple[observatory_mod.Citation, ...]]:
+        """``reference repo -> the lessons that cite it`` (see :mod:`hsai.observatory`)."""
+        return observatory_mod.adopted_index(
+            self.read_lessons(), [r.repo for r in self.reference_repos]
+        )
+
+    def write_reference_dossiers(
+        self, *, adopted: dict[str, tuple[observatory_mod.Citation, ...]] | None = None
+    ) -> list[Path]:
+        """One dossier per reference project, from the digest cache + lessons.
+
+        Offline and deterministic: the delta each dossier reports was persisted
+        by ``hsai observe`` / the synthesis cycle, so regenerating without new
+        data changes nothing but the ``updated:`` stamp.
+        """
+        adopted = self.adopted_index() if adopted is None else adopted
+        return [self._write_dossier(ref, adopted) for ref in self.reference_repos]
+
+    def _write_dossier(
+        self, ref: ReferenceRepo, adopted: dict[str, tuple[observatory_mod.Citation, ...]]
+    ) -> Path:
+        observation = observatory_mod.read_observation(self.reference_dir, ref.repo)
+        path = self.reference_dir / f"{observatory_mod.dossier_name(ref.repo)}.md"
+        path.write_text(self._render_dossier(ref, observation, adopted.get(ref.repo, ())))
+        return path
+
+    @staticmethod
+    def _dossier_questions(
+        ref: ReferenceRepo,
+        observation: observatory_mod.Observation | None,
+        citations: tuple[observatory_mod.Citation, ...],
+    ) -> str:
+        """What this dossier does not yet answer - derived, never invented."""
+        lines: list[str] = []
+        if observation is None:
+            lines.append(
+                "- Never observed. Run `hsai observe --refresh` to record a baseline for "
+                f"`{ref.repo}`."
+            )
+        elif observation.delta.new_commits:
+            lines.append(
+                f"- Do the {len(observation.delta.new_commits)} new commit subject(s) above "
+                "point at a practice worth adopting?"
+            )
+        if not citations:
+            lines.append(
+                "- Nothing here has been adopted yet - which of its practices should the "
+                "next synthesis cycle mine first?"
+            )
+        lines.append(
+            "- Which of its CI workflows has no counterpart in this repo's "
+            "`.github/workflows`?"
+        )
+        return "\n".join(lines)
+
+    def _render_dossier(
+        self,
+        ref: ReferenceRepo,
+        observation: observatory_mod.Observation | None,
+        citations: tuple[observatory_mod.Citation, ...],
+    ) -> str:
+        fm = self._frontmatter(
+            ("reference", "dossier", f"source/{slugify(ref.repo)}"),
+            {"repo": ref.repo, "updated": _today()},
+        )
+        digest = observation.digest if observation else None
+        observed = (
+            f"{digest.fetched_at} (head `{digest.head_sha[:7] or '?'}` "
+            f"on `{digest.default_branch or '?'}`)"
+            if digest and digest.fetched_at
+            else "_never observed_"
+        )
+        adopted = (
+            "\n".join(f"- [[{c.note_name}]] - {c.title}" for c in citations)
+            or "_Nothing adopted from this project yet._"
+        )
+        delta = (
+            observation.delta.render(max_commits=self.observatory.delta_commits)
+            if observation
+            else "_No observation on record - nothing to diff against yet._"
+        )
+        workflows = (
+            ", ".join(f"`{w}`" for w in digest.workflows) if digest and digest.workflows
+            else "_(none recorded)_"
+        )
+        return f"""{fm}
+
+# {ref.repo}
+
+> Part of [[Reference Set MOC]] - [[Knowledge Base MOC]]
+
+| field | value |
+| --- | --- |
+| repo | `{ref.repo}` |
+| rank | {ref.rank} |
+| stars | {ref.stars} |
+| license | {ref.license or "_(unknown)_"} |
+| last observed | {observed} |
+| CI workflows | {workflows} |
+
+## What it is
+{ref.note or "_(no note recorded in core.yaml)_"}
+
+## What we have adopted
+{adopted}
+
+## What changed last cycle
+{delta}
+
+## Open questions
+{self._dossier_questions(ref, observation, citations)}
+"""
+
+    def _write_reference_moc(
+        self, adopted: dict[str, tuple[observatory_mod.Citation, ...]]
+    ) -> Path:
+        """Index of the ten dossiers, with how long ago each was observed.
+
+        Ordered by the rank pinned in core.yaml, so the MOC reads as the
+        reference set rather than as an alphabetical accident.
+        """
+        rows: list[str] = []
+        for ref in sorted(self.reference_repos, key=lambda r: (r.rank, r.repo)):
+            observation = observatory_mod.read_observation(self.reference_dir, ref.repo)
+            observed = observation.digest.fetched_at[:10] if observation else "never"
+            rows.append(
+                f"| {ref.rank} | [[{observatory_mod.dossier_name(ref.repo)}]] | "
+                f"`{ref.repo}` | {observed} | {len(adopted.get(ref.repo, ()))} |"
+            )
+        body = "\n".join(rows) or "| - | _(none pinned)_ | - | - | 0 |"
+        fm = self._frontmatter(("moc", "reference"), {"updated": _today()})
+        content = f"""{fm}
+
+# Reference Set MOC
+
+Up: [[Knowledge Base MOC]]
+
+One dossier per pinned reference project: what it is, what this loop has
+adopted from it, and what changed since it was last studied. Digests are cached
+under `{self.observatory.dir}/` by `hsai observe` and refreshed by every
+synthesis cycle.
+
+| rank | dossier | repo | last observed | adopted |
+| --- | --- | --- | --- | --- |
+{body}
+"""
+        path = self.mocs_dir / "Reference Set MOC.md"
+        path.write_text(content)
+        return path
 
     # --- rendering ------------------------------------------------------------
     @staticmethod
@@ -514,6 +685,7 @@ project - the durable record behind G1's traceability claim. Total: **{len(recor
         n_lessons = len(self.lesson_notes())
         n_papers = len(self.whitepaper_notes())
         n_practices = len(self.practice_notes())
+        n_refs = len(self.reference_repos)
         content = f"""{fm}
 
 # Knowledge Base MOC
@@ -525,12 +697,15 @@ vault and use the graph view to explore how lessons connect.
 - [[Lessons MOC]] - {n_lessons} lesson(s)
 - [[Whitepapers MOC]] - {n_papers} whitepaper(s)
 - [[Practices MOC]] - {n_practices} practice(s)
+- [[Reference Set MOC]] - {n_refs} reference project dossier(s)
 
 ## How this is maintained
 - Each PR the [[hsai]] loop opens contributes exactly one lesson.
 - Every {self.whitepaper_every} lessons, a whitepaper synthesizes the themes.
 - Every synthesized ticket that adds or extends a practice is recorded in the
   practices registry, indexed by [[Practices MOC]].
+- Each reference project keeps a dossier of what changed since it was last
+  studied and what this loop has adopted from it, refreshed by `hsai observe`.
 - These MOCs are regenerated by `hsai reindex` after each iteration.
 """
         path = self.mocs_dir / "Knowledge Base MOC.md"

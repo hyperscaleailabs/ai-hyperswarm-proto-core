@@ -3,10 +3,12 @@
 This is the "planner" half of the two-phase engine. Instead of one small idea
 copied from one project, a heavy model:
 
-1. receives a context pack built from a rotating subset of the reference set
-   (README, recent commit subjects, CI workflow inventory - fetched via `gh`),
-   plus the :mod:`hsai.practices` registry of what this loop has already
-   adopted from that set, rendered as ground it must not re-propose, plus the
+1. receives a context pack built from a rotating subset of the reference set -
+   per project, the :mod:`hsai.observatory` delta since that project was last
+   studied, the cached baseline digest behind it, and the lessons this repo has
+   already written citing it - plus the :mod:`hsai.practices` registry of what
+   this loop has already adopted from that set, rendered as ground it must not
+   re-propose, plus the
    prior art :mod:`hsai.retrieval` finds in this repo's OWN lessons,
    whitepapers and ADRs for the goals being planned against,
 2. generates ~``ideas_target`` candidate improvements, each required to COMBINE
@@ -28,12 +30,14 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 
-from . import github, retrieval
+from . import github, observatory, retrieval
 from .ai import run_agent
 from .config import CoreConfig
-from .knowledge import KnowledgeBase
+from .knowledge import KnowledgeBase, LessonRecord
 from .models import ModelChoice
+from .observatory import ObservatoryConfig
 from .practices import ADOPTED_HEADING, Practice, render_adopted_section
 from .proc import Runner, run
 from .retrieval import PRIOR_ART_HEADING, NoteIndex, PriorArt
@@ -77,43 +81,44 @@ def pick_rotation(cfg: CoreConfig, cycle_index: int) -> list[str]:
     return [repos[(start + i) % len(repos)] for i in range(min(k, len(repos)))]
 
 
+def _lesson_records(cfg: CoreConfig | None, root: str | Path) -> list[LessonRecord]:
+    """The vault's lessons, or none - a thin adopted-practice list beats an abort."""
+    if cfg is None:
+        return []
+    try:
+        return KnowledgeBase.from_config(cfg, root).read_lessons()
+    except OSError:
+        return []
+
+
 def build_context_pack(
     repos: list[str],
     *,
     runner: Runner = run,
-    commits: int = 30,
+    cfg: CoreConfig | None = None,
+    root: str | Path = ".",
     prior_art: tuple[PriorArt, ...] = (),
 ) -> ContextPack:
-    """Fetch a compact study digest for each repo via the GitHub API.
+    """Study each rotated repo through the observatory, and render the result.
+
+    Three layers per project, in the order the planner should read them: what
+    CHANGED since the last observation, the baseline digest behind it, and the
+    practices this repo has already adopted from that project. The digests are
+    cached (:mod:`hsai.observatory`), so the cycle after this one can tell new
+    ground from ground it already walked - which is the whole point.
 
     ``prior_art`` is retrieved separately (:func:`gather_prior_art`) and passed
     in: everything here talks to the network, everything there is pure.
     """
-    sections: dict[str, str] = {}
-    for repo in repos:
-        parts: list[str] = []
-        readme = runner(
-            ["gh", "api", f"repos/{repo}/readme", "-H", "Accept: application/vnd.github.raw"]
-        )
-        if readme.ok:
-            parts.append("README (truncated):\n" + readme.stdout[:4000])
-        log = runner(
-            [
-                "gh", "api", f"repos/{repo}/commits?per_page={commits}",
-                "--jq", ".[].commit.message | split(\"\\n\")[0]",
-            ]
-        )
-        if log.ok and log.stdout.strip():
-            parts.append("Recent commit subjects:\n" + log.stdout[:2000])
-        workflows = runner(
-            [
-                "gh", "api", f"repos/{repo}/contents/.github/workflows",
-                "--jq", ".[].name",
-            ]
-        )
-        if workflows.ok and workflows.stdout.strip():
-            parts.append("CI workflows:\n" + workflows.stdout[:500])
-        sections[repo] = "\n\n".join(parts) or "(no data fetched)"
+    ocfg = ObservatoryConfig.from_core(cfg)
+    adopted = observatory.adopted_index(_lesson_records(cfg, root), repos)
+    observations = observatory.observe(
+        cfg, root, repos=repos, runner=runner, force=True
+    )
+    sections = {
+        obs.repo: observatory.render_section(obs, adopted, ocfg=ocfg)
+        for obs in observations
+    }
     return ContextPack(repos=repos, sections=sections, prior_art=prior_art)
 
 
@@ -351,7 +356,14 @@ these by name - they are the evidence trail behind every claim you make about
 what this repo has already done:
 {prior_art_section}
 
-Study digest of reference projects for this cycle:
+Study digest of reference projects for this cycle. Each project is rendered in
+three layers: "{observatory.DELTA_HEADING}" (what moved in that project since we
+last studied it), the baseline digest behind it, and
+"{observatory.ADOPTED_FROM_PROJECT_HEADING}".
+PREFER THE DELTA: a candidate grounded in what CHANGED in the field beats one
+grounded in what has merely always been there. If a candidate overlaps something
+listed as already adopted from that project, you must say in its rationale what
+it adds beyond that - otherwise drop it:
 {pack.render()}
 
 Work in three explicit phases and show them all in your output:
@@ -512,7 +524,10 @@ def synthesize(
     """
     repos = pick_rotation(cfg, cycle_index)
     index = retrieval.load_index(root, cfg)
-    pack = build_context_pack(repos, runner=runner, prior_art=gather_prior_art(cfg, index))
+    pack = build_context_pack(
+        repos, runner=runner, cfg=cfg, root=root,
+        prior_art=gather_prior_art(cfg, index),
+    )
     memory = MemoryPack.gather(cfg, root=root, runner=runner)
     try:
         practices = KnowledgeBase.from_config(cfg, root).read_practices()

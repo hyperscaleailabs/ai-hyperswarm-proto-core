@@ -122,16 +122,30 @@ def _iteration_payload(res: IterationResult) -> dict:
 
 
 def _synthesis_step(
-    cfg: CoreConfig, *, idx: int, runner: Runner, ai_runner: Runner, dry_run: bool
+    cfg: CoreConfig,
+    *,
+    idx: int,
+    root: Path,
+    runner: Runner,
+    ai_runner: Runner,
+    dry_run: bool,
 ) -> dict:
-    """Synthesize tickets when the well-formed backlog is thin (journaled once)."""
+    """Synthesize tickets when the well-formed backlog is thin (journaled once).
+
+    ``root`` is threaded through explicitly: synthesis both READS the vault
+    (prior art, lessons, practices) and WRITES to it (the observatory's digest
+    cache), so it must resolve against the block's repo root rather than
+    whatever directory the cycle happened to be launched from.
+    """
     low_water = int(cfg.cycle.get("backlog_low_watermark", 4))
     if dry_run or _well_formed_backlog(cfg, runner=runner) >= low_water:
         return {
             "ran": False, "filed": [], "error": "", "rejected": 0, "rejected_titles": [],
             "risk_flags": [], "risk_dropped": 0,
         }
-    sres = synthesize(cfg, cycle_index=idx, runner=runner, ai_runner=ai_runner)
+    sres = synthesize(
+        cfg, cycle_index=idx, root=str(root), runner=runner, ai_runner=ai_runner
+    )
     return {
         "ran": True, "filed": list(sres.filed), "error": sres.error,
         "rejected": sres.rejected, "rejected_titles": list(sres.rejected_titles),

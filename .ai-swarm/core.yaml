@@ -141,6 +141,20 @@ synthesis:
   memory_max_lessons: 25       # knowledge-base lessons folded into synthesis memory
   duplicate_threshold: 0.6     # Jaccard token overlap above which a candidate is a duplicate
 
+# The reference-set observatory (see src/hsai/observatory.py). Each reference
+# project's README hash, head sha, commit stream and workflow inventory are
+# cached under knowledge/reference/ so every cycle can study what CHANGED since
+# the last observation instead of re-deriving what is merely present. The cache
+# also feeds one Obsidian dossier per project and the staleness line in
+# DIRECTION.md's "Now" section. Refresh without running a cycle: `hsai observe`.
+observatory:
+  dir: knowledge/reference     # digest cache + per-project dossiers
+  commits: 30                  # commit subjects stored (and diffed) per project
+  readme_chars: 4000           # cap on the stored README excerpt
+  subject_chars: 200           # cap on any single stored commit subject
+  stale_days: 14               # unobserved for longer than this = stale, surfaced in DIRECTION.md
+  delta_commits: 12            # new commit subjects rendered into the synthesis prompt
+
 # Quota/cost budget for one half-day block (subscription-only: purely local
 # measurement, never a metered API call). The ledger aggregates each block's
 # spend; this gate warns then halts NEW work when a ceiling is crossed. It never

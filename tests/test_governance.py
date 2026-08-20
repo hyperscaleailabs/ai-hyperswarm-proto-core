@@ -35,6 +35,17 @@ def test_direction_has_three_layers_and_issue_map(tmp_path):
     assert NOTES_START in text and NOTES_END in text
 
 
+def test_direction_now_section_reports_reference_set_staleness(tmp_path):
+    """An unobserved reference project is a visible state, not a silent one."""
+    cfg = load_config()
+    text = render_direction(cfg, repo_root=tmp_path, runner=_issues_runner)
+
+    now_section = text.split("## Now (current state)", 1)[1].split("## Issues Map", 1)[0]
+    assert f"**{len(cfg.reference_top10)}/{len(cfg.reference_top10)}**" in now_section
+    assert "not observed in the last" in now_section
+    assert "hsai observe --refresh" in now_section
+
+
 def test_architect_notes_survive_regeneration(tmp_path):
     cfg = load_config()
     doc = tmp_path / "governance" / "DIRECTION.md"

@@ -55,6 +55,7 @@ class CoreConfig:
     governance: dict[str, Any]
     cycle: dict[str, Any]
     synthesis: dict[str, Any]
+    observatory: dict[str, Any]
     budget: dict[str, Any]
     review: dict[str, Any]
     postmortem: dict[str, Any]
@@ -148,6 +149,7 @@ def load_config(path: str | Path | None = None) -> CoreConfig:
         governance=data.get("governance", {}),
         cycle=data.get("cycle", {}),
         synthesis=data.get("synthesis", {}),
+        observatory=data.get("observatory", {}),
         budget=data.get("budget", {}),
         review=data.get("review", {}),
         postmortem=data.get("postmortem", {}),
