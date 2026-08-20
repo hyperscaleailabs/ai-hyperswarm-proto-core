@@ -25,6 +25,7 @@ from . import (
     __version__,
     ai,
     ledger,
+    permissions,
     postmortem,
     practices,
     recall,
@@ -78,6 +79,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     live_ok, live_msg = ai.check_child_env(cfg)
     print(f"  child-environment guard: {'PASS' if live_ok else 'FAIL'} - {live_msg}")
     if not live_ok:
+        ok = False
+    # Worker capability contract (see hsai.permissions): the committed
+    # .claude/settings.json must exist, grant no wildcard Bash, and match
+    # execution.worker_tools.allowed_tools in core.yaml - a drift here is
+    # exactly the "worker was never allowed to run its own verification"
+    # failure mode this ticket exists to make loud instead of silent.
+    settings_path = cfg.worker_tools_settings_file or permissions.DEFAULT_SETTINGS_FILE
+    profile = permissions.check_profile(settings_path, cfg.worker_tools_allowed)
+    print(f"  worker capability contract: {'PASS' if profile.ok else 'FAIL'} - {profile.message}")
+    if not profile.ok:
         ok = False
     print(f"  constraints: subscription_only={cfg.subscription_only}, "
           f"require_ticket_per_pr={cfg.constraints.get('require_ticket_per_pr')}")

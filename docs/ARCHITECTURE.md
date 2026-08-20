@@ -19,6 +19,8 @@ so the decision logic stays pure and unit-tested.
 | `hsai.knowledge` | lessons, whitepapers, MOC reindex (Obsidian) | write files |
 | `hsai.recall` | BM25 index over the vault; retrieve prior notes | read files |
 | `hsai.review` | independent, different-tier review of the branch diff | subprocess |
+| `hsai.permissions` | worker capability contract: `.claude/settings.json` profile checks | read files |
+| `hsai.verify` | parse a worker's `<<<HSAI-VERIFY>>>` self-report, reconcile vs CI | none (pure) |
 | `hsai.orchestrator` | one iteration; `decide_path`, `build_pr_body` (pure) | composes above |
 | `hsai.swarm` | run N iterations concurrently | threads |
 | `hsai.cli` | `hsai` entry point | - |
@@ -197,6 +199,66 @@ live run of the same block.
 (default `acceptEdits`). For fully unattended operation this can be raised, at
 the cost of granting the agent broader autonomy inside its worktree. Because
 merges are green-gated, a bad change is contained to an unmerged PR.
+
+## Worker capability contract
+
+`permission_mode` governs file edits; it says nothing about which *shell
+commands* a worker may run. Before this contract existed, `_task_prompt` told
+every worker to "ensure `ruff check .` and `pytest` both pass" with no
+enumerated permission to run either - `pytest`/`ruff`/`python` were denied in
+practice, ambiently, and nothing distinguished "the worker ran the tests and
+they passed" from "the worker was never allowed to run them". The first real
+signal was the orchestrator's own post-hoc `ci.run_local`, by which point a
+whole model invocation and worktree had already been spent.
+
+The fix is a narrow, committed permission profile at `.claude/settings.json`,
+mirrored in `execution.worker_tools.allowed_tools` in `core.yaml` so the two
+travel together (`hsai doctor` fails loudly on drift - see `hsai.permissions`)
+and so the contract rides explicitly on every `claude -p` command vector via
+`ai.build_command`'s `--settings`/`--allowedTools` flags, rather than
+depending on `claude` discovering it from the ephemeral worktree's cwd.
+
+Every entry is a Bash command a worker actually needs, and nothing else -
+there is deliberately no wildcard Bash grant and no network or `gh` access:
+
+| entry | justification |
+| --- | --- |
+| `Bash(ruff check:*)` | the lint half of the CI gate the worker must self-verify against |
+| `Bash(pytest:*)` | the test half of the CI gate the worker must self-verify against |
+| `Bash(python -m pytest:*)` | the module-invocation form of the same test run, for environments where the `pytest` entry point isn't on `PATH` |
+| `Bash(git diff:*)` | inspect its own uncommitted change before finishing, without granting write access to git history |
+| `Bash(git status:*)` | check what it has touched (used by the orchestrator's own completeness guard, mirrored here for the worker) |
+
+File edits, reads, and everything else a worker does inside its worktree stay
+governed by `permission_mode` as before; this contract narrows only the Bash
+surface. Because the profile is a single committed file plus a config list
+`hsai doctor` cross-checks, a permissions regression (the profile drifting
+from `core.yaml`, or someone widening it to a wildcard) is a doctor failure,
+not a silent capability loss discovered only after tickets start burning
+attempts.
+
+### Self-verification: observability, not a gate
+
+`_task_prompt` now also requires every worker to run its own verification
+commands and end its final message with a delimited `<<<HSAI-VERIFY>>>` block
+(command + exit code per line; see `hsai.verify`). `orchestrator.run_once`
+parses that block and reconciles it against `ci.run_local`'s own result into
+exactly one of three statuses, recorded on the `IterationResult`, the ledger
+record, and the lesson:
+
+- **`verified-agree`** - the worker's self-report matches the orchestrator's
+  own CI result.
+- **`verified-disagree`** - the worker claimed a result the orchestrator's own
+  CI contradicts (e.g. claimed green while `ci.run_local` is red).
+- **`unverified`** - no parseable claim was made at all (missing block, or a
+  block with no `<command>: exit <code>` lines) - a dry run is always this.
+
+This is diagnostic, never a merge gate: `ci.run_local` and the remote CI poll
+(`ci.wait_remote`) remain the sole arbiters of whether a change merges,
+completely unchanged by this reconciliation - a worker's claim can widen or
+narrow nothing. The governance brief aggregates the unverified rate per block
+(`hsai.ledger.BlockAggregate.unverified_rate`) so a permissions regression
+shows up as a governance signal instead of as mysterious wasted attempts.
 
 ## Concurrency
 

@@ -41,6 +41,8 @@ class CoreConfig:
     default_branch: str
     worktrees_dir: str
     permission_mode: str
+    worker_tools_settings_file: str
+    worker_tools_allowed: tuple[str, ...]
     output_format: str
     trajectory_retention_blocks: int
     agent_timeout: float | None
@@ -98,6 +100,7 @@ def load_config(path: str | Path | None = None) -> CoreConfig:
     identity = data.get("identity", {})
     execution = data.get("execution", {})
     ramp = execution.get("ramp", {})
+    worker_tools = execution.get("worker_tools") or {}
     models = data.get("models", {})
     tiers_raw = models.get("tiers", {})
 
@@ -132,6 +135,8 @@ def load_config(path: str | Path | None = None) -> CoreConfig:
         default_branch=execution.get("default_branch", "main"),
         worktrees_dir=execution.get("worktrees_dir", ".hsai/worktrees"),
         permission_mode=execution.get("permission_mode", "acceptEdits"),
+        worker_tools_settings_file=str(worker_tools.get("settings_file", "")),
+        worker_tools_allowed=tuple(worker_tools.get("allowed_tools", []) or []),
         # Config-driven so a `claude` CLI change can be worked around by editing
         # YAML instead of shipping code: "text" (or empty) drops the flag entirely.
         output_format=str(execution.get("output_format", "json") or ""),

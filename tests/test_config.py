@@ -75,3 +75,34 @@ def test_ramp_config():
     assert cfg.proven_at == 1
     assert cfg.ramp_target == 3
     assert cfg.max_parallel >= 1
+
+
+def test_worker_tools_capability_contract_is_configured():
+    """The permission profile config that travels on the `claude -p` command
+    vector (see hsai.ai.build_command) and is cross-checked by `hsai doctor`
+    (see hsai.permissions)."""
+    cfg = load_config()
+    assert cfg.worker_tools_settings_file == ".claude/settings.json"
+    assert cfg.worker_tools_allowed == (
+        "Bash(ruff check:*)",
+        "Bash(pytest:*)",
+        "Bash(python -m pytest:*)",
+        "Bash(git diff:*)",
+        "Bash(git status:*)",
+    )
+    # No wildcard Bash grant, no network/gh access.
+    assert not any(t in ("Bash", "Bash(*)", "Bash(*:*)") for t in cfg.worker_tools_allowed)
+    assert not any("gh " in t or "curl" in t for t in cfg.worker_tools_allowed)
+
+
+def test_worker_tools_default_when_absent(tmp_path):
+    core = tmp_path / ".ai-swarm"
+    core.mkdir()
+    (core / "core.yaml").write_text(
+        "identity:\n  owner: someone\n"
+        "models:\n  tiers:\n    standard:\n      model: sonnet\n"
+        "  default_tier: standard\n"
+    )
+    cfg = load_config(core / "core.yaml")
+    assert cfg.worker_tools_settings_file == ""
+    assert cfg.worker_tools_allowed == ()

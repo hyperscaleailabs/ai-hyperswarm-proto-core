@@ -67,6 +67,13 @@ class Lesson:
     # (empty for a pass) - mirrored into frontmatter as a `failure/<class>` tag
     # so the Obsidian graph can filter failures by cause.
     failure_class: str = ""
+    # Worker self-verification (see hsai.verify): one of verify.STATUSES,
+    # reconciling the worker's own `<<<HSAI-VERIFY>>>` claim against the
+    # orchestrator's authoritative `ci.run_local` - which stays the sole merge
+    # gate. `verify_claim` is the rendered claim itself (commands + exit
+    # codes), for a human reading the lesson to see exactly what was compared.
+    verification: str = ""
+    verify_claim: str = ""
 
     def note_name(self) -> str:
         return f"{self.created}-{slugify(self.title)}"
@@ -378,6 +385,14 @@ class KnowledgeBase:
             if lesson.outcome == "fail" and lesson.failure_class
             else ""
         )
+        # Always rendered (unlike failure_row, which is fail-only): every
+        # iteration since this field shipped carries exactly one of
+        # verify.STATUSES, so a blank verification column would itself be an
+        # anomaly worth seeing.
+        verification_row = (
+            f"\n| self-verification | `{lesson.verification}` |" if lesson.verification else ""
+        )
+        verify_claim = lesson.verify_claim or "_(no self-verification claim parsed)_"
         return f"""{fm}
 
 # {lesson.title}
@@ -392,7 +407,7 @@ class KnowledgeBase:
 | ticket | {ticket} |
 | pull request | {pr} |
 | model | `{lesson.model}` |
-| remote CI | {lesson.remote_ci or "_(pending)_"} |{failure_row}
+| remote CI | {lesson.remote_ci or "_(pending)_"} |{failure_row}{verification_row}
 
 ## Context
 {lesson.context}
@@ -408,6 +423,9 @@ class KnowledgeBase:
 
 ## Independent review
 {review}
+
+## Self-verification
+Worker claim vs `ci.run_local`: {verify_claim}
 
 ## Reproduction evidence
 {repro}

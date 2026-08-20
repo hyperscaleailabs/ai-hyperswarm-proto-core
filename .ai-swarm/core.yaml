@@ -87,6 +87,20 @@ execution:
   default_branch: main
   worktrees_dir: .hsai/worktrees
   permission_mode: acceptEdits   # headless claude permission mode; see docs/ARCHITECTURE.md
+  # Worker capability contract (see docs/ARCHITECTURE.md and src/hsai/permissions.py):
+  # the ONLY Bash commands a worker may run, travelling explicitly on the
+  # `claude -p` command vector rather than depending on cwd discovery inside an
+  # ephemeral worktree. `settings_file` must match the committed
+  # .claude/settings.json's `permissions.allow` list exactly - `hsai doctor`
+  # fails loudly on drift between the two.
+  worker_tools:
+    settings_file: .claude/settings.json
+    allowed_tools:
+      - "Bash(ruff check:*)"
+      - "Bash(pytest:*)"
+      - "Bash(python -m pytest:*)"
+      - "Bash(git diff:*)"
+      - "Bash(git status:*)"
   output_format: json            # `claude -p --output-format`: the structured envelope that
                                  # feeds the quota ledger + trajectory store. Set to `text`
                                  # to drop the flag if a CLI change ever breaks it.

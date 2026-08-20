@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import github
+from . import github, verify
 from .config import CoreConfig
 from .knowledge import KnowledgeBase
 from .ledger import BlockAggregate
@@ -157,6 +157,22 @@ def _cost_summary(cost: BlockAggregate | None) -> str:
     return f"{cost.summary()}\n\n**Efficiency:** {efficiency}"
 
 
+def _verification_summary(cost: BlockAggregate | None) -> str:
+    """Worker self-verification for one block (see hsai.verify): the
+    unverified rate is the governance signal a permissions regression shows
+    up as, rather than as mysterious wasted attempts nobody connects to a
+    cause.
+    """
+    if cost is None or not cost.verification_counts:
+        return "_no self-verification records for this block_"
+    counts = ", ".join(
+        f"{status}={cost.verification_counts.get(status, 0)}" for status in verify.STATUSES
+    )
+    rate = cost.unverified_rate()
+    rate_str = f"{rate:.0%}" if rate is not None else "n/a"
+    return f"{counts}\n\n**Unverified rate:** {rate_str}"
+
+
 def render_brief(cfg: CoreConfig, report: BlockReport) -> str:
     """The review-issue body for one block: everything clickable in one place."""
     repo = cfg.repo_slug
@@ -175,6 +191,7 @@ def render_brief(cfg: CoreConfig, report: BlockReport) -> str:
     paper = f"`knowledge/whitepapers/{report.whitepaper}.md`" if report.whitepaper else "_none_"
     articles = "\n".join(f"- `{a}`" for a in report.articles) or "_none_"
     cost = _cost_summary(report.cost)
+    verification = _verification_summary(report.cost)
     pareto = render_pareto_table(report.pareto)
     postmortem_line = (
         f"Filed #{report.postmortem_ticket} for the dominant failure class."
@@ -207,6 +224,9 @@ sequentially, records your feedback as ADRs, and ends with a merged PR.
 
 ## Cost this block (quota ledger)
 {cost}
+
+## Worker self-verification (this block)
+{verification}
 
 ## Failure taxonomy (this block)
 {pareto}
