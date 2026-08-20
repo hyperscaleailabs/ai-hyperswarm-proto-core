@@ -97,6 +97,29 @@ def decide_path(ci_green: bool, has_tickets: bool) -> str:
     return IMPROVE
 
 
+def _routing_columns(choice: ModelChoice) -> dict:
+    """The ledger columns that record *why* this tier was chosen.
+
+    Kept beside :func:`build_pr_body` because it serves the same purpose from
+    the other end: the PR shows a human the routing decision, these columns let
+    :mod:`hsai.calibrate` replay it. A choice made without features (a manually
+    constructed :class:`ModelChoice`) contributes no feature columns rather than
+    fabricating zeros.
+    """
+    feats = choice.features
+    return {
+        "complexity_score": feats.complexity_score if feats else None,
+        "est_files": feats.est_files if feats else None,
+        "heavy_signals": feats.heavy_signals if feats else None,
+        "light_signals": feats.light_signals if feats else None,
+        "size_label": feats.size_label if feats else None,
+        "demoted": choice.demoted,
+        "strategy": choice.strategy,
+        "shadow_tier": choice.shadow_tier or None,
+        "shadow_strategy": choice.shadow_strategy or None,
+    }
+
+
 def build_pr_body(
     *,
     ticket: int,
@@ -133,11 +156,20 @@ def build_pr_body(
     # Who checked the work, not just who wrote it: always rendered, so a PR that
     # skipped the gate says so out loud instead of staying silent about it.
     verdict = review_verdict or "_(no independent review recorded)_"
+    # Shadow evaluation (see hsai.models): the strategy that did NOT route this
+    # work still says what it would have done, on the PR, where a human sees it.
+    shadow_line = ""
+    if choice.shadow_tier:
+        agreement = "disagrees" if choice.shadow_disagrees else "agrees"
+        shadow_line = (
+            f"\n- **shadow**: `{choice.shadow_strategy}` would have chosen "
+            f"`{choice.shadow_tier}` ({agreement}) - advisory only, routing is unchanged"
+        )
     return f"""Closes #{ticket}
 
 ## Model used
 - **model**: `{choice.model}` (tier: `{choice.tier}`)
-- **selection**: {choice.rationale} [strategy: `{choice.strategy}`]{artifacts_section}{traj_section}
+- **selection**: {choice.rationale} [strategy: `{choice.strategy}`]{shadow_line}{artifacts_section}{traj_section}
 
 ## CI
 {ci_summary}
@@ -425,6 +457,9 @@ def run_once(
                 output_tokens=tokens[1] if tokens else None,
                 failure_class=failure_class,
                 failure_detail=failure_detail[:200],
+                # Routing features + shadow tier: this is what turns a cost
+                # record into a labelled training example for hsai.calibrate.
+                **_routing_columns(choice),
             ),
         )
 

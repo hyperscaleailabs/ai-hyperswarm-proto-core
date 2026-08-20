@@ -59,6 +59,10 @@ class CoreConfig:
     review: dict[str, Any]
     postmortem: dict[str, Any]
     personas: tuple[dict[str, Any], ...]
+    # The whole `models:` block, kept raw so the router can read the parts that
+    # are not tiers - `selection_strategy` (which strategy is pinned active) and
+    # the `calibration` sub-block a `hsai calibrate` fit is promoted into.
+    models: dict[str, Any] = field(default_factory=dict)
 
     # --- convenience accessors -------------------------------------------------
     @property
@@ -152,6 +156,7 @@ def load_config(path: str | Path | None = None) -> CoreConfig:
         review=data.get("review", {}),
         postmortem=data.get("postmortem", {}),
         personas=tuple(data.get("personas", [])),
+        models=models,
     )
 
 

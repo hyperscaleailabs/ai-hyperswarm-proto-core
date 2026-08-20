@@ -110,7 +110,27 @@ models:
       model: opus
       use_for: [architecture, hard-bug, large-refactor, design]
   default_tier: standard
+  # Which routing strategy actually routes work: heuristic-v1 (the hand-tuned
+  # thresholds) or heuristic-v2 (the thresholds fitted below). The other one is
+  # always computed in SHADOW mode - recorded in the ledger and printed on the
+  # PR - so a learned fit is measured in production before it spends a token
+  # differently. Flipping this line is a deliberate human act.
   selection_strategy: heuristic-v1   # improved over time; tracked as a backlog skill
+  # Outcome-calibrated thresholds, fitted by `hsai calibrate` from
+  # knowledge/ledger/iterations.jsonl and pinned here by a human after reading
+  # the committed calibration article. Absent (as now) or malformed => v2 falls
+  # back to the v1 thresholds, so routing is unchanged. Uncomment and fill in
+  # from the article to promote a fit:
+  #
+  # calibration:
+  #   version: 1
+  #   thresholds:
+  #     heavy: 5                  # complexity score at or above this -> heavy tier
+  #     light: -3                 # at or below this (and <= 2 files) -> light tier
+  #   fitted_at: 2026-01-01       # date of the `hsai calibrate` run
+  #   sample_size: 42             # labelled ledger records behind the fit
+  #   min_samples: 20             # refuse to fit below this many labelled records
+  #   rationale: "see knowledge/articles/2026-01-01-model-routing-calibration.md"
 
 # Governance: the architect steering loop (three streams).
 # Stream 1: steering  - DIRECTION.md + review briefs + /review-next sessions -> ADRs

@@ -31,6 +31,21 @@ def test_execution_telemetry_defaults_when_keys_absent(tmp_path):
     assert cfg.trajectory_retention_blocks == 8
 
 
+def test_models_block_pins_v1_and_ships_no_calibration():
+    """Routing parity: until a human pins a fit, heuristic-v1 is what routes."""
+    cfg = load_config()
+    assert cfg.models["selection_strategy"] == "heuristic-v1"
+    assert "calibration" not in cfg.models   # the commented example is a comment
+    assert cfg.models["default_tier"] == cfg.default_tier
+
+
+def test_models_block_defaults_to_empty_when_absent(tmp_path):
+    core = tmp_path / ".ai-swarm"
+    core.mkdir()
+    (core / "core.yaml").write_text("identity:\n  owner: someone\n")
+    assert load_config(core / "core.yaml").models == {}
+
+
 def test_review_gate_is_configured_and_enabled():
     """The independent review gate is config, not code."""
     cfg = load_config()

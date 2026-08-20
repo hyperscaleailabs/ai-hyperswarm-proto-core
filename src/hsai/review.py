@@ -320,6 +320,10 @@ def review_change(
             outcome=verdict.status,
             input_tokens=tokens[0] if tokens else None,
             output_tokens=tokens[1] if tokens else None,
+            # No routing features: a reviewer tier comes from `review.tier_policy`,
+            # not from the scored router, so this record is deliberately NOT a
+            # training example for hsai.calibrate - only the strategy id is kept.
+            strategy=choice.strategy,
         ),
     )
     return verdict

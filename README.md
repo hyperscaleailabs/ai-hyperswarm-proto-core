@@ -96,6 +96,35 @@ set `enabled: false` to restore the previous prompt exactly.
 hsai recall "remote CI gate"       # what would a worker be shown for this task?
 ```
 
+**Model-size selection learns from outcomes - in shadow mode first.** The
+quota ledger already recorded the tier, wall-clock, attempts and outcome of
+every iteration; it now also records the *routing features* the decision was
+made from (complexity score, files, matched heavy/light signals, size label,
+demotion flag), which turns each cost record into a labelled training example.
+`hsai.calibrate` reads them back, computes the observed success rate and mean
+wall-clock per tier, and grid-searches integer `(heavy, light)` thresholds that
+maximise **merged outcomes per heavy-tier iteration** subject to a floor on the
+overall success rate. Below 20 labelled records it returns an explicit
+*insufficient data* result and emits no thresholds at all - never a fit off
+three data points.
+
+`models.select()` then evaluates **both** strategies on every call:
+`heuristic-v1` (the hand-tuned constants) and `heuristic-v2` (the same rule
+read against the calibrated thresholds pinned under `models.calibration` in
+`.ai-swarm/core.yaml`). Only the strategy named by `models.selection_strategy`
+routes work; the other runs in **shadow mode** - its tier is recorded in the
+ledger and printed on the PR as *"shadow: heuristic-v2 would have chosen
+X"* - so a learned artifact is measured in production before it can spend a
+single token differently. With no calibration block present, v2 falls back to
+v1's thresholds and nothing about routing changes. Promoting a fit is a
+deliberate human edit, and `hsai calibrate` writes the evidence for it as a
+committed article plus a *Routing calibration* section in every block review
+brief.
+
+```bash
+hsai calibrate                     # fit thresholds from the ledger; writes one article
+```
+
 **Nothing merges on the author's word alone.** Once local CI is green and the
 work is committed, `hsai.review` hands the branch diff, the ticket and its
 parsed acceptance criteria to a model on a *different tier* than the one that
@@ -120,6 +149,7 @@ hsai loop          # one real iteration (opens & merges a PR on green)
 hsai loop --max-parallel 3 -n 1   # ramp to the swarm (after proving one iteration)
 hsai traj 12       # print what agent run (iteration) 12 did (spends no quota)
 hsai recall "knowledge-only diff on a code ticket"   # rank prior lessons for a task
+hsai calibrate     # fit routing thresholds from the quota ledger (advisory, no quota)
 hsai cycle --resume   # finish an interrupted governance block, replaying what completed
 ```
 
