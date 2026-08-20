@@ -180,6 +180,18 @@ postmortem:
   ratio_threshold: 0.4   # a class must be >= this share of the block's failures
   min_count: 3            # AND at least this many occurrences, before filing a ticket
 
+# Reference-set observatory (see src/hsai/observatory.py). Each studied project
+# gets a cached digest under `dir` (head sha, README hash + excerpt, commit
+# subjects, workflow inventory) plus an Obsidian dossier, so a cycle can study
+# what CHANGED since the last observation instead of re-deriving what is merely
+# present. Staleness is surfaced in DIRECTION.md's "Now" section; refresh it
+# out of band with `hsai observe --refresh`.
+observatory:
+  dir: knowledge/reference   # digest cache (<owner>__<repo>.json) + dossiers (<repo>.md)
+  commits: 30                # commit subjects kept per digest - also the delta window
+  readme_bytes: 4000         # hard cap on the stored README excerpt, so the vault cannot bloat
+  stale_after_days: 7        # unobserved longer than this counts as stale
+
 personas:                      # article targets generated from each whitepaper
   - id: cto
     audience: CTO level - business impact, risk posture, strategic direction
