@@ -69,6 +69,21 @@ class LedgerRecord:
     # to "" so read_records() parses pre-existing records that lack them.
     failure_class: str = ""
     failure_detail: str = ""
+    # Routing features captured at decision time (see hsai.models.RoutingFeatures)
+    # plus which strategy was active and what the shadow strategy would have
+    # picked. Together with `outcome` this makes every record a labelled training
+    # example for hsai.calibrate. All optional with a None default so lines
+    # written before routing features existed still parse - the ledger is
+    # append-only, so old records are never rewritten to carry them.
+    complexity_score: int | None = None
+    est_files: int | None = None
+    heavy_signals: int | None = None
+    light_signals: int | None = None
+    size_label: str | None = None
+    demoted: bool | None = None
+    strategy: str | None = None
+    shadow_tier: str | None = None
+    shadow_strategy: str | None = None
     created: str = field(default_factory=_now)
 
     def to_json(self) -> str:

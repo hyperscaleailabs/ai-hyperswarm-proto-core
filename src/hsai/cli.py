@@ -10,6 +10,7 @@ Commands:
   hsai practices list                                          show the adopted-practice registry
   hsai practices add --title T --source-project P ...          record a new adopted practice
   hsai postmortem [--block N]                                  print the failure-class Pareto for a block
+  hsai calibrate [--min-samples N]                             fit routing thresholds from the ledger
   hsai doctor                                                  verify environment + invariants
   hsai traj <iteration> [--json]                               print a stored agent run
   hsai replay <iteration> [--json]                              alias of `hsai traj`
@@ -24,7 +25,9 @@ import time
 from . import (
     __version__,
     ai,
+    calibrate,
     ledger,
+    models,
     postmortem,
     practices,
     recall,
@@ -182,6 +185,42 @@ def cmd_postmortem(args: argparse.Namespace) -> int:
         )
     else:
         print(f"no class clears the postmortem trigger (ratio>={ratio:g}, count>={min_count})")
+    return 0
+
+
+def cmd_calibrate(args: argparse.Namespace) -> int:
+    """Fit routing thresholds from the quota ledger and commit the report.
+
+    Reads the ledger, prints the fit and the shadow-vs-active disagreement rate,
+    and writes exactly one file: the dated calibration article. It never edits
+    core.yaml - promoting a fit into ``models.calibration`` (and flipping
+    ``models.selection_strategy``) is a human's call, by design.
+    """
+    cfg = _load(args)
+    path = ledger.ledger_path(cfg, args.root)
+    try:
+        records = ledger.read_records(path)
+    except (OSError, ValueError, TypeError) as exc:
+        print(f"calibrate: unreadable ledger {path}: {exc}", file=sys.stderr)
+        return 1
+
+    min_samples = (
+        args.min_samples
+        if args.min_samples is not None
+        else calibrate.min_samples_for(cfg)
+    )
+    fit = calibrate.fit(
+        records, min_samples=min_samples, default_tier=cfg.default_tier
+    )
+    dis = calibrate.disagreement(records)
+
+    print(f"calibrate: {len(records)} ledger record(s) at {path}")
+    print(f"active strategy: {models.active_strategy(cfg)}")
+    print(fit.render())
+    print(dis.render())
+    print(fit.recommendation())
+    out = calibrate.write_article(args.root, fit, dis)
+    print(f"wrote {out}")
     return 0
 
 
@@ -361,6 +400,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pm.add_argument("--root", default=".", help="repo root holding knowledge/ledger")
     pm.set_defaults(func=cmd_postmortem)
+
+    cb = sub.add_parser(
+        "calibrate",
+        help="fit routing thresholds from the quota ledger (advisory; spends no quota)",
+    )
+    cb.add_argument("--root", default=".", help="repo root holding knowledge/ledger")
+    cb.add_argument(
+        "--min-samples", type=int, default=None,
+        help=f"labelled records required before a fit (default: {calibrate.DEFAULT_MIN_SAMPLES})",
+    )
+    cb.set_defaults(func=cmd_calibrate)
 
     cy = sub.add_parser("cycle", help="run one half-day governance block")
     cy.add_argument("--index", "--cycle-index", dest="index", type=int, default=None,

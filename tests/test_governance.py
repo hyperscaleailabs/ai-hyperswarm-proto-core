@@ -1,5 +1,6 @@
 import json
 
+from hsai.calibrate import disagreement, fit
 from hsai.config import load_config
 from hsai.governance import (
     NOTES_END,
@@ -9,7 +10,7 @@ from hsai.governance import (
     render_brief,
     render_direction,
 )
-from hsai.ledger import BlockAggregate
+from hsai.ledger import BlockAggregate, LedgerRecord
 from hsai.proc import Proc
 
 
@@ -79,6 +80,69 @@ def test_brief_cost_note_when_no_ledger_records():
     cfg = load_config()
     body = render_brief(cfg, BlockReport(cycle_index=7))
     assert "_no ledger records for this block_" in body
+
+
+# --- routing calibration section (see hsai.calibrate) ------------------------
+
+def _routing_records():
+    """Enough labelled records to clear the sample floor, with a clear optimum."""
+    records = []
+    for i in range(12):
+        records.append(LedgerRecord(
+            iteration=100 + i, block=7, ticket=1, kind="implement", tier="heavy",
+            model="opus", wall_clock_seconds=100.0, attempts=1,
+            outcome="merged" if i < 6 else "recovered",
+            complexity_score=6, est_files=3, heavy_signals=1, light_signals=0,
+            size_label="", demoted=False, strategy="heuristic-v1",
+            shadow_tier="standard", shadow_strategy="heuristic-v2",
+        ))
+    for i in range(12):
+        records.append(LedgerRecord(
+            iteration=200 + i, block=7, ticket=1, kind="implement", tier="standard",
+            model="sonnet", wall_clock_seconds=50.0, attempts=1, outcome="merged",
+            complexity_score=3, est_files=3, heavy_signals=1, light_signals=0,
+            size_label="", demoted=False, strategy="heuristic-v1",
+            shadow_tier="standard", shadow_strategy="heuristic-v2",
+        ))
+    return records
+
+
+def test_brief_has_a_routing_calibration_section_with_the_fit():
+    cfg = load_config()
+    records = _routing_records()
+    report = BlockReport(
+        cycle_index=7,
+        routing_fit=fit(records),
+        routing_disagreement=disagreement(records),
+    )
+    body = render_brief(cfg, report)
+
+    assert "## Routing calibration" in body
+    assert "Active strategy: `heuristic-v1`" in body
+    assert "heavy>=7, light<=-3" in body           # the fitted recommendation
+    assert "Shadow disagreement: 12/24 (50%)" in body
+    assert "models.calibration" in body            # the human step is spelled out
+    # It reads before the failure taxonomy, next to the other economics.
+    assert body.index("## Cost this block") < body.index("## Routing calibration")
+    assert body.index("## Routing calibration") < body.index("## Failure taxonomy")
+
+
+def test_brief_states_insufficient_data_rather_than_a_fitted_guess():
+    cfg = load_config()
+    report = BlockReport(cycle_index=7, routing_fit=fit(_routing_records()[:4]))
+    body = render_brief(cfg, report)
+
+    assert "## Routing calibration" in body
+    assert "Insufficient data" in body
+    assert "No recommendation" in body
+    assert "heavy>=" not in body
+
+
+def test_brief_routing_section_when_no_fit_was_computed():
+    body = render_brief(load_config(), BlockReport(cycle_index=7))
+    assert "## Routing calibration" in body
+    assert "no routing calibration computed for this block" in body
+    assert "hsai calibrate" in body
 
 
 def test_brief_reports_tokens_per_merged_pr():

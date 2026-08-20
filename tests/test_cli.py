@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 from hsai import cli as cli_module
 from hsai import trajectory
@@ -227,6 +228,101 @@ def test_practices_add_refuses_a_duplicate(tmp_path, capsys):
     assert "refused" in err
     notes = list((tmp_path / "knowledge" / "practices").glob("*.md"))
     assert len(notes) == 1  # the duplicate attempt never wrote a second note
+
+
+# --- hsai calibrate (see hsai.calibrate) -------------------------------------
+
+def _calibration_repo(tmp_path, *, records=24, ledger_text=None):
+    """A throwaway repo with its own core.yaml, a source file, and a ledger."""
+    repo_root = Path(__file__).resolve().parents[1]
+    core = tmp_path / ".ai-swarm" / "core.yaml"
+    core.parent.mkdir(parents=True)
+    core.write_text((repo_root / ".ai-swarm" / "core.yaml").read_text())
+    source = tmp_path / "src" / "hsai" / "models.py"
+    source.parent.mkdir(parents=True)
+    source.write_text((repo_root / "src" / "hsai" / "models.py").read_text())
+
+    path = tmp_path / "knowledge" / "ledger" / "iterations.jsonl"
+    path.parent.mkdir(parents=True)
+    if ledger_text is not None:
+        path.write_text(ledger_text)
+    else:
+        lines = []
+        for i in range(records):
+            heavy = i % 2 == 0
+            lines.append(json.dumps({
+                "iteration": i, "block": 1, "ticket": 1, "kind": "implement",
+                "tier": "heavy" if heavy else "standard",
+                "model": "opus" if heavy else "sonnet",
+                "wall_clock_seconds": 100.0 if heavy else 40.0, "attempts": 1,
+                "outcome": "recovered" if heavy and i % 4 == 0 else "merged",
+                "complexity_score": 6 if heavy else 3, "est_files": 3,
+                "heavy_signals": 1, "light_signals": 0, "size_label": "",
+                "demoted": False, "strategy": "heuristic-v1",
+                "shadow_tier": "standard", "shadow_strategy": "heuristic-v2",
+            }))
+        path.write_text("\n".join(lines) + "\n")
+    return core, source
+
+
+def test_parser_calibrate_defaults():
+    args = build_parser().parse_args(["calibrate"])
+    assert args.command == "calibrate"
+    assert args.root == "." and args.min_samples is None
+
+
+def test_calibrate_writes_an_article_and_edits_nothing_else(tmp_path, capsys):
+    core, source = _calibration_repo(tmp_path)
+    core_before, source_before = core.read_bytes(), source.read_bytes()
+
+    rc = main(["--config", str(core), "calibrate", "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    articles = sorted((tmp_path / "knowledge" / "articles").glob("*-model-routing-calibration.md"))
+    assert len(articles) == 1
+    text = articles[0].read_text()
+    assert "(sample size): **24**" in text          # the sample size
+    assert "heavy>=" in text                        # the fitted thresholds
+    assert "Shadow disagreement: 12/24 (50%)" in text
+    assert "## Recommendation" in text
+    assert "24 ledger record(s)" in out and "active strategy: heuristic-v1" in out
+
+    # It edits nothing else: not the config it read, not a line of source.
+    assert core.read_bytes() == core_before
+    assert source.read_bytes() == source_before
+
+
+def test_calibrate_reports_insufficient_data_without_fitting(tmp_path, capsys):
+    core, _source = _calibration_repo(tmp_path, records=4)
+
+    rc = main(["--config", str(core), "calibrate", "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "Insufficient data" in out and "No recommendation" in out
+    article = next((tmp_path / "knowledge" / "articles").glob("*-model-routing-calibration.md"))
+    assert "(sample size): **4**" in article.read_text()
+    assert "heavy>=" not in article.read_text()
+
+
+def test_calibrate_min_samples_flag_overrides_the_floor(tmp_path, capsys):
+    core, _source = _calibration_repo(tmp_path, records=4)
+    rc = main([
+        "--config", str(core), "calibrate", "--root", str(tmp_path), "--min-samples", "4",
+    ])
+    assert rc == 0
+    assert "Fitted thresholds" in capsys.readouterr().out
+
+
+def test_calibrate_exits_nonzero_on_an_unreadable_ledger(tmp_path, capsys):
+    core, _source = _calibration_repo(tmp_path, ledger_text="{not json at all\n")
+
+    rc = main(["--config", str(core), "calibrate", "--root", str(tmp_path)])
+
+    assert rc == 1
+    assert "unreadable ledger" in capsys.readouterr().err
+    assert not (tmp_path / "knowledge" / "articles").exists()
 
 
 def test_parser_repro_check_defaults():

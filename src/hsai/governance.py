@@ -15,9 +15,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import github
+from .calibrate import Disagreement, Fit
 from .config import CoreConfig
 from .knowledge import KnowledgeBase
 from .ledger import BlockAggregate
+from .models import active_strategy
 from .postmortem import ParetoRow, render_pareto_table
 from .proc import Runner, run
 
@@ -48,6 +50,12 @@ class BlockReport:
     cost: BlockAggregate | None = None                     # quota-ledger aggregate
     pareto: list[ParetoRow] = field(default_factory=list)  # failure-class histogram (hsai.postmortem)
     postmortem_ticket: int = 0                             # P1 ticket filed for a dominant class
+    # Outcome-calibrated routing (see hsai.calibrate): the latest threshold fit
+    # over the whole ledger and how often the shadow strategy disagreed. Both
+    # None/empty until enough labelled records exist - the brief then says so
+    # rather than showing a fit nobody should trust.
+    routing_fit: Fit | None = None
+    routing_disagreement: Disagreement | None = None
     notes: list[str] = field(default_factory=list)
     # New entries in the practices registry (see hsai.practices) that showed up
     # during this block - each a plain dict (JSON-serializable for the journal):
@@ -157,6 +165,27 @@ def _cost_summary(cost: BlockAggregate | None) -> str:
     return f"{cost.summary()}\n\n**Efficiency:** {efficiency}"
 
 
+def _routing_summary(
+    fit: Fit | None, dis: Disagreement | None, active: str
+) -> str:
+    """The brief's routing-calibration section: the fit, or an honest refusal.
+
+    The architect is the only one who can promote a fit (shadow mode never
+    promotes itself), so the recommendation has to reach them every block -
+    including the block where the recommendation is "not enough data yet".
+    """
+    if fit is None:
+        return (
+            "_no routing calibration computed for this block_ "
+            "(run `hsai calibrate` to fit thresholds from the quota ledger)"
+        )
+    shadow = f"\n\n{dis.render()}" if dis is not None else ""
+    return (
+        f"Active strategy: `{active}`.\n\n{fit.render()}{shadow}\n\n"
+        f"{fit.recommendation()}"
+    )
+
+
 def render_brief(cfg: CoreConfig, report: BlockReport) -> str:
     """The review-issue body for one block: everything clickable in one place."""
     repo = cfg.repo_slug
@@ -175,6 +204,9 @@ def render_brief(cfg: CoreConfig, report: BlockReport) -> str:
     paper = f"`knowledge/whitepapers/{report.whitepaper}.md`" if report.whitepaper else "_none_"
     articles = "\n".join(f"- `{a}`" for a in report.articles) or "_none_"
     cost = _cost_summary(report.cost)
+    routing = _routing_summary(
+        report.routing_fit, report.routing_disagreement, active_strategy(cfg)
+    )
     pareto = render_pareto_table(report.pareto)
     postmortem_line = (
         f"Filed #{report.postmortem_ticket} for the dominant failure class."
@@ -207,6 +239,9 @@ sequentially, records your feedback as ADRs, and ends with a merged PR.
 
 ## Cost this block (quota ledger)
 {cost}
+
+## Routing calibration
+{routing}
 
 ## Failure taxonomy (this block)
 {pareto}

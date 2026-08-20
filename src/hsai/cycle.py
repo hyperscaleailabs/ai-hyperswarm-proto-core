@@ -19,7 +19,16 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import github, gitops, journal, ledger, postmortem, retrieval, trajectory
+from . import (
+    calibrate,
+    github,
+    gitops,
+    journal,
+    ledger,
+    postmortem,
+    retrieval,
+    trajectory,
+)
 from .ai import run_agent
 from .config import CoreConfig
 from .governance import BlockReport, open_review_issue, write_direction
@@ -280,6 +289,17 @@ def run_cycle(
     # like `report.cost` above, it needs no journal record of its own; only the
     # ticket-filing side effect below does.
     report.pareto = postmortem.pareto_table(block_records, idx)
+
+    # Routing calibration for the brief. Fitted over the WHOLE ledger, not just
+    # this block: thresholds are a property of accumulated history, and one
+    # block rarely clears the sample floor on its own. Pure reading - the fit is
+    # advisory until a human pins it (see hsai.calibrate).
+    report.routing_fit = calibrate.fit(
+        block_records,
+        min_samples=calibrate.min_samples_for(cfg),
+        default_tier=cfg.default_tier,
+    )
+    report.routing_disagreement = calibrate.disagreement(block_records)
 
     # File (at most) one P1 ticket for a dominant failure class, deduped by
     # title against anything already open. Journaled so a resumed block never

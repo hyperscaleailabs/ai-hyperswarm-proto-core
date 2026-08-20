@@ -7,7 +7,7 @@ import pytest
 
 from hsai import ledger, orchestrator, recall, review, trajectory
 from hsai.config import load_config
-from hsai.models import ModelChoice
+from hsai.models import ModelChoice, Task, select
 from hsai.orchestrator import (
     HEAL,
     IMPLEMENT,
@@ -273,6 +273,70 @@ def test_build_pr_body_contains_traceability():
     assert "kept it small" in body       # lesson present
     assert "[[2026-07-25-do-thing]]" in body
     assert "openai/swarm" in body
+
+
+def test_routing_columns_label_a_ledger_record_with_the_decision():
+    """The ledger columns that make a cost record a training example."""
+    cfg = load_config()
+    choice = select(Task(kind="improve", title="migration: upgrade", est_files=9), cfg)
+    columns = orchestrator._routing_columns(choice)
+
+    assert columns["complexity_score"] == 6
+    assert columns["est_files"] == 9
+    assert columns["heavy_signals"] == 1 and columns["light_signals"] == 0
+    assert columns["size_label"] == ""
+    assert columns["demoted"] is False
+    assert columns["strategy"] == "heuristic-v1"
+    assert columns["shadow_strategy"] == "heuristic-v2"
+    # Every column is a valid LedgerRecord field, so the record still parses.
+    assert ledger.LedgerRecord(
+        iteration=1, block=1, ticket=1, kind="improve", tier=choice.tier,
+        model=choice.model, wall_clock_seconds=1.0, attempts=1, outcome="merged",
+        **columns,
+    ).complexity_score == 6
+
+
+def test_routing_columns_of_a_featureless_choice_are_empty_not_zero():
+    # A hand-built ModelChoice (synthesis, review) never saw the scorer; it must
+    # not enter hsai.calibrate's training set disguised as a zero-scored task.
+    columns = orchestrator._routing_columns(
+        ModelChoice(tier="heavy", model="opus", rationale="x")
+    )
+    assert columns["complexity_score"] is None
+    assert columns["shadow_tier"] is None and columns["shadow_strategy"] is None
+
+
+def test_build_pr_body_renders_the_shadow_routing_line():
+    """Shadow evaluation is only useful if a human sees it on the PR."""
+    kwargs = dict(
+        ticket=42, choice=None, lesson_note="2026-08-20-x",
+        lesson_summary="s", ci_summary="green",
+    )
+    plain = ModelChoice(tier="standard", model="sonnet", rationale="score=3 -> standard")
+    shadowed = replace(
+        plain, shadow_tier="heavy", shadow_strategy="heuristic-v2",
+    )
+    agreeing = replace(
+        plain, shadow_tier="standard", shadow_strategy="heuristic-v2",
+    )
+
+    body = build_pr_body(**{**kwargs, "choice": shadowed})
+    assert "**shadow**: `heuristic-v2` would have chosen `heavy` (disagrees)" in body
+    assert "routing is unchanged" in body
+    # ...and it sits inside the Model used section, not tacked on elsewhere.
+    assert body.index("## Model used") < body.index("**shadow**") < body.index("## CI")
+
+    # An agreeing shadow still reports, so silence never means "not evaluated".
+    assert "`standard` (agrees)" in build_pr_body(**{**kwargs, "choice": agreeing})
+
+    # No shadow tier (a manually constructed choice) => no line at all, and the
+    # traceability invariants are untouched either way.
+    without = build_pr_body(**{**kwargs, "choice": plain})
+    assert "**shadow**" not in without
+    for text in (without, body):
+        assert "Closes #42" in text
+        assert "## Model used" in text
+        assert "## Lesson learned" in text
 
 
 def test_build_pr_body_includes_phase_artifacts():

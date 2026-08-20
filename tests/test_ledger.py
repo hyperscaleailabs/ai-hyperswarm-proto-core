@@ -85,6 +85,98 @@ def test_read_records_parses_pre_existing_records_lacking_failure_fields(tmp_pat
     assert records[0].outcome == "merged"
 
 
+# --- routing features + shadow tier (see hsai.models / hsai.calibrate) -------
+
+def test_ledger_record_carries_the_routing_features_and_shadow_tier(tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    append_record(
+        path,
+        _rec(
+            complexity_score=6, est_files=9, heavy_signals=3, light_signals=0,
+            size_label="L", demoted=False, strategy="heuristic-v1",
+            shadow_tier="standard", shadow_strategy="heuristic-v2",
+        ),
+    )
+    stored = read_records(path)[0]
+    assert stored.complexity_score == 6
+    assert stored.est_files == 9
+    assert stored.heavy_signals == 3 and stored.light_signals == 0
+    assert stored.size_label == "L"
+    assert stored.demoted is False
+    assert stored.strategy == "heuristic-v1"
+    assert stored.shadow_tier == "standard"
+    assert stored.shadow_strategy == "heuristic-v2"
+
+
+def test_routing_feature_fields_default_to_none(tmp_path):
+    """An unlabelled record must be distinguishable from a zero-scored one:
+    `hsai.calibrate` trains only on records that actually carry features."""
+    stored = read_records(append_record(tmp_path / "l.jsonl", _rec()))[0]
+    assert stored.complexity_score is None
+    assert stored.est_files is None
+    assert stored.heavy_signals is None and stored.light_signals is None
+    assert stored.size_label is None and stored.demoted is None
+    assert stored.strategy is None
+    assert stored.shadow_tier is None and stored.shadow_strategy is None
+
+
+def test_read_records_parses_records_written_before_routing_features_existed(tmp_path):
+    """Backward compatibility with the append-only file: two generations of
+    older lines (pre-failure-taxonomy and post-taxonomy) must still parse, and
+    must not masquerade as labelled training examples."""
+    path = tmp_path / "ledger.jsonl"
+    oldest = {
+        "iteration": 101, "block": 1, "ticket": 7, "kind": "implement",
+        "tier": "standard", "model": "sonnet", "wall_clock_seconds": 12.0,
+        "attempts": 1, "outcome": "merged", "created": "2026-01-01T00:00:00+00:00",
+    }
+    with_taxonomy = {
+        **oldest, "iteration": 102, "outcome": "recovered", "tier": "heavy",
+        "model": "opus", "input_tokens": 100, "output_tokens": 20,
+        "failure_class": "remote_ci_fail", "failure_detail": "ci red",
+    }
+    path.write_text(json.dumps(oldest) + "\n" + json.dumps(with_taxonomy) + "\n")
+
+    records = read_records(path)
+    assert [r.iteration for r in records] == [101, 102]
+    assert records[1].failure_class == "remote_ci_fail"
+    for r in records:
+        assert r.complexity_score is None and r.shadow_tier is None
+        assert r.strategy is None and r.size_label is None
+
+    # An append after the upgrade sits alongside them without rewriting anything.
+    before = path.read_text()
+    append_record(path, _rec(block=2, complexity_score=4, shadow_tier="light"))
+    assert path.read_text().startswith(before)
+    assert read_records(path)[2].complexity_score == 4
+
+
+def test_select_populates_the_routing_columns_the_ledger_records(tmp_path):
+    """End to end: what select() decided is what a ledger record can replay."""
+    cfg = load_config()
+    choice = select(Task(kind="improve", title="migration: upgrade", est_files=9), cfg)
+    stored = read_records(
+        append_record(
+            tmp_path / "l.jsonl",
+            _rec(
+                tier=choice.tier,
+                complexity_score=choice.features.complexity_score,
+                est_files=choice.features.est_files,
+                heavy_signals=choice.features.heavy_signals,
+                light_signals=choice.features.light_signals,
+                size_label=choice.features.size_label,
+                demoted=choice.demoted,
+                strategy=choice.strategy,
+                shadow_tier=choice.shadow_tier,
+                shadow_strategy=choice.shadow_strategy,
+            ),
+        )
+    )[0]
+    assert stored.tier == "heavy" and stored.complexity_score == 6
+    assert stored.strategy == "heuristic-v1"
+    assert stored.shadow_tier == "heavy" and stored.shadow_strategy == "heuristic-v2"
+
+
 def test_ledger_path_from_config(tmp_path):
     cfg = load_config()
     path = ledger_path(cfg, tmp_path)
