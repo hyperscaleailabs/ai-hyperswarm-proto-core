@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from hsai import ledger, orchestrator, recall, review, trajectory
+from hsai import ledger, orchestrator, recall, review, trajectory, verify
 from hsai.config import load_config
 from hsai.models import ModelChoice
 from hsai.orchestrator import (
@@ -45,6 +45,19 @@ AGENT_JSON = json.dumps(
         ],
     }
 )
+
+
+def _agent_envelope_with_verify(claims: list[tuple[str, int]], *, prose: str = "Done.") -> str:
+    """What a worker prints once it follows the `<<<HSAI-VERIFY>>>` instruction
+    in its prompt (see hsai.verify)."""
+    lines = "\n".join(f"{cmd}: exit {code}" for cmd, code in claims)
+    return json.dumps(
+        {
+            "type": "result",
+            "result": f"{prose}\n\n{verify.START}\n{lines}\n{verify.END}\n",
+            "usage": {"input_tokens": 1500, "output_tokens": 320},
+        }
+    )
 
 
 def _reviewer_envelope(verdict: dict, *, prose: str = "Checked the diff.") -> str:
@@ -783,6 +796,86 @@ def test_disabling_the_review_gate_restores_the_pre_review_flow(tmp_path):
     assert [r.kind for r in ledger.read_records(ledger.ledger_path(cfg, tmp_path))] == [
         IMPLEMENT
     ]
+
+
+# --- worker self-verification (see hsai.verify) -----------------------------
+
+def test_task_prompt_instructs_workers_to_report_a_verify_block():
+    cfg = load_config()
+    for kind in (HEAL, IMPLEMENT, IMPROVE):
+        prompt = _task_prompt(kind, cfg, "t", "b")
+        assert verify.START in prompt and verify.END in prompt
+
+
+def test_verification_status_is_verified_agree_when_worker_and_ci_both_pass(tmp_path):
+    cfg = load_config()
+    agent_output = _agent_envelope_with_verify(
+        [("ruff check .", 0), ("pytest", 0)]
+    )
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[dict(CODE_ISSUE)], agent_output=agent_output,
+        worktree_status="?? src/hsai/widget.py\n",
+    )
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+    assert result.verification == verify.VERIFIED_AGREE
+    assert result.merged is True
+
+    lesson_text = Path(result.lesson_path).read_text() if result.lesson_path else ""
+    assert "| self-verification | `verified-agree` |" in lesson_text
+    record = _iteration_records(cfg, tmp_path)[-1]
+    assert record.verification == verify.VERIFIED_AGREE
+
+
+def test_verification_status_is_unverified_when_no_block_is_reported(tmp_path):
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[dict(CODE_ISSUE)], agent_output=AGENT_JSON,  # no HSAI-VERIFY block
+        worktree_status="?? src/hsai/widget.py\n",
+    )
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+    assert result.verification == verify.UNVERIFIED
+    record = _iteration_records(cfg, tmp_path)[-1]
+    assert record.verification == verify.UNVERIFIED
+
+
+def test_verified_disagree_blocks_merge_when_worker_claims_green_but_ci_is_red(tmp_path):
+    """AC: a worker claiming green while `ci.run_local` is red is recorded as
+    verified-disagree and does NOT merge - the remote-CI gate is untouched."""
+    cfg = load_config()
+    agent_output = _agent_envelope_with_verify(
+        [("ruff check .", 0), ("pytest", 0)]
+    )
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, False],  # ci_after is RED
+        open_issues=[dict(CODE_ISSUE)], agent_output=agent_output,
+        remote_ci="FAILURE",  # local == remote by construction (see ARCHITECTURE.md)
+        worktree_status="?? src/hsai/widget.py\n",
+    )
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+    assert result.verification == verify.VERIFIED_DISAGREE
+    assert result.ci_after is False
+    assert result.merged is False
+    assert result.recovered is True
+    assert not any(c[:3] == ["gh", "pr", "merge"] for c in runner.calls)
+    record = _iteration_records(cfg, tmp_path)[-1]
+    assert record.verification == verify.VERIFIED_DISAGREE
+
+
+def test_dry_run_verification_is_unverified(tmp_path):
+    cfg = load_config()
+    result = run_once(cfg, repo_dir=str(tmp_path), dry_run=True, iteration=1)
+    assert result.verification == verify.UNVERIFIED
 
 
 def test_build_pr_body_always_carries_an_independent_review_section():

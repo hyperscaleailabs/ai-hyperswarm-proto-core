@@ -57,6 +57,28 @@ def test_build_command_requests_json_output():
     assert cmd[cmd.index("--model") + 1] == "sonnet"
 
 
+def test_build_command_carries_the_worker_capability_contract():
+    """Acceptance criterion #2: the settings path and the configured
+    allowed-tools list travel explicitly on the command vector, not via cwd
+    discovery inside an ephemeral worktree."""
+    cfg = load_config()
+    cmd = ai.build_command("do the thing", CHOICE, cfg)
+    assert cmd[cmd.index("--settings") + 1] == cfg.worker_tools_settings_file
+    assert cfg.worker_tools_settings_file == ".claude/settings.json"
+    allowed_idx = cmd.index("--allowedTools")
+    allowed = cmd[allowed_idx + 1: allowed_idx + 1 + len(cfg.worker_tools_allowed)]
+    assert allowed == list(cfg.worker_tools_allowed)
+    # No wildcard Bash grant ever reaches the command vector.
+    assert not any(t in ("Bash", "Bash(*)", "Bash(*:*)") for t in cfg.worker_tools_allowed)
+
+
+def test_build_command_drops_the_contract_flags_when_unconfigured():
+    cfg = _cfg(worker_tools_settings_file="", worker_tools_allowed=())
+    cmd = ai.build_command("x", CHOICE, cfg)
+    assert "--settings" not in cmd
+    assert "--allowedTools" not in cmd
+
+
 def test_output_format_flag_is_config_driven():
     # The shipped config asks for json...
     assert load_config().output_format == "json"

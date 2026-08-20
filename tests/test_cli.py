@@ -31,8 +31,20 @@ def test_status_command_returns_zero(capsys):
     assert "hyperscaleailabs/ai-hyperswarm-proto-core" in out
 
 
+def _stub_ok_profile(monkeypatch):
+    """Isolate doctor checks from the worker-capability-contract check (see
+    test_permissions.py / the doctor tests below for that check on its own)."""
+    monkeypatch.setattr(
+        cli_module.permissions, "check_profile",
+        lambda settings_path, configured_tools: cli_module.permissions.ProfileCheck(
+            True, "stubbed OK"
+        ),
+    )
+
+
 def test_doctor_reports_the_live_child_env_check_and_exits_zero_on_pass(monkeypatch, capsys):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy")
+    _stub_ok_profile(monkeypatch)
     rc = main(["doctor"])
     out = capsys.readouterr().out
     assert rc == 0
@@ -47,11 +59,57 @@ def test_doctor_exits_nonzero_when_the_live_check_reports_a_leak(monkeypatch, ca
         cli_module.ai, "check_child_env",
         lambda cfg: (False, "leaked into a real spawned child process: ANTHROPIC_API_KEY"),
     )
+    _stub_ok_profile(monkeypatch)
     rc = main(["doctor"])
     out = capsys.readouterr().out
     assert rc == 1
     assert "child-environment guard: FAIL" in out
     assert "ANTHROPIC_API_KEY" in out
+
+
+def test_doctor_reports_the_worker_capability_contract_and_exits_zero_on_pass(
+    monkeypatch, capsys
+):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy")
+    _stub_ok_profile(monkeypatch)
+    rc = main(["doctor"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "worker capability contract: PASS" in out
+
+
+def test_doctor_exits_nonzero_when_the_profile_is_missing(monkeypatch, capsys):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy")
+    monkeypatch.setattr(
+        cli_module.permissions, "check_profile",
+        lambda settings_path, configured_tools: cli_module.permissions.ProfileCheck(
+            False, f"{settings_path} is missing or unreadable"
+        ),
+    )
+    rc = main(["doctor"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "worker capability contract: FAIL" in out
+    assert "missing or unreadable" in out
+
+
+def test_doctor_exits_nonzero_when_the_profile_has_a_wildcard_bash_entry(monkeypatch, capsys):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy")
+    monkeypatch.setattr(
+        cli_module.permissions, "check_profile",
+        lambda settings_path, configured_tools: cli_module.permissions.ProfileCheck(
+            False, f"wildcard Bash permission(s) in {settings_path}: ['Bash(*)']"
+        ),
+    )
+    rc = main(["doctor"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "worker capability contract: FAIL" in out
+    assert "wildcard Bash" in out
+    # The two failure modes render distinct messages, per the ticket's
+    # verification plan ("confirm both exit non-zero with distinct messages").
+    missing_msg = "is missing or unreadable"
+    assert missing_msg not in out
 
 
 def test_parser_cycle_resume_args():

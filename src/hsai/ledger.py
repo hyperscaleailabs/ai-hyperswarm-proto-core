@@ -30,6 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import CoreConfig
+from .verify import UNVERIFIED
 
 # Budget-gate statuses.
 OK = "ok"
@@ -69,6 +70,11 @@ class LedgerRecord:
     # to "" so read_records() parses pre-existing records that lack them.
     failure_class: str = ""
     failure_detail: str = ""
+    # Worker self-verification (see hsai.verify): one of verify.STATUSES.
+    # Defaults to "" so pre-existing ledger lines (written before this field
+    # existed) still parse; every record appended after this field shipped
+    # always carries one of the three closed statuses.
+    verification: str = ""
     created: str = field(default_factory=_now)
 
     def to_json(self) -> str:
@@ -154,10 +160,25 @@ class BlockAggregate:
     # Per-class failure counts this block (see hsai.postmortem.pareto_table for
     # the richer share/exemplar breakdown the review brief renders).
     failure_histogram: dict[str, int] = field(default_factory=dict)
+    # Worker self-verification (see hsai.verify): counts by status among
+    # records that carry one - records predating this field contribute
+    # nothing, so `unverified_rate` never divides by iterations that could
+    # never have reported a status.
+    verification_counts: dict[str, int] = field(default_factory=dict)
 
     @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
+
+    def unverified_rate(self) -> float | None:
+        """Share of self-verification-eligible iterations that were
+        UNVERIFIED this block - the governance signal a permissions
+        regression shows up as. ``None`` when nothing in the block carries a
+        verification status."""
+        total = sum(self.verification_counts.values())
+        if not total:
+            return None
+        return self.verification_counts.get(UNVERIFIED, 0) / total
 
     def tokens_per_merged_pr(self) -> float | None:
         """Quota spent per unit of delivered work - the block's efficiency.
@@ -205,6 +226,10 @@ def aggregate_block(records: list[LedgerRecord], block: int) -> BlockAggregate:
         if r.failure_class:
             agg.failure_histogram[r.failure_class] = (
                 agg.failure_histogram.get(r.failure_class, 0) + 1
+            )
+        if r.verification:
+            agg.verification_counts[r.verification] = (
+                agg.verification_counts.get(r.verification, 0) + 1
             )
         agg.input_tokens += r.input_tokens or 0
         agg.output_tokens += r.output_tokens or 0

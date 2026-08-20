@@ -61,6 +61,31 @@ def test_lesson_records_the_independent_review_verdict(tmp_path):
     assert "## Lesson learned" in text and "## Reproduction evidence" in text
 
 
+def test_lesson_records_the_self_verification_status_and_claim(tmp_path):
+    """The worker's own claim, and how it was reconciled against
+    `ci.run_local`, land in the lesson (see hsai.verify)."""
+    kb = KnowledgeBase(tmp_path)
+    lesson = Lesson(
+        title="implement: add widget",
+        outcome="pass",
+        kind="implement",
+        context="ctx",
+        what_happened="did the thing",
+        lesson="kept it small",
+        ticket=7,
+    )
+    path = kb.write_lesson(lesson)
+    assert "## Self-verification" in path.read_text()
+    assert "_(no self-verification claim parsed)_" in path.read_text()
+
+    lesson.verification = "verified-agree"
+    lesson.verify_claim = "`ruff check .`=exit 0; `pytest`=exit 0"
+    kb.write_lesson(lesson)
+    text = path.read_text()
+    assert "| self-verification | `verified-agree` |" in text
+    assert "`ruff check .`=exit 0; `pytest`=exit 0" in text
+
+
 def test_failed_lesson_carries_a_failure_class_tag_and_row(tmp_path):
     """G4: the Obsidian graph can filter failures by cause (see hsai.postmortem)."""
     kb = KnowledgeBase(tmp_path)

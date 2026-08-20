@@ -85,6 +85,27 @@ def test_read_records_parses_pre_existing_records_lacking_failure_fields(tmp_pat
     assert records[0].outcome == "merged"
 
 
+def test_ledger_record_carries_verification_status(tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    append_record(path, _rec(outcome="merged", verification="verified-agree"))
+    stored = read_records(path)[0]
+    assert stored.verification == "verified-agree"
+
+
+def test_read_records_parses_pre_existing_records_lacking_verification(tmp_path):
+    """Backward compatibility: a ledger written before this field existed must
+    still parse - `verification` defaults to ''."""
+    path = tmp_path / "ledger.jsonl"
+    legacy = {
+        "iteration": 101, "block": 1, "ticket": 7, "kind": "implement",
+        "tier": "standard", "model": "sonnet", "wall_clock_seconds": 12.0,
+        "attempts": 1, "outcome": "merged", "created": "2026-01-01T00:00:00+00:00",
+    }
+    path.write_text(json.dumps(legacy) + "\n")
+    records = read_records(path)
+    assert records[0].verification == ""
+
+
 def test_ledger_path_from_config(tmp_path):
     cfg = load_config()
     path = ledger_path(cfg, tmp_path)
@@ -157,6 +178,27 @@ def test_aggregate_block_folds_a_per_class_failure_histogram():
     ]
     agg = aggregate_block(records, block=1)
     assert agg.failure_histogram == {"remote_ci_fail": 2, "incomplete_diff": 1}
+
+
+def test_aggregate_block_folds_verification_counts_and_unverified_rate():
+    records = [
+        _rec(block=1, verification="verified-agree"),
+        _rec(block=1, verification="verified-agree"),
+        _rec(block=1, verification="verified-disagree"),
+        _rec(block=1, verification="unverified"),
+        _rec(block=2, verification="unverified"),  # other block, ignored
+    ]
+    agg = aggregate_block(records, block=1)
+    assert agg.verification_counts == {
+        "verified-agree": 2, "verified-disagree": 1, "unverified": 1,
+    }
+    assert agg.unverified_rate() == 0.25
+
+
+def test_unverified_rate_is_none_without_any_verification_records():
+    agg = aggregate_block([_rec(block=1)], block=1)
+    assert agg.verification_counts == {}
+    assert agg.unverified_rate() is None
 
 
 # --- budget gate transitions ------------------------------------------------

@@ -110,6 +110,13 @@ def build_command(
     must not be brickable by a CLI flag change: setting it to ``text`` (or
     empty) drops the flag and falls back to the plain-text path, which every
     consumer already tolerates.
+
+    The worker capability contract (``execution.worker_tools`` in core.yaml,
+    mirrored in the committed ``.claude/settings.json`` - see
+    :mod:`hsai.permissions`) is passed explicitly here rather than relying on
+    the CLI to discover it from cwd: an ephemeral worktree should not have to
+    be trusted to find its own permission profile, and the recorded command
+    vector should show exactly what a worker was allowed to do.
     """
     mode = permission_mode or cfg.permission_mode
     cmd = [
@@ -121,6 +128,10 @@ def build_command(
         "--permission-mode",
         mode,
     ]
+    if cfg.worker_tools_settings_file:
+        cmd += ["--settings", cfg.worker_tools_settings_file]
+    if cfg.worker_tools_allowed:
+        cmd += ["--allowedTools", *cfg.worker_tools_allowed]
     fmt = (cfg.output_format or "").strip()
     if fmt and fmt != "text":
         cmd += ["--output-format", fmt]

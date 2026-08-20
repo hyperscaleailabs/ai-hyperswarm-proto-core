@@ -101,6 +101,27 @@ def test_brief_says_when_tokens_per_merged_pr_is_unavailable():
     assert "tokens per merged PR: _not available_" in body
 
 
+def test_brief_renders_the_unverified_rate_for_the_block():
+    """AC #6: an unverified rate shows up as a governance signal."""
+    cfg = load_config()
+    cost = BlockAggregate(
+        block=7, iterations=4, total_seconds=10.0,
+        verification_counts={"verified-agree": 2, "verified-disagree": 1, "unverified": 1},
+    )
+    body = render_brief(cfg, BlockReport(cycle_index=7, cost=cost))
+    assert "## Worker self-verification (this block)" in body
+    assert "verified-agree=2" in body
+    assert "verified-disagree=1" in body
+    assert "unverified=1" in body
+    assert "Unverified rate:** 25%" in body
+
+
+def test_brief_notes_absent_verification_records():
+    cfg = load_config()
+    body = render_brief(cfg, BlockReport(cycle_index=7))
+    assert "_no self-verification records for this block_" in body
+
+
 # --- practices adopted this block --------------------------------------------
 
 def test_brief_reports_practices_adopted_this_block():
