@@ -93,10 +93,23 @@ closes the loop.
   with a prior title clears the configured Jaccard threshold, is dropped and
   its slot is never back-filled - `SynthesisResult.rejected` and
   `.rejected_titles` carry the count and matches into `BlockReport.notes`.
+- **Observe.** `observatory.observe` caches one digest per reference project
+  (`knowledge/reference/<owner>__<repo>.json`: head sha, README hash + capped
+  excerpt, commit-subject window, workflow inventory) and `diff_digest` turns
+  the next observation into a delta - new commits since the stored head, added
+  and removed workflows, whether the README moved. A first look is marked
+  `baseline` rather than reported as a wall of change, and an empty fetch never
+  overwrites a good observation. `build_context_pack` renders, per repo, the
+  delta first, then the baseline digest, then *Practices already adopted from
+  this project (do NOT re-propose)* - built by `build_adoption_index` from the
+  lessons that cite the project plus the practices registry. Dossiers and the
+  Reference Set MOC are regenerated in `KnowledgeBase.reindex_mocs`, and
+  `hsai observe [--refresh]` refreshes both out of band.
 - **Audit.** What was retrieved is recorded three times: on `IterationResult`,
   as a `recalled:` list in the lesson's frontmatter, and as a
   *Prior lessons consulted* section on the PR. `hsai recall "<query>"` prints
-  the same ranking by hand.
+  the same ranking by hand. How stale the reference set has become is reported
+  in DIRECTION.md's *Now* section (`observatory.stale_report`).
 
 Reference-set lineage: retrieval-before-planning from `assafelovic/gpt-researcher`,
 index-then-retrieve with metadata preserved from `run-llama/llama_index`, and

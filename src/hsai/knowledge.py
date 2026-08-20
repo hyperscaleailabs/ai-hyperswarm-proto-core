@@ -14,10 +14,13 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 from . import practices as practices_mod
-from .config import CoreConfig
+from .config import CoreConfig, ReferenceRepo
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _TAG_RE = re.compile(r"^\s*-\s+(\S.*)$", re.MULTILINE)
+# A cited reference project inside the "References" section: `owner/repo`,
+# with or without backticks, and with or without a trailing gloss.
+_REFERENCE_LINE_RE = re.compile(r"^-\s+`?([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)`?")
 _FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
 _TITLE_RE = re.compile(r"^# (.+)$", re.MULTILINE)
 _SECTION_RE = re.compile(r"^## (.+)$", re.MULTILINE)
@@ -86,6 +89,10 @@ class LessonRecord:
     body: str = ""  # everything after the frontmatter; what the recall index reads
     failure_class: str = ""  # "" when absent (pass, or a note predating this field)
     created: str = ""  # frontmatter `created:`, "" for notes that carry no date
+    # Reference-set repos this note cites, read back off the "References
+    # (reference-set evidence)" section - the read side of `Lesson.references`,
+    # and what hsai.observatory builds its adoption index from.
+    references: tuple[str, ...] = ()
 
 
 def split_sections(text: str) -> dict[str, str]:
@@ -132,6 +139,21 @@ def _frontmatter_scalar(fm: str, key: str) -> str:
     return ""
 
 
+def _cited_references(sections: dict[str, str]) -> tuple[str, ...]:
+    """Reference-set repos cited under the note's "References" heading.
+
+    Deduplicated, order preserved. A note with no such section (a whitepaper,
+    an ADR) or one whose section says "_(none cited)_" yields an empty tuple.
+    """
+    body = next((v for k, v in sections.items() if k.startswith("references")), "")
+    repos: list[str] = []
+    for line in body.splitlines():
+        match = _REFERENCE_LINE_RE.match(line.strip())
+        if match:
+            repos.append(match.group(1))
+    return tuple(dict.fromkeys(repos))
+
+
 def parse_note(path: str | Path) -> LessonRecord:
     """Parse any Obsidian note in the vault into a :class:`LessonRecord`.
 
@@ -163,6 +185,7 @@ def parse_note(path: str | Path) -> LessonRecord:
         body=body.strip(),
         failure_class=failure_class,
         created=_frontmatter_scalar(fm, "created"),
+        references=_cited_references(sections),
     )
 
 
@@ -190,6 +213,12 @@ class KnowledgeBase:
         whitepapers_dir: str = "knowledge/whitepapers",
         mocs_dir: str = "knowledge/MOCs",
         practices_dir: str = practices_mod.PRACTICES_DIR_DEFAULT,
+        # Literal rather than hsai.observatory.REFERENCE_DIR_DEFAULT: that
+        # module reads notes through THIS one, so importing it here would close
+        # an import cycle. tests/test_observatory.py asserts the two agree.
+        reference_dir: str = "knowledge/reference",
+        reference_repos: tuple[ReferenceRepo, ...] = (),
+        stale_after_days: int = 7,
         whitepaper_every: int = 10,
     ) -> None:
         self.root = Path(root)
@@ -197,19 +226,29 @@ class KnowledgeBase:
         self.whitepapers_dir = self.root / whitepapers_dir
         self.mocs_dir = self.root / mocs_dir
         self.practices_dir = self.root / practices_dir
+        self.reference_dir = self.root / reference_dir
+        self.reference_repos = tuple(reference_repos)
+        self.stale_after_days = stale_after_days
         self.whitepaper_every = whitepaper_every
-        for d in (self.lessons_dir, self.whitepapers_dir, self.mocs_dir, self.practices_dir):
+        for d in (
+            self.lessons_dir, self.whitepapers_dir, self.mocs_dir,
+            self.practices_dir, self.reference_dir,
+        ):
             d.mkdir(parents=True, exist_ok=True)
 
     @classmethod
     def from_config(cls, cfg: CoreConfig, root: str | Path) -> KnowledgeBase:
         k = cfg.knowledge or {}
+        o = cfg.observatory or {}
         return cls(
             root,
             lessons_dir=k.get("lessons_dir", "knowledge/lessons"),
             whitepapers_dir=k.get("whitepapers_dir", "knowledge/whitepapers"),
             mocs_dir=k.get("mocs_dir", "knowledge/MOCs"),
             practices_dir=k.get("practices_dir", practices_mod.PRACTICES_DIR_DEFAULT),
+            reference_dir=o.get("dir", "knowledge/reference"),
+            reference_repos=cfg.reference_top10,
+            stale_after_days=int(o.get("stale_after_days", 7)),
             whitepaper_every=int(k.get("whitepaper_every_lessons", 10)),
         )
 
@@ -324,14 +363,36 @@ class KnowledgeBase:
 
     # --- indexing -------------------------------------------------------------
     def reindex_mocs(self) -> list[Path]:
-        """Rebuild the MOC files from what is currently on disk."""
+        """Rebuild the MOC files (and the reference dossiers) from what is on disk."""
         written = [
             self._write_lessons_moc(),
             self._write_whitepapers_moc(),
             self._write_practices_moc(),
-            self._write_root_moc(),
         ]
+        written.extend(self.write_reference_dossiers())
+        written.append(self._write_root_moc())
         return written
+
+    def write_reference_dossiers(self) -> list[Path]:
+        """Regenerate one dossier per reference project plus the Reference Set MOC.
+
+        Derived files: they read the digest cache (:mod:`hsai.observatory`) and
+        the committed vault, never the network. Regenerated here - serialized,
+        once per block - for the same reason the other MOCs are: parallel PRs
+        must never collide on them.
+        """
+        # Imported inside the method, not at module scope: hsai.observatory
+        # reads notes through this module, so a top-level import would cycle.
+        from . import observatory
+
+        index = observatory.build_adoption_index(self.read_lessons(), self.read_practices())
+        return observatory.write_dossiers(
+            self.reference_repos,
+            reference_dir=self.reference_dir,
+            mocs_dir=self.mocs_dir,
+            index=index,
+            stale_after_days=self.stale_after_days,
+        )
 
     # --- rendering ------------------------------------------------------------
     @staticmethod
@@ -514,6 +575,7 @@ project - the durable record behind G1's traceability claim. Total: **{len(recor
         n_lessons = len(self.lesson_notes())
         n_papers = len(self.whitepaper_notes())
         n_practices = len(self.practice_notes())
+        n_refs = len(self.reference_repos)
         content = f"""{fm}
 
 # Knowledge Base MOC
@@ -525,12 +587,15 @@ vault and use the graph view to explore how lessons connect.
 - [[Lessons MOC]] - {n_lessons} lesson(s)
 - [[Whitepapers MOC]] - {n_papers} whitepaper(s)
 - [[Practices MOC]] - {n_practices} practice(s)
+- [[Reference Set MOC]] - {n_refs} reference project(s) under observation
 
 ## How this is maintained
 - Each PR the [[hsai]] loop opens contributes exactly one lesson.
 - Every {self.whitepaper_every} lessons, a whitepaper synthesizes the themes.
 - Every synthesized ticket that adds or extends a practice is recorded in the
   practices registry, indexed by [[Practices MOC]].
+- Every reference project carries a dossier - what it is, what we adopted, what
+  changed since we last looked - refreshed by `hsai observe`.
 - These MOCs are regenerated by `hsai reindex` after each iteration.
 """
         path = self.mocs_dir / "Knowledge Base MOC.md"

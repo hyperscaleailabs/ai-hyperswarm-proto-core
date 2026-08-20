@@ -4,7 +4,9 @@ from pathlib import Path
 
 from hsai import ai, retrieval
 from hsai.config import load_config
+from hsai.knowledge import KnowledgeBase, Lesson
 from hsai.models import ModelChoice
+from hsai.observatory import ADOPTED_FROM_HEADING, BASELINE_HEADING, DELTA_HEADING
 from hsai.practices import ADOPTED_HEADING, build_practice
 from hsai.proc import Proc
 from hsai.retrieval import PRIOR_ART_HEADING, PriorArt
@@ -14,6 +16,7 @@ from hsai.synthesis import (
     MEMORY_HEADING,
     ContextPack,
     MemoryPack,
+    build_context_pack,
     build_prompt,
     gather_prior_art,
     goal_queries,
@@ -651,3 +654,91 @@ def test_synthesis_drops_a_candidate_that_restates_a_failed_lesson(tmp_path):
     assert "[[2026-01-04-vector-memory]]" in dropped
     kept = next(f for f in res.risk_flags if f.startswith("feat: signed provenance"))
     assert "keep" in kept
+
+
+# --- the reference-set observatory feeds the context pack ---------------------
+
+STUDIED = "run-llama/llama_index"
+
+
+def _digest_runner(*, commits, workflows=("ci.yml",), readme="# llama_index\n"):
+    """A fake `gh` answering the four observatory API calls. No network."""
+
+    def runner(cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None):
+        path = cmd[2] if len(cmd) > 2 else ""
+        if path.endswith("/readme"):
+            return Proc(cmd, 0, readme, "")
+        if "/commits" in path:
+            return Proc(cmd, 0, "".join(f"{sha}\t{subj}\n" for sha, subj in commits), "")
+        if path.endswith("/workflows"):
+            return Proc(cmd, 0, "".join(f"{name}\n" for name in workflows), "")
+        return Proc(cmd, 0, "main\n", "")
+
+    return runner
+
+
+def _cite_lesson(root) -> Lesson:
+    lesson = Lesson(
+        title="implement: mirror the reference set instead of re-reading it",
+        outcome="pass", kind="implement", context="c", what_happened="w",
+        lesson="A cached digest beats a re-fetch.", references=(STUDIED,),
+    )
+    KnowledgeBase.from_config(_cfg(), root).write_lesson(lesson)
+    return lesson
+
+
+def test_context_pack_renders_a_delta_and_an_adopted_practices_section(tmp_path):
+    """Per rotated repo: what changed, the baseline, and what we already took."""
+    cfg = _cfg()
+    lesson = _cite_lesson(tmp_path)
+    first = [("aaa1", "feat: sync docs"), ("aaa0", "fix: pin the mirror")]
+
+    pack = build_context_pack(
+        [STUDIED], runner=_digest_runner(commits=first), root=str(tmp_path), cfg=cfg
+    )
+    section = pack.sections[STUDIED]
+
+    assert DELTA_HEADING in section
+    assert ADOPTED_FROM_HEADING in section
+    assert section.index(DELTA_HEADING) < section.index(BASELINE_HEADING)
+    assert "BASELINE" in section                       # first-ever observation
+    assert "feat: sync docs" in section                # the baseline digest itself
+    # the adopted section is derived from knowledge/lessons, and links back to it
+    assert f"[[{lesson.note_name()}]]" in section
+    assert "mirror the reference set" in section
+
+    # A second cycle over the same repo leads with what is genuinely new.
+    second = [("bbb2", "feat: retain cited sources")] + first
+    again = build_context_pack(
+        [STUDIED], runner=_digest_runner(commits=second, workflows=("ci.yml", "stale_bot.yml")),
+        root=str(tmp_path), cfg=cfg,
+    )
+    delta_block = again.sections[STUDIED].split(BASELINE_HEADING)[0]
+    assert "feat: retain cited sources" in delta_block
+    assert "stale_bot.yml" in delta_block
+    assert "BASELINE" not in delta_block
+
+
+def test_context_pack_persists_a_digest_the_next_cycle_can_diff_against(tmp_path):
+    cfg = _cfg()
+    build_context_pack(
+        [STUDIED], runner=_digest_runner(commits=[("aaa1", "feat: sync docs")]),
+        root=str(tmp_path), cfg=cfg,
+    )
+    cached = tmp_path / "knowledge" / "reference" / "run-llama__llama_index.json"
+    assert cached.is_file()
+    assert json.loads(cached.read_text())["head_sha"] == "aaa1"
+
+
+def test_prompt_prefers_deltas_and_still_ends_with_the_json_block_instruction():
+    cfg = _cfg()
+    pack = ContextPack(repos=["a/b"], sections={"a/b": f"**{DELTA_HEADING}**\nnothing new"})
+
+    prompt = build_prompt(cfg, pack)
+
+    assert DELTA_HEADING in prompt and ADOPTED_FROM_HEADING in prompt
+    assert "PREFER THIS" in prompt
+    assert "JUSTIFY the overlap" in prompt
+    # parse_ticket_specs depends on this being the LAST instruction in the prompt
+    assert prompt.rstrip().endswith("The JSON block must be the LAST fenced block in your reply.")
+    assert parse_ticket_specs(PLAIN_TEXT_OUTPUT)[0].title == "feat: adaptive budget"

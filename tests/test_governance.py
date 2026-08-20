@@ -1,5 +1,7 @@
 import json
+from datetime import datetime, timezone
 
+from hsai import observatory
 from hsai.config import load_config
 from hsai.governance import (
     NOTES_END,
@@ -33,6 +35,28 @@ def test_direction_has_three_layers_and_issue_map(tmp_path):
     assert "#1 feat: x" in text
     assert "BLOCKED" in text  # blocked tickets visibly flagged
     assert NOTES_START in text and NOTES_END in text
+
+
+def test_direction_now_section_reports_reference_set_staleness(tmp_path):
+    """A stale reference set is an explicit, surfaced state - not a silent one."""
+    cfg = load_config()
+    total = len(cfg.reference_top10)
+
+    text = render_direction(cfg, repo_root=tmp_path, runner=_issues_runner)
+    now_section = text.split("## Now (current state)")[1].split("## Issues Map")[0]
+    assert f"{total} of {total} reference project(s) not observed" in now_section
+    assert "hsai observe --refresh" in now_section
+    assert "[[Reference Set MOC]]" in now_section
+
+    # observe them all, and the same line flips to "all N observed"
+    directory = observatory.reference_dir(tmp_path, cfg)
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    for ref in cfg.reference_top10:
+        observatory.write_digest(
+            directory, observatory.Digest(repo=ref.repo, fetched_at=stamp, head_sha="abc1234")
+        )
+    refreshed = render_direction(cfg, repo_root=tmp_path, runner=_issues_runner)
+    assert f"all {total} reference project(s) observed within the last" in refreshed
 
 
 def test_architect_notes_survive_regeneration(tmp_path):

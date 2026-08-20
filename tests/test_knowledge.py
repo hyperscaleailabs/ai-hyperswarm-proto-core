@@ -162,7 +162,8 @@ def test_write_lesson_and_reindex(tmp_path):
     written = kb.reindex_mocs()
     names = {p.name for p in written}
     assert names == {
-        "Lessons MOC.md", "Whitepapers MOC.md", "Practices MOC.md", "Knowledge Base MOC.md",
+        "Lessons MOC.md", "Whitepapers MOC.md", "Practices MOC.md",
+        "Reference Set MOC.md", "Knowledge Base MOC.md",
     }
     lessons_moc = (kb.mocs_dir / "Lessons MOC.md").read_text()
     assert f"[[{lesson.note_name()}]]" in lessons_moc
@@ -211,6 +212,34 @@ def test_read_lessons_round_trips_written_lessons(tmp_path):
     assert r.kind == "implement"
     assert r.lesson_text == "small steps win"
     assert r.what_happened == "did the thing"
+
+
+def test_cited_reference_projects_round_trip_back_off_disk(tmp_path):
+    """The read side of `Lesson.references` - what the observatory indexes."""
+    kb = KnowledgeBase(tmp_path)
+    path = kb.write_lesson(
+        Lesson(
+            title="implement: mirror the reference set",
+            outcome="pass", kind="implement", context="c", what_happened="w", lesson="l",
+            references=("run-llama/llama_index", "openai/swarm"),
+        )
+    )
+    assert parse_note(path).references == ("run-llama/llama_index", "openai/swarm")
+
+    # a gloss after the slug is normal in hand-written notes, and must not break it
+    path.write_text(
+        path.read_text().replace(
+            "- `openai/swarm`", "- `openai/swarm` (keep the concurrency core tiny)"
+        )
+    )
+    assert parse_note(path).references == ("run-llama/llama_index", "openai/swarm")
+
+    # a lesson citing nothing yields nothing - never a stray "_(none cited)_"
+    nothing = kb.write_lesson(
+        Lesson(title="implement: something", outcome="pass", kind="implement",
+               context="c", what_happened="w", lesson="l")
+    )
+    assert parse_note(nothing).references == ()
 
 
 def test_recalled_notes_are_written_as_a_frontmatter_list(tmp_path):
