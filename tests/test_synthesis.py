@@ -2,22 +2,25 @@ import json
 import re
 from pathlib import Path
 
-from hsai import ai, retrieval
+from hsai import ai, github, retrieval
 from hsai.config import load_config
+from hsai.governance import BlockReport, render_brief
+from hsai.ledger import LedgerRecord
 from hsai.models import ModelChoice
 from hsai.practices import ADOPTED_HEADING, build_practice
 from hsai.proc import Proc
 from hsai.retrieval import PRIOR_ART_HEADING, PriorArt
 from hsai.synthesis import (
     DEFAULT_MEMORY_MAX_CHARS,
-    DUPLICATE_JACCARD_THRESHOLD,
+    DEFAULT_NOVELTY_THRESHOLD,
     MEMORY_HEADING,
     ContextPack,
-    MemoryPack,
+    LessonMemory,
+    SynthesisMemory,
     build_prompt,
     gather_prior_art,
     goal_queries,
-    is_duplicate,
+    is_novel,
     parse_ticket_specs,
     pick_rotation,
     synthesize,
@@ -191,11 +194,10 @@ def test_synthesize_survives_output_without_a_json_envelope():
     assert res.ok is True
     assert res.filed == [321]
     assert res.error == ""
-    assert res.rejected == 0
-    assert res.rejected_titles == []
+    assert res.rejected == []
 
 
-# --- MemoryPack: what this loop already knows about its own state ------------
+# --- SynthesisMemory: what this loop already knows about its own state -------
 
 OPEN_ISSUES = [
     {
@@ -234,59 +236,140 @@ def _memory_runner(*, open_issues=None, closed_issues=None):
     return runner
 
 
-def _write_lesson(root, name, *, outcome, title):
+def _write_lesson(root, name, *, outcome, title, lesson="Something."):
     directory = root / "knowledge" / "lessons"
     directory.mkdir(parents=True, exist_ok=True)
     (directory / f"{name}.md").write_text(
         f"---\ntags:\n  - lesson\n  - outcome/{outcome}\n  - kind/implement\n"
-        f"created: 2026-01-01\n---\n\n# {title}\n\n## Lesson learned\nSomething.\n"
+        f"created: 2026-01-01\n---\n\n# {title}\n\n## Lesson learned\n{lesson}\n"
     )
 
 
-def test_memory_pack_gather_collects_open_closed_and_lessons(tmp_path):
+def _write_ledger(root, records):
+    path = root / "knowledge" / "ledger"
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "iterations.jsonl").write_text(
+        "\n".join(r.to_json() for r in records) + "\n"
+    )
+
+
+def _record(**kw):
+    base = dict(
+        iteration=1, block=7, ticket=1, kind="implement", tier="heavy", model="opus",
+        wall_clock_seconds=60.0, attempts=1, outcome="merged",
+    )
+    return LedgerRecord(**{**base, **kw})
+
+
+def test_memory_gather_collects_tickets_lessons_and_ledger_blocks(tmp_path):
     cfg = _cfg()
     _write_lesson(tmp_path, "2026-01-01-a", outcome="pass", title="Poll remote CI")
-    _write_lesson(tmp_path, "2026-01-02-b", outcome="fail", title="Edit the workflows")
+    _write_lesson(
+        tmp_path, "2026-01-02-b", outcome="fail", title="Edit the workflows",
+        lesson="The harness denies every write under .github/workflows.",
+    )
+    _write_ledger(tmp_path, [
+        _record(block=6, tier="standard", outcome="failed", failure_class="ci-red"),
+        _record(block=7),
+        _record(block=7, iteration=2, tier="standard", outcome="failed",
+                failure_class="review-blocked"),
+    ])
 
-    memory = MemoryPack.gather(cfg, root=str(tmp_path), runner=_memory_runner())
+    memory = SynthesisMemory.gather(cfg, root=str(tmp_path), runner=_memory_runner())
 
     assert [i.title for i in memory.open_tickets] == [
         "feat: lesson-retrieval memory", "ci: main is red - auto-heal",
     ]
     assert memory.closed_titles == ("feat: adaptive budget throttling",)
-    # read_lessons() is oldest-first; the pack flips it so the newest lesson leads.
-    assert memory.lessons == (("fail", "Edit the workflows"), ("pass", "Poll remote CI"))
+    # read_lessons() is oldest-first; the memory flips it so the newest lesson leads,
+    # and only a recorded FAILURE carries its lesson text.
+    assert memory.lessons == (
+        LessonMemory("fail", "implement", "Edit the workflows",
+                     "The harness denies every write under .github/workflows."),
+        LessonMemory("pass", "implement", "Poll remote CI"),
+    )
+    # Ledger blocks, newest first, with the heavy-tier spend and outcome mix folded in.
+    assert [b.block for b in memory.blocks] == [7, 6]
+    assert memory.blocks[0].heavy_iterations == 1
+    assert memory.blocks[0].merged_iterations == 1
+    assert memory.blocks[0].failure_histogram == {"review-blocked": 1}
+
+    prov = memory.provenance()
+    assert (prov.lessons, prov.failed_lessons) == (2, 1)
+    assert (prov.open_tickets, prov.closed_tickets, prov.blocks) == (2, 1, 2)
+    assert "2 lesson(s) (1 recorded as fail)" in prov.summary()
+    assert "2 ledger block(s) summarized" in prov.summary()
 
 
-def test_memory_pack_render_lists_all_three_sources(tmp_path):
+def test_memory_render_lists_every_source(tmp_path):
     cfg = _cfg()
-    _write_lesson(tmp_path, "2026-01-02-b", outcome="fail", title="Edit the workflows")
-    memory = MemoryPack.gather(cfg, root=str(tmp_path), runner=_memory_runner())
+    _write_lesson(tmp_path, "2026-01-02-b", outcome="fail", title="Edit the workflows",
+                  lesson="The harness denies workflow writes.")
+    _write_ledger(tmp_path, [_record(block=9)])
+    memory = SynthesisMemory.gather(cfg, root=str(tmp_path), runner=_memory_runner())
 
     text = memory.render()
     assert "#40 feat: lesson-retrieval memory" in text
     assert "feat: adaptive budget throttling" in text
-    assert "**fail** - Edit the workflows" in text
+    assert "**fail**/implement - Edit the workflows" in text
+    assert "why it failed: The harness denies workflow writes." in text
+    assert "block 9:" in text and "heavy-tier=1" in text and "merged 1/1" in text
 
 
-def test_memory_pack_render_degrades_to_a_placeholder_when_empty():
-    assert MemoryPack().render() == "_(nothing recorded yet - this is an early cycle)_"
+def test_memory_render_flags_blocked_and_needs_refinement_tickets(tmp_path):
+    """A refused ticket is not free ground - the planner must see why."""
+    cfg = _cfg()
+    issues = [
+        {"number": 50, "title": "feat: vague idea",
+         "labels": [{"name": "needs-refinement"}], "assignees": [], "body": ""},
+        {"number": 51, "title": "feat: stuck idea",
+         "labels": [{"name": "blocked"}], "assignees": [], "body": ""},
+    ]
+    memory = SynthesisMemory.gather(
+        cfg, root=str(tmp_path), runner=_memory_runner(open_issues=issues, closed_issues=[])
+    )
+    text = memory.render()
+    assert "#50 feat: vague idea [needs-refinement] NEEDS-REFINEMENT" in text
+    assert "#51 feat: stuck idea [blocked] BLOCKED" in text
 
 
-def test_memory_pack_render_is_hard_capped():
-    many_lessons = tuple(("pass", f"lesson number {i} about something") for i in range(500))
-    memory = MemoryPack(lessons=many_lessons)
+def test_memory_render_degrades_to_a_placeholder_when_empty():
+    assert SynthesisMemory().render() == "_(nothing recorded yet - this is an early cycle)_"
 
-    capped = memory.render(max_chars=200)
-    assert len(capped) <= 200
-    assert capped.endswith("...")
+
+def test_memory_render_is_capped_and_truncates_oldest_first():
+    many = tuple(
+        LessonMemory("pass", "implement", f"lesson number {i} about something")
+        for i in range(500)
+    )  # newest first, as gather() emits them
+    memory = SynthesisMemory(lessons=many)
+
+    capped = memory.render(max_chars=400)
+    assert len(capped) <= 400
+    # The NEWEST entries survive; the oldest are the ones dropped, and the
+    # elision is stated rather than left to look like "nothing else happened".
+    assert "lesson number 0 about something" in capped
+    assert "lesson number 499 about something" not in capped
+    assert "older entries elided" in capped
 
     # A generous cap does not truncate content that already fits.
-    small = MemoryPack(lessons=(("pass", "one short lesson"),))
-    assert not small.render(max_chars=DEFAULT_MEMORY_MAX_CHARS).endswith("...")
+    small = SynthesisMemory(lessons=(LessonMemory("pass", "implement", "one short lesson"),))
+    rendered = small.render(max_chars=DEFAULT_MEMORY_MAX_CHARS)
+    assert "elided" not in rendered and not rendered.endswith("...")
 
 
-def test_memory_pack_gathering_degrades_gracefully_when_gh_is_unavailable(tmp_path):
+def test_memory_render_drops_the_least_load_bearing_section_first():
+    """Open ticket titles are the primary dedupe target: they outlive closed ones."""
+    memory = SynthesisMemory(
+        open_tickets=(github.Issue(number=1, title="feat: still open", labels=(), assignees=()),),
+        closed_titles=tuple(f"feat: closed thing {i}" for i in range(50)),
+    )
+    capped = memory.render(max_chars=300)
+    assert len(capped) <= 300
+    assert "feat: still open" in capped
+
+
+def test_memory_gathering_degrades_gracefully_when_gh_is_unavailable(tmp_path):
     """`gh` missing (exit 127, empty stdout) and an empty knowledge base must
     yield an empty memory section, never raise."""
     cfg = _cfg()
@@ -294,24 +377,25 @@ def test_memory_pack_gathering_degrades_gracefully_when_gh_is_unavailable(tmp_pa
     def broken_runner(cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None):
         return Proc(cmd, 127, "", "gh: command not found")
 
-    memory = MemoryPack.gather(cfg, root=str(tmp_path), runner=broken_runner)
+    memory = SynthesisMemory.gather(cfg, root=str(tmp_path), runner=broken_runner)
     assert memory.open_tickets == ()
     assert memory.closed_titles == ()
     assert memory.lessons == ()
+    assert memory.blocks == ()
     assert memory.render() == "_(nothing recorded yet - this is an early cycle)_"
+    assert memory.provenance().summary().startswith("0 lesson(s)")
 
     # And synthesis itself must not abort because memory gathering came back empty:
     # it runs to completion (the model call still happens) rather than raising.
     res = synthesize(cfg, cycle_index=0, root=str(tmp_path), runner=broken_runner,
                       ai_runner=_plain_text_runner())
-    assert res.rejected == 0
-    assert res.rejected_titles == []
+    assert res.rejected == []
 
 
 def test_prompt_puts_memory_section_before_the_study_digest():
     cfg = _cfg()
     pack = ContextPack(repos=["a/b"], sections={"a/b": "digest of a/b"})
-    memory = MemoryPack(closed_titles=("feat: something already shipped",))
+    memory = SynthesisMemory(closed_titles=("feat: something already shipped",))
 
     prompt = build_prompt(cfg, pack, memory)
     assert MEMORY_HEADING in prompt
@@ -325,15 +409,41 @@ def test_prompt_puts_memory_section_before_the_study_digest():
     assert "nothing recorded yet" in build_prompt(cfg, pack)
 
 
-def test_synthesize_feeds_memory_to_the_model():
+def test_prompt_names_a_recorded_failure_and_an_open_ticket(tmp_path):
+    """The planner must be shown BOTH halves of its own history, and told what
+    to do with them - not just handed a digest."""
     cfg = _cfg()
+    _write_lesson(tmp_path, "2026-01-02-b", outcome="fail", title="Edit the workflows",
+                  lesson="The harness denies every write under .github/workflows.")
+    memory = SynthesisMemory.gather(cfg, root=str(tmp_path), runner=_memory_runner())
+    pack = ContextPack(repos=["a/b"], sections={"a/b": "digest of a/b"})
+
+    prompt = build_prompt(cfg, pack, memory)
+
+    assert "**fail**/implement - Edit the workflows" in prompt          # a recorded failure
+    assert "why it failed: The harness denies every write" in prompt    # and WHY it failed
+    assert "#40 feat: lesson-retrieval memory" in prompt                # a currently-open ticket
+    assert "Never re-propose the" in prompt
+    assert "how it DIFFERS from that failure" in prompt
+
+
+def test_synthesize_feeds_memory_to_the_model_within_the_character_cap():
+    """The `hsai synthesize` path itself: the captured prompt carries the memory
+    section, and that section respects the configured budget."""
+    cfg = _cfg()
+    cfg.synthesis["memory_max_chars"] = 300
     runner = _plain_text_runner()
-    synthesize(cfg, cycle_index=0, root=".", runner=runner, ai_runner=runner)
-    claude_call = next(c for c in runner.calls if c[:1] == ["claude"])
-    assert MEMORY_HEADING in claude_call[2]
+    synthesize(cfg, cycle_index=0, root=str(REPO_ROOT), runner=runner, ai_runner=runner)
+
+    prompt = next(c for c in runner.calls if c[:1] == ["claude"])[2]
+    assert MEMORY_HEADING in prompt
+    section = prompt.split(f"{MEMORY_HEADING} -", 1)[1].split(ADOPTED_HEADING, 1)[0]
+    # The digest itself (everything after the instruction paragraph's colon).
+    digest = section.split(":\n", 1)[1].strip()
+    assert len(digest) <= 300
 
 
-# --- is_duplicate(): pure normalized-title overlap ----------------------------
+# --- is_novel(): pure normalized-title overlap --------------------------------
 
 def _spec(title: str) -> TicketSpec:
     return TicketSpec(
@@ -342,58 +452,71 @@ def _spec(title: str) -> TicketSpec:
     )
 
 
-def test_is_duplicate_exact_title_match():
-    memory = MemoryPack(closed_titles=("feat: adaptive budget throttling per tier",))
-    dup, matched = is_duplicate(_spec("feat: adaptive budget throttling per tier"), memory)
-    assert dup is True
-    assert matched == "feat: adaptive budget throttling per tier"
+def test_is_novel_rejects_an_exact_title_match():
+    verdict = is_novel(
+        _spec("feat: adaptive budget throttling per tier"),
+        ["feat: adaptive budget throttling per tier"],
+    )
+    assert verdict.novel is False
+    assert verdict.matched == "feat: adaptive budget throttling per tier"
+    assert "exact duplicate" in verdict.reason
 
 
-def test_is_duplicate_prefix_only_difference():
+def test_is_novel_rejects_a_prefix_only_difference():
     """`feat:` vs `refactor:` on an otherwise identical title is still a duplicate."""
-    memory = MemoryPack(closed_titles=("feat: adaptive budget throttling per tier",))
-    dup, matched = is_duplicate(
-        _spec("refactor: adaptive budget throttling per tier"), memory
+    verdict = is_novel(
+        _spec("refactor: adaptive budget throttling per tier"),
+        ["feat: adaptive budget throttling per tier"],
     )
-    assert dup is True
-    assert matched == "feat: adaptive budget throttling per tier"
+    assert verdict.novel is False
+    assert verdict.matched == "feat: adaptive budget throttling per tier"
 
 
-def test_is_duplicate_genuine_near_duplicate():
+def test_is_novel_rejects_a_near_duplicate_above_the_threshold():
     """Same idea, reworded - high token overlap, not an exact or prefix match."""
-    memory = MemoryPack(closed_titles=("feat: retry queue backoff for flaky CI checks",))
-    dup, matched = is_duplicate(
-        _spec("feat: add exponential backoff to the retry queue for flaky checks"), memory
+    verdict = is_novel(
+        _spec("feat: add exponential backoff to the retry queue for flaky checks"),
+        ["feat: retry queue backoff for flaky CI checks"],
     )
-    assert dup is True
-    assert matched == "feat: retry queue backoff for flaky CI checks"
+    assert verdict.novel is False
+    assert verdict.matched == "feat: retry queue backoff for flaky CI checks"
+    assert verdict.score >= DEFAULT_NOVELTY_THRESHOLD
+    assert "title overlap" in verdict.reason
 
 
-def test_is_duplicate_distinct_idea_is_not_rejected():
-    memory = MemoryPack(closed_titles=("feat: retry queue backoff for flaky CI checks",))
-    dup, matched = is_duplicate(_spec("feat: cost ledger visualization dashboard"), memory)
-    assert dup is False
-    assert matched == ""
+def test_is_novel_accepts_a_genuinely_distinct_title():
+    verdict = is_novel(
+        _spec("feat: cost ledger visualization dashboard"),
+        ["feat: retry queue backoff for flaky CI checks"],
+    )
+    assert verdict.novel is True
+    assert verdict.matched == ""
+    assert verdict.reason == ""
+    assert bool(verdict) is True
 
 
-def test_is_duplicate_threshold_is_configurable_and_documented():
-    memory = MemoryPack(closed_titles=("feat: retry queue backoff for flaky CI checks",))
+def test_is_novel_threshold_is_configurable_and_documented():
     spec = _spec("feat: add exponential backoff to the retry queue for flaky checks")
-    # A stricter threshold than the documented default rejects the same pair.
-    assert DUPLICATE_JACCARD_THRESHOLD < 1.0
-    dup, _ = is_duplicate(spec, memory, threshold=0.99)
-    assert dup is False
+    known = ["feat: retry queue backoff for flaky CI checks"]
+    # A stricter threshold than the documented default accepts the same pair.
+    assert DEFAULT_NOVELTY_THRESHOLD < 1.0
+    assert is_novel(spec, known, threshold=0.99).novel is True
 
 
-def test_is_duplicate_checks_open_and_closed_tickets_and_lessons():
-    memory = MemoryPack(
-        open_tickets=(),
-        closed_titles=(),
-        lessons=(("fail", "feat: adaptive budget throttling per tier"),),
+def test_is_novel_is_pure_and_checks_every_remembered_title():
+    """Tickets AND lesson titles are all `known_titles()` - one flat check."""
+    memory = SynthesisMemory(
+        lessons=(LessonMemory("fail", "implement", "feat: adaptive budget throttling per tier"),),
     )
-    dup, matched = is_duplicate(_spec("feat: adaptive budget throttling per tier"), memory)
-    assert dup is True
-    assert matched == "feat: adaptive budget throttling per tier"
+    known = memory.known_titles()
+    spec = _spec("feat: adaptive budget throttling per tier")
+
+    verdict = is_novel(spec, known)
+    assert verdict.novel is False
+    assert verdict.matched == "feat: adaptive budget throttling per tier"
+    # Pure: neither argument is mutated, and a repeat call gives the same verdict.
+    assert known == memory.known_titles()
+    assert is_novel(spec, known) == verdict
 
 
 # --- synthesize() drops duplicates before filing ------------------------------
@@ -443,8 +566,8 @@ def test_synthesize_drops_duplicates_and_files_only_the_survivors():
 
     assert res.ok is True
     assert len(res.filed) == 2
-    assert res.rejected == 1
-    assert res.rejected_titles == ["feat: lesson-retrieval memory"]
+    assert [r.title for r in res.rejected] == ["feat: lesson-retrieval memory"]
+    assert "feat: lesson-retrieval memory" in res.rejected[0].reason
 
     created_titles = [
         c[c.index("--title") + 1] for c in runner.calls if c[:3] == ["gh", "issue", "create"]
@@ -463,6 +586,63 @@ def test_synthesize_never_backfills_a_thin_block():
     res = synthesize(cfg, cycle_index=0, root=".", runner=runner, ai_runner=runner)
     assert len(res.filed) < int(cfg.synthesis.get("file_top", 3))
     assert len(res.filed) == 2
+
+
+TWO_IDENTICAL_SPECS = """PHASE 3:
+```json
+[
+  {"title": "feat: signed provenance attestation per merged pull request",
+   "problem": "p", "proposal": "pp",
+   "acceptance_criteria": ["a", "b", "c"], "verification_plan": ["v1", "v2"],
+   "size": "M", "goal_ids": ["G2"], "synthesis_rationale": "combines a+b+c"},
+  {"title": "feat: signed provenance attestation per merged pull request",
+   "problem": "p", "proposal": "pp",
+   "acceptance_criteria": ["a", "b", "c"], "verification_plan": ["v1", "v2"],
+   "size": "M", "goal_ids": ["G2"], "synthesis_rationale": "combines d+e+f"}
+]
+```"""
+
+
+def test_synthesize_files_one_issue_when_the_model_proposes_the_same_spec_twice(tmp_path):
+    """The gate also dedupes WITHIN a batch: an empty memory is no excuse for
+    filing the same ticket twice."""
+    runner = _prior_art_runner(TWO_IDENTICAL_SPECS)
+
+    res = synthesize(_cfg(), cycle_index=0, root=str(tmp_path), runner=runner, ai_runner=runner)
+
+    created = [c for c in runner.calls if c[:3] == ["gh", "issue", "create"]]
+    assert len(created) == 1
+    assert len(res.filed) == 1
+    assert [r.title for r in res.rejected] == [
+        "feat: signed provenance attestation per merged pull request"
+    ]
+    assert "exact duplicate" in res.rejected[0].reason
+
+
+def test_provenance_and_rejection_reasons_reach_the_block_review_brief(tmp_path):
+    """One seeded `fail` lesson + one open ticket: the architect must be able to
+    read what the planner was shown AND what it suppressed."""
+    cfg = _cfg()
+    _write_lesson(tmp_path, "2026-01-02-b", outcome="fail", title="Edit the workflows",
+                  lesson="The harness denies every write under .github/workflows.")
+    runner = _duplicate_fixture_runner()
+
+    res = synthesize(cfg, cycle_index=0, root=str(tmp_path), runner=runner, ai_runner=runner)
+
+    assert res.memory.open_tickets == 2
+    assert (res.memory.lessons, res.memory.failed_lessons) == (1, 1)
+    assert res.rejected
+
+    brief = render_brief(cfg, BlockReport(
+        cycle_index=1,
+        synthesized=list(res.filed),
+        synthesis_memory=res.memory.summary(),
+        synthesis_rejections=[r.line() for r in res.rejected],
+    ))
+    assert "1 lesson(s) (1 recorded as fail)" in brief
+    assert "2 open + 0 recently closed ticket(s)" in brief
+    assert "feat: lesson-retrieval memory - " in brief       # the suppressed candidate...
+    assert "exact duplicate of prior work" in brief          # ...and why it was suppressed
 
 
 # --- prior art: the planner reads its own knowledge base ----------------------

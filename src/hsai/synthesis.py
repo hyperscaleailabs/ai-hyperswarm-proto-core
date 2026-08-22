@@ -8,7 +8,10 @@ copied from one project, a heavy model:
    plus the :mod:`hsai.practices` registry of what this loop has already
    adopted from that set, rendered as ground it must not re-propose, plus the
    prior art :mod:`hsai.retrieval` finds in this repo's OWN lessons,
-   whitepapers and ADRs for the goals being planned against,
+   whitepapers and ADRs for the goals being planned against, plus a
+   :class:`SynthesisMemory` of the loop's own outcome history - open and
+   recently closed tickets, lesson outcomes (with the reason behind every
+   failure), and what recent blocks cost in the quota ledger,
 2. generates ~``ideas_target`` candidate improvements, each required to COMBINE
    practices from >= ``min_projects_combined`` different reference projects,
 3. runs a reflection pass - critiques its own candidates for feasibility,
@@ -18,7 +21,10 @@ copied from one project, a heavy model:
 4. prioritizes by impact x effort and emits the top ``file_top`` as fully
    structured tickets (schema in :mod:`hsai.tickets`, each naming the
    practice(s) it adds or extends and citing the prior art it builds on),
-   which are filed on GitHub for the cheaper implementation agents to pick up.
+   which pass the novelty gate (:func:`is_novel`) before being filed on GitHub
+   for the cheaper implementation agents to pick up. What the planner was shown
+   and what the gate suppressed both travel back out on
+   :class:`SynthesisResult` and into the block review brief.
 
 The model call goes through :mod:`hsai.ai`, so it stays subscription-only.
 """
@@ -29,10 +35,11 @@ import logging
 import re
 from dataclasses import dataclass, field, replace
 
-from . import github, retrieval
+from . import github, ledger, retrieval
 from .ai import run_agent
 from .config import CoreConfig
 from .knowledge import KnowledgeBase
+from .ledger import BlockAggregate
 from .models import ModelChoice
 from .practices import ADOPTED_HEADING, Practice, render_adopted_section
 from .proc import Runner, run
@@ -131,7 +138,7 @@ def gather_prior_art(cfg: CoreConfig, index: NoteIndex) -> tuple[PriorArt, ...]:
     return retrieval.for_queries(index, goal_queries(cfg))
 
 
-MEMORY_HEADING = "What this loop has already tried"
+MEMORY_HEADING = "What this loop has already learned / already tried / must not repeat"
 
 # Hard cap on the memory section's rendered length: it exists to keep the
 # planner from re-proposing done/queued/failed work, not to crowd out the
@@ -139,11 +146,16 @@ MEMORY_HEADING = "What this loop has already tried"
 DEFAULT_MEMORY_MAX_CHARS = 3000
 DEFAULT_MEMORY_CLOSED_LIMIT = 15
 DEFAULT_MEMORY_MAX_LESSONS = 25
+DEFAULT_MEMORY_MAX_BLOCKS = 3
+# How much of a failed lesson's own text travels into the prompt. Enough to say
+# WHY it failed (which is what stops a reworded re-proposal), not enough for one
+# verbose lesson to eat the whole budget.
+LESSON_TEXT_CHARS = 200
 
 # Above this Jaccard token-overlap ratio (over normalized titles) a candidate
 # is treated as a re-proposal of prior work, not a new idea. Documented here
 # because it is the one number that decides what gets silently dropped.
-DUPLICATE_JACCARD_THRESHOLD = 0.6
+DEFAULT_NOVELTY_THRESHOLD = 0.6
 
 _CONVENTIONAL_PREFIX_RE = re.compile(
     r"^\s*(feat|fix|refactor|chore|docs|test|ci|skill|perf|style|build)"
@@ -177,20 +189,62 @@ def _normalize_title(title: str) -> frozenset[str]:
     )
 
 
+@dataclass(frozen=True)
+class LessonMemory:
+    """One recorded outcome, as the planner sees it.
+
+    ``lesson`` is carried only for a recorded failure: the title alone says an
+    idea was tried, but only the lesson text says WHY it did not work, which is
+    what lets the planner explain how a new idea differs from it.
+    """
+
+    outcome: str
+    kind: str
+    title: str
+    lesson: str = ""
+
+    def render(self) -> str:
+        line = f"- **{self.outcome}**/{self.kind} - {self.title}"
+        return f"{line}\n  why it failed: {self.lesson}" if self.lesson else line
+
+
+@dataclass(frozen=True)
+class MemoryProvenance:
+    """How much history the planner was actually shown - the audit counterpart
+    of :meth:`SynthesisMemory.render`, surfaced in the block review brief."""
+
+    lessons: int = 0
+    failed_lessons: int = 0
+    open_tickets: int = 0
+    closed_tickets: int = 0
+    blocks: int = 0
+
+    def summary(self) -> str:
+        return (
+            f"{self.lessons} lesson(s) ({self.failed_lessons} recorded as fail), "
+            f"{self.open_tickets} open + {self.closed_tickets} recently closed ticket(s), "
+            f"{self.blocks} ledger block(s) summarized"
+        )
+
+
 @dataclass
-class MemoryPack:
+class SynthesisMemory:
     """What this loop already knows about its own state, for the planner.
 
-    Built from three sources so the heavy model stops re-proposing work that
-    is already open, already shipped, or already tried and recorded as a
-    failure: open tickets, recently closed tickets, and knowledge-base
-    lessons. Purely data + rendering - :func:`MemoryPack.gather` is the only
-    place that touches `gh` or the filesystem.
+    Built from four sources so the heavy model stops re-proposing work that is
+    already open, already shipped, or already tried and recorded as a failure:
+    open tickets (with their `blocked` / `needs-refinement` flags), recently
+    closed tickets, knowledge-base lessons (outcome, kind, and the lesson text
+    of every failure), and the quota ledger's recent blocks (heavy-tier spend
+    and outcome mix, so the planner knows what its proposals cost). Purely data
+    + rendering - :meth:`gather` is the only place that touches `gh`, the
+    ledger, or the filesystem.
     """
 
     open_tickets: tuple[github.Issue, ...] = ()
-    closed_titles: tuple[str, ...] = ()          # newest first
-    lessons: tuple[tuple[str, str], ...] = ()     # (outcome, title), newest first
+    closed_titles: tuple[str, ...] = ()           # newest first
+    lessons: tuple[LessonMemory, ...] = ()        # newest first
+    blocks: tuple[BlockAggregate, ...] = ()       # newest block first
 
     @classmethod
     def gather(
@@ -201,10 +255,11 @@ class MemoryPack:
         runner: Runner = run,
         closed_limit: int | None = None,
         max_lessons: int | None = None,
-    ) -> MemoryPack:
-        """Collect the pack. Each source degrades to empty on its own failure
-        (missing `gh`, empty/unwritable knowledge base) rather than aborting
-        synthesis - a thin memory section beats no synthesis at all."""
+        max_blocks: int | None = None,
+    ) -> SynthesisMemory:
+        """Collect the memory. Each source degrades to empty on its own failure
+        (missing `gh`, empty/unwritable knowledge base, absent ledger) rather
+        than aborting synthesis - a thin memory section beats no synthesis."""
         closed_limit = (
             int(cfg.synthesis.get("memory_closed_limit", DEFAULT_MEMORY_CLOSED_LIMIT))
             if closed_limit is None else closed_limit
@@ -212,6 +267,10 @@ class MemoryPack:
         max_lessons = (
             int(cfg.synthesis.get("memory_max_lessons", DEFAULT_MEMORY_MAX_LESSONS))
             if max_lessons is None else max_lessons
+        )
+        max_blocks = (
+            int(cfg.synthesis.get("memory_max_blocks", DEFAULT_MEMORY_MAX_BLOCKS))
+            if max_blocks is None else max_blocks
         )
 
         try:
@@ -230,51 +289,152 @@ class MemoryPack:
         except OSError:
             records = []
         # read_lessons() is oldest-first; take the newest window, then flip it.
-        lessons = tuple((r.outcome, r.title) for r in reversed(records[-max_lessons:]))
+        lessons = tuple(
+            LessonMemory(
+                outcome=r.outcome,
+                kind=r.kind,
+                title=r.title,
+                lesson=_one_line(r.lesson_text) if r.outcome == "fail" else "",
+            )
+            for r in reversed(records[-max_lessons:])
+        )
 
-        return cls(open_tickets=open_tickets, closed_titles=closed_titles, lessons=lessons)
+        try:
+            ledger_records = ledger.read_records(ledger.ledger_path(cfg, root))
+        except (OSError, TypeError, ValueError):  # unreadable or malformed ledger line
+            ledger_records = []
+        recent = sorted({r.block for r in ledger_records}, reverse=True)[:max_blocks]
+        blocks = tuple(ledger.aggregate_block(ledger_records, b) for b in recent)
 
-    def all_titles(self) -> list[str]:
-        """Every title this pack knows about - what :func:`is_duplicate` checks against."""
+        return cls(
+            open_tickets=open_tickets, closed_titles=closed_titles,
+            lessons=lessons, blocks=blocks,
+        )
+
+    def known_titles(self) -> list[str]:
+        """Every title this memory knows about - what :func:`is_novel` checks against."""
         return (
             [i.title for i in self.open_tickets]
             + list(self.closed_titles)
-            + [title for _, title in self.lessons]
+            + [lesson.title for lesson in self.lessons]
         )
 
+    def provenance(self) -> MemoryProvenance:
+        """Counts of what was gathered, for the block report."""
+        return MemoryProvenance(
+            lessons=len(self.lessons),
+            failed_lessons=sum(1 for lesson in self.lessons if lesson.outcome == "fail"),
+            open_tickets=len(self.open_tickets),
+            closed_tickets=len(self.closed_titles),
+            blocks=len(self.blocks),
+        )
+
+    def _sections(self) -> list[tuple[str, list[str]]]:
+        """(heading, entries) - entries newest-first, sections most load-bearing
+        first. Truncation eats from the end of this list, so the last section
+        listed is the first one to lose entries."""
+        opens: list[str] = []
+        for i in self.open_tickets:
+            flags = [
+                flag
+                for flag, on in (
+                    ("BLOCKED", i.is_blocked),
+                    ("NEEDS-REFINEMENT", i.needs_refinement),
+                )
+                if on
+            ]
+            labels = ", ".join(i.labels) or "-"
+            suffix = f" {' '.join(flags)}" if flags else ""
+            opens.append(f"- #{i.number} {i.title} [{labels}]{suffix}")
+
+        sections = [
+            ("Open tickets (never re-propose one of these titles):", opens),
+            ("Lesson outcomes recorded (newest first):",
+             [lesson.render() for lesson in self.lessons]),
+            ("Recent block economics (quota ledger):",
+             [_block_line(b) for b in self.blocks]),
+            ("Recently closed tickets:", [f"- {t}" for t in self.closed_titles]),
+        ]
+        return [(heading, entries) for heading, entries in sections if entries]
+
     def render(self, *, max_chars: int = DEFAULT_MEMORY_MAX_CHARS) -> str:
-        """Titles only, newest first, hard-capped so it can never crowd out
-        the reference-project study material that follows it in the prompt."""
-        lines: list[str] = []
-        if self.open_tickets:
-            lines.append("Open tickets:")
-            for i in self.open_tickets:
-                flag = " BLOCKED" if i.is_blocked else ""
-                labels = ", ".join(i.labels) or "-"
-                lines.append(f"- #{i.number} {i.title} [{labels}]{flag}")
-        if self.closed_titles:
-            lines.append("")
-            lines.append("Recently closed tickets:")
-            lines.extend(f"- {t}" for t in self.closed_titles)
-        if self.lessons:
-            lines.append("")
-            lines.append("Lesson outcomes recorded (newest first):")
-            lines.extend(f"- **{outcome}** - {title}" for outcome, title in self.lessons)
+        """Newest-first digest of the whole memory, hard-capped at ``max_chars``.
 
-        text = "\n".join(lines)
-        if not text:
+        Over budget, the OLDEST entries are dropped first (from the last
+        section, which is the least load-bearing) and the elision is stated in
+        the output - a silently truncated memory would read to the planner as
+        "nothing else happened".
+        """
+        sections = self._sections()
+        if not sections:
             return "_(nothing recorded yet - this is an early cycle)_"
-        if len(text) <= max_chars:
-            return text
-        return text[: max(0, max_chars - 3)].rstrip() + "..."
+
+        elided = 0
+        while True:
+            text = _render_sections(sections, elided, max_chars)
+            if len(text) <= max_chars:
+                return text
+            for _, entries in reversed(sections):
+                if entries:
+                    entries.pop()
+                    elided += 1
+                    break
+            else:  # nothing left to drop: the headings alone blow the budget
+                return text[: max(0, max_chars - 3)].rstrip() + "..."
 
 
-def is_duplicate(
-    spec: TicketSpec, memory: MemoryPack, *, threshold: float = DUPLICATE_JACCARD_THRESHOLD
-) -> tuple[bool, str]:
-    """Would filing `spec` duplicate something in `memory`?
+def _block_line(agg: BlockAggregate) -> str:
+    """One block's economics: what it spent, and what it got for it."""
+    failures = ", ".join(
+        f"{cls}={agg.failure_histogram[cls]}" for cls in sorted(agg.failure_histogram)
+    )
+    return (
+        f"- block {agg.block}: {agg.summary()}, "
+        f"merged {agg.merged_iterations}/{agg.iterations}"
+        + (f", failures[{failures}]" if failures else "")
+    )
 
-    Pure and side-effect free. Two checks, either is enough to flag a match:
+
+def _one_line(text: str, limit: int = LESSON_TEXT_CHARS) -> str:
+    """Collapse a note section to one bounded line fit for a prompt bullet."""
+    flat = " ".join(text.split())
+    return flat if len(flat) <= limit else flat[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _render_sections(
+    sections: list[tuple[str, list[str]]], elided: int, max_chars: int
+) -> str:
+    parts: list[str] = []
+    for heading, entries in sections:
+        if entries:
+            parts.append(heading + "\n" + "\n".join(entries))
+    if elided:
+        parts.append(f"_({elided} older entries elided to fit the {max_chars}-char budget)_")
+    return "\n\n".join(parts)
+
+
+@dataclass(frozen=True)
+class NoveltyVerdict:
+    """Why a candidate was kept or dropped - one rejection, fully explained."""
+
+    novel: bool
+    matched: str = ""    # the prior title it duplicates, when not novel
+    score: float = 0.0   # token overlap against `matched`
+    reason: str = ""
+
+    def __bool__(self) -> bool:
+        return self.novel
+
+
+def is_novel(
+    spec: TicketSpec,
+    known_titles: list[str],
+    *,
+    threshold: float = DEFAULT_NOVELTY_THRESHOLD,
+) -> NoveltyVerdict:
+    """Is `spec` genuinely new work relative to `known_titles`?
+
+    Pure and side-effect free. Two checks, either is enough to reject:
 
     1. exact title match (case-insensitive) - catches the CI-worker style
        stranded-run repeat that filed nine identical chore tickets;
@@ -283,17 +443,20 @@ def is_duplicate(
        planner re-proposing the same idea with a different verb or a
        different type prefix (``feat:`` vs ``refactor:``).
 
-    Returns ``(is_duplicate, matched_prior_title)`` - the matched title is
-    what gets logged, so a rejection is always explainable.
+    The verdict names the prior title it matched and the score that matched it,
+    so every rejection is explainable in the block review brief.
     """
     candidate = spec.title.strip()
     candidate_tokens = _normalize_title(candidate)
-    for prior in memory.all_titles():
+    for prior in known_titles:
         if candidate.lower() == prior.strip().lower():
-            return True, prior
+            return NoveltyVerdict(
+                novel=False, matched=prior, score=1.0,
+                reason=f'exact duplicate of prior work "{prior}"',
+            )
 
     best_title, best_score = "", 0.0
-    for prior in memory.all_titles():
+    for prior in known_titles:
         prior_tokens = _normalize_title(prior)
         if not candidate_tokens or not prior_tokens:
             continue
@@ -302,14 +465,18 @@ def is_duplicate(
         if score > best_score:
             best_score, best_title = score, prior
     if best_score >= threshold:
-        return True, best_title
-    return False, ""
+        return NoveltyVerdict(
+            novel=False, matched=best_title, score=best_score,
+            reason=f'duplicates prior work "{best_title}" '
+                   f"(title overlap {best_score:.2f} >= {threshold:g})",
+        )
+    return NoveltyVerdict(novel=True, score=best_score)
 
 
 def build_prompt(
     cfg: CoreConfig,
     pack: ContextPack,
-    memory: MemoryPack | None = None,
+    memory: SynthesisMemory | None = None,
     practices: list[Practice] | None = None,
 ) -> str:
     goals = "\n".join(f"- {g.get('id')}: {g.get('title')} - {g.get('description', '')}"
@@ -317,7 +484,7 @@ def build_prompt(
     ideas = int(cfg.synthesis.get("ideas_target", 10))
     top = int(cfg.synthesis.get("file_top", 3))
     combine = int(cfg.synthesis.get("min_projects_combined", 3))
-    memory = memory or MemoryPack()
+    memory = memory or SynthesisMemory()
     max_chars = int(cfg.synthesis.get("memory_max_chars", DEFAULT_MEMORY_MAX_CHARS))
     memory_section = memory.render(max_chars=max_chars)
     practices_section = render_adopted_section(practices or [])
@@ -331,10 +498,15 @@ gh tickets, claude -p workers, CI gates, Obsidian knowledge base).
 Project goals:
 {goals}
 
-{MEMORY_HEADING} - this is our OWN history, not another project's. A candidate
-that substantially overlaps anything listed below must be DROPPED in PHASE 2
-(reflect) and its slot refilled with a genuinely new idea. Never duplicate the
-title of a ticket that is still open or already closed; build on them instead:
+{MEMORY_HEADING} - this is our OWN history, not another project's: every open
+and recently closed ticket, every lesson outcome (a failure carries the reason
+it failed), and what recent blocks actually cost. A candidate that
+substantially overlaps anything listed below must be DROPPED in PHASE 2
+(reflect) and its slot refilled with a genuinely new idea. Never re-propose the
+title of a ticket that is still open or already closed - one marked BLOCKED or
+NEEDS-REFINEMENT is not free ground either, it is work already refused. For any
+candidate that touches the same area as a recorded failure, state explicitly
+how it DIFFERS from that failure:
 {memory_section}
 
 {ADOPTED_HEADING} - the registry of practices this loop has already pulled
@@ -420,39 +592,56 @@ def parse_ticket_specs(output: str) -> list[TicketSpec]:
     return specs
 
 
+@dataclass(frozen=True)
+class RejectedSpec:
+    """A candidate the novelty gate suppressed, and why."""
+
+    title: str
+    reason: str
+
+    def line(self) -> str:
+        return f"{self.title} - {self.reason}"
+
+
 @dataclass
 class SynthesisResult:
     ok: bool
     studied: list[str]
     filed: list[int]
     error: str = ""
-    rejected: int = 0                              # duplicate specs dropped before filing
-    rejected_titles: list[str] = field(default_factory=list)  # matched prior title, one per drop
+    rejected: list[RejectedSpec] = field(default_factory=list)  # specs dropped before filing
+    # How much of its own history the planner was shown before it proposed.
+    memory: MemoryProvenance = field(default_factory=MemoryProvenance)
     # One line per surviving candidate: its closest prior-art note and the
     # keep/drop decision that followed - the reflection phase's audit trail.
     risk_flags: list[str] = field(default_factory=list)
     risk_dropped: int = 0                          # candidates dropped as restated failures
 
 
-def _filter_duplicates(
-    specs: list[TicketSpec], memory: MemoryPack, *, threshold: float
-) -> tuple[list[TicketSpec], list[str]]:
-    """Drop specs that duplicate something in `memory`.
+def _apply_novelty_gate(
+    specs: list[TicketSpec], memory: SynthesisMemory, *, threshold: float
+) -> tuple[list[TicketSpec], list[RejectedSpec]]:
+    """Keep only the specs the novelty gate passes.
 
     Never back-fills: an honest thin block (fewer than `file_top` tickets
     filed) beats padding the backlog with a duplicate, and the caller surfaces
-    why in `SynthesisResult` / `BlockReport.notes`.
+    why in `SynthesisResult` / `BlockReport`.
+
+    The gate also checks each candidate against the ones already kept in this
+    same batch, so a model that emits the same idea twice files it once.
     """
     survivors: list[TicketSpec] = []
-    rejected_titles: list[str] = []
+    rejected: list[RejectedSpec] = []
+    known = memory.known_titles()
     for spec in specs:
-        dup, matched = is_duplicate(spec, memory, threshold=threshold)
-        if dup:
-            _logger.info("synthesis: dropping duplicate %r (matches %r)", spec.title, matched)
-            rejected_titles.append(matched)
-        else:
+        verdict = is_novel(spec, known, threshold=threshold)
+        if verdict.novel:
             survivors.append(spec)
-    return survivors, rejected_titles
+            known.append(spec.title)
+        else:
+            _logger.info("synthesis: dropping %r - %s", spec.title, verdict.reason)
+            rejected.append(RejectedSpec(title=spec.title, reason=verdict.reason))
+    return survivors, rejected
 
 
 def _query_for(spec: TicketSpec) -> str:
@@ -475,7 +664,7 @@ def ground_prior_art(specs: list[TicketSpec], index: NoteIndex) -> list[TicketSp
 
 def _screen_duplicate_risk(
     specs: list[TicketSpec], index: NoteIndex
-) -> tuple[list[TicketSpec], list[str]]:
+) -> tuple[list[TicketSpec], list[str], list[RejectedSpec]]:
     """Drop candidates that restate a recorded failure, and record every verdict.
 
     Both halves matter for the audit trail: a dropped candidate names the failed
@@ -483,6 +672,7 @@ def _screen_duplicate_risk(
     """
     survivors: list[TicketSpec] = []
     flags: list[str] = []
+    rejected: list[RejectedSpec] = []
     for spec in specs:
         risk = retrieval.duplicate_risk(index, _query_for(spec))
         flags.append(risk.render(spec.title))
@@ -491,9 +681,14 @@ def _screen_duplicate_risk(
                 "synthesis: dropping %r - restates failed note %s (coverage %.2f)",
                 spec.title, risk.note_name, risk.coverage,
             )
+            rejected.append(RejectedSpec(
+                title=spec.title,
+                reason=f"restates failed note [[{risk.note_name}]] "
+                       f"(coverage {risk.coverage:.2f})",
+            ))
         else:
             survivors.append(spec)
-    return survivors, flags
+    return survivors, flags, rejected
 
 
 def synthesize(
@@ -504,16 +699,19 @@ def synthesize(
     runner: Runner = run,
     ai_runner: Runner = run,
 ) -> SynthesisResult:
-    """Run one synthesis pass, drop duplicates of prior work, and file the rest.
+    """Run one synthesis pass, drop re-proposals of prior work, and file the rest.
 
-    Grounded in the repo's own knowledge base at both ends: prior art goes INTO
-    the prompt, and the citations of what each filed ticket builds on come back
-    OUT of it (deterministically, from the same index).
+    Grounded in the repo's own history at both ends: the loop's outcome memory
+    and its prior art go INTO the prompt, and what came back out is gated on
+    novelty before filing, so every suppression is explainable
+    (:attr:`SynthesisResult.rejected`) against what the planner was actually
+    shown (:attr:`SynthesisResult.memory`).
     """
     repos = pick_rotation(cfg, cycle_index)
     index = retrieval.load_index(root, cfg)
     pack = build_context_pack(repos, runner=runner, prior_art=gather_prior_art(cfg, index))
-    memory = MemoryPack.gather(cfg, root=root, runner=runner)
+    memory = SynthesisMemory.gather(cfg, root=root, runner=runner)
+    provenance = memory.provenance()
     try:
         practices = KnowledgeBase.from_config(cfg, root).read_practices()
     except OSError:
@@ -531,14 +729,17 @@ def synthesize(
         runner=ai_runner,
     )
     if not ares.ok:
-        return SynthesisResult(ok=False, studied=repos, filed=[], error=ares.error[:500])
+        return SynthesisResult(
+            ok=False, studied=repos, filed=[], error=ares.error[:500], memory=provenance,
+        )
 
     specs = parse_ticket_specs(ares.output)
-    threshold = float(cfg.synthesis.get("duplicate_threshold", DUPLICATE_JACCARD_THRESHOLD))
-    survivors, rejected_titles = _filter_duplicates(specs, memory, threshold=threshold)
+    threshold = float(cfg.synthesis.get("novelty_threshold", DEFAULT_NOVELTY_THRESHOLD))
+    survivors, rejected = _apply_novelty_gate(specs, memory, threshold=threshold)
     grounded = ground_prior_art(survivors, index)
-    survivors, risk_flags = _screen_duplicate_risk(grounded, index)
-    risk_dropped = len(grounded) - len(survivors)
+    survivors, risk_flags, risk_rejected = _screen_duplicate_risk(grounded, index)
+    rejected += risk_rejected
+    risk_dropped = len(risk_rejected)
 
     filed: list[int] = []
     for spec in survivors:
@@ -560,12 +761,13 @@ def synthesize(
     elif not survivors:
         error = (
             f"all {len(specs)} candidate(s) rejected as duplicates of prior work "
-            f"({len(rejected_titles)} by title, {risk_dropped} restating a recorded failure)"
+            f"({len(rejected) - risk_dropped} by title, "
+            f"{risk_dropped} restating a recorded failure)"
         )
     else:
         error = ""
     return SynthesisResult(
         ok=bool(filed), studied=repos, filed=filed, error=error,
-        rejected=len(rejected_titles), rejected_titles=rejected_titles,
+        rejected=rejected, memory=provenance,
         risk_flags=risk_flags, risk_dropped=risk_dropped,
     )

@@ -139,7 +139,8 @@ synthesis:
   memory_max_chars: 3000       # hard cap on the "what this loop already tried" prompt section
   memory_closed_limit: 15      # recently-closed tickets folded into synthesis memory
   memory_max_lessons: 25       # knowledge-base lessons folded into synthesis memory
-  duplicate_threshold: 0.6     # Jaccard token overlap above which a candidate is a duplicate
+  memory_max_blocks: 3         # recent quota-ledger blocks summarized into synthesis memory
+  novelty_threshold: 0.6       # Jaccard title overlap at/above which a candidate is not novel
 
 # Quota/cost budget for one half-day block (subscription-only: purely local
 # measurement, never a metered API call). The ledger aggregates each block's

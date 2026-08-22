@@ -211,8 +211,9 @@ def cmd_synthesize(args: argparse.Namespace) -> int:
     res = synthesize(cfg, cycle_index=args.index)
     print(f"studied: {', '.join(res.studied)}")
     print(f"filed tickets: {res.filed or 'none'}")
-    if res.rejected:
-        print(f"duplicates rejected: {res.rejected} (matched: {', '.join(res.rejected_titles)})")
+    print(f"memory shown to the planner: {res.memory.summary()}")
+    for rejection in res.rejected:
+        print(f"rejected: {rejection.line()}")
     for flag in res.risk_flags:
         print(f"duplicate-risk: {flag}")
     if res.error:

@@ -80,16 +80,18 @@ hsai practices add --title "..." --source-project o/r --source-artifact source_c
 a BM25 index over `knowledge/lessons`, `knowledge/whitepapers` and `docs/adr`
 and injects the most relevant prior notes into the worker's prompt - failures
 first, and biased toward notes whose `kind/` matches the task at hand. The
-planner gets the same treatment: a *What this loop has already tried* memory
-section (open tickets, recently closed tickets, lesson outcomes) so it stops
-re-proposing ideas that are already queued, shipped, or recorded as a
-failure, and `synthesis.is_duplicate` drops any candidate the model proposes
-anyway before it is filed. Retrieval is deterministic, costs no quota, and
-adds no dependency; what it returned - and what was rejected as a duplicate -
-is recorded in the lesson's `recalled:` frontmatter, on the PR, and in the
-block review brief, so it stays auditable. Tune it under `knowledge.recall`
+planner gets the same treatment: a *What this loop has already learned /
+already tried / must not repeat* memory section (open tickets with their
+`blocked` / `needs-refinement` flags, recently closed tickets, lesson outcomes
+with the reason behind each failure, and recent block economics from the quota
+ledger) so it stops re-proposing ideas that are already queued, shipped, or
+recorded as a failure, and `synthesis.is_novel` drops any candidate the model
+proposes anyway before it is filed. Retrieval is deterministic, costs no quota,
+and adds no dependency; what it returned - and what was rejected, with the
+reason - is recorded in the lesson's `recalled:` frontmatter, on the PR, and in
+the block review brief, so it stays auditable. Tune it under `knowledge.recall`
 and `synthesis` in `.ai-swarm/core.yaml` (`enabled`, `k`, `max_chars`,
-`fail_weight`, `kind_weight`, `memory_max_chars`, `duplicate_threshold`), or
+`fail_weight`, `kind_weight`, `memory_max_chars`, `novelty_threshold`), or
 set `enabled: false` to restore the previous prompt exactly.
 
 ```bash

@@ -50,6 +50,11 @@ class Issue:
     def is_blocked(self) -> bool:
         return "blocked" in self.labels
 
+    @property
+    def needs_refinement(self) -> bool:
+        """Refused as too vague to implement - not free ground for a re-proposal."""
+        return "needs-refinement" in self.labels
+
     def attempts(self) -> int:
         """Read the current retry count from an ``attempts:N`` label (0 if none)."""
         best = 0
