@@ -47,6 +47,7 @@ class CoreConfig:
     ci_remote_timeout: float
     ci_poll_interval: float
     max_ticket_attempts: int
+    max_infra_requeues: int
     tiers: dict[str, ModelTier]
     default_tier: str
     constraints: dict[str, Any]
@@ -140,6 +141,10 @@ def load_config(path: str | Path | None = None) -> CoreConfig:
         ci_remote_timeout=float(execution.get("ci_remote_timeout_seconds", 300)),
         ci_poll_interval=float(execution.get("ci_poll_interval_seconds", 10)),
         max_ticket_attempts=int(execution.get("max_ticket_attempts", 2)),
+        # How many times infrastructure noise (a remote CI timeout) may hand a
+        # ticket back WITHOUT spending one of its attempts. Bounded so a
+        # permanently sick CI cannot re-queue the same ticket forever.
+        max_infra_requeues=int(execution.get("max_infra_requeues", 2)),
         tiers=tiers,
         default_tier=models.get("default_tier", "standard"),
         constraints=data.get("constraints", {}),

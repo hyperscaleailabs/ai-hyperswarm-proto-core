@@ -275,6 +275,10 @@ def run_cycle(
     # Derived from the durable ledger, so it needs no journal record of its own.
     block_records = ledger.read_records(ledger_file)
     report.cost = ledger.aggregate_block(block_records, idx)
+    # How many of those iterations left a committed trajectory. Read from the
+    # run index rather than the ledger, so the brief shows the two counts side
+    # by side and a gap between them is visible instead of assumed away.
+    report.cost.trajectories = len(trajectory.read_block_runs(cfg, repo_root, idx))
 
     # Failure-class Pareto for the brief (see hsai.postmortem). Pure reading -
     # like `report.cost` above, it needs no journal record of its own; only the

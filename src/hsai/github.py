@@ -29,7 +29,14 @@ STANDARD_LABELS = {
     "attempts:1": ("ededed", "hsai retry counter"),
     "attempts:2": ("d4c5f9", "hsai retry counter"),
     "attempts:3": ("c2a3f5", "hsai retry counter"),
+    "infra-requeue:1": ("e4e669", "Returned to the backlog by infrastructure noise"),
+    "infra-requeue:2": ("d9c800", "Returned to the backlog by infrastructure noise"),
+    "infra-requeue:3": ("b3a600", "Returned to the backlog by infrastructure noise"),
 }
+
+# Label prefixes whose `:N` suffix the loop reads as a counter.
+ATTEMPTS_PREFIX = "attempts:"
+INFRA_REQUEUE_PREFIX = "infra-requeue:"
 
 
 @dataclass
@@ -50,16 +57,30 @@ class Issue:
     def is_blocked(self) -> bool:
         return "blocked" in self.labels
 
-    def attempts(self) -> int:
-        """Read the current retry count from an ``attempts:N`` label (0 if none)."""
+    def _counter(self, prefix: str) -> int:
+        """Highest ``<prefix>N`` label value carried by this issue (0 if none)."""
         best = 0
         for lbl in self.labels:
-            if lbl.startswith("attempts:"):
+            if lbl.startswith(prefix):
                 try:
                     best = max(best, int(lbl.split(":", 1)[1]))
                 except ValueError:
                     continue
         return best
+
+    def attempts(self) -> int:
+        """Read the current retry count from an ``attempts:N`` label (0 if none)."""
+        return self._counter(ATTEMPTS_PREFIX)
+
+    def infra_requeues(self) -> int:
+        """How often infrastructure noise handed this ticket back for free.
+
+        Tracked separately from :meth:`attempts` precisely because it is NOT an
+        attempt: a remote CI timeout says nothing about the change, so it must
+        not consume the ticket's budget - but it still needs a bound, which is
+        what this counter (against ``execution.max_infra_requeues``) provides.
+        """
+        return self._counter(INFRA_REQUEUE_PREFIX)
 
 
 def _gh(args: list[str], *, cwd: str | None = None, runner: Runner = run) -> Proc:

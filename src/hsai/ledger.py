@@ -154,6 +154,11 @@ class BlockAggregate:
     # Per-class failure counts this block (see hsai.postmortem.pareto_table for
     # the richer share/exemplar breakdown the review brief renders).
     failure_histogram: dict[str, int] = field(default_factory=dict)
+    # Model runs with a committed trajectory index line (see hsai.trajectory).
+    # Not derivable from the ledger - it is set by whoever reads the index -
+    # so a mismatch with `iterations` is itself the signal: a run that spent
+    # quota without leaving a replayable record.
+    trajectories: int = 0
 
     @property
     def total_tokens(self) -> int:
@@ -171,6 +176,13 @@ class BlockAggregate:
 
     def summary(self) -> str:
         tiers = ", ".join(f"{t}={self.tier_counts[t]}" for t in sorted(self.tier_counts))
+        # Where the block actually lost time, ranked so the dominant cause
+        # reads first - the same ordering hsai.postmortem.pareto_table uses.
+        failures = ", ".join(
+            f"{c}={n}" for c, n in sorted(
+                self.failure_histogram.items(), key=lambda kv: (-kv[1], kv[0])
+            )
+        )
         toks = self.total_tokens
         per_pr = self.tokens_per_merged_pr()
         return (
@@ -183,6 +195,8 @@ class BlockAggregate:
             + (f", tiers[{tiers}]" if tiers else "")
             + (f", {toks} tokens" if toks else "")
             + (f", {per_pr:.0f} tokens/merged PR" if per_pr else "")
+            + (f", {self.trajectories} trajectories" if self.trajectories else "")
+            + (f", failures[{failures}]" if failures else "")
         )
 
 

@@ -94,6 +94,18 @@ def test_brief_reports_tokens_per_merged_pr():
     assert "10000 tokens / 2 merged" in body
 
 
+def test_brief_shows_where_the_block_lost_time():
+    """Trajectory count + failure histogram, folded into the cost summary."""
+    cfg = load_config()
+    cost = BlockAggregate(
+        block=7, iterations=3, total_seconds=180.0, total_attempts=3,
+        trajectories=5, failure_histogram={"timeout": 1, "test": 2},
+    )
+    body = render_brief(cfg, BlockReport(cycle_index=7, cost=cost))
+    assert "5 trajectories" in body
+    assert "failures[test=2, timeout=1]" in body
+
+
 def test_brief_says_when_tokens_per_merged_pr_is_unavailable():
     cfg = load_config()
     cost = BlockAggregate(block=7, iterations=2, total_seconds=10.0)

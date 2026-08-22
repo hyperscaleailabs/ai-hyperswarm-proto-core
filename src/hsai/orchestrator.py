@@ -402,13 +402,43 @@ def run_once(
     block = iteration // 100 if block is None else block
     tokens: tuple[int, int] | None = None
     traj: trajectory.Trajectory | None = None
+    # Guard verdicts and the remote rollup, as they become known. Read (never
+    # assigned) by `_record_cost` below, so the committed run index always
+    # reflects how far this iteration actually got.
+    completeness_ok = True
+    remote_ci_outcome = ""
+
+    def _guard_verdicts() -> dict[str, str]:
+        """What each harness gate said about this run, for the run index.
+
+        A gate that does not apply to this ticket reports ``n/a`` rather than
+        being omitted, so a reader can tell "passed" from "never ran".
+        """
+        return {
+            "workflow_revert": "reverted" if reverted_workflows else "clean",
+            "completeness": (
+                "blocked" if not completeness_ok
+                else "ok" if _requires_code(ticket_title) else "n/a"
+            ),
+            "repro": (
+                "n/a" if repro_result is None else "ok" if repro_result.ok else "blocked"
+            ),
+        }
 
     def _record_cost(outcome: str, *, failure_class: str = "", failure_detail: str = "") -> None:
         # Every terminal path passes through here, so it is also where the
-        # trajectory learns how its run ended.
+        # trajectory learns how its run ended - and the single choke point that
+        # appends this run's committed index line (exactly one per model run).
         if traj is not None:
             traj.outcome = outcome
+            # The coarse projection of the SAME classification the ledger
+            # records, so the two artifacts can never disagree.
+            traj.failure_class = postmortem.coarsen(failure_class) if failure_class else ""
             trajectory.write(traj, repo_dir)
+            trajectory.index_run(
+                cfg, repo_dir, traj,
+                guards=_guard_verdicts(), remote_ci=remote_ci_outcome,
+            )
         ledger.append_record(
             ledger.ledger_path(cfg, repo_dir),
             ledger.LedgerRecord(
@@ -475,11 +505,16 @@ def run_once(
             touched = gitops.changed_paths(cwd=wt, runner=runner)
             code_files = [p for p in touched if not p.startswith("knowledge/")]
             if not code_files:
-                result.notes.append("completeness guard: knowledge-only diff on a code ticket")
+                completeness_ok = False
+                note = "completeness guard: knowledge-only diff on a code ticket"
+                result.notes.append(note)
                 _recover_failed(
                     cfg, repo, 0, kind=kind, ticket_num=ticket_num,
                     claimed_issue=claimed_issue, login=login,
                     remote="INCOMPLETE", runner=runner,
+                    failure_class=postmortem.classify_failure(
+                        agent_error="" if agent_ok else agent_err, guard_notes=(note,),
+                    ),
                 )
                 result.recovered = True
                 _record_cost(
@@ -511,6 +546,10 @@ def run_once(
                     cfg, repo, 0, kind=kind, ticket_num=ticket_num,
                     claimed_issue=claimed_issue, login=login,
                     remote="NO_REPRO", runner=runner,
+                    failure_class=postmortem.classify_failure(
+                        agent_error="" if agent_ok else agent_err,
+                        guard_notes=(f"repro guard: {repro_result.reason}",),
+                    ),
                 )
                 result.recovered = True
                 _record_cost(
@@ -635,6 +674,11 @@ def run_once(
             cfg, repo, 0, kind=kind, ticket_num=ticket_num,
             claimed_issue=claimed_issue, login=login,
             remote="REVIEW_BLOCKED", runner=runner,
+            failure_class=postmortem.classify_failure(
+                ci_result=ci_after,
+                agent_error="" if agent_ok else agent_err,
+                guard_notes=tuple(verdict.blocking) or ("independent review blocked",),
+            ),
         )
         result.recovered = True
         result.notes.append("recovered: independent review blocked the change")
@@ -682,7 +726,21 @@ def run_once(
         timeout=cfg.ci_remote_timeout, interval=cfg.ci_poll_interval, runner=runner,
     )
     result.remote = remote
+    remote_ci_outcome = remote
     result.notes.append(f"remote CI={remote}")
+
+    # Classify BEFORE the merge/recover decision: the retry policy acts on the
+    # coarse class, and the committed lesson has to name the same cause the
+    # policy acted on - otherwise the knowledge base and the bookkeeping tell
+    # two different stories about the same iteration.
+    fclass = detail = coarse = ""
+    if remote != ci.SUCCESS:
+        fclass, detail = postmortem.classify_with_detail(_failure_evidence(remote))
+        coarse = postmortem.coarsen(fclass)
+        lesson.failure_class = fclass
+        if traj is not None:
+            traj.failure_class = coarse
+            lesson.execution_trace = traj.execution_trace()
 
     # Record the true remote outcome in the lesson itself, then push that
     # update so it lands in the knowledge base once the PR merges.
@@ -697,19 +755,16 @@ def run_once(
     if remote == ci.SUCCESS:
         github.merge_pr(repo, pr_num, auto=True, runner=runner)
         result.merged = True
-    else:
-        result.merged = False
-        _recover_failed(
-            cfg, repo, pr_num, kind=kind, ticket_num=ticket_num,
-            claimed_issue=claimed_issue, login=login, remote=remote, runner=runner,
-        )
-        result.recovered = True
-        result.notes.append("recovered: closed PR, returned ticket to backlog")
-
-    if result.merged:
         _record_cost("merged")
     else:
-        fclass, detail = postmortem.classify_with_detail(_failure_evidence(remote))
+        result.merged = False
+        action = _recover_failed(
+            cfg, repo, pr_num, kind=kind, ticket_num=ticket_num,
+            claimed_issue=claimed_issue, login=login, remote=remote, runner=runner,
+            failure_class=coarse,
+        )
+        result.recovered = True
+        result.notes.append(f"recovered [{coarse}]: closed PR, ticket {action}")
         _record_cost("recovered", failure_class=fclass, failure_detail=detail)
 
     # 13. cleanup worktree
@@ -728,9 +783,22 @@ def _recover_failed(
     login: str,
     remote: str,
     runner: Runner,
-) -> None:
+    failure_class: str = "",
+) -> str:
     """A PR did not go green (or never got one): close it, and either return the
-    ticket to the backlog for another attempt or mark it ``blocked``."""
+    ticket to the backlog for another attempt or mark it ``blocked``. Returns a
+    one-line description of what it did with the ticket, for the iteration notes.
+
+    ``failure_class`` is the coarse cause (see
+    :func:`hsai.postmortem.classify_failure`). It changes exactly one thing: a
+    ``timeout`` - infrastructure noise, where the build never concluded and so
+    nothing was learned about the change - hands the ticket back WITHOUT
+    spending an attempt, bounded by ``execution.max_infra_requeues``. Every
+    other class (and an unclassified caller) keeps the original behaviour: one
+    attempt spent, ``blocked`` once ``max_ticket_attempts`` is reached. The PR
+    is closed either way - a non-SUCCESS PR is never left open, and never
+    merged.
+    """
     if pr_num:
         github.close_pr(
             repo, pr_num,
@@ -738,12 +806,26 @@ def _recover_failed(
             delete_branch=True, runner=runner,
         )
     if not ticket_num:
-        return
+        return "no ticket to return"
 
     # Determine how many attempts this ticket has already had.
     issue = claimed_issue or github.get_issue(repo, ticket_num, runner=runner)
     prior = issue.attempts() if issue else 0
     nxt = prior + 1
+
+    requeues = issue.infra_requeues() if issue else 0
+    if failure_class == postmortem.TIMEOUT and requeues < cfg.max_infra_requeues:
+        github.edit_labels(
+            repo, ticket_num,
+            add=[f"{github.INFRA_REQUEUE_PREFIX}{requeues + 1}"],
+            remove=[f"{github.INFRA_REQUEUE_PREFIX}{requeues}"] if requeues else None,
+            runner=runner,
+        )
+        github.unassign(repo, ticket_num, login, runner=runner)
+        return (
+            "re-queued unassigned without spending an attempt "
+            f"(infra-requeue {requeues + 1}/{cfg.max_infra_requeues}, still attempts:{prior})"
+        )
 
     if nxt >= cfg.max_ticket_attempts:
         github.edit_labels(
@@ -752,13 +834,14 @@ def _recover_failed(
         )
         # Leave it unassigned but blocked so no worker retries it.
         github.unassign(repo, ticket_num, login, runner=runner)
-    else:
-        github.edit_labels(
-            repo, ticket_num,
-            add=[f"attempts:{nxt}"], remove=[f"attempts:{prior}"] if prior else None,
-            runner=runner,
-        )
-        github.unassign(repo, ticket_num, login, runner=runner)
+        return f"marked blocked after {nxt} attempt(s)"
+    github.edit_labels(
+        repo, ticket_num,
+        add=[f"attempts:{nxt}"], remove=[f"attempts:{prior}"] if prior else None,
+        runner=runner,
+    )
+    github.unassign(repo, ticket_num, login, runner=runner)
+    return f"returned to the backlog (attempts:{nxt})"
 
 
 def run_loop(

@@ -2,7 +2,7 @@
 import json
 from dataclasses import replace
 
-from hsai import ledger, review
+from hsai import ledger, review, trajectory
 from hsai.config import load_config
 from hsai.models import ModelChoice
 from hsai.proc import Proc
@@ -186,6 +186,25 @@ def test_review_change_approves_and_appends_a_review_ledger_record(tmp_path):
     agg = ledger.aggregate_block(records, block=0)
     assert agg.iterations == 1 and agg.total_tokens == 460
     assert agg.tier_counts == {verdict.reviewer_tier: 1}
+
+
+def test_the_reviewer_run_leaves_a_trajectory_index_line(tmp_path):
+    """A second opinion is a model run: it belongs in the run index too."""
+    cfg = load_config()
+
+    _review(cfg, tmp_path, _ReviewRunner())
+
+    runs = trajectory.read_block_runs(cfg, tmp_path, 0)
+    assert len(runs) == 1
+    assert runs[0].kind == "review" and runs[0].outcome == "approve"
+    assert runs[0].iteration == 3 and runs[0].ticket == 7
+    assert (runs[0].input_tokens, runs[0].output_tokens) == (400, 60)
+    assert runs[0].guards == {"verdict": "approve"}
+    assert runs[0].transcript                      # something to read afterwards
+    assert len(runs[0].transcript) <= trajectory.transcript_chars(cfg)
+    # ...but it never gets a LOCAL trajectory: that store is keyed by iteration,
+    # which it shares with the worker whose diff it graded.
+    assert trajectory.find(tmp_path, "3") is None
 
 
 def test_review_change_blocks_on_unparseable_output_and_records_it(tmp_path):

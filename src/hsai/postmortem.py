@@ -158,6 +158,85 @@ def classify_with_detail(evidence: FailureEvidence) -> tuple[str, str]:
     return failure_class, default_detail(failure_class, evidence)
 
 
+# --- the coarse taxonomy the retry policy acts on ------------------------------
+#
+# :data:`FAILURE_CLASSES` is the reporting vocabulary: eleven classes, tuned for
+# a Pareto table a human reads. The retry policy needs something blunter - the
+# question it asks is "was this the change's fault, or the infrastructure's?" -
+# so the coarse taxonomy below collapses the eleven into six. It is a pure
+# projection of :func:`classify`, never a second opinion, so the two can never
+# disagree about the same iteration.
+LINT = "lint"
+TEST = "test"
+GUARD = "guard"
+TIMEOUT = "timeout"
+# AGENT_ERROR and UNKNOWN are shared verbatim with the fine-grained vocabulary.
+
+COARSE_FAILURE_CLASSES = (LINT, TEST, GUARD, AGENT_ERROR, TIMEOUT, UNKNOWN)
+
+_COARSE_BY_CLASS = {
+    AGENT_TIMEOUT: TIMEOUT,
+    REMOTE_CI_TIMEOUT: TIMEOUT,
+    AGENT_ERROR: AGENT_ERROR,
+    # Every harness-owned gate that refused the change, whatever it checked.
+    INCOMPLETE_DIFF: GUARD,
+    NO_REPRO: GUARD,
+    MERGE_CONFLICT: GUARD,
+    BUDGET_HALT: GUARD,
+    LINT_FAIL: LINT,
+    # A red remote build is a red build: local lint failure is caught earlier
+    # (classify() ranks LINT_FAIL above REMOTE_CI_FAIL), so what reaches here
+    # is the test dimension.
+    TEST_FAIL: TEST,
+    REMOTE_CI_FAIL: TEST,
+    UNKNOWN: UNKNOWN,
+}
+
+
+def coarsen(failure_class: str) -> str:
+    """Project a member of :data:`FAILURE_CLASSES` onto the coarse vocabulary."""
+    return _COARSE_BY_CLASS.get(failure_class, UNKNOWN)
+
+
+def classify_failure(
+    ci_result: object = None,
+    remote: str = "",
+    agent_error: str = "",
+    guard_notes: object = (),
+) -> str:
+    """Coarse cause of one iteration, as a member of :data:`COARSE_FAILURE_CLASSES`.
+
+    Pure: it reads its four arguments and nothing else, so it can be unit-tested
+    (and reasoned about) without a repo, a ledger, or a GitHub call.
+
+    - ``ci_result`` - anything with a ``steps`` mapping (:class:`hsai.ci.CIResult`),
+      or ``None`` when local CI never ran.
+    - ``remote`` - the remote rollup (``SUCCESS``/``FAILURE``/``TIMEOUT``), or
+      ``""`` when the change never reached a PR.
+    - ``agent_error`` - the agent's error output, and ONLY when the run itself
+      failed; a successful run's stderr chatter is not a failure.
+    - ``guard_notes`` - one entry per harness gate that refused the change.
+
+    Precedence follows :func:`classify`: a timeout outranks everything, because
+    a run that never concluded taught us nothing about the change itself - and
+    that distinction is exactly what :func:`hsai.orchestrator._recover_failed`
+    spends (or refuses to spend) a ticket attempt on.
+    """
+    notes = [str(n) for n in (guard_notes or ()) if n]
+    steps = getattr(ci_result, "steps", None)
+    return coarsen(
+        classify(
+            FailureEvidence(
+                agent_ok=not agent_error,
+                agent_error=agent_error or "",
+                completeness_ok=not notes,
+                ci_steps=dict(steps) if isinstance(steps, dict) else {},
+                remote_ci=remote or "",
+            )
+        )
+    )
+
+
 # --- Pareto analysis ----------------------------------------------------------
 
 @dataclass(frozen=True)

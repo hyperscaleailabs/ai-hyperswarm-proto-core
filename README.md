@@ -132,6 +132,17 @@ exit status) plus a redacted tail. `hsai traj <iteration> [--json]` reads one
 back without invoking `claude`; older blocks are pruned per
 `execution.trajectory_retention_blocks`.
 
+Because that store is pruned, every model run - the worker *and* the
+independent reviewer - also appends one JSONL line to
+`knowledge/trajectories/block-<n>.jsonl`: iteration, ticket, tier, model,
+prompt digest, duration, token counts, guard verdicts, the remote CI rollup,
+the failure class, and a transcript tail capped at
+`knowledge.trajectory_transcript_chars`. That is the part that is committed and
+kept, so model selection and the failure taxonomy have a dataset to calibrate
+against. A remote CI `TIMEOUT` is classified as infrastructure and re-queues
+its ticket *without* spending an attempt, bounded by
+`execution.max_infra_requeues`.
+
 ## Learning targets (top-10, pinned snapshot)
 
 Ranked by stars, weighted to swarm/multi-agent relevance; all ≥10k stars and

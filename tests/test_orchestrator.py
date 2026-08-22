@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from hsai import ledger, orchestrator, recall, review, trajectory
+from hsai import ledger, orchestrator, postmortem, recall, review, trajectory
 from hsai.config import load_config
 from hsai.models import ModelChoice
 from hsai.orchestrator import (
@@ -195,6 +195,10 @@ class FakeRunner:
         if cmd[:3] == ["gh", "pr", "merge"]:
             return Proc(cmd, 0, "", "")
         if cmd[:3] == ["gh", "pr", "view"]:
+            if self.remote_ci == "TIMEOUT":
+                # Checks that never conclude: an empty rollup reads as PENDING,
+                # so `ci.wait_remote` gives up and returns TIMEOUT.
+                return Proc(cmd, 0, json.dumps({"statusCheckRollup": []}), "")
             concl = "SUCCESS" if self.remote_ci == "SUCCESS" else "FAILURE"
             rollup = {
                 "statusCheckRollup": [
@@ -1358,3 +1362,201 @@ def test_dry_run_still_records_what_it_recalled(tmp_path):
     assert result.kind == IMPROVE
     assert result.recalled                       # retrieval runs without an agent
     assert "recalled:" in Path(result.lesson_path).read_text().split("---\n")[1]
+
+
+# --- the committed run index + the taxonomy-aware retry policy ----------------
+
+def _label_args(runner: FakeRunner) -> list[str]:
+    """Every `--add-label` / `--remove-label` value the run passed to `gh`."""
+    out: list[str] = []
+    for cmd in runner.calls:
+        if cmd[:3] != ["gh", "issue", "edit"]:
+            continue
+        out += [
+            cmd[i + 1] for i, tok in enumerate(cmd)
+            if tok in ("--add-label", "--remove-label")
+        ]
+    return out
+
+
+def _index_lines(cfg, root: Path, block: int) -> list[dict]:
+    path = trajectory.index_path(cfg, root, block)
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def test_every_model_run_leaves_one_jsonl_record_under_knowledge(tmp_path):
+    """Acceptance: one append-only JSONL line per model run, valid JSON each."""
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[dict(WIDGET_ISSUE)]
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=3, block=7,
+    )
+
+    assert result.merged is True
+    path = trajectory.index_path(cfg, tmp_path, 7)
+    assert path.parent == tmp_path / "knowledge" / "trajectories"
+
+    runs = _index_lines(cfg, tmp_path, 7)
+    # Two model runs this iteration: the worker, and the independent reviewer.
+    assert len(runs) == len(_claude_prompts(runner)) == 2
+    assert sorted(r["kind"] for r in runs) == ["implement", "review"]
+
+    worker = next(r for r in runs if r["kind"] == IMPLEMENT)
+    assert worker["iteration"] == 3 and worker["block"] == 7 and worker["ticket"] == 7
+    assert worker["tier"] and worker["model"] == result.model
+    # The digest identifies the prompt; the prompt itself is never committed.
+    assert worker["prompt_digest"] and "prompt" not in worker
+    assert "add widget" not in json.dumps(worker)
+    assert worker["duration_seconds"] >= 0
+    assert worker["remote_ci"] == "SUCCESS"
+    assert worker["outcome"] == "merged"
+    assert worker["input_tokens"] == 1500 and worker["output_tokens"] == 320
+    assert worker["guards"] == {
+        "workflow_revert": "clean", "completeness": "n/a", "repro": "n/a",
+    }
+    cap = trajectory.transcript_chars(cfg)
+    assert all(len(r["transcript"]) <= cap for r in runs)
+    assert "widget source" in worker["transcript"]     # a real tail, not a stub
+
+
+def test_a_guard_abort_still_leaves_exactly_one_indexed_run(tmp_path):
+    """The aborted run is the one most worth having a record of."""
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[dict(WIDGET_ISSUE, number=9, title="feat: add widget")],
+        worktree_status="?? knowledge/lessons/2026-07-26-fake.md\n",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=2, block=7,
+    )
+
+    assert result.recovered is True
+    runs = _index_lines(cfg, tmp_path, 7)
+    assert len(runs) == 1                      # the reviewer never ran
+    assert runs[0]["guards"]["completeness"] == "blocked"
+    assert runs[0]["outcome"] == "incomplete"
+    assert runs[0]["failure_class"] == postmortem.GUARD
+    assert runs[0]["remote_ci"] == ""           # it never reached a PR
+
+
+def test_a_remote_timeout_requeues_the_ticket_without_spending_an_attempt(tmp_path):
+    """Infrastructure noise is not the change's fault (acceptance criterion)."""
+    cfg = replace(load_config(), ci_remote_timeout=0)
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[dict(WIDGET_ISSUE)], remote_ci="TIMEOUT",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.remote == "TIMEOUT"
+    assert result.merged is False and result.recovered is True
+    # The PR is still closed - a non-SUCCESS PR is never left open or merged.
+    assert any(c[:3] == ["gh", "pr", "close"] for c in runner.calls)
+    assert not any(c[:3] == ["gh", "pr", "merge"] for c in runner.calls)
+    # ...and the ticket goes back to the backlog unassigned, attempts intact.
+    assert any(
+        c[:3] == ["gh", "issue", "edit"] and "--remove-assignee" in c for c in runner.calls
+    )
+    labels = _label_args(runner)
+    assert "attempts:1" not in labels
+    assert "blocked" not in labels
+    assert "infra-requeue:1" in labels
+
+    record = _iteration_records(cfg, tmp_path)[0]
+    assert record.failure_class == postmortem.REMOTE_CI_TIMEOUT
+    assert _index_lines(cfg, tmp_path, 0)[-1]["failure_class"] == postmortem.TIMEOUT
+
+
+def test_a_remote_failure_still_spends_an_attempt_and_closes_the_pr(tmp_path):
+    """The other half of the criterion: a genuine red build is unchanged."""
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[dict(WIDGET_ISSUE)], remote_ci="FAILURE",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.remote == "FAILURE" and result.merged is False
+    assert any(c[:3] == ["gh", "pr", "close"] for c in runner.calls)
+    assert not any(c[:3] == ["gh", "pr", "merge"] for c in runner.calls)
+    labels = _label_args(runner)
+    assert "attempts:1" in labels
+    assert not any(lbl.startswith("infra-requeue:") for lbl in labels)
+
+    assert _iteration_records(cfg, tmp_path)[0].failure_class == postmortem.REMOTE_CI_FAIL
+    assert _index_lines(cfg, tmp_path, 0)[-1]["failure_class"] == postmortem.TEST
+
+
+def test_infra_requeues_are_bounded_so_a_sick_ci_cannot_loop_forever(tmp_path):
+    """At the ceiling, a timeout stops being free and spends an attempt."""
+    cfg = replace(load_config(), ci_remote_timeout=0, max_infra_requeues=2)
+    exhausted = dict(
+        WIDGET_ISSUE,
+        labels=[{"name": "priority:P2"}, {"name": "infra-requeue:2"}],
+    )
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[exhausted], remote_ci="TIMEOUT",
+    )
+
+    run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    labels = _label_args(runner)
+    assert "infra-requeue:3" not in labels
+    assert "attempts:1" in labels
+
+
+def test_the_failure_class_reaches_the_trajectory_and_the_lesson(tmp_path):
+    """One classification, visible in both artifacts (acceptance criterion)."""
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[dict(WIDGET_ISSUE)], remote_ci="FAILURE",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert trajectory.load(tmp_path, "1").failure_class == postmortem.TEST
+    # The lesson's own execution trace names the same class the policy acted on.
+    assert f"| failure class | `{postmortem.TEST}` |" in Path(result.lesson_path).read_text()
+    assert f"recovered [{postmortem.TEST}]" in " ".join(result.notes)
+    assert _index_lines(cfg, tmp_path, 0)[-1]["failure_class"] == postmortem.TEST
+
+
+def test_a_merged_iteration_names_no_failure_class_anywhere(tmp_path):
+    """A green run's artifacts stay exactly as they were before the taxonomy."""
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=[dict(WIDGET_ISSUE)]
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.merged is True
+    assert trajectory.load(tmp_path, "1").failure_class == ""
+    assert "failure class" not in Path(result.lesson_path).read_text()
+    assert _index_lines(cfg, tmp_path, 0)[-1]["failure_class"] == ""

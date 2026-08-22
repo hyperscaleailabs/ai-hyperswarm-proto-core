@@ -1,9 +1,12 @@
 import json
+import threading
+from dataclasses import replace
 
 import pytest
 
 from hsai import trajectory
 from hsai.ai import AIResult
+from hsai.config import load_config
 from hsai.trajectory import REDACTED, Step, Trajectory, redact, steps_from_output
 
 MESSAGES_PAYLOAD = {
@@ -356,3 +359,156 @@ def test_render_shows_prompt_steps_and_usage():
 
 def test_render_reports_missing_usage():
     assert "usage: (not reported)" in _traj(usage=None).render()
+
+
+def test_render_and_trace_name_the_failure_class_when_there_is_one():
+    traj = _traj(outcome="recovered", failure_class="timeout")
+    assert "failure: timeout" in traj.render()
+    assert "| failure class | `timeout` |" in traj.execution_trace()
+    # A run that ended well says nothing at all - the row is not rendered empty.
+    assert "failure class" not in _traj().execution_trace()
+
+
+# --- the committed run index (knowledge/trajectories/*.jsonl) ----------------
+
+def test_index_path_is_config_driven_and_sharded_by_block(tmp_path):
+    cfg = load_config()
+    path = trajectory.index_path(cfg, tmp_path, 41)
+    assert path == tmp_path / "knowledge" / "trajectories" / "block-41.jsonl"
+    assert trajectory.index_path(cfg, tmp_path, 42).name == "block-42.jsonl"
+
+    moved = replace(cfg, knowledge={**cfg.knowledge, "trajectory_dir": "knowledge/runs"})
+    assert trajectory.index_dir(moved, tmp_path) == tmp_path / "knowledge" / "runs"
+
+
+def test_index_run_appends_one_valid_json_line_per_run(tmp_path):
+    cfg = load_config()
+    for i in (1, 2, 3):
+        trajectory.index_run(
+            cfg, tmp_path, _traj(iteration=i, block=4, outcome="merged"),
+            guards={"completeness": "ok"}, remote_ci="SUCCESS",
+        )
+
+    path = trajectory.index_path(cfg, tmp_path, 4)
+    lines = path.read_text().splitlines()
+    assert len(lines) == 3
+    for line in lines:                       # JSONL: one valid object per line
+        assert isinstance(json.loads(line), dict)
+
+    runs = trajectory.read_runs(path)
+    assert [r.iteration for r in runs] == [1, 2, 3]
+    assert runs[0].guards == {"completeness": "ok"}
+    assert runs[0].remote_ci == "SUCCESS"
+    assert runs[0].prompt_digest == trajectory.prompt_digest("Implement the widget.")
+    assert runs[0].steps == 8
+
+
+def test_index_is_append_only(tmp_path):
+    """A second write never rewrites or truncates what the first one recorded."""
+    cfg = load_config()
+    trajectory.index_run(cfg, tmp_path, _traj(iteration=1, block=0))
+    path = trajectory.index_path(cfg, tmp_path, 0)
+    first = path.read_text()
+
+    trajectory.index_run(cfg, tmp_path, _traj(iteration=2, block=0))
+    after = path.read_text()
+
+    assert after.startswith(first)
+    assert len(after.splitlines()) == 2
+
+
+def test_concurrent_appends_never_interleave_a_partial_line(tmp_path):
+    """The lock is what keeps parallel workers from corrupting the index."""
+    cfg = load_config()
+    path = trajectory.index_path(cfg, tmp_path, 9)
+
+    def append(i: int) -> None:
+        trajectory.index_run(
+            cfg, tmp_path, _traj(iteration=i, block=9, steps=[
+                Step(index=1, kind="output", text="x" * 500)
+            ]),
+        )
+
+    threads = [threading.Thread(target=append, args=(i,)) for i in range(24)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    lines = path.read_text().splitlines()
+    assert len(lines) == 24
+    assert sorted(json.loads(line)["iteration"] for line in lines) == list(range(24))
+
+
+def test_stored_transcript_is_capped_at_the_configured_size(tmp_path):
+    cfg = replace(
+        load_config(),
+        knowledge={**load_config().knowledge, "trajectory_transcript_chars": 200},
+    )
+    traj = _traj(steps=[Step(index=i, kind="output", text="y" * 400) for i in range(1, 12)])
+    trajectory.index_run(cfg, tmp_path, traj)
+
+    run = trajectory.read_runs(trajectory.index_path(cfg, tmp_path, 0))[0]
+    assert 0 < len(run.transcript) <= 200
+    assert run.steps == 11                 # the count survives; the text does not
+
+
+def test_transcript_tail_keeps_the_end_and_says_what_it_dropped():
+    traj = _traj(steps=[
+        Step(index=1, kind="output", text="A" * 300),
+        Step(index=2, kind="output", text="OMEGA"),
+    ])
+    tail = traj.transcript_tail(120)
+    assert len(tail) <= 120
+    assert "OMEGA" in tail                 # a tail, not a head
+    assert "chars total; tail only" in tail  # and it says so, never silently
+    # Under the cap, nothing is dropped and no marker is added.
+    short = _traj(steps=[Step(index=1, kind="output", text="tiny")]).transcript_tail(120)
+    assert short.endswith("tiny") and "tail only" not in short
+    assert _traj().transcript_tail(0) == ""
+
+
+def test_index_lines_are_redacted_like_every_other_artifact(tmp_path):
+    cfg = load_config()
+    traj = _traj(steps=[
+        Step(index=1, kind="output", text="export ANTHROPIC_API_KEY=sk-ant-abcdef0123456789")
+    ])
+    trajectory.index_run(cfg, tmp_path, traj)
+
+    text = trajectory.index_path(cfg, tmp_path, 0).read_text()
+    assert "sk-ant-abcdef0123456789" not in text
+    assert REDACTED in text
+
+
+def test_index_records_tokens_and_failure_class(tmp_path):
+    cfg = load_config()
+    trajectory.index_run(cfg, tmp_path, _traj(
+        block=2, usage={"input_tokens": 1500, "output_tokens": 320},
+        outcome="recovered", failure_class="timeout",
+    ))
+    run = trajectory.read_runs(trajectory.index_path(cfg, tmp_path, 2))[0]
+    assert (run.input_tokens, run.output_tokens) == (1500, 320)
+    assert run.failure_class == "timeout"
+    assert run.outcome == "recovered"
+
+    # A run whose CLI reported nothing keeps null token columns rather than 0.
+    trajectory.index_run(cfg, tmp_path, _traj(iteration=13, block=2, usage=None))
+    plain = trajectory.read_runs(trajectory.index_path(cfg, tmp_path, 2))[1]
+    assert plain.input_tokens is None and plain.output_tokens is None
+
+
+def test_read_runs_of_a_missing_index_is_empty(tmp_path):
+    cfg = load_config()
+    assert trajectory.read_runs(tmp_path / "nope.jsonl") == []
+    assert trajectory.read_block_runs(cfg, tmp_path, 3) == []
+
+
+def test_build_does_not_write_to_the_local_store(tmp_path):
+    """The reviewer shares the worker's iteration id, so it indexes only."""
+    ares = AIResult(ok=True, model="haiku", output="ok", error="", cmd=["claude"])
+    traj = trajectory.build(
+        iteration=8, ticket=7, kind="review", tier="light", model="haiku",
+        prompt="grade it", result=ares, block=1, outcome="approve",
+    )
+    assert traj.kind == "review" and traj.outcome == "approve"
+    assert trajectory.find(tmp_path, "8") is None

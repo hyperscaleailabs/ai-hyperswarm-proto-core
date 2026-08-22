@@ -29,6 +29,16 @@ def test_execution_telemetry_defaults_when_keys_absent(tmp_path):
     cfg = load_config(core / "core.yaml")
     assert cfg.output_format == "json"          # structured envelope by default
     assert cfg.trajectory_retention_blocks == 8
+    assert cfg.max_infra_requeues == 2          # bounded even with no config
+
+
+def test_retry_and_infra_requeue_ceilings_are_config():
+    """How often infra noise may hand a ticket back is YAML, not a constant."""
+    cfg = load_config()
+    assert cfg.max_ticket_attempts >= 1
+    assert cfg.max_infra_requeues >= 1
+    assert cfg.knowledge["trajectory_dir"] == "knowledge/trajectories"
+    assert cfg.knowledge["trajectory_transcript_chars"] > 0
 
 
 def test_review_gate_is_configured_and_enabled():

@@ -137,7 +137,7 @@ iteration's cost record is appended. Sharding by block is what makes the store
 bounded: `hsai cycle` prunes block directories beyond
 `execution.trajectory_retention_blocks`.
 
-Two audiences, deliberately split:
+Three audiences, deliberately split:
 
 - **Local and complete.** Trajectories quote repo content, so they are
   gitignored and never pushed. Everything is redacted on the way to disk -
@@ -145,11 +145,41 @@ Two audiences, deliberately split:
   `hsai traj <iteration> [--json]` reconstructs one - prompt, step stream, exit
   status, usage - purely by reading the file, with no `claude` subprocess and
   no quota spent. (`hsai replay` is an alias.)
+- **Committed and structured.** Every model run - the worker *and* the
+  independent reviewer - also appends one JSON line to
+  `knowledge/trajectories/block-<n>.jsonl`, under the same lock as the ledger's
+  own append. Each line carries the counters and verdicts, never the prompt:
+  iteration, ticket, tier, model, kind, prompt digest, duration, token counts,
+  guard verdicts (workflow-revert / completeness / repro), the remote CI
+  rollup, the failure class, and a transcript tail hard-capped at
+  `knowledge.trajectory_transcript_chars`. The local store is pruned; this is
+  the part that survives, so model selection and the failure taxonomy have a
+  dataset to calibrate against.
 - **Committed and redacted.** The lesson and the PR body carry
   `Trajectory.digest()` - tokens, duration, exit status, first failing step -
   plus, in the lesson, `Trajectory.excerpt()`: a secrets-scrubbed tail of the
   last few steps. The audit trail is visible on the PR; the knowledge base
   gains signal without mirroring the working tree.
+
+## The failure taxonomy, and what the retry policy does with it
+
+Every non-merged iteration is classified twice, from one set of evidence.
+`postmortem.classify` assigns a fine-grained class out of `FAILURE_CLASSES`
+(eleven of them) - that is the reporting vocabulary the Pareto table and
+`hsai postmortem` render. `postmortem.classify_failure` is a pure projection of
+the same call onto six coarse classes - `lint`, `test`, `guard`, `agent_error`,
+`timeout`, `unknown` - because the retry policy asks a blunter question: *was
+this the change's fault, or the infrastructure's?* Being a projection rather
+than a second opinion, the two can never disagree about the same iteration.
+
+`orchestrator._recover_failed` acts on the coarse class in exactly one way. A
+`timeout` - the remote build never concluded, so nothing was learned about the
+change - closes the PR and hands the ticket back **without spending an
+attempt**, bounded by `execution.max_infra_requeues` (tracked with an
+`infra-requeue:N` label, the same shape as `attempts:N`) so a permanently sick
+CI cannot re-queue forever. Every other class keeps the original behaviour: one
+attempt spent, `blocked` at `execution.max_ticket_attempts`. In both cases the
+PR is closed - a non-SUCCESS PR is never left open and never merged.
 
 The same envelope feeds `ledger.parse_tokens` (which accepts the parsed payload
 directly), so the quota ledger's token columns - and the block aggregate in the
@@ -241,3 +271,7 @@ and `main`; green-gated auto-merge serializes the actual integration.
   to the backlog with an incremented `attempts:N` label. After
   `execution.max_ticket_attempts`, the ticket is labelled `blocked` and left for
   a human; blocked/assigned tickets are skipped by future workers.
+- **Infrastructure noise does not burn attempts.** A remote `TIMEOUT` is
+  classified `timeout` and re-queues the ticket with its attempt budget intact
+  (see the failure-taxonomy section above), so a flaky runner cannot push real
+  work to `blocked` for human triage.

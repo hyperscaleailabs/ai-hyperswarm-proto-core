@@ -34,7 +34,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import gitops, ledger
+from . import gitops, ledger, trajectory
 from .ai import run_agent
 from .config import CoreConfig
 from .models import ModelChoice, select_reviewer
@@ -304,6 +304,21 @@ def review_change(
             *verdict.blocking[:cap],
             f"... {dropped} further blocking finding(s) elided (max_blocking_findings={cap})",
         ]
+
+    # The reviewer is a model run like any other, so it leaves an index line
+    # too - otherwise a block's trajectory count would silently under-report
+    # what the loop actually spent quota on. It gets no LOCAL trajectory file:
+    # it shares the worker's iteration number, which is that store's id.
+    trajectory.index_run(
+        cfg, repo_root,
+        trajectory.build(
+            iteration=iteration, ticket=ticket, kind="review",
+            tier=choice.tier, model=choice.model, prompt=prompt, result=ares,
+            block=block, duration_seconds=time.time() - started,
+            outcome=verdict.status,
+        ),
+        guards={"verdict": verdict.status},
+    )
 
     tokens = ledger.parse_tokens(ares.payload)
     ledger.append_record(

@@ -136,6 +136,37 @@ def test_block_soft_biases_then_hard_halts_but_inflight_merges(tmp_path, monkeyp
         json.loads(line)
 
 
+def test_the_brief_counts_the_blocks_committed_trajectories(tmp_path, monkeypatch):
+    """The run index is read per block and folded into the cost summary."""
+    cfg = load_config()
+    cfg.budget.clear()
+    cfg.cycle["block_size"] = 1
+
+    # Two model runs already indexed for this block: a worker and its reviewer.
+    for i, kind in enumerate(("implement", "review")):
+        trajectory.append_run(
+            trajectory.index_path(cfg, tmp_path, 1),
+            trajectory.RunRecord(
+                iteration=101, block=1, ticket=7, kind=kind, tier="standard",
+                model="sonnet", prompt_digest="abc123", duration_seconds=float(i),
+                ok=True, outcome="merged",
+            ),
+        )
+
+    runner = _Runner()
+    fake, _ = _make_fake_run_once(
+        ledger.ledger_path(cfg, tmp_path), tier="standard", seconds=5.0
+    )
+    monkeypatch.setattr(cycle, "run_once", fake)
+    monkeypatch.setattr(cycle, "_well_formed_backlog", lambda cfg, *, runner: 999)
+    monkeypatch.setattr(cycle, "_governance_pr", lambda *a, **k: 0)
+
+    res = cycle.run_cycle(cfg, repo_dir=str(tmp_path), cycle_index=1, runner=runner)
+
+    assert res.report.cost.trajectories == 2
+    assert "2 trajectories" in runner.review_bodies[-1]
+
+
 # --- synthesis duplicate rejections reach the review brief -------------------
 
 def test_synthesis_duplicate_rejections_surface_in_block_notes(tmp_path, monkeypatch):

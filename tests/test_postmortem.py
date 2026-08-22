@@ -3,25 +3,33 @@ from __future__ import annotations
 
 import json
 
+from hsai.ci import CIResult
 from hsai.config import load_config
 from hsai.ledger import LedgerRecord
 from hsai.postmortem import (
     AGENT_ERROR,
     AGENT_TIMEOUT,
     BUDGET_HALT,
+    COARSE_FAILURE_CLASSES,
     FAILURE_CLASSES,
+    GUARD,
     INCOMPLETE_DIFF,
+    LINT,
     LINT_FAIL,
     MERGE_CONFLICT,
     NO_REPRO,
     REMOTE_CI_FAIL,
     REMOTE_CI_TIMEOUT,
+    TEST,
     TEST_FAIL,
+    TIMEOUT,
     UNKNOWN,
     FailureEvidence,
     build_postmortem_ticket,
     classify,
+    classify_failure,
     classify_with_detail,
+    coarsen,
     default_detail,
     dominant_failure,
     file_postmortem_ticket,
@@ -306,3 +314,87 @@ def test_core_yaml_configures_postmortem_thresholds():
     cfg = load_config()
     assert cfg.postmortem["ratio_threshold"] > 0
     assert cfg.postmortem["min_count"] >= 1
+
+
+# --- the coarse taxonomy the retry policy acts on -----------------------------
+
+def _ci(**steps: bool) -> CIResult:
+    """A local CI result with the given step outcomes."""
+    return CIResult(ok=all(steps.values()), steps=steps)
+
+
+def test_classify_failure_covers_every_coarse_class():
+    """All six classes are reachable, each from evidence a real run produces."""
+    assert classify_failure(_ci(ruff=False, pytest=True)) == LINT
+    assert classify_failure(_ci(ruff=True, pytest=False)) == TEST
+    assert classify_failure(
+        guard_notes=("completeness guard: knowledge-only diff on a code ticket",)
+    ) == GUARD
+    assert classify_failure(
+        agent_error="[phase=implement] claude exited 1: permission denied"
+    ) == AGENT_ERROR
+    assert classify_failure(agent_error="[phase=implement] timeout after 1200s") == TIMEOUT
+    # Nothing in the evidence explains the failure: `unknown` is a branch that
+    # is actually reached, never a silent default.
+    assert classify_failure(_ci(ruff=True, pytest=True)) == UNKNOWN
+
+    assert set(COARSE_FAILURE_CLASSES) == {LINT, TEST, GUARD, AGENT_ERROR, TIMEOUT, UNKNOWN}
+
+
+def test_classify_failure_maps_the_remote_rollup():
+    """A remote timeout is infrastructure; a remote failure is a red build."""
+    green = _ci(ruff=True, pytest=True)
+    assert classify_failure(green, remote="TIMEOUT") == TIMEOUT
+    assert classify_failure(green, remote="FAILURE") == TEST
+    assert classify_failure(green, remote="SUCCESS") == UNKNOWN
+
+
+def test_classify_failure_precedence_puts_timeout_first():
+    """A run that never concluded taught us nothing about the change itself."""
+    repro_note = ("repro guard: no failing test on the parent tree",)
+    red = _ci(ruff=False, pytest=False)
+    assert classify_failure(red, "FAILURE", "timed out", repro_note) == TIMEOUT
+    # Without the timeout, the agent's own error outranks the guards and CI.
+    assert classify_failure(red, "FAILURE", "claude crashed", repro_note) == AGENT_ERROR
+    # And a guard outranks CI steps it never let run honestly.
+    assert classify_failure(red, "", "", repro_note) == GUARD
+
+
+def test_classify_failure_is_pure():
+    """Same arguments, same answer - and no argument is mutated."""
+    ci = _ci(ruff=False, pytest=True)
+    notes = ["completeness guard: knowledge-only diff on a code ticket"]
+    first = classify_failure(ci, "FAILURE", "", notes)
+    second = classify_failure(ci, "FAILURE", "", notes)
+    assert first == second == GUARD
+    assert ci.steps == {"ruff": False, "pytest": True}
+    assert notes == ["completeness guard: knowledge-only diff on a code ticket"]
+
+
+def test_classify_failure_tolerates_missing_evidence():
+    """Guards fire before local CI exists, so `None` must be a valid input."""
+    assert classify_failure() == UNKNOWN
+    assert classify_failure(None, "", "", ()) == UNKNOWN
+    assert classify_failure(None, "TIMEOUT") == TIMEOUT
+
+
+def test_coarsen_projects_every_fine_grained_class():
+    """The coarse vocabulary is a total projection of the fine-grained one."""
+    for cls in FAILURE_CLASSES:
+        assert coarsen(cls) in COARSE_FAILURE_CLASSES
+    assert coarsen(AGENT_TIMEOUT) == TIMEOUT
+    assert coarsen(REMOTE_CI_TIMEOUT) == TIMEOUT
+    assert coarsen(AGENT_ERROR) == AGENT_ERROR
+    assert coarsen(LINT_FAIL) == LINT
+    assert coarsen(TEST_FAIL) == TEST
+    assert coarsen(REMOTE_CI_FAIL) == TEST
+    for guard_class in (INCOMPLETE_DIFF, NO_REPRO, MERGE_CONFLICT, BUDGET_HALT):
+        assert coarsen(guard_class) == GUARD
+    # An unknown (or future) class degrades, never raises.
+    assert coarsen("something-new") == UNKNOWN
+
+
+def test_classify_failure_never_disagrees_with_classify():
+    """The two taxonomies are one classification, projected twice."""
+    evidence = FailureEvidence(ci_steps={"ruff": True, "pytest": False})
+    assert coarsen(classify(evidence)) == classify_failure(_ci(ruff=True, pytest=False))

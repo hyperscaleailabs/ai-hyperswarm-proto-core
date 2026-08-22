@@ -339,3 +339,40 @@ def test_tokens_per_merged_pr_is_undefined_without_merges_or_tokens():
 
     no_tokens = aggregate_block([_rec(block=1, outcome="merged")], block=1)
     assert no_tokens.tokens_per_merged_pr() is None
+
+
+# --- what the review brief shows: where the block lost time ------------------
+
+def test_summary_shows_the_failure_histogram_ranked_by_count():
+    """The brief should say where the block actually lost time, not just how much."""
+    records = [
+        _rec(block=1, outcome="recovered", failure_class="test"),
+        _rec(block=1, outcome="recovered", failure_class="timeout"),
+        _rec(block=1, outcome="recovered", failure_class="test"),
+        _rec(block=1, outcome="merged"),
+    ]
+    agg = aggregate_block(records, block=1)
+    assert agg.failure_histogram == {"test": 2, "timeout": 1}
+    # Dominant class first, so the line reads as a Pareto rather than a dump.
+    assert "failures[test=2, timeout=1]" in agg.summary()
+
+
+def test_summary_folds_in_the_trajectory_count():
+    agg = aggregate_block([_rec(block=1, outcome="merged")], block=1)
+    assert agg.trajectories == 0
+    assert "trajectories" not in agg.summary()   # nothing to say, so nothing said
+
+    agg.trajectories = 4
+    assert "4 trajectories" in agg.summary()
+
+
+def test_summary_stays_quiet_for_a_block_that_never_failed():
+    """A clean block's summary is byte-for-byte what it was before the taxonomy."""
+    agg = aggregate_block([_rec(block=1, outcome="merged")], block=1)
+    assert "failures[" not in agg.summary()
+    assert agg.failure_histogram == {}
+
+
+def test_block_aggregate_defaults_carry_the_new_fields():
+    empty = BlockAggregate(block=3)
+    assert empty.trajectories == 0 and empty.failure_histogram == {}

@@ -13,11 +13,19 @@ block directories beyond ``execution.trajectory_retention_blocks`` on each
 cycle, so forensics stay available for the recent past without growing without
 limit.
 
-Two audiences, deliberately separated:
+Three audiences, deliberately separated:
 
 - **local, complete** - the trajectory file itself. It quotes repo content and
   therefore stays out of git (``.hsai/`` is ignored); ``hsai replay <id>``
   reconstructs it without spending any quota.
+- **committed, structured** - the run index: one append-only JSONL line per
+  model run under ``knowledge/trajectories/``, written with the same
+  lock-protected discipline as :mod:`hsai.ledger`. Where the ledger answers
+  "what did the block cost", the index answers "what happened in each run" -
+  which guards fired, how the remote build concluded, which failure class
+  explains it, and a size-capped tail of the transcript. It survives the local
+  store's retention window, so calibration data (model selection, failure
+  taxonomy) outlives the forensics it was derived from.
 - **committed, redacted** - :meth:`Trajectory.excerpt`, a secrets-scrubbed tail
   of the last few steps embedded in the lesson note. The knowledge base gains
   signal without becoming a mirror of the working tree.
@@ -34,12 +42,22 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .config import CoreConfig
+
 TRAJECTORY_DIR = ".hsai/traj"
+
+# The committed run index: one JSONL file per block, one line per model run.
+DEFAULT_INDEX_DIR = "knowledge/trajectories"
+# Hard ceiling on the transcript tail each index line carries. Config-driven
+# (``knowledge.trajectory_transcript_chars``) because it trades forensic depth
+# against the size of a file that lives in git forever.
+DEFAULT_TRANSCRIPT_CHARS = 1200
 
 # Per-step text is clipped so one runaway tool result cannot bloat the store.
 STEP_CHARS = 2000
@@ -62,6 +80,10 @@ _SECRET_PATTERNS = (
 # every worker prompt is full of them. Collapse any `/Users/<name>` or
 # `/home/<name>` prefix to `~` so a trajectory can be shared as-is.
 _HOME_PATTERN = re.compile(r"/(?:Users|home)/[^/\s:\"']+")
+
+# Serializes index appends so concurrent workers never interleave a partial
+# line - the same discipline (and for the same reason) as hsai.ledger.
+_INDEX_LOCK = threading.Lock()
 
 
 def _now() -> str:
@@ -197,6 +219,10 @@ class Trajectory:
     num_turns: int | None = None
     duration_seconds: float = 0.0
     outcome: str = "ran"
+    # Coarse cause of a failed run (see hsai.postmortem.classify_failure);
+    # empty for a run that ended well. Defaults to "" so read() still parses
+    # trajectories written before the taxonomy existed.
+    failure_class: str = ""
     created: str = field(default_factory=_now)
 
     @property
@@ -250,6 +276,11 @@ class Trajectory:
         tools = self.tools_used()
         tools_cell = ", ".join(f"`{t}`" for t in tools) if tools else "_(none recorded)_"
         turns_cell = str(self.num_turns) if self.num_turns is not None else "unavailable"
+        # Rendered only when a class was actually assigned, so a passing run's
+        # trace stays byte-for-byte as it was before the taxonomy existed.
+        failure_row = (
+            f"| failure class | `{self.failure_class}` |\n" if self.failure_class else ""
+        )
         return (
             "| field | value |\n"
             "| --- | --- |\n"
@@ -257,6 +288,7 @@ class Trajectory:
             f"| tools used | {tools_cell} |\n"
             f"| tokens | {tokens_cell} |\n"
             f"| exit status | {self.exit_status} |\n"
+            f"{failure_row}"
             f"| duration | {self.duration_seconds:.1f}s |\n"
             f"| telemetry | {telemetry} |\n"
             f"| replay | `hsai traj {self.identifier}` |"
@@ -301,13 +333,33 @@ class Trajectory:
             lines.insert(0, f"... {dropped} earlier step(s) elided")
         return "\n".join(redact(line) for line in lines)
 
+    def transcript_tail(self, limit: int = DEFAULT_TRANSCRIPT_CHARS) -> str:
+        """A redacted transcript tail, hard-capped at ``limit`` characters.
+
+        What the committed run index stores: enough of how the run ended to
+        calibrate a model choice or explain a failure class after the local
+        store has been pruned, without letting one runaway run bloat a file
+        that lives in git forever. The elision marker is counted against the
+        cap, so the returned string never exceeds it.
+        """
+        if limit <= 0:
+            return ""
+        text = redact("\n".join(s.render() for s in self.steps)).strip()
+        if len(text) <= limit:
+            return text
+        marker = f"...[{len(text)} chars total; tail only]\n"
+        if len(marker) >= limit:
+            return text[-limit:]
+        return marker + text[-(limit - len(marker)):]
+
     def render(self) -> str:
         """Human-readable reconstruction (what ``hsai replay`` prints)."""
         ticket = f"#{self.ticket}" if self.ticket else "(none)"
         head = [
             f"trajectory {self.identifier}  [{self.kind}] ticket {ticket} block {self.block}",
             f"model: {self.model} (tier={self.tier})  duration: {self.duration_seconds:.3f}s",
-            f"exit: {self.exit_status}  ok={self.ok}  outcome: {self.outcome}",
+            f"exit: {self.exit_status}  ok={self.ok}  outcome: {self.outcome}"
+            + (f"  failure: {self.failure_class}" if self.failure_class else ""),
             self.usage_summary(),
             f"session: {self.session_id or '(not reported)'}",
             f"prompt digest: {self.prompt_digest or '(none)'}",
@@ -400,8 +452,7 @@ def prompt_digest(prompt: str) -> str:
     return hashlib.sha256((prompt or "").encode("utf-8")).hexdigest()[:12]
 
 
-def record(
-    repo_root: str | Path,
+def build(
     *,
     iteration: int,
     ticket: int | None,
@@ -414,14 +465,17 @@ def record(
     duration_seconds: float = 0.0,
     outcome: str = "ran",
 ) -> Trajectory:
-    """Build a trajectory from an :class:`hsai.ai.AIResult` and persist it.
+    """Build a trajectory from an :class:`hsai.ai.AIResult` without writing it.
 
     ``result`` is duck-typed (``ok``/``output``/``error``/``usage``/``payload``)
-    so this module stays independent of :mod:`hsai.ai`.
+    so this module stays independent of :mod:`hsai.ai`. Separate from
+    :func:`record` because not every model run belongs in the local store: the
+    independent reviewer shares an iteration number with the worker it grades,
+    so it builds a trajectory for the committed index only.
     """
     payload = getattr(result, "payload", None)
     num_turns = payload.get("num_turns") if isinstance(payload, dict) else None
-    traj = Trajectory(
+    return Trajectory(
         iteration=iteration,
         ticket=ticket,
         kind=kind,
@@ -440,5 +494,125 @@ def record(
         duration_seconds=round(max(0.0, duration_seconds), 3),
         outcome=outcome,
     )
+
+
+def record(repo_root: str | Path, **kwargs: Any) -> Trajectory:
+    """:func:`build` a trajectory and persist it to the local store."""
+    traj = build(**kwargs)
     write(traj, repo_root)
     return traj
+
+
+# --- the committed run index --------------------------------------------------
+
+@dataclass
+class RunRecord:
+    """One model run's committed index line - the unit ``knowledge/`` keeps.
+
+    Deliberately narrower than :class:`Trajectory`: counters, verdicts and a
+    capped transcript tail, never the prompt or the full step stream. That is
+    what makes it safe to commit and cheap to keep forever, which in turn is
+    what makes it usable as a calibration dataset for model selection and the
+    failure taxonomy.
+    """
+
+    iteration: int
+    block: int
+    ticket: int | None
+    kind: str
+    tier: str
+    model: str
+    prompt_digest: str
+    duration_seconds: float
+    ok: bool
+    outcome: str
+    failure_class: str = ""
+    remote_ci: str = ""
+    # Which guards ran and what they said: workflow_revert / completeness /
+    # repro. A guard absent from the map never ran for this kind of ticket.
+    guards: dict[str, str] = field(default_factory=dict)
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    steps: int = 0
+    transcript: str = ""
+    created: str = field(default_factory=_now)
+
+    def to_json(self) -> str:
+        return json.dumps(redact_value(asdict(self)), sort_keys=True)
+
+
+def index_dir(cfg: CoreConfig, repo_root: str | Path) -> Path:
+    rel = cfg.knowledge.get("trajectory_dir", DEFAULT_INDEX_DIR)
+    return Path(repo_root) / rel
+
+
+def index_path(cfg: CoreConfig, repo_root: str | Path, block: int) -> Path:
+    """The block's append-only JSONL. Sharded like the local store, so one
+    block's runs stay readable without parsing every run ever made."""
+    return index_dir(cfg, repo_root) / f"block-{block}.jsonl"
+
+
+def transcript_chars(cfg: CoreConfig) -> int:
+    return int(cfg.knowledge.get("trajectory_transcript_chars", DEFAULT_TRANSCRIPT_CHARS))
+
+
+def append_run(path: str | Path, run_record: RunRecord) -> Path:
+    """Append one run as a single JSON line (append-only, never rewrites)."""
+    path = Path(path)
+    line = run_record.to_json() + "\n"
+    with _INDEX_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+    return path
+
+
+def read_runs(path: str | Path) -> list[RunRecord]:
+    """Parse every run back off disk (empty list if the index is absent)."""
+    path = Path(path)
+    if not path.exists():
+        return []
+    runs: list[RunRecord] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            runs.append(RunRecord(**json.loads(line)))
+    return runs
+
+
+def read_block_runs(cfg: CoreConfig, repo_root: str | Path, block: int) -> list[RunRecord]:
+    return read_runs(index_path(cfg, repo_root, block))
+
+
+def index_run(
+    cfg: CoreConfig,
+    repo_root: str | Path,
+    traj: Trajectory,
+    *,
+    guards: dict[str, str] | None = None,
+    remote_ci: str = "",
+) -> Path:
+    """Append ``traj`` to the committed run index for its block."""
+    toks = traj.tokens()
+    return append_run(
+        index_path(cfg, repo_root, traj.block),
+        RunRecord(
+            iteration=traj.iteration,
+            block=traj.block,
+            ticket=traj.ticket,
+            kind=traj.kind,
+            tier=traj.tier,
+            model=traj.model,
+            prompt_digest=traj.prompt_digest,
+            duration_seconds=traj.duration_seconds,
+            ok=traj.ok,
+            outcome=traj.outcome,
+            failure_class=traj.failure_class,
+            remote_ci=remote_ci,
+            guards=dict(guards or {}),
+            input_tokens=toks[0] if toks else None,
+            output_tokens=toks[1] if toks else None,
+            steps=len(traj.steps),
+            transcript=traj.transcript_tail(transcript_chars(cfg)),
+        ),
+    )
