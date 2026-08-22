@@ -15,6 +15,7 @@ from pathlib import Path
 
 from . import practices as practices_mod
 from .config import CoreConfig
+from .lessons import FALLBACK_FAIL, FALLBACK_PASS
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _TAG_RE = re.compile(r"^\s*-\s+(\S.*)$", re.MULTILINE)
@@ -67,6 +68,14 @@ class Lesson:
     # (empty for a pass) - mirrored into frontmatter as a `failure/<class>` tag
     # so the Obsidian graph can filter failures by cause.
     failure_class: str = ""
+    # True when hsai.lessons.synthesize_lesson fell back to the deterministic
+    # template (disabled, budget breach, error, timeout, empty/unparseable
+    # output) rather than a real synthesis. Mirrored into frontmatter as a
+    # `synthesis/fallback` tag - the signal the CI boilerplate gate (see
+    # ci.yml's SDLC-evidence step) uses to tell "this lesson legitimately IS
+    # boilerplate because the model call fell back" apart from a worker
+    # silently reusing the template.
+    synthesis_fallback: bool = False
 
     def note_name(self) -> str:
         return f"{self.created}-{slugify(self.title)}"
@@ -86,6 +95,7 @@ class LessonRecord:
     body: str = ""  # everything after the frontmatter; what the recall index reads
     failure_class: str = ""  # "" when absent (pass, or a note predating this field)
     created: str = ""  # frontmatter `created:`, "" for notes that carry no date
+    synthesis_fallback: bool = False  # `synthesis/fallback` tag present
 
 
 def split_sections(text: str) -> dict[str, str]:
@@ -163,7 +173,32 @@ def parse_note(path: str | Path) -> LessonRecord:
         body=body.strip(),
         failure_class=failure_class,
         created=_frontmatter_scalar(fm, "created"),
+        synthesis_fallback="synthesis/fallback" in tags,
     )
+
+
+# The deterministic fallback text hsai.lessons emits when synthesis cannot
+# run - and, before that module existed, what EVERY lesson's text was. A
+# lesson whose text is byte-identical to one of these (or to another lesson
+# already on disk) has grown no new knowledge (G3).
+BOILERPLATE_PHRASES = (FALLBACK_PASS, FALLBACK_FAIL)
+
+
+def detect_boilerplate(lesson_text: str, other_lessons: tuple[str, ...] = ()) -> bool:
+    """True when ``lesson_text`` is byte-identical to a known template
+    phrase, or to another lesson already on disk (``other_lessons``).
+
+    Deliberately exact-match only, not a similarity heuristic: a genuinely
+    distinct lesson that happens to share vocabulary with another is not
+    boilerplate, and a fuzzy match would eventually flag real prose as if it
+    were the template.
+    """
+    text = lesson_text.strip()
+    if not text:
+        return False
+    if text in BOILERPLATE_PHRASES:
+        return True
+    return any(text == other.strip() for other in other_lessons)
 
 
 @dataclass
@@ -252,6 +287,43 @@ class KnowledgeBase:
 
     def _parse_lesson(self, note_name: str) -> LessonRecord:
         return parse_note(self.lessons_dir / f"{note_name}.md")
+
+    def audit_boilerplate(self) -> list[str]:
+        """Every lesson note on disk whose lesson text is boilerplate.
+
+        Backs ``hsai lessons --audit`` (see :mod:`hsai.cli`): a count and a
+        list to seed a backfill of the notes recorded before evidence-driven
+        synthesis (:mod:`hsai.lessons`) existed.
+        """
+        records = self.read_lessons()
+        texts = [r.lesson_text for r in records]
+        flagged = []
+        for i, r in enumerate(records):
+            others = tuple(texts[:i] + texts[i + 1 :])
+            if detect_boilerplate(r.lesson_text, others):
+                flagged.append(r.note_name)
+        return flagged
+
+    def check_added_lessons(self, added_paths: list[str]) -> list[str]:
+        """Which of ``added_paths`` (repo-relative, e.g. from a PR diff) is a
+        NEW boilerplate, non-fallback lesson.
+
+        The CI gate's payload (see ``ci.yml`` and ``hsai lessons --gate-diff``):
+        a path outside :attr:`lessons_dir`, or one that no longer exists on
+        disk, is ignored rather than flagged - this is a boilerplate check,
+        not a path-validity check.
+        """
+        all_lessons = {p: self._parse_lesson(p.stem) for p in self.lessons_dir.glob("*.md")}
+        violations = []
+        for rel in added_paths:
+            path = self.root / rel
+            if path.parent != self.lessons_dir or path not in all_lessons:
+                continue
+            record = all_lessons[path]
+            others = [r.lesson_text for p, r in all_lessons.items() if p != path]
+            if detect_boilerplate(record.lesson_text, tuple(others)) and not record.synthesis_fallback:
+                violations.append(rel)
+        return violations
 
     def synthesize_whitepaper(self, n: int | None = None) -> Whitepaper:
         """Synthesize a whitepaper by grouping the last `n` lessons by outcome/kind
@@ -356,6 +428,10 @@ class KnowledgeBase:
         # passing note byte-for-byte identical to before this field existed.
         if lesson.outcome == "fail" and lesson.failure_class:
             tags = (*tags, f"failure/{lesson.failure_class}")
+        # Only when synthesis actually fell back - keeps a lesson that got a
+        # real synthesis byte-for-byte identical to before this field existed.
+        if lesson.synthesis_fallback:
+            tags = (*tags, "synthesis/fallback")
         extra: dict[str, str | tuple[str, ...]] = {
             "created": lesson.created,
             "iteration": str(lesson.iteration),

@@ -234,6 +234,21 @@ knowledge:
     half_life_days: 180              # recency decay, measured against the newest note
     duplicate_threshold: 0.55        # coverage of a FAILED note above which a candidate is dropped
     min_query_terms: 8               # below this many distinct words, coverage is noise - never flag
+  # Evidence-driven lesson synthesis (see src/hsai/lessons.py). After the
+  # lesson's evidence bundle (diff, failing CI tail, guard verdicts, repro
+  # evidence, attempt count) is assembled, a CHEAP-tier (light/standard,
+  # NEVER heavy) claude -p call turns it into three short fields - what was
+  # attempted, what happened, and one transferable rule. Fail-safe: any
+  # error, timeout, empty/unparseable output, or a hard block-budget breach
+  # falls back to the deterministic template text, marked as a fallback
+  # (`synthesis/fallback` tag) rather than silently substituted. Set
+  # enabled: false to always use the deterministic template.
+  lesson_synthesis:
+    enabled: true
+    timeout_seconds: 180
+    max_output_chars: 4000           # hard cap on the reply before it is parsed
+    max_diffstat_chars: 4000         # hard cap on the diffstat shown to the synthesizer
+    max_log_chars: 1600              # hard cap on the failing CI tail shown to the synthesizer
 
 # Ranked snapshot pinned on 2026-07-25. Criteria: >= 10k stars, permissive
 # license (MIT or Apache-2.0), quality README, relevance to swarm / multi-agent.

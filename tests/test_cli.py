@@ -260,6 +260,97 @@ def test_repro_check_command_passes_and_exits_zero(monkeypatch, capsys):
     assert "PASS" in out
 
 
+# --- lessons --audit / --gate-diff (see hsai.knowledge.detect_boilerplate) --
+
+def test_parser_lessons_args():
+    parser = build_parser()
+    args = parser.parse_args(["lessons", "--audit", "--root", "/tmp/x"])
+    assert args.command == "lessons"
+    assert args.audit is True and args.gate_diff is None and args.root == "/tmp/x"
+
+    gate = parser.parse_args(["lessons", "--gate-diff", "origin/main"])
+    assert gate.gate_diff == "origin/main" and gate.audit is False
+
+
+def test_lessons_audit_reports_boilerplate_lessons(tmp_path, capsys):
+    from hsai.knowledge import KnowledgeBase, Lesson
+    from hsai.lessons import FALLBACK_PASS
+
+    kb = KnowledgeBase(tmp_path)
+    kb.write_lesson(Lesson(
+        title="implement: boilerplate one", outcome="pass", kind="implement",
+        context="ctx", what_happened="x", lesson=FALLBACK_PASS, ticket=1,
+    ))
+    kb.write_lesson(Lesson(
+        title="implement: distinct", outcome="pass", kind="implement",
+        context="ctx", what_happened="x",
+        lesson="A genuinely distinct, evidence-grounded lesson.", ticket=2,
+    ))
+
+    rc = main(["lessons", "--audit", "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "1/2 lesson(s) are boilerplate" in out
+    assert "boilerplate-one" in out
+    assert "implement-distinct" not in out
+
+
+def test_lessons_gate_diff_blocks_a_boilerplate_non_fallback_addition(monkeypatch, tmp_path, capsys):
+    from hsai.knowledge import KnowledgeBase, Lesson
+    from hsai.lessons import FALLBACK_PASS
+
+    kb = KnowledgeBase(tmp_path)
+    path = kb.write_lesson(Lesson(
+        title="implement: boilerplate", outcome="pass", kind="implement",
+        context="ctx", what_happened="x", lesson=FALLBACK_PASS, ticket=1,
+    ))
+    added_rel = f"knowledge/lessons/{path.stem}.md"
+    monkeypatch.setattr(cli_module.gitops, "added_paths", lambda *a, **k: [added_rel])
+
+    rc = main(["lessons", "--gate-diff", "origin/main", "--root", str(tmp_path)])
+    out, err = capsys.readouterr()
+    assert rc == 1
+    assert "BLOCKED" in out
+    assert added_rel in err and "boilerplate" in err
+
+
+def test_lessons_gate_diff_passes_a_fallback_marked_addition(monkeypatch, tmp_path, capsys):
+    from hsai.knowledge import KnowledgeBase, Lesson
+    from hsai.lessons import FALLBACK_PASS
+
+    kb = KnowledgeBase(tmp_path)
+    path = kb.write_lesson(Lesson(
+        title="implement: marked fallback", outcome="pass", kind="implement",
+        context="ctx", what_happened="x", lesson=FALLBACK_PASS, ticket=1,
+        synthesis_fallback=True,
+    ))
+    added_rel = f"knowledge/lessons/{path.stem}.md"
+    monkeypatch.setattr(cli_module.gitops, "added_paths", lambda *a, **k: [added_rel])
+
+    rc = main(["lessons", "--gate-diff", "origin/main", "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "OK" in out
+
+
+def test_lessons_gate_diff_passes_a_distinct_addition(monkeypatch, tmp_path, capsys):
+    from hsai.knowledge import KnowledgeBase, Lesson
+
+    kb = KnowledgeBase(tmp_path)
+    path = kb.write_lesson(Lesson(
+        title="implement: distinct", outcome="pass", kind="implement",
+        context="ctx", what_happened="x",
+        lesson="A genuinely distinct, evidence-grounded lesson.", ticket=1,
+    ))
+    added_rel = f"knowledge/lessons/{path.stem}.md"
+    monkeypatch.setattr(cli_module.gitops, "added_paths", lambda *a, **k: [added_rel])
+
+    rc = main(["lessons", "--gate-diff", "origin/main", "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "OK" in out
+
+
 # --- replay (reads the local trajectory store, spends no quota) -------------
 
 class _RunnerSpy:

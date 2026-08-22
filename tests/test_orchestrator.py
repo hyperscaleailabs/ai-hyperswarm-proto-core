@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from hsai import ledger, orchestrator, recall, review, trajectory
+from hsai import ledger, lessons, orchestrator, recall, review, trajectory
 from hsai.config import load_config
 from hsai.models import ModelChoice
 from hsai.orchestrator import (
@@ -75,23 +75,39 @@ REVIEW_BLOCK = _reviewer_envelope(
     }
 )
 
+# The lesson synthesizer's default reply: a well-formed envelope with an
+# EMPTY result, so by default it falls back to the deterministic template
+# (outcome="empty") without perturbing token totals other tests assert on
+# (0/0 usage contributes nothing to a block aggregate).
+SYNTHESIS_EMPTY = json.dumps({
+    "type": "result", "result": "", "usage": {"input_tokens": 0, "output_tokens": 0},
+})
+
 
 def _claude_prompts(runner) -> list[str]:
     return [c[2] for c in runner.calls if c[:1] == ["claude"]]
 
 
 def _worker_prompts(runner) -> list[str]:
-    return [p for p in _claude_prompts(runner) if review.PROMPT_MARKER not in p]
+    return [
+        p for p in _claude_prompts(runner)
+        if review.PROMPT_MARKER not in p and lessons.PROMPT_MARKER not in p
+    ]
 
 
 def _review_prompts(runner) -> list[str]:
     return [p for p in _claude_prompts(runner) if review.PROMPT_MARKER in p]
 
 
+def _synthesis_prompts(runner) -> list[str]:
+    return [p for p in _claude_prompts(runner) if lessons.PROMPT_MARKER in p]
+
+
 def _iteration_records(cfg, root) -> list[ledger.LedgerRecord]:
-    """Ledger records for the iteration itself, without the review's own line."""
+    """Ledger records for the iteration itself, without the review's or the
+    lesson synthesizer's own line."""
     records = ledger.read_records(ledger.ledger_path(cfg, root))
-    return [r for r in records if r.kind != "review"]
+    return [r for r in records if r.kind not in ("review", "lesson_synthesis")]
 
 
 class FakeRunner:
@@ -117,10 +133,12 @@ class FakeRunner:
         repro_parent_ok: bool = False,
         agent_output: str = AGENT_JSON,
         review_output: str = REVIEW_APPROVE,
+        synthesis_output: str = SYNTHESIS_EMPTY,
     ) -> None:
         self.repo_root = repo_root
         self.agent_output = agent_output
         self.review_output = review_output
+        self.synthesis_output = synthesis_output
         self.ci_sequence = ci_sequence
         self.open_issues = open_issues or []
         self.remote_ci = remote_ci
@@ -152,9 +170,15 @@ class FakeRunner:
         if cmd[:2] == ["git", "merge-base"]:
             return Proc(cmd, 0, "parentsha\n", "")
         if cmd[:2] == ["git", "diff"]:
-            # What the review gate reads off the branch: paths, then the diff.
+            # What the review gate and the lesson synthesizer read off the
+            # branch: paths, a compact diffstat, then the full diff text.
             if "--name-only" in cmd:
                 return Proc(cmd, 0, "src/hsai/widget.py\ntests/test_widget.py\n", "")
+            if "--stat" in cmd:
+                return Proc(
+                    cmd, 0,
+                    " src/hsai/widget.py | 3 +++\n 1 file changed, 3 insertions(+)\n", "",
+                )
             return Proc(cmd, 0, "diff --git a/src/hsai/widget.py\n+def widget(): ...\n", "")
         if cmd[:3] in (["git", "worktree", "add"], ["git", "worktree", "remove"]):
             return Proc(cmd, 0, "", "")
@@ -188,6 +212,8 @@ class FakeRunner:
             prompt = cmd[2] if len(cmd) > 2 else ""
             if review.PROMPT_MARKER in prompt:
                 return Proc(cmd, 0, self.review_output, "")
+            if lessons.PROMPT_MARKER in prompt:
+                return Proc(cmd, 0, self.synthesis_output, "")
             return Proc(cmd, 0, self.agent_output, "")
         if cmd[:3] == ["gh", "pr", "create"]:
             self._pr_seq += 1
@@ -676,10 +702,12 @@ def test_a_blocking_review_verdict_never_opens_a_pr_and_costs_one_attempt(tmp_pa
     assert not any("blocked" in c for c in runner.calls)
     assert any("independent review" in n for n in result.notes)
 
-    # Both the review and the blocked iteration are on the ledger.
+    # The review, the lesson synthesis attempt, and the blocked iteration are
+    # all on the ledger - a blocking verdict still writes (and metering) a
+    # lesson, per the "always" invariant.
     records = ledger.read_records(ledger.ledger_path(cfg, tmp_path))
     assert [(r.kind, r.outcome) for r in records] == [
-        ("review", "blocked"), (IMPLEMENT, "review_blocked"),
+        ("review", "blocked"), ("lesson_synthesis", "empty"), (IMPLEMENT, "review_blocked"),
     ]
 
 
@@ -780,8 +808,10 @@ def test_disabling_the_review_gate_restores_the_pre_review_flow(tmp_path):
     # Even a blocking reviewer is never consulted, and the PR merges as before.
     assert _review_prompts(runner) == []
     assert result.review == "skipped" and result.merged is True
+    # Review is disabled, but lesson synthesis is an independent feature and
+    # still runs (and is metered) alongside the iteration's own record.
     assert [r.kind for r in ledger.read_records(ledger.ledger_path(cfg, tmp_path))] == [
-        IMPLEMENT
+        "lesson_synthesis", IMPLEMENT
     ]
 
 
@@ -957,9 +987,11 @@ def test_token_counts_reach_the_ledger_and_the_block_aggregate(tmp_path):
     )
 
     records = ledger.read_records(ledger.ledger_path(cfg, tmp_path))
-    # The independent review is metered like any other spend, so the block
-    # carries one 'review' line next to the iteration's own.
-    assert [r.kind for r in records] == ["review", IMPLEMENT]
+    # The independent review AND the lesson synthesis call are each metered
+    # like any other spend, so the block carries their lines next to the
+    # iteration's own. The synthesizer's default fake reply is empty (0/0
+    # tokens), so it does not perturb the token totals asserted below.
+    assert [r.kind for r in records] == ["review", "lesson_synthesis", IMPLEMENT]
     authored = _iteration_records(cfg, tmp_path)[0]
     assert authored.input_tokens == 1500 and authored.output_tokens == 320
 
@@ -1358,3 +1390,105 @@ def test_dry_run_still_records_what_it_recalled(tmp_path):
     assert result.kind == IMPROVE
     assert result.recalled                       # retrieval runs without an agent
     assert "recalled:" in Path(result.lesson_path).read_text().split("---\n")[1]
+
+
+# --- evidence-driven lesson synthesis (see hsai.lessons) ---------------------
+
+SYNTHESIS_JSON = json.dumps({
+    "type": "result",
+    "result": (
+        "Reviewed the evidence.\n\n```json\n"
+        + json.dumps({
+            "attempted": "Add the widget end to end per the ticket.",
+            "happened": "Local CI passed and the independent reviewer approved the diff.",
+            "rule": (
+                "Per openai/swarm's small-core practice, keep the added surface "
+                "area minimal."
+            ),
+            "references": ["openai/swarm"],
+        })
+        + "\n```"
+    ),
+    "usage": {"input_tokens": 111, "output_tokens": 22},
+})
+
+
+def test_the_evidence_bundle_reaches_the_synthesis_prompt_and_the_written_lesson(
+    tmp_path,
+):
+    cfg = load_config()
+    open_issues = [dict(WIDGET_ISSUE)]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+        worktree_status="?? src/hsai/widget.py\n", synthesis_output=SYNTHESIS_JSON,
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.merged is True
+    # exactly one worker call, one review call, one synthesis call
+    assert len(_worker_prompts(runner)) == 1
+    assert len(_review_prompts(runner)) == 1
+    synth_prompts = _synthesis_prompts(runner)
+    assert len(synth_prompts) == 1
+
+    # the evidence bundle - diff, guards, tier, ticket - reached the prompt
+    prompt = synth_prompts[0]
+    assert lessons.PROMPT_MARKER in prompt
+    assert WIDGET_ISSUE["title"] in prompt
+    assert "src/hsai/widget.py" in prompt          # changed files
+    assert "completeness guard:" in prompt
+    assert "independent review:" in prompt
+    assert "Author model tier:" in prompt
+
+    # the synthesized fields (not the old constant boilerplate) landed in the
+    # written lesson
+    lesson_text = Path(result.lesson_path).read_text()
+    assert "**Attempted:** Add the widget end to end per the ticket." in lesson_text
+    assert "**Happened:** Local CI passed and the independent reviewer approved" in lesson_text
+    assert "**Rule:**" in lesson_text and "openai/swarm" in lesson_text
+    assert "Change merged cleanly under a green build." not in lesson_text
+    assert "synthesis/fallback" not in lesson_text.split("---\n")[1]
+
+    # metered like the review gate, and never on the heavy tier
+    records = ledger.read_records(ledger.ledger_path(cfg, tmp_path))
+    synth_record = next(r for r in records if r.kind == "lesson_synthesis")
+    assert synth_record.outcome == "ok"
+    assert synth_record.tier != "heavy"
+    assert synth_record.input_tokens == 111 and synth_record.output_tokens == 22
+
+
+def test_a_synthesis_failure_still_falls_back_to_the_deterministic_lesson(tmp_path):
+    cfg = load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[dict(WIDGET_ISSUE)], worktree_status="?? src/hsai/widget.py\n",
+        synthesis_output=json.dumps({"type": "result", "result": "no json here"}),
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.merged is True
+    lesson_text = Path(result.lesson_path).read_text()
+    # the deterministic fallback text, byte-for-byte, plus a marker in the
+    # frontmatter and a never-silent note in "What happened"
+    assert "Change merged cleanly under a green build." in lesson_text
+    assert "  - synthesis/fallback" in lesson_text.split("---\n")[1]
+    assert "fell back to the deterministic template" in lesson_text
+    assert any("lesson synthesis: fallback" in n for n in result.notes)
+
+
+def test_dry_run_skips_the_synthesis_call_entirely(tmp_path):
+    cfg = load_config()
+    result = run_once(cfg, repo_dir=str(tmp_path), dry_run=True, iteration=1)
+
+    assert result.lesson_path
+    lesson_text = Path(result.lesson_path).read_text()
+    assert "Change merged cleanly under a green build." in lesson_text
+    assert "  - synthesis/fallback" in lesson_text.split("---\n")[1]

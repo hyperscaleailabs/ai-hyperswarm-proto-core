@@ -10,6 +10,7 @@ Commands:
   hsai practices list                                          show the adopted-practice registry
   hsai practices add --title T --source-project P ...          record a new adopted practice
   hsai postmortem [--block N]                                  print the failure-class Pareto for a block
+  hsai lessons --audit                                          report boilerplate lessons on disk
   hsai doctor                                                  verify environment + invariants
   hsai traj <iteration> [--json]                               print a stored agent run
   hsai replay <iteration> [--json]                              alias of `hsai traj`
@@ -24,6 +25,7 @@ import time
 from . import (
     __version__,
     ai,
+    gitops,
     ledger,
     postmortem,
     practices,
@@ -156,6 +158,35 @@ def cmd_practices_add(args: argparse.Namespace) -> int:
         print(f"practices add: refused - {exc}", file=sys.stderr)
         return 1
     print(f"wrote {path}")
+    return 0
+
+
+def cmd_lessons(args: argparse.Namespace) -> int:
+    """Inspect the lesson vault (see hsai.knowledge). Spends no quota."""
+    cfg = _load(args)
+    kb = KnowledgeBase.from_config(cfg, args.root)
+    if args.audit:
+        flagged = kb.audit_boilerplate()
+        total = len(kb.lesson_notes())
+        print(f"lessons --audit: {len(flagged)}/{total} lesson(s) are boilerplate")
+        for name in flagged:
+            print(f"  - {name}")
+        return 0
+    if args.gate_diff:
+        added = gitops.added_paths(args.gate_diff, "knowledge/lessons", cwd=args.root)
+        violations = kb.check_added_lessons(added)
+        if violations:
+            for v in violations:
+                print(
+                    f"::error file={v}::lesson text is boilerplate and not marked "
+                    "as a synthesis fallback",
+                    file=sys.stderr,
+                )
+            print(f"lessons --gate-diff: BLOCKED - {len(violations)} boilerplate lesson(s)")
+            return 1
+        print(f"lessons --gate-diff: OK - {len(added)} new lesson(s), 0 boilerplate")
+        return 0
+    print("lessons: nothing to do (pass --audit or --gate-diff BASE_REF)")
     return 0
 
 
@@ -352,6 +383,19 @@ def build_parser() -> argparse.ArgumentParser:
     pr_add.add_argument("--adopted-date", default="", help="YYYY-MM-DD (default: today)")
     pr_add.add_argument("--notes", default="")
     pr_add.set_defaults(func=cmd_practices_add)
+
+    ls = sub.add_parser("lessons", help="inspect the lesson vault (see hsai.knowledge)")
+    ls.add_argument(
+        "--audit", action="store_true",
+        help="report how many lessons on disk are boilerplate (see hsai.lessons)",
+    )
+    ls.add_argument(
+        "--gate-diff", default=None, metavar="BASE_REF",
+        help="fail if this PR adds a boilerplate, non-fallback lesson (vs BASE_REF); "
+             "the ci.yml lesson boilerplate gate",
+    )
+    ls.add_argument("--root", default=".", help="repo root holding knowledge/lessons")
+    ls.set_defaults(func=cmd_lessons)
 
     pm = sub.add_parser(
         "postmortem", help="print the failure-class Pareto for a block (spends no quota)"

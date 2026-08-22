@@ -1,13 +1,16 @@
 from hsai import practices as practices_mod
 from hsai.knowledge import (
+    BOILERPLATE_PHRASES,
     KnowledgeBase,
     Lesson,
     LessonRecord,
     Whitepaper,
+    detect_boilerplate,
     parse_note,
     slugify,
     split_sections,
 )
+from hsai.lessons import FALLBACK_FAIL, FALLBACK_PASS
 
 
 def test_slugify():
@@ -361,4 +364,95 @@ def test_practices_moc_placeholder_when_empty(tmp_path):
     kb.reindex_mocs()
     text = (kb.mocs_dir / "Practices MOC.md").read_text()
     assert "No practices recorded yet" in text
+
+
+# --- boilerplate detection (see hsai.lessons for the synthesizer this gates) -
+
+def test_boilerplate_phrases_are_the_deterministic_fallback_text():
+    assert BOILERPLATE_PHRASES == (FALLBACK_PASS, FALLBACK_FAIL)
+
+
+def test_detect_boilerplate_flags_the_known_template_phrases():
+    assert detect_boilerplate(FALLBACK_PASS) is True
+    assert detect_boilerplate(FALLBACK_FAIL) is True
+    # whitespace padding doesn't hide it
+    assert detect_boilerplate(f"  {FALLBACK_PASS}  \n") is True
+
+
+def test_detect_boilerplate_flags_a_duplicate_of_another_lesson_on_disk():
+    other = "Keep the added surface area minimal, per openai/swarm's small-core practice."
+    assert detect_boilerplate(other, (other,)) is True
+    # padding on the stored copy doesn't hide it either
+    assert detect_boilerplate(other, (f"{other}\n",)) is True
+
+
+def test_detect_boilerplate_does_not_flag_a_genuinely_distinct_lesson():
+    distinct = "The repro guard rejected this fix because no regression test was added."
+    other = "A completely different lesson about workflow-edit reverts."
+    assert detect_boilerplate(distinct, (other,)) is False
+    assert detect_boilerplate(distinct) is False
+
+
+def test_detect_boilerplate_ignores_empty_text():
+    assert detect_boilerplate("") is False
+    assert detect_boilerplate("   ") is False
+
+
+def test_audit_boilerplate_lists_boilerplate_and_distinct_lessons_separately(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+
+    def _write(title, text, ticket):
+        kb.write_lesson(Lesson(
+            title=title, outcome="pass", kind="implement", context="ctx",
+            what_happened="did the thing", lesson=text, ticket=ticket,
+        ))
+
+    _write("implement: widget one", FALLBACK_PASS, 1)
+    _write("implement: widget two", "A genuinely distinct, evidence-grounded lesson.", 2)
+    _write("implement: widget three", FALLBACK_PASS, 3)
+
+    flagged = kb.audit_boilerplate()
+    assert len(flagged) == 2
+    assert all("widget-one" in n or "widget-three" in n for n in flagged)
+    assert not any("widget-two" in n for n in flagged)
+
+
+# --- the CI boilerplate gate's payload: which ADDED lessons are violations --
+
+def test_check_added_lessons_flags_boilerplate_but_exempts_a_fallback_marked_one(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    kb.write_lesson(Lesson(
+        title="implement: silent boilerplate", outcome="pass", kind="implement",
+        context="ctx", what_happened="did the thing", lesson=FALLBACK_PASS, ticket=1,
+    ))
+    kb.write_lesson(Lesson(
+        title="implement: marked fallback", outcome="pass", kind="implement",
+        context="ctx", what_happened="did the thing", lesson=FALLBACK_PASS, ticket=2,
+        synthesis_fallback=True,
+    ))
+    kb.write_lesson(Lesson(
+        title="implement: distinct lesson", outcome="pass", kind="implement",
+        context="ctx", what_happened="did the thing",
+        lesson="A genuinely distinct, evidence-grounded lesson.", ticket=3,
+    ))
+
+    # note_name() uses today's date, not a fixed one - resolve from disk.
+    added = [f"knowledge/lessons/{p.stem}.md" for p in sorted(kb.lessons_dir.glob("*.md"))]
+    silent = next(p for p in added if "silent" in p)
+    marked = next(p for p in added if "marked" in p)
+    distinct = next(p for p in added if "distinct" in p)
+
+    violations = kb.check_added_lessons(added)
+    assert violations == [silent]
+    assert marked not in violations
+    assert distinct not in violations
+
+
+def test_check_added_lessons_ignores_paths_outside_the_lessons_dir_or_missing_on_disk(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    violations = kb.check_added_lessons([
+        "knowledge/whitepapers/2026-01-01-not-a-lesson.md",
+        "knowledge/lessons/2026-01-01-never-written.md",
+    ])
+    assert violations == []
     assert "Total: **0**" in text

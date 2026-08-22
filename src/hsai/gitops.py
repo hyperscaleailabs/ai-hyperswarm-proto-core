@@ -85,6 +85,35 @@ def diff_paths(base_ref: str, *, cwd: str | None = None, runner: Runner = run) -
     return [line.strip() for line in p.stdout.splitlines() if line.strip()]
 
 
+def added_paths(
+    base_ref: str, pathspec: str = "", *, cwd: str | None = None, runner: Runner = run
+) -> list[str]:
+    """Paths ADDED (not modified/deleted/renamed) between ``base_ref`` and
+    HEAD, optionally restricted to ``pathspec``.
+
+    What the lesson-boilerplate CI gate (see ``ci.yml`` and
+    ``hsai.cli.cmd_lessons``'s ``--gate-diff``) uses to find which lesson
+    file(s) a pull request is introducing - a modified pre-existing lesson is
+    none of this gate's business, only a brand new one.
+    """
+    args = ["diff", "--name-only", "--diff-filter=A", f"{base_ref}...HEAD"]
+    if pathspec:
+        args += ["--", pathspec]
+    p = _git(args, cwd=cwd, runner=runner)
+    return [line.strip() for line in p.stdout.splitlines() if line.strip()]
+
+
+def diff_stat(base_ref: str, *, cwd: str | None = None, runner: Runner = run) -> str:
+    """``git diff --stat`` between ``base_ref`` and HEAD.
+
+    A compact, bounded-size evidence line for :mod:`hsai.lessons` - the shape
+    of the change (which files, how many lines) without pulling the full diff
+    text the way :func:`diff_text` does for the independent review gate.
+    """
+    p = _git(["diff", "--stat", f"{base_ref}...HEAD"], cwd=cwd, runner=runner)
+    return p.stdout.strip()
+
+
 def diff_text(base_ref: str, *, cwd: str | None = None, runner: Runner = run) -> str:
     """The full textual diff between ``base_ref`` and HEAD.
 

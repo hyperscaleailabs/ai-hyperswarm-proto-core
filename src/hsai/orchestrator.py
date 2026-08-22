@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from uuid import uuid4
 
-from . import ai, ci, github, gitops, ledger, postmortem, recall, repro, review, trajectory
+from . import ai, ci, github, gitops, ledger, lessons, postmortem, recall, repro, review, trajectory
 from .config import CoreConfig
 from .knowledge import KnowledgeBase, Lesson
 from .models import ModelChoice, Task, select
@@ -563,7 +563,12 @@ def run_once(
             remote_ci=remote_ci,
         )
 
-    # 7. lesson (ALWAYS, pass or fail)
+    # 7. lesson (ALWAYS, pass or fail) - evidence-driven synthesis
+    # (hsai.lessons), with today's deterministic sentence as its fail-safe
+    # fallback. The lesson-per-PR invariant (G2) never depends on the
+    # synthesis call succeeding: any error, timeout, empty/unparseable
+    # output, disabled config, or hard budget breach falls back to that exact
+    # text, and the lesson file below is always written regardless.
     outcome = "pass" if (agent_ok and ci_after.ok) else "fail"
     lesson_failure_class = postmortem.classify(_failure_evidence()) if outcome == "fail" else ""
     if traj is not None:
@@ -572,6 +577,59 @@ def run_once(
         traj.outcome = outcome
     kb = KnowledgeBase.from_config(cfg, wt)
     references = tuple(r.repo for r in cfg.reference_top10[:3])
+
+    # Which guards fired this iteration, and their verdicts - part of the
+    # evidence bundle the synthesizer is shown (see hsai.lessons.build_evidence).
+    guards = [
+        "completeness guard: "
+        + (
+            "passed" if _requires_code(ticket_title)
+            else "not applicable (ticket did not require code)"
+        ),
+        (
+            f"repro guard: {'reproduced' if repro_result.ok else 'blocked'} - {repro_result.reason}"
+            if repro_result is not None
+            else "repro guard: not applicable (not a heal/bugfix ticket)"
+        ),
+        (
+            f"workflow-edit guard: reverted {reverted_workflows}"
+            if reverted_workflows else "workflow-edit guard: no workflow edits found"
+        ),
+        f"independent review: {verdict.summary()}",
+    ]
+    if dry_run:
+        synthesis = lessons.dry_run_result(outcome)
+    else:
+        # `merge_base` is cheap and read-only; recomputed here (rather than
+        # threaded out of the review section above, which does not always
+        # run it) so evidence-gathering never depends on which guards fired.
+        evidence_base_ref = gitops.merge_base(
+            "HEAD", f"origin/{cfg.default_branch}", cwd=wt, runner=runner,
+        ) or f"origin/{cfg.default_branch}"
+        shadow_tier = lessons.synthesis_tier(cfg)
+        lesson_synth_cfg = cfg.knowledge.get("lesson_synthesis", {}) or {}
+        evidence = lessons.build_evidence(
+            kind=kind, ticket_title=ticket_title, outcome=outcome,
+            wt=wt, base_ref=evidence_base_ref, ci_result=ci_after,
+            guards=guards, reverted_workflows=reverted_workflows,
+            repro_evidence=repro.render_evidence(repro_result) if repro_result else "",
+            attempts=attempts, tier=choice.tier, shadow_tier=shadow_tier,
+            references=references, agent_error=agent_err, runner=runner,
+            max_diff_chars=int(
+                lesson_synth_cfg.get("max_diffstat_chars", lessons.DEFAULT_MAX_DIFFSTAT_CHARS)
+            ),
+            max_log_chars=int(
+                lesson_synth_cfg.get("max_log_chars", lessons.DEFAULT_MAX_LOG_CHARS)
+            ),
+        )
+        synthesis = lessons.synthesize_lesson(
+            cfg, evidence, repo_root=repo_dir, wt=wt, block=block,
+            iteration=iteration, ticket=ticket_num, attempts=attempts,
+            tier=shadow_tier, ai_runner=ai_runner,
+        )
+    if synthesis.used_fallback:
+        result.notes.append(f"lesson synthesis: fallback ({synthesis.fallback_reason})")
+
     lesson = Lesson(
         title=f"{kind}: {ticket_title}"[:120],
         outcome=outcome,
@@ -585,6 +643,7 @@ def run_once(
                 if reverted_workflows else ""
             )
             + (f"\n\nAgent error:\n```\n{agent_err[:800]}\n```" if agent_err else "")
+            + (f"\n\n{synthesis.fallback_note()}" if synthesis.used_fallback else "")
             # Only a digest line plus a redacted tail of the trajectory is
             # committed; the full record stays in the (gitignored) local store,
             # replayable with `hsai traj <iteration>`.
@@ -594,12 +653,7 @@ def run_once(
                 if traj else ""
             )
         ),
-        lesson=(
-            "Change merged cleanly under a green build."
-            if outcome == "pass"
-            else "Change did not reach green; auto-merge will hold until CI passes. "
-            "Investigate the failure captured above before the next attempt."
-        ),
+        lesson=synthesis.lesson_text(),
         iteration=iteration,
         ticket=ticket_num,
         model=choice.model,
@@ -609,6 +663,7 @@ def run_once(
         review_verdict=verdict.render(),
         execution_trace=traj.execution_trace() if traj else "",
         failure_class=lesson_failure_class,
+        synthesis_fallback=synthesis.used_fallback,
     )
     # Each PR commits ONLY its own uniquely-named lesson file. The MOC indexes
     # and whitepapers are regenerated by the serialized `hsai reindex`
