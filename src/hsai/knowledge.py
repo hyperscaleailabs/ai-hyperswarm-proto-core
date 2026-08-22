@@ -9,12 +9,33 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 
 from . import practices as practices_mod
 from .config import CoreConfig
+
+# The two deterministic sentences every lesson's ``## Lesson learned`` used to
+# be, byte-for-byte, before evidence-driven synthesis (see hsai.lessons):
+# `synthesize_lesson` still falls back to exactly this text on any error,
+# timeout, empty output, or hard budget breach - the lesson-per-PR invariant
+# must never depend on a model call succeeding. Kept here (not in
+# hsai.lessons) so :func:`detect_boilerplate` and the CI gate can compare
+# against them without importing the synthesis module.
+FALLBACK_PASS = "Change merged cleanly under a green build."
+FALLBACK_FAIL = (
+    "Change did not reach green; auto-merge will hold until CI passes. "
+    "Investigate the failure captured above before the next attempt."
+)
+KNOWN_BOILERPLATE_PHRASES = (FALLBACK_PASS, FALLBACK_FAIL)
+
+# Frontmatter tag `synthesize_lesson` adds when it fell back to the
+# deterministic text - the CI gate exempts a lesson carrying this tag even
+# though its lesson text matches a known boilerplate phrase, since a fallback
+# means synthesis was unavailable, not that the loop got lazy.
+FALLBACK_TAG = "synthesis/fallback"
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _TAG_RE = re.compile(r"^\s*-\s+(\S.*)$", re.MULTILINE)
@@ -164,6 +185,39 @@ def parse_note(path: str | Path) -> LessonRecord:
         failure_class=failure_class,
         created=_frontmatter_scalar(fm, "created"),
     )
+
+
+def detect_boilerplate(lesson_text: str, other_lesson_texts: Iterable[str] = ()) -> bool:
+    """Is ``lesson_text`` boilerplate: a known constant template phrase, or
+    byte-identical to another lesson's text already on disk?
+
+    ``other_lesson_texts`` should exclude ``lesson_text``'s own record - a
+    lesson is never flagged solely for matching itself. A blank field is not
+    boilerplate (it is simply missing); that is a different problem.
+    """
+    text = (lesson_text or "").strip()
+    if not text:
+        return False
+    if text in KNOWN_BOILERPLATE_PHRASES:
+        return True
+    return text in {t.strip() for t in other_lesson_texts if t.strip()}
+
+
+def audit_boilerplate(records: Iterable[LessonRecord]) -> list[LessonRecord]:
+    """Every lesson in ``records`` whose lesson text is boilerplate.
+
+    Each record is checked against every OTHER record's lesson text (never its
+    own), so two genuinely duplicate lessons both get flagged while a lesson
+    that merely happens to be the sole copy of its own wording does not.
+    """
+    records = list(records)
+    all_texts = [r.lesson_text.strip() for r in records]
+    flagged = []
+    for i, r in enumerate(records):
+        others = all_texts[:i] + all_texts[i + 1:]
+        if detect_boilerplate(r.lesson_text, others):
+            flagged.append(r)
+    return flagged
 
 
 @dataclass

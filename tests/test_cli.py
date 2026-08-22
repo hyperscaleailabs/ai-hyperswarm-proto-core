@@ -229,6 +229,111 @@ def test_practices_add_refuses_a_duplicate(tmp_path, capsys):
     assert len(notes) == 1  # the duplicate attempt never wrote a second note
 
 
+# --- lessons: boilerplate audit + the PR-gate counterpart -------------------
+
+def test_parser_lessons_defaults():
+    parser = build_parser()
+    args = parser.parse_args(["lessons"])
+    assert args.command == "lessons"
+    assert args.audit is False and args.check_pr is False
+    assert args.base_ref == "origin/main" and args.root == "."
+
+
+def _write_lesson(root, title, *, lesson_text, tags=()):
+    from hsai.knowledge import KnowledgeBase, Lesson
+
+    kb = KnowledgeBase(root)
+    return kb.write_lesson(Lesson(
+        title=title, outcome="pass", kind="implement",
+        context="c", what_happened="w", lesson=lesson_text, tags=tags,
+    ))
+
+
+def test_lessons_audit_reports_boilerplate_and_distinct_counts(tmp_path, capsys):
+    from hsai.knowledge import FALLBACK_PASS
+
+    a = _write_lesson(tmp_path, "implement: a", lesson_text=FALLBACK_PASS)
+    _write_lesson(tmp_path, "implement: b", lesson_text="Retries need a jittered backoff.")
+    _write_lesson(tmp_path, "implement: c", lesson_text="Retries need a jittered backoff.")
+    d = _write_lesson(tmp_path, "implement: d", lesson_text="Ship the smallest widget slice first.")
+
+    rc = main(["lessons", "--audit", "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "lessons audit: 3/4 boilerplate lesson(s)" in out
+    assert a.stem in out
+    assert d.stem not in out
+
+
+def test_lessons_check_pr_fails_on_a_boilerplate_non_fallback_lesson(tmp_path, monkeypatch, capsys):
+    from hsai.knowledge import FALLBACK_PASS
+
+    path = _write_lesson(tmp_path, "boilerplate one", lesson_text=FALLBACK_PASS)
+    rel = str(path.relative_to(tmp_path))
+    monkeypatch.setattr(cli_module.gitops, "diff_added_paths", lambda *a, **k: [rel])
+
+    rc = main(["lessons", "--check-pr", "--base-ref", "origin/main", "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+
+    assert rc == 1
+    assert "boilerplate" in out
+
+
+def test_lessons_check_pr_passes_on_a_genuinely_distinct_lesson(tmp_path, monkeypatch, capsys):
+    path = _write_lesson(tmp_path, "distinct one", lesson_text="Ship the smallest slice first.")
+    rel = str(path.relative_to(tmp_path))
+    monkeypatch.setattr(cli_module.gitops, "diff_added_paths", lambda *a, **k: [rel])
+
+    rc = main(["lessons", "--check-pr", "--base-ref", "origin/main", "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "none boilerplate" in out
+
+
+def test_lessons_check_pr_exempts_a_fallback_marked_lesson(tmp_path, monkeypatch, capsys):
+    """A synthesis fallback keeps the deterministic (boilerplate) text on
+    purpose - the gate must not punish the fail-safe path."""
+    from hsai.knowledge import FALLBACK_PASS, FALLBACK_TAG
+
+    path = _write_lesson(
+        tmp_path, "fallback one", lesson_text=FALLBACK_PASS, tags=(FALLBACK_TAG,)
+    )
+    rel = str(path.relative_to(tmp_path))
+    monkeypatch.setattr(cli_module.gitops, "diff_added_paths", lambda *a, **k: [rel])
+
+    rc = main(["lessons", "--check-pr", "--base-ref", "origin/main", "--root", str(tmp_path)])
+
+    assert rc == 0
+
+
+def test_lessons_check_pr_and_a_boilerplate_diff_exit_differently(tmp_path, monkeypatch):
+    """The two crafted-diff scenario from the ticket's verification plan, in
+    one assertion: a boilerplate PR and a distinct PR must not exit alike."""
+    from hsai.knowledge import FALLBACK_PASS
+
+    boilerplate = _write_lesson(tmp_path, "boilerplate two", lesson_text=FALLBACK_PASS)
+    distinct = _write_lesson(
+        tmp_path, "distinct two", lesson_text="Poll the remote rollup before merging."
+    )
+
+    monkeypatch.setattr(
+        cli_module.gitops, "diff_added_paths",
+        lambda *a, **k: [str(boilerplate.relative_to(tmp_path))],
+    )
+    boilerplate_rc = main(["lessons", "--check-pr", "--root", str(tmp_path)])
+
+    monkeypatch.setattr(
+        cli_module.gitops, "diff_added_paths",
+        lambda *a, **k: [str(distinct.relative_to(tmp_path))],
+    )
+    distinct_rc = main(["lessons", "--check-pr", "--root", str(tmp_path)])
+
+    assert boilerplate_rc != distinct_rc
+    assert (boilerplate_rc, distinct_rc) == (1, 0)
+
+
 def test_parser_repro_check_defaults():
     parser = build_parser()
     args = parser.parse_args(["repro-check"])

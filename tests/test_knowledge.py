@@ -1,9 +1,15 @@
 from hsai import practices as practices_mod
 from hsai.knowledge import (
+    FALLBACK_FAIL,
+    FALLBACK_PASS,
+    FALLBACK_TAG,
+    KNOWN_BOILERPLATE_PHRASES,
     KnowledgeBase,
     Lesson,
     LessonRecord,
     Whitepaper,
+    audit_boilerplate,
+    detect_boilerplate,
     parse_note,
     slugify,
     split_sections,
@@ -362,3 +368,66 @@ def test_practices_moc_placeholder_when_empty(tmp_path):
     text = (kb.mocs_dir / "Practices MOC.md").read_text()
     assert "No practices recorded yet" in text
     assert "Total: **0**" in text
+
+
+# --- boilerplate detection (see hsai.lessons for the synthesis that replaces it) --
+
+def test_detect_boilerplate_flags_the_known_template_phrases():
+    assert detect_boilerplate(FALLBACK_PASS) is True
+    assert detect_boilerplate(FALLBACK_FAIL) is True
+    assert FALLBACK_PASS in KNOWN_BOILERPLATE_PHRASES
+    assert FALLBACK_FAIL in KNOWN_BOILERPLATE_PHRASES
+
+
+def test_detect_boilerplate_flags_a_duplicate_of_another_lesson_on_disk():
+    others = ("Poll the remote rollup before merging.", "Keep the diff scoped to the ticket.")
+    assert detect_boilerplate("Poll the remote rollup before merging.", others) is True
+    # never flagged solely for matching ITSELF (others excludes the record's
+    # own text - see audit_boilerplate)
+    assert detect_boilerplate("Poll the remote rollup before merging.", ()) is False
+
+
+def test_detect_boilerplate_does_not_flag_a_genuinely_distinct_lesson():
+    others = ("Poll the remote rollup before merging.",)
+    assert detect_boilerplate("Cite the reference project when practice-driven.", others) is False
+    assert detect_boilerplate("", others) is False   # blank is missing, not boilerplate
+
+
+def test_audit_boilerplate_finds_template_and_duplicate_lessons_only(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    kb.write_lesson(Lesson(
+        title="implement: a", outcome="pass", kind="implement",
+        context="c", what_happened="w", lesson=FALLBACK_PASS,
+    ))
+    kb.write_lesson(Lesson(
+        title="implement: b", outcome="fail", kind="implement",
+        context="c", what_happened="w", lesson="Retries need a jittered backoff.",
+    ))
+    kb.write_lesson(Lesson(
+        title="implement: c", outcome="fail", kind="implement",
+        context="c", what_happened="w", lesson="Retries need a jittered backoff.",
+    ))
+    kb.write_lesson(Lesson(
+        title="implement: d", outcome="pass", kind="implement",
+        context="c", what_happened="w",
+        lesson="Ship the smallest widget that satisfies every checkbox first.",
+    ))
+
+    flagged = audit_boilerplate(kb.read_lessons())
+
+    assert {r.title for r in flagged} == {"implement: a", "implement: b", "implement: c"}
+    assert "implement: d" not in {r.title for r in flagged}
+
+
+def test_a_fallback_marked_lesson_still_matches_the_template_phrase(tmp_path):
+    """The CI gate (hsai.cli.cmd_lessons --check-pr) exempts a fallback via the
+    FALLBACK_TAG frontmatter tag, NOT by changing the lesson text itself - the
+    detector must still recognise the (unmodified) boilerplate text."""
+    kb = KnowledgeBase(tmp_path)
+    path = kb.write_lesson(Lesson(
+        title="implement: e", outcome="pass", kind="implement",
+        context="c", what_happened="w", lesson=FALLBACK_PASS, tags=(FALLBACK_TAG,),
+    ))
+    record = parse_note(path)
+    assert detect_boilerplate(record.lesson_text) is True
+    assert FALLBACK_TAG in record.tags

@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from uuid import uuid4
 
-from . import ai, ci, github, gitops, ledger, postmortem, recall, repro, review, trajectory
+from . import ai, ci, github, gitops, ledger, lessons, postmortem, recall, repro, review, trajectory
 from .config import CoreConfig
 from .knowledge import KnowledgeBase, Lesson
 from .models import ModelChoice, Task, select
@@ -379,6 +379,11 @@ def run_once(
         tuple(claimed_issue.labels) if claimed_issue else ()
     ))
     choice = select(task, cfg, demote=demote_tier)
+    # The tier this task would have gotten WITHOUT a soft-budget demotion -
+    # pure/cheap to recompute, and evidence for the synthesized lesson (see
+    # hsai.lessons.EvidenceBundle.shadow_tier) of how much the budget gate is
+    # actually costing in model quality this block.
+    shadow_tier = select(task, cfg, demote=False).tier
 
     # Read side of the knowledge base: pull the most relevant prior notes for
     # this ticket out of the vault in the worktree. Computed before the agent
@@ -531,17 +536,21 @@ def run_once(
     # first because the reviewer reads `git diff <merge-base>...HEAD`; nothing is
     # pushed until the verdict is in, so a blocking verdict never opens a PR.
     verdict = review.skip_review("dry-run: nothing was committed to review")
+    changed_files: list[str] = []
     if not dry_run:
         commit_msg = f"{kind}: {ticket_title}\n\nRefs #{ticket_num}\nModel: {choice.model}"
         gitops.commit_all(commit_msg, cwd=wt, runner=runner)
+        # Computed unconditionally (not only when CI is green): the evidence
+        # bundle below wants the changed-file list even on a red iteration.
+        base_ref = gitops.merge_base(
+            "HEAD", f"origin/{cfg.default_branch}", cwd=wt, runner=runner,
+        ) or f"origin/{cfg.default_branch}"
+        changed_files = gitops.diff_paths(base_ref, cwd=wt, runner=runner)
         if not ci_after.ok:
             # A red branch is already headed for _recover_failed via remote CI;
             # spending review quota on it would buy nothing.
             verdict = review.skip_review("local CI is red; the CI gate decides this one")
         else:
-            base_ref = gitops.merge_base(
-                "HEAD", f"origin/{cfg.default_branch}", cwd=wt, runner=runner,
-            ) or f"origin/{cfg.default_branch}"
             verdict = review.review_change(
                 cfg,
                 repo_root=repo_dir, wt=wt, base_ref=base_ref,
@@ -572,13 +581,65 @@ def run_once(
         traj.outcome = outcome
     kb = KnowledgeBase.from_config(cfg, wt)
     references = tuple(r.repo for r in cfg.reference_top10[:3])
+
+    # Evidence-driven synthesis (see hsai.lessons): a cheap-tier model call
+    # over exactly what this iteration already knows, prompted to report what
+    # was attempted, what actually happened, and one transferable rule -
+    # instead of the constant sentence every prior iteration wrote. Skipped
+    # entirely in dry-run (no model call, no side effect at all); on any
+    # error, timeout, empty reply, or hard budget breach it falls back to
+    # that same deterministic sentence and marks the note as a fallback.
+    if dry_run:
+        synthesized = lessons.fallback_lesson(
+            outcome, "dry-run: synthesis skipped (no model call in dry-run)"
+        )
+    else:
+        guards = [
+            lessons.GuardOutcome(
+                "workflow-revert", fired=bool(reverted_workflows),
+                detail=f"reverted: {reverted_workflows}" if reverted_workflows
+                else "no off-spec workflow edits",
+            ),
+        ]
+        if repro_result is not None:
+            guards.append(
+                lessons.GuardOutcome("repro", fired=not repro_result.ok, detail=repro_result.reason)
+            )
+        if not verdict.skipped:
+            guards.append(
+                lessons.GuardOutcome(
+                    "independent-review", fired=not verdict.approve, detail=verdict.summary()
+                )
+            )
+        evidence = lessons.build_evidence(
+            kind=kind, ticket_title=ticket_title, ticket_body=ticket_body, outcome=outcome,
+            changed_files=changed_files, ci_ok=ci_after.ok, ci_log=ci_after.log,
+            guards=guards, reverted_workflows=reverted_workflows,
+            repro_evidence=repro.render_evidence(repro_result) if repro_result else "",
+            review_verdict=verdict.render() if not verdict.skipped else "",
+            attempts=attempts, tier=choice.tier, shadow_tier=shadow_tier,
+            agent_ok=agent_ok, agent_error=agent_err,
+        )
+        synthesized = lessons.synthesize_lesson(
+            evidence, cfg, repo_root=repo_dir, block=block, ai_runner=ai_runner,
+        )
+    if synthesized.fallback:
+        result.notes.append(f"lesson synthesis: fallback ({synthesized.fallback_reason})")
+    else:
+        result.notes.append(f"lesson synthesis: `{synthesized.model}` ({synthesized.tier})")
+
     lesson = Lesson(
         title=f"{kind}: {ticket_title}"[:120],
         outcome=outcome,
         kind=kind,
         context=f"Iteration {iteration}. Ticket #{ticket_num}. CI before: {ci_before.summary()}.",
         what_happened=(
-            f"Model `{choice.model}` ({choice.tier}) ran the task. "
+            (
+                f"**Attempted:** {synthesized.what_attempted}\n\n"
+                f"**Observed:** {synthesized.what_happened}\n\n"
+                if not synthesized.fallback else ""
+            )
+            + f"Model `{choice.model}` ({choice.tier}) ran the task. "
             f"Agent ok={agent_ok}. CI after: {ci_after.summary()}."
             + (
                 f"\n\nReverted off-spec workflow edits: {reverted_workflows}."
@@ -594,16 +655,12 @@ def run_once(
                 if traj else ""
             )
         ),
-        lesson=(
-            "Change merged cleanly under a green build."
-            if outcome == "pass"
-            else "Change did not reach green; auto-merge will hold until CI passes. "
-            "Investigate the failure captured above before the next attempt."
-        ),
+        lesson=synthesized.render_lesson(),
         iteration=iteration,
         ticket=ticket_num,
         model=choice.model,
         references=references,
+        tags=synthesized.tags,
         repro_evidence=repro.render_evidence(repro_result) if repro_result else "",
         recalled=recalled.note_names,
         review_verdict=verdict.render(),

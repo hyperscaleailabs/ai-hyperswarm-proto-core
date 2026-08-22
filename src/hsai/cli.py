@@ -10,6 +10,8 @@ Commands:
   hsai practices list                                          show the adopted-practice registry
   hsai practices add --title T --source-project P ...          record a new adopted practice
   hsai postmortem [--block N]                                  print the failure-class Pareto for a block
+  hsai lessons --audit                                          report boilerplate lessons on disk
+  hsai lessons --check-pr --base-ref REF                        CI gate: fail on a boilerplate, non-fallback lesson
   hsai doctor                                                  verify environment + invariants
   hsai traj <iteration> [--json]                               print a stored agent run
   hsai replay <iteration> [--json]                              alias of `hsai traj`
@@ -20,10 +22,13 @@ import argparse
 import os
 import sys
 import time
+from pathlib import Path
 
 from . import (
     __version__,
     ai,
+    gitops,
+    knowledge as knowledge_mod,
     ledger,
     postmortem,
     practices,
@@ -182,6 +187,56 @@ def cmd_postmortem(args: argparse.Namespace) -> int:
         )
     else:
         print(f"no class clears the postmortem trigger (ratio>={ratio:g}, count>={min_count})")
+    return 0
+
+
+def cmd_lessons(args: argparse.Namespace) -> int:
+    """Lesson knowledge-base maintenance (see hsai.knowledge, hsai.lessons).
+
+    ``--audit`` (the default) reports how many lessons already on disk are
+    boilerplate - a known template phrase, or byte-identical to another
+    lesson - so the backlog can be seeded with a backfill. ``--check-pr`` is
+    the CI gate counterpart: it fails when this PR adds a lesson file whose
+    lesson section is boilerplate and NOT marked as a synthesis fallback
+    (see :data:`hsai.knowledge.FALLBACK_TAG`). Both spend no quota.
+    """
+    cfg = _load(args)
+    kb = KnowledgeBase.from_config(cfg, args.root)
+
+    if args.check_pr:
+        lessons_rel = cfg.knowledge.get("lessons_dir", "knowledge/lessons").rstrip("/")
+        added = [
+            p for p in gitops.diff_added_paths(args.base_ref, cwd=args.root)
+            if p.startswith(f"{lessons_rel}/") and p.endswith(".md")
+        ]
+        added_stems = {Path(p).stem for p in added}
+        # Every OTHER lesson already on disk, so this PR's added lesson(s) are
+        # also caught when they duplicate one that already exists - not only
+        # when they match the two hardcoded template phrases.
+        existing_texts = [
+            r.lesson_text for r in kb.read_lessons() if r.note_name not in added_stems
+        ]
+        bad = []
+        for rel in added:
+            record = knowledge_mod.parse_note(Path(args.root) / rel)
+            if not knowledge_mod.detect_boilerplate(record.lesson_text, existing_texts):
+                continue
+            if knowledge_mod.FALLBACK_TAG in record.tags:
+                continue
+            bad.append(rel)
+        if bad:
+            for rel in bad:
+                print(f"::error::{rel}: lesson section is boilerplate and not marked as a fallback")
+            print(f"lessons check-pr: {len(bad)}/{len(added)} added lesson(s) are boilerplate")
+            return 1
+        print(f"lessons check-pr: {len(added)} new lesson file(s), none boilerplate")
+        return 0
+
+    records = kb.read_lessons()
+    flagged = knowledge_mod.audit_boilerplate(records)
+    print(f"lessons audit: {len(flagged)}/{len(records)} boilerplate lesson(s)")
+    for r in flagged:
+        print(f"  {r.note_name}  ({r.outcome}/{r.kind})")
     return 0
 
 
@@ -361,6 +416,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pm.add_argument("--root", default=".", help="repo root holding knowledge/ledger")
     pm.set_defaults(func=cmd_postmortem)
+
+    ls = sub.add_parser(
+        "lessons", help="lesson knowledge-base maintenance / CI gate (spends no quota)"
+    )
+    ls.add_argument(
+        "--audit", action="store_true",
+        help="report boilerplate lessons currently on disk (default when no flag is given)",
+    )
+    ls.add_argument(
+        "--check-pr", action="store_true",
+        help="CI gate: fail if this PR adds a boilerplate, non-fallback lesson",
+    )
+    ls.add_argument(
+        "--base-ref", default="origin/main", help="base ref to diff against for --check-pr"
+    )
+    ls.add_argument("--root", default=".", help="repo root holding knowledge/lessons")
+    ls.set_defaults(func=cmd_lessons)
 
     cy = sub.add_parser("cycle", help="run one half-day governance block")
     cy.add_argument("--index", "--cycle-index", dest="index", type=int, default=None,

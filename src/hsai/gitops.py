@@ -95,6 +95,23 @@ def diff_text(base_ref: str, *, cwd: str | None = None, runner: Runner = run) ->
     return p.stdout
 
 
+def diff_added_paths(
+    base_ref: str, head_ref: str = "HEAD", *, cwd: str | None = None, runner: Runner = run
+) -> list[str]:
+    """Paths ADDED between ``base_ref`` and ``head_ref``.
+
+    A two-dot diff (unlike :func:`diff_paths`'s three-dot merge-base diff): it
+    only needs the two commits' own trees, not a shared history walk, so it
+    works on a shallow CI checkout that fetched just those two tips. Used by
+    the lesson-boilerplate PR gate (see ``hsai lessons --check-pr``).
+    """
+    p = _git(
+        ["diff", "--name-only", "--diff-filter=A", base_ref, head_ref],
+        cwd=cwd, runner=runner,
+    )
+    return [line.strip() for line in p.stdout.splitlines() if line.strip()]
+
+
 def has_changes(*, cwd: str, runner: Runner = run) -> bool:
     p = _git(["status", "--porcelain"], cwd=cwd, runner=runner)
     return bool(p.stdout.strip())

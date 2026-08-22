@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from hsai import ledger, orchestrator, recall, review, trajectory
+from hsai import ledger, lessons, orchestrator, recall, review, trajectory
 from hsai.config import load_config
 from hsai.models import ModelChoice
 from hsai.orchestrator import (
@@ -76,16 +76,44 @@ REVIEW_BLOCK = _reviewer_envelope(
 )
 
 
+def _synthesis_envelope(reply: dict, *, prose: str = "Read the evidence.") -> str:
+    """What the lesson synthesizer prints: prose plus a fenced JSON reply."""
+    return json.dumps(
+        {
+            "type": "result",
+            "result": f"{prose}\n\n```json\n{json.dumps(reply)}\n```\n",
+            "usage": {"input_tokens": 150, "output_tokens": 30},
+        }
+    )
+
+
+LESSON_SYNTHESIS_SUCCESS = _synthesis_envelope(
+    {
+        "what_attempted": "Implement the widget end to end per the ticket.",
+        "what_happened": "widget.py and a test were added; CI and the independent review both passed.",
+        "lesson": "Ship the smallest widget slice that satisfies every acceptance checkbox first.",
+        "references": ["openai/swarm"],
+    }
+)
+
+
 def _claude_prompts(runner) -> list[str]:
     return [c[2] for c in runner.calls if c[:1] == ["claude"]]
 
 
 def _worker_prompts(runner) -> list[str]:
-    return [p for p in _claude_prompts(runner) if review.PROMPT_MARKER not in p]
+    return [
+        p for p in _claude_prompts(runner)
+        if review.PROMPT_MARKER not in p and lessons.PROMPT_MARKER not in p
+    ]
 
 
 def _review_prompts(runner) -> list[str]:
     return [p for p in _claude_prompts(runner) if review.PROMPT_MARKER in p]
+
+
+def _lesson_synthesis_prompts(runner) -> list[str]:
+    return [p for p in _claude_prompts(runner) if lessons.PROMPT_MARKER in p]
 
 
 def _iteration_records(cfg, root) -> list[ledger.LedgerRecord]:
@@ -117,10 +145,15 @@ class FakeRunner:
         repro_parent_ok: bool = False,
         agent_output: str = AGENT_JSON,
         review_output: str = REVIEW_APPROVE,
+        lesson_synthesis_output: str = "",
     ) -> None:
         self.repo_root = repo_root
         self.agent_output = agent_output
         self.review_output = review_output
+        # Empty by default: every pre-existing test that doesn't care about
+        # lesson synthesis exercises its "empty output" fallback path for
+        # free, and gets the exact deterministic lesson text it always did.
+        self.lesson_synthesis_output = lesson_synthesis_output
         self.ci_sequence = ci_sequence
         self.open_issues = open_issues or []
         self.remote_ci = remote_ci
@@ -188,6 +221,8 @@ class FakeRunner:
             prompt = cmd[2] if len(cmd) > 2 else ""
             if review.PROMPT_MARKER in prompt:
                 return Proc(cmd, 0, self.review_output, "")
+            if lessons.PROMPT_MARKER in prompt:
+                return Proc(cmd, 0, self.lesson_synthesis_output, "")
             return Proc(cmd, 0, self.agent_output, "")
         if cmd[:3] == ["gh", "pr", "create"]:
             self._pr_seq += 1
@@ -1358,3 +1393,113 @@ def test_dry_run_still_records_what_it_recalled(tmp_path):
     assert result.kind == IMPROVE
     assert result.recalled                       # retrieval runs without an agent
     assert "recalled:" in Path(result.lesson_path).read_text().split("---\n")[1]
+
+
+# --- evidence-driven lesson synthesis (see hsai.lessons) ---------------------
+
+def test_evidence_bundle_reaches_the_synthesis_prompt_and_the_note_carries_the_fields(
+    tmp_path,
+):
+    open_issues = [dict(WIDGET_ISSUE)]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+        lesson_synthesis_output=LESSON_SYNTHESIS_SUCCESS,
+    )
+
+    result = run_once(
+        load_config(), repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.merged is True
+
+    # the evidence bundle - not the worker's own prompt - reached the
+    # synthesis call
+    synth_prompts = _lesson_synthesis_prompts(runner)
+    assert len(synth_prompts) == 1
+    prompt = synth_prompts[0]
+    assert lessons.PROMPT_MARKER in prompt
+    assert "add widget" in prompt                  # the ticket
+    assert "src/hsai/widget.py" in prompt           # changed files (via gitops)
+    assert "independent-review: clear" in prompt    # a guard's verdict
+    assert "tier used: standard" in prompt
+
+    # the synthesized fields (not the deterministic boilerplate) landed in
+    # the written note
+    lesson_text = Path(result.lesson_path).read_text()
+    assert "**Attempted:** Implement the widget end to end per the ticket." in lesson_text
+    assert "**Observed:** widget.py and a test were added" in lesson_text
+    assert "Ship the smallest widget slice that satisfies every acceptance checkbox first." in lesson_text
+    assert "openai/swarm" in lesson_text
+    # a genuine synthesis is never marked as a fallback
+    frontmatter = lesson_text.split("---\n")[1]
+    assert "synthesis/fallback" not in frontmatter
+    assert any("lesson synthesis: `" in n for n in result.notes)
+
+
+def test_lesson_synthesis_falls_back_to_the_deterministic_text_by_default(tmp_path):
+    """Every pre-existing fake-runner test exercises this path: the FakeRunner
+    answers the synthesis call with empty output by default, so the lesson is
+    byte-identical to the pre-synthesis boilerplate and marked as a fallback."""
+    open_issues = [dict(WIDGET_ISSUE)]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+    )
+
+    result = run_once(
+        load_config(), repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.merged is True
+    lesson_text = Path(result.lesson_path).read_text()
+    assert "Change merged cleanly under a green build." in lesson_text
+    frontmatter = lesson_text.split("---\n")[1]
+    assert "synthesis/fallback" in frontmatter
+    assert any("lesson synthesis: fallback" in n for n in result.notes)
+
+
+def test_dry_run_never_calls_the_lesson_synthesizer(tmp_path):
+    _seed_recall_corpus(tmp_path)
+    result = run_once(load_config(), repo_dir=str(tmp_path), dry_run=True, iteration=1)
+
+    assert result.lesson_path
+    lesson_text = Path(result.lesson_path).read_text()
+    assert "Change merged cleanly under a green build." in lesson_text
+    assert "synthesis/fallback" in lesson_text.split("---\n")[1]
+
+
+def test_lesson_synthesis_is_skipped_on_a_hard_budget_breach(tmp_path):
+    cfg = load_config()
+    ledger.append_record(
+        ledger.ledger_path(cfg, tmp_path),
+        ledger.LedgerRecord(
+            iteration=0, block=0, ticket=1, kind=IMPLEMENT, tier="heavy", model="opus",
+            wall_clock_seconds=1.0, attempts=1, outcome="merged",
+        ),
+    )
+    for i in range(1, cfg.budget["max_heavy_iterations_per_block"]):
+        ledger.append_record(
+            ledger.ledger_path(cfg, tmp_path),
+            ledger.LedgerRecord(
+                iteration=i, block=0, ticket=1, kind=IMPLEMENT, tier="heavy", model="opus",
+                wall_clock_seconds=1.0, attempts=1, outcome="merged",
+            ),
+        )
+    open_issues = [dict(WIDGET_ISSUE)]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+        lesson_synthesis_output=LESSON_SYNTHESIS_SUCCESS,
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1, block=0,
+    )
+
+    # the block was already over budget before this iteration started, so the
+    # synthesis call is never made - even though the fake runner would have
+    # answered it successfully
+    assert _lesson_synthesis_prompts(runner) == []
+    lesson_text = Path(result.lesson_path).read_text()
+    assert "synthesis/fallback" in lesson_text.split("---\n")[1]
