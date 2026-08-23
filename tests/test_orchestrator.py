@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from hsai import ledger, orchestrator, recall, review, trajectory
+from hsai import audit, ledger, orchestrator, postmortem, recall, review, trajectory
 from hsai.config import load_config
 from hsai.models import ModelChoice
 from hsai.orchestrator import (
@@ -76,22 +76,74 @@ REVIEW_BLOCK = _reviewer_envelope(
 )
 
 
+AUDIT_PASS = json.dumps(
+    {
+        "type": "result",
+        "result": "Scored the diff against the ticket.\n\n```json\n"
+        + json.dumps(
+            {
+                "criteria": [
+                    {"criterion": "widget builds", "status": "satisfied",
+                     "evidence": "src/hsai/widget.py"},
+                    {"criterion": "widget tested", "status": "satisfied",
+                     "evidence": "tests/test_widget.py"},
+                ],
+                "verdict": "pass",
+                "rationale": "Both criteria are implemented and covered by a test.",
+            }
+        )
+        + "\n```\n",
+        "usage": {"input_tokens": 300, "output_tokens": 40},
+    }
+)
+
+# What the fake `git diff` reports for a branch, in both textual and numstat
+# form. A real unified-diff header so hsai.audit can attribute lines to files.
+BRANCH_DIFF = (
+    "diff --git a/src/hsai/widget.py b/src/hsai/widget.py\n"
+    "--- a/src/hsai/widget.py\n"
+    "+++ b/src/hsai/widget.py\n"
+    "@@ -0,0 +1 @@\n"
+    "+def widget(): ...\n"
+)
+BRANCH_NUMSTAT = "1\t0\tsrc/hsai/widget.py\n7\t0\ttests/test_widget.py\n"
+
+# A diff that raises the loop's own permission mode - exactly the merge the
+# architect would have refused, and what the deterministic audit layer catches.
+ESCALATING_DIFF = (
+    "diff --git a/.ai-swarm/core.yaml b/.ai-swarm/core.yaml\n"
+    "--- a/.ai-swarm/core.yaml\n"
+    "+++ b/.ai-swarm/core.yaml\n"
+    "@@ -89,1 +89,1 @@ execution:\n"
+    "-  permission_mode: acceptEdits\n"
+    "+  permission_mode: bypassPermissions\n"
+)
+ESCALATING_NUMSTAT = "1\t1\t.ai-swarm/core.yaml\n"
+
+
 def _claude_prompts(runner) -> list[str]:
     return [c[2] for c in runner.calls if c[:1] == ["claude"]]
 
 
 def _worker_prompts(runner) -> list[str]:
-    return [p for p in _claude_prompts(runner) if review.PROMPT_MARKER not in p]
+    return [
+        p for p in _claude_prompts(runner)
+        if review.PROMPT_MARKER not in p and audit.PROMPT_MARKER not in p
+    ]
 
 
 def _review_prompts(runner) -> list[str]:
     return [p for p in _claude_prompts(runner) if review.PROMPT_MARKER in p]
 
 
+def _audit_prompts(runner) -> list[str]:
+    return [p for p in _claude_prompts(runner) if audit.PROMPT_MARKER in p]
+
+
 def _iteration_records(cfg, root) -> list[ledger.LedgerRecord]:
-    """Ledger records for the iteration itself, without the review's own line."""
+    """Ledger records for the iteration itself, without the gates' own lines."""
     records = ledger.read_records(ledger.ledger_path(cfg, root))
-    return [r for r in records if r.kind != "review"]
+    return [r for r in records if r.kind not in ("review", "audit")]
 
 
 class FakeRunner:
@@ -101,8 +153,8 @@ class FakeRunner:
     invocation is matched by command prefix and answered with a canned `Proc`.
     `ci_sequence` gives the ruff+pytest outcome for the Nth `ci.run_local()`
     call (index 0 = ci_before, index 1 = ci_after, ...). A `claude` call is
-    answered as the worker or as the independent reviewer depending on which
-    prompt it carries.
+    answered as the worker, as the independent reviewer, or as the acceptance
+    auditor depending on which prompt it carries.
     """
 
     def __init__(
@@ -117,10 +169,16 @@ class FakeRunner:
         repro_parent_ok: bool = False,
         agent_output: str = AGENT_JSON,
         review_output: str = REVIEW_APPROVE,
+        audit_output: str = AUDIT_PASS,
+        diff_text: str = BRANCH_DIFF,
+        diff_numstat: str = BRANCH_NUMSTAT,
     ) -> None:
         self.repo_root = repo_root
         self.agent_output = agent_output
         self.review_output = review_output
+        self.audit_output = audit_output
+        self.diff_text = diff_text
+        self.diff_numstat = diff_numstat
         self.ci_sequence = ci_sequence
         self.open_issues = open_issues or []
         self.remote_ci = remote_ci
@@ -152,10 +210,13 @@ class FakeRunner:
         if cmd[:2] == ["git", "merge-base"]:
             return Proc(cmd, 0, "parentsha\n", "")
         if cmd[:2] == ["git", "diff"]:
-            # What the review gate reads off the branch: paths, then the diff.
+            # What the audit and review gates read off the branch: per-file line
+            # churn, the changed paths, then the diff itself.
+            if "--numstat" in cmd:
+                return Proc(cmd, 0, self.diff_numstat, "")
             if "--name-only" in cmd:
                 return Proc(cmd, 0, "src/hsai/widget.py\ntests/test_widget.py\n", "")
-            return Proc(cmd, 0, "diff --git a/src/hsai/widget.py\n+def widget(): ...\n", "")
+            return Proc(cmd, 0, self.diff_text, "")
         if cmd[:3] in (["git", "worktree", "add"], ["git", "worktree", "remove"]):
             return Proc(cmd, 0, "", "")
         if cmd[:2] == ["git", "status"]:
@@ -188,6 +249,8 @@ class FakeRunner:
             prompt = cmd[2] if len(cmd) > 2 else ""
             if review.PROMPT_MARKER in prompt:
                 return Proc(cmd, 0, self.review_output, "")
+            if audit.PROMPT_MARKER in prompt:
+                return Proc(cmd, 0, self.audit_output, "")
             return Proc(cmd, 0, self.agent_output, "")
         if cmd[:3] == ["gh", "pr", "create"]:
             self._pr_seq += 1
@@ -676,10 +739,11 @@ def test_a_blocking_review_verdict_never_opens_a_pr_and_costs_one_attempt(tmp_pa
     assert not any("blocked" in c for c in runner.calls)
     assert any("independent review" in n for n in result.notes)
 
-    # Both the review and the blocked iteration are on the ledger.
+    # The audit, the review and the blocked iteration are all on the ledger, in
+    # the order the gates run.
     records = ledger.read_records(ledger.ledger_path(cfg, tmp_path))
     assert [(r.kind, r.outcome) for r in records] == [
-        ("review", "blocked"), (IMPLEMENT, "review_blocked"),
+        ("audit", "pass"), ("review", "blocked"), (IMPLEMENT, "review_blocked"),
     ]
 
 
@@ -781,7 +845,7 @@ def test_disabling_the_review_gate_restores_the_pre_review_flow(tmp_path):
     assert _review_prompts(runner) == []
     assert result.review == "skipped" and result.merged is True
     assert [r.kind for r in ledger.read_records(ledger.ledger_path(cfg, tmp_path))] == [
-        IMPLEMENT
+        "audit", IMPLEMENT
     ]
 
 
@@ -804,6 +868,161 @@ def test_build_pr_body_always_carries_an_independent_review_section():
     plain = build_pr_body(**kwargs)
     assert "## Independent review" in plain
     assert "_(no independent review recorded)_" in plain
+
+
+# --- pre-PR acceptance audit (hygiene + semantics, before any commit) --------
+
+def _audit_run(tmp_path, *, cfg=None, issue=None, **runner_kwargs):
+    cfg = cfg or load_config()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[dict(issue or CODE_ISSUE)],
+        worktree_status="?? src/hsai/widget.py\n",
+        **runner_kwargs,
+    )
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+    return cfg, runner, result
+
+
+def test_a_hard_failing_audit_never_opens_a_pr_and_costs_one_attempt(tmp_path):
+    cfg, runner, result = _audit_run(
+        tmp_path, diff_text=ESCALATING_DIFF, diff_numstat=ESCALATING_NUMSTAT
+    )
+
+    # The gate refused the change before anything left the worktree.
+    assert result.recovered is True
+    assert result.pr is None and result.merged is False
+    assert not any(c[:3] == ["gh", "pr", "create"] for c in runner.calls)
+    assert not any(c[:2] == ["git", "push"] for c in runner.calls)
+    assert not any(c[:2] == ["git", "commit"] for c in runner.calls)
+    assert any(n.startswith("acceptance audit: fail") for n in result.notes)
+
+    # It routed through the SAME retry policy a red PR uses - one attempt spent,
+    # still unassigned, no new stall state.
+    assert any("attempts:1" in c for c in runner.calls)
+    assert any(
+        c[:3] == ["gh", "issue", "edit"] and "--remove-assignee" in c for c in runner.calls
+    )
+    assert not any("blocked" in c for c in runner.calls)
+
+    # The audit runs first, so the (more expensive) review gate is never reached.
+    assert _review_prompts(runner) == []
+
+    # The failure is classified, and the reason survives the discarded worktree.
+    records = ledger.read_records(ledger.ledger_path(cfg, tmp_path))
+    assert [(r.kind, r.outcome) for r in records] == [
+        ("audit", "fail"), (IMPLEMENT, "audit_failed"),
+    ]
+    assert records[-1].failure_class == postmortem.AUDIT_FAILED
+    assert "permission_mode" in records[-1].failure_detail
+
+
+def test_the_auditor_sees_the_ticket_and_the_diff_but_not_the_implementers_work(tmp_path):
+    _cfg, runner, _result = _audit_run(tmp_path)
+
+    prompts = _audit_prompts(runner)
+    assert len(prompts) == 1          # capped at one audit per iteration
+    prompt = prompts[0]
+
+    # The ticket and the diff...
+    assert CODE_ISSUE["title"] in prompt
+    assert "1. widget builds" in prompt and "2. widget tested" in prompt
+    assert "+def widget(): ..." in prompt
+    assert "src/hsai/widget.py" in prompt
+
+    # ...and nothing at all from the agent that wrote it.
+    worker_prompt = _worker_prompts(runner)[0]
+    assert worker_prompt not in prompt
+    assert "Implement this ticket END TO END" not in prompt
+    assert "Implemented the widget and added a test." not in prompt  # AGENT_JSON's result
+
+    # It is a real subscription-only `claude -p` run, like every other.
+    audit_call = next(
+        c for c in runner.calls if c[:1] == ["claude"] and audit.PROMPT_MARKER in c[2]
+    )
+    assert "--output-format" in audit_call and "json" in audit_call
+
+
+def test_a_passing_audit_is_rendered_on_the_pr_and_in_the_lesson(tmp_path):
+    _cfg, runner, result = _audit_run(tmp_path)
+
+    assert result.merged is True
+    assert any(n.startswith("acceptance audit: pass") for n in result.notes)
+
+    pr_create = next(c for c in runner.calls if c[:3] == ["gh", "pr", "create"])
+    pr_body = pr_create[pr_create.index("--body") + 1]
+    lesson_text = Path(result.lesson_path).read_text()
+    for text in (pr_body, lesson_text):
+        assert "## Acceptance audit" in text
+        assert "- result: **PASS**" in text
+        assert "| widget builds | `satisfied` | src/hsai/widget.py |" in text
+        assert "| widget tested | `satisfied` | tests/test_widget.py |" in text
+        assert "Both criteria are implemented and covered by a test." in text
+        assert "**Diff hygiene (deterministic)**" in text
+
+
+def test_an_unusable_layer_b_annotates_the_lesson_but_still_merges(tmp_path):
+    """Fail-open: only the deterministic layer may ever stop a ticket."""
+    _cfg, runner, result = _audit_run(
+        tmp_path, audit_output=json.dumps({"result": "Seems fine, no JSON from me."})
+    )
+
+    assert result.merged is True and result.recovered is False
+    lesson_text = Path(result.lesson_path).read_text()
+    assert "## Acceptance audit" in lesson_text
+    assert "- result: **PASS**" in lesson_text
+    assert audit.UNPARSEABLE in lesson_text
+    assert "not treated as a failure" in lesson_text
+
+
+def test_disabling_the_audit_restores_the_pre_audit_iteration(tmp_path):
+    off = replace(load_config(), audit={"enabled": False})
+    _cfg, runner, result = _audit_run(tmp_path, cfg=off)
+
+    assert result.merged is True
+
+    # The `gh` call sequence is exactly what a pre-audit iteration made.
+    assert [c[:3] for c in runner.calls if c[0] == "gh"] == [
+        ["gh", "api", "user"],
+        ["gh", "issue", "list"],
+        ["gh", "issue", "edit"],
+        ["gh", "pr", "create"],
+        ["gh", "pr", "view"],
+        ["gh", "pr", "merge"],
+    ]
+
+    # Nothing this gate introduced ran at all.
+    assert _audit_prompts(runner) == []
+    assert not any(c[:3] == ["git", "add", "-N"] for c in runner.calls)
+    assert not any(c[:2] == ["git", "diff"] and "--numstat" in c for c in runner.calls)
+    assert not any("acceptance audit" in n for n in result.notes)
+    assert [r.kind for r in ledger.read_records(ledger.ledger_path(off, tmp_path))] == [
+        "review", IMPLEMENT
+    ]
+
+    # ...and neither the PR body nor the lesson grew a section.
+    pr_create = next(c for c in runner.calls if c[:3] == ["gh", "pr", "create"])
+    assert "## Acceptance audit" not in pr_create[pr_create.index("--body") + 1]
+    assert "## Acceptance audit" not in Path(result.lesson_path).read_text()
+
+
+def test_build_pr_body_renders_the_audit_only_when_the_gate_ran():
+    choice = ModelChoice(tier="standard", model="sonnet", rationale="x")
+    kwargs = dict(
+        ticket=42, choice=choice, lesson_note="2026-08-23-note",
+        lesson_summary="kept it small", ci_summary="green", kind=IMPLEMENT,
+    )
+    body = build_pr_body(**kwargs, audit_verdict="- result: **PASS**")
+    assert "## Acceptance audit" in body
+    assert "- result: **PASS**" in body
+
+    # With the gate off the body is byte-for-byte the pre-gate one.
+    plain = build_pr_body(**kwargs)
+    assert "## Acceptance audit" not in plain
+    assert plain == build_pr_body(**kwargs, audit_verdict="")
 
 
 # --- trajectory store (one durable record per agent run) --------------------
@@ -957,20 +1176,21 @@ def test_token_counts_reach_the_ledger_and_the_block_aggregate(tmp_path):
     )
 
     records = ledger.read_records(ledger.ledger_path(cfg, tmp_path))
-    # The independent review is metered like any other spend, so the block
-    # carries one 'review' line next to the iteration's own.
-    assert [r.kind for r in records] == ["review", IMPLEMENT]
+    # Both gates are metered like any other spend, so the block carries an
+    # 'audit' and a 'review' line next to the iteration's own, in gate order.
+    assert [r.kind for r in records] == ["audit", "review", IMPLEMENT]
     authored = _iteration_records(cfg, tmp_path)[0]
     assert authored.input_tokens == 1500 and authored.output_tokens == 320
 
     agg = ledger.aggregate_block(records, block=0)
-    assert agg.input_tokens == 1900 and agg.output_tokens == 380   # 1500/320 + 400/60
-    assert "2280 tokens" in agg.summary()      # no longer reporting zero
-    # Tokens per merged PR is the block's efficiency signal (G4), and reviewing
-    # a change is part of what delivering it costs.
+    # 1500/320 (worker) + 400/60 (review) + 300/40 (audit)
+    assert agg.input_tokens == 2200 and agg.output_tokens == 420
+    assert "2620 tokens" in agg.summary()      # no longer reporting zero
+    # Tokens per merged PR is the block's efficiency signal (G4), and auditing
+    # and reviewing a change are part of what delivering it costs.
     assert agg.merged_iterations == 1
-    assert agg.tokens_per_merged_pr() == 2280
-    assert "2280 tokens/merged PR" in agg.summary()
+    assert agg.tokens_per_merged_pr() == 2620
+    assert "2620 tokens/merged PR" in agg.summary()
 
 
 def test_run_once_honors_an_explicit_block_over_the_iteration_derived_default(tmp_path):

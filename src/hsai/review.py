@@ -39,13 +39,11 @@ from .ai import run_agent
 from .config import CoreConfig
 from .models import ModelChoice, select_reviewer
 from .proc import Runner, run
-from .tickets import ACCEPTANCE_HEADING, CHECKBOX
+from .tickets import acceptance_criteria
 
 # The last fenced JSON *object* in the reply is the verdict (prose around it is
 # tolerated, exactly as in synthesis.parse_ticket_specs).
 _JSON_BLOCK = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
-_CHECKBOX_PREFIX = re.compile(r"^\s*-\s*\[[ xX]?\]\s+")
-_NEXT_HEADING = re.compile(r"^#{1,6}\s", re.MULTILINE)
 
 # Recognisable opening line: the reviewer prompt is never the worker prompt.
 PROMPT_MARKER = "You are the INDEPENDENT REVIEWER"
@@ -113,24 +111,6 @@ def skip_review(reason: str) -> ReviewVerdict:
 
 def is_enabled(cfg: CoreConfig) -> bool:
     return bool(cfg.review.get("enabled", True))
-
-
-def acceptance_criteria(body: str) -> list[str]:
-    """The ticket's acceptance-criteria checkboxes, in order.
-
-    Reuses :data:`hsai.tickets.CHECKBOX` so "what a ticket promises" is parsed
-    in exactly one way across the well-formedness gate and this reviewer.
-    """
-    heading = ACCEPTANCE_HEADING.search(body)
-    region = body[heading.end():] if heading else body
-    nxt = _NEXT_HEADING.search(region)
-    if nxt:
-        region = region[: nxt.start()]
-    return [
-        _CHECKBOX_PREFIX.sub("", line).strip()
-        for line in region.splitlines()
-        if CHECKBOX.match(line)
-    ]
 
 
 def build_prompt(

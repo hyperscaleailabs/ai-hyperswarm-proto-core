@@ -34,6 +34,28 @@ def test_diff_text_returns_the_branch_diff_verbatim():
     assert runner.calls[0][0] == ["git", "diff", "deadbeef...HEAD"]
 
 
+def test_worktree_diff_reads_the_uncommitted_change_against_head():
+    """What the pre-PR acceptance audit reads: a refusal must cost no commit."""
+    patch = "diff --git a/src/hsai/x.py b/src/hsai/x.py\n+def x(): ...\n"
+    runner = _fake(patch)
+    assert gitops.worktree_diff(cwd="/repo", runner=runner) == patch
+    assert runner.calls[0][0] == ["git", "diff", "HEAD"]
+
+
+def test_worktree_numstat_reports_per_file_line_churn():
+    runner = _fake("3\t1\tsrc/hsai/x.py\n")
+    assert gitops.worktree_numstat(cwd="/repo", runner=runner) == "3\t1\tsrc/hsai/x.py\n"
+    assert runner.calls[0][0] == ["git", "diff", "--numstat", "HEAD"]
+
+
+def test_stage_intent_to_add_makes_untracked_files_diffable():
+    """Without `-N`, a brand-new file is invisible to `git diff` - and a new
+    feature's diff is mostly new files."""
+    runner = _fake()
+    gitops.stage_intent_to_add(cwd="/repo", runner=runner)
+    assert runner.calls[0][0] == ["git", "add", "-N", "--", "."]
+
+
 def test_create_detached_worktree_builds_expected_path():
     def runner(cmd, **kwargs):
         cmd = list(cmd)

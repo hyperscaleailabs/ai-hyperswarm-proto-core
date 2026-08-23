@@ -41,6 +41,7 @@ AGENT_TIMEOUT = "agent_timeout"
 AGENT_ERROR = "agent_error"
 INCOMPLETE_DIFF = "incomplete_diff"
 NO_REPRO = "no_repro"
+AUDIT_FAILED = "audit_failed"
 LINT_FAIL = "lint_fail"
 TEST_FAIL = "test_fail"
 REMOTE_CI_FAIL = "remote_ci_fail"
@@ -50,8 +51,8 @@ BUDGET_HALT = "budget_halt"
 UNKNOWN = "unknown"
 
 FAILURE_CLASSES = (
-    AGENT_TIMEOUT, AGENT_ERROR, INCOMPLETE_DIFF, NO_REPRO, LINT_FAIL, TEST_FAIL,
-    REMOTE_CI_FAIL, REMOTE_CI_TIMEOUT, MERGE_CONFLICT, BUDGET_HALT, UNKNOWN,
+    AGENT_TIMEOUT, AGENT_ERROR, INCOMPLETE_DIFF, NO_REPRO, AUDIT_FAILED, LINT_FAIL,
+    TEST_FAIL, REMOTE_CI_FAIL, REMOTE_CI_TIMEOUT, MERGE_CONFLICT, BUDGET_HALT, UNKNOWN,
 )
 
 # `hsai.proc.run` stamps a timed-out subprocess's stderr with exactly this
@@ -73,6 +74,7 @@ class FailureEvidence:
     agent_error: str = ""
     completeness_ok: bool = True          # False: the "code ticket, no code" guard fired
     repro_ok: bool | None = None          # None: guard did not run; False: it blocked
+    audit_ok: bool = True                 # False: the pre-PR acceptance audit hard-failed
     review_approved: bool | None = None   # None: review skipped/disabled; False: blocked
     ci_steps: dict[str, bool] = field(default_factory=dict)  # local CI step map
     remote_ci: str = ""                   # SUCCESS | FAILURE | TIMEOUT | "" (not reached)
@@ -105,6 +107,8 @@ def classify(evidence: FailureEvidence) -> str:
         return INCOMPLETE_DIFF
     if evidence.repro_ok is False:
         return NO_REPRO
+    if not evidence.audit_ok:
+        return AUDIT_FAILED
     if evidence.review_approved is False:
         return AGENT_ERROR
     if evidence.ci_steps.get("ruff") is False:
@@ -137,6 +141,8 @@ def default_detail(failure_class: str, evidence: FailureEvidence) -> str:
         return "knowledge-only diff on a code ticket"
     if failure_class == NO_REPRO:
         return "reproduce-before-fix guard rejected the change"
+    if failure_class == AUDIT_FAILED:
+        return "pre-PR acceptance audit found a blocking diff-hygiene violation"
     if failure_class == LINT_FAIL:
         return "ruff check failed"
     if failure_class == TEST_FAIL:

@@ -8,6 +8,7 @@ from hsai.ledger import LedgerRecord
 from hsai.postmortem import (
     AGENT_ERROR,
     AGENT_TIMEOUT,
+    AUDIT_FAILED,
     BUDGET_HALT,
     FAILURE_CLASSES,
     INCOMPLETE_DIFF,
@@ -35,9 +36,9 @@ from hsai.tickets import check_well_formed
 # --- classify(): one branch per closed-vocabulary member ---------------------
 
 
-def test_vocabulary_has_eleven_closed_members():
-    assert len(FAILURE_CLASSES) == 11
-    assert len(set(FAILURE_CLASSES)) == 11  # no duplicates
+def test_vocabulary_has_twelve_closed_members():
+    assert len(FAILURE_CLASSES) == 12
+    assert len(set(FAILURE_CLASSES)) == 12  # no duplicates
 
 
 def test_classify_agent_timeout_from_the_proc_timeout_marker():
@@ -59,6 +60,17 @@ def test_classify_incomplete_diff():
 def test_classify_no_repro():
     ev = FailureEvidence(repro_ok=False)
     assert classify(ev) == NO_REPRO
+
+
+def test_classify_audit_failed():
+    """The pre-PR acceptance audit gets its own class: a diff that raised a
+    permission or added a dependency is a different cause from a wrong diff."""
+    ev = FailureEvidence(audit_ok=False)
+    assert classify(ev) == AUDIT_FAILED
+    # ...and it is ordered where the guard actually runs: after repro, before
+    # the independent review.
+    assert classify(FailureEvidence(repro_ok=False, audit_ok=False)) == NO_REPRO
+    assert classify(FailureEvidence(audit_ok=False, review_approved=False)) == AUDIT_FAILED
 
 
 def test_classify_review_blocked_is_agent_error():
