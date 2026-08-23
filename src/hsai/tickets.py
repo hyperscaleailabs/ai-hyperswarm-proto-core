@@ -19,6 +19,8 @@ VERIFICATION_HEADING = re.compile(
 )
 PRIOR_ART_HEADING = re.compile(r"^#{2,3}\s*prior art\s*$", re.IGNORECASE | re.MULTILINE)
 CHECKBOX = re.compile(r"^\s*-\s*\[[ xX]?\]\s+\S", re.MULTILINE)
+_CHECKBOX_PREFIX = re.compile(r"^\s*-\s*\[[ xX]?\]\s+")
+_NEXT_HEADING = re.compile(r"^#{1,6}\s", re.MULTILINE)
 
 # What a ticket says when retrieval found nothing. An explicit sentence, not an
 # empty section: "we looked and there is none" and "nobody looked" must not
@@ -125,9 +127,34 @@ def issue_well_formed(issue: Issue) -> WellFormedness:
     return check_well_formed(issue.title, issue.body)
 
 
-def size_of(issue: Issue) -> str:
-    """Read the size label off an issue ('M' when unlabeled)."""
-    for lbl in issue.labels:
+def acceptance_criteria(body: str) -> list[str]:
+    """The ticket's acceptance-criteria checkboxes, in order.
+
+    Lives here, next to the regexes the well-formedness gate uses, so "what a
+    ticket promises" is parsed in exactly one way everywhere it matters - the
+    gate that refuses vague tickets, the independent reviewer
+    (:mod:`hsai.review`), and the pre-PR acceptance audit (:mod:`hsai.audit`).
+    """
+    heading = ACCEPTANCE_HEADING.search(body)
+    region = body[heading.end():] if heading else body
+    nxt = _NEXT_HEADING.search(region)
+    if nxt:
+        region = region[: nxt.start()]
+    return [
+        _CHECKBOX_PREFIX.sub("", line).strip()
+        for line in region.splitlines()
+        if CHECKBOX.match(line)
+    ]
+
+
+def size_from_labels(labels: tuple[str, ...] | list[str]) -> str:
+    """Read the size band off a label set ('M' when unlabeled)."""
+    for lbl in labels:
         if lbl.startswith("size:"):
             return lbl.split(":", 1)[1]
     return "M"
+
+
+def size_of(issue: Issue) -> str:
+    """Read the size label off an issue ('M' when unlabeled)."""
+    return size_from_labels(issue.labels)

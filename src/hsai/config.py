@@ -57,6 +57,7 @@ class CoreConfig:
     synthesis: dict[str, Any]
     budget: dict[str, Any]
     review: dict[str, Any]
+    audit: dict[str, Any]
     postmortem: dict[str, Any]
     personas: tuple[dict[str, Any], ...]
 
@@ -150,6 +151,7 @@ def load_config(path: str | Path | None = None) -> CoreConfig:
         synthesis=data.get("synthesis", {}),
         budget=data.get("budget", {}),
         review=data.get("review", {}),
+        audit=data.get("audit", {}),
         postmortem=data.get("postmortem", {}),
         personas=tuple(data.get("personas", [])),
     )

@@ -170,6 +170,45 @@ review:
   max_diff_chars: 20000        # hard ceiling on the diff handed to the reviewer
   timeout_seconds: 900         # cap per reviewer run so the gate cannot hang the loop
 
+# Pre-PR acceptance audit + diff-hygiene gate (see src/hsai/audit.py). Runs
+# after the completeness/repro guards and BEFORE any commit, so a refusal costs
+# no push and no PR. Layer A is deterministic (title prefix, diff size banded by
+# the ticket's size: label, added dependencies, permission/constraint
+# escalation, credential deny-list) and is the ONLY layer that can hard-fail; a
+# hard failure routes through the normal retry policy under `AUDIT_FAILED`.
+# Layer B is a fresh-context semantic auditor - it scores the diff against the
+# ticket's acceptance criteria and is fail-OPEN, so an error, a timeout or an
+# unparseable reply annotates the PR and never blocks. Set enabled: false to
+# restore the pre-audit flow exactly.
+audit:
+  enabled: true
+  tier: light                  # the audit runs on EVERY change; grading must cost less than doing
+  timeout_seconds: 600         # cap per auditor run so the gate cannot hang the loop
+  max_diff_chars: 20000        # hard ceiling on the diff handed to the auditor
+  # Changed lines (added + deleted) tolerated per size band. An unlabeled ticket
+  # is graded as M - ordinary, never unbounded.
+  size_bands:
+    S: 300
+    M: 800
+    L: 2000
+  # Per-check severity: `block` refuses the change, `warn` only annotates. The
+  # title check is advisory because the loop does not author most ticket titles,
+  # and no retry could fix a heading.
+  severity:
+    title_prefix: warn
+    diff_size: block
+    new_dependency: block
+    config_escalation: block
+    deny_list: block
+  # Credential shapes scanned over ADDED lines only. A hit is reported by
+  # pattern, never by quoting the line - these findings land in a public PR body.
+  deny_list:
+    - "sk-ant-[A-Za-z0-9_\\-]{8,}"
+    - "gh[pousr]_[A-Za-z0-9]{16,}"
+    - "AKIA[0-9A-Z]{12,}"
+    - "-----BEGIN [A-Z ]*PRIVATE KEY-----"
+    - "(?i)\\b(?:api[_-]?key|secret|password|passwd|token)\\s*[:=]\\s*[\"'][A-Za-z0-9/+=_\\-]{16,}[\"']"
+
 # Failure taxonomy + Pareto backlog trigger (see src/hsai/postmortem.py). Every
 # non-merged iteration is classified into a closed FailureClass vocabulary and
 # folded into a per-block histogram; when one class dominates a block's

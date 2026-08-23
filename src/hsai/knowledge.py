@@ -62,6 +62,11 @@ class Lesson:
     repro_evidence: str = ""  # heal/bugfix only: failing-then-passing reproduction proof
     recalled: tuple[str, ...] = ()  # prior notes injected into this run's prompt
     review_verdict: str = ""  # the independent reviewer's verdict, verbatim
+    # The pre-PR acceptance audit's verdict, verbatim (see hsai.audit). Empty
+    # when the gate did not run, and then the section is omitted entirely, so a
+    # lesson written with `audit.enabled: false` is byte-for-byte what it was
+    # before the gate existed.
+    audit_verdict: str = ""
     execution_trace: str = ""  # turns/tools/tokens/exit/duration - the committed digest
     # A member of hsai.postmortem.FAILURE_CLASSES, set only when outcome=="fail"
     # (empty for a pass) - mirrored into frontmatter as a `failure/<class>` tag
@@ -371,6 +376,11 @@ class KnowledgeBase:
         repro = lesson.repro_evidence or "_(not applicable: not a heal/bugfix ticket)_"
         # Who checked the work, not just who wrote it (G2).
         review = lesson.review_verdict or "_(no independent review recorded)_"
+        audit = (
+            f"\n## Acceptance audit\n{lesson.audit_verdict}\n"
+            if lesson.audit_verdict
+            else ""
+        )
         # Same "fail only" rule as the tag above, so a pass row set is
         # byte-for-byte unchanged (no extra line, no stray whitespace either).
         failure_row = (
@@ -408,7 +418,7 @@ class KnowledgeBase:
 
 ## Independent review
 {review}
-
+{audit}
 ## Reproduction evidence
 {repro}
 

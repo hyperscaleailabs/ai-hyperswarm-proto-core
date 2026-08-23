@@ -95,6 +95,39 @@ def diff_text(base_ref: str, *, cwd: str | None = None, runner: Runner = run) ->
     return p.stdout
 
 
+def stage_intent_to_add(*, cwd: str, runner: Runner = run) -> Proc:
+    """Record *intent to add* for every untracked file (``git add -N``).
+
+    A brand-new file is invisible to ``git diff``, so a diff taken before the
+    worker's work is committed would silently omit exactly the files a new
+    feature consists of. ``-N`` registers the path in the index without staging
+    its content, which is enough for ``git diff`` to render it as a full
+    addition. Nothing is committed, and the later ``git add -A`` in
+    :func:`commit_all` is unaffected.
+    """
+    return _git(["add", "-N", "--", "."], cwd=cwd, runner=runner)
+
+
+def worktree_diff(*, cwd: str, runner: Runner = run) -> str:
+    """The full textual diff of the working tree against HEAD.
+
+    The pre-commit counterpart of :func:`diff_text`: what the pre-PR acceptance
+    audit (:mod:`hsai.audit`) reads, so a rejected change never even reaches a
+    local commit. Pair with :func:`stage_intent_to_add` to include new files.
+    """
+    return _git(["diff", "HEAD"], cwd=cwd, runner=runner).stdout
+
+
+def worktree_numstat(*, cwd: str, runner: Runner = run) -> str:
+    """Raw ``git diff --numstat HEAD`` output: per-file added/deleted counts.
+
+    A superset of :func:`diff_paths` for the working tree - it names every
+    changed path *and* says how much of it changed, which is what the audit's
+    diff-size band is measured against. Parsed by :func:`hsai.audit.parse_numstat`.
+    """
+    return _git(["diff", "--numstat", "HEAD"], cwd=cwd, runner=runner).stdout
+
+
 def has_changes(*, cwd: str, runner: Runner = run) -> bool:
     p = _git(["status", "--porcelain"], cwd=cwd, runner=runner)
     return bool(p.stdout.strip())

@@ -16,7 +16,19 @@ import time
 from dataclasses import dataclass, field
 from uuid import uuid4
 
-from . import ai, ci, github, gitops, ledger, postmortem, recall, repro, review, trajectory
+from . import (
+    ai,
+    audit,
+    ci,
+    github,
+    gitops,
+    ledger,
+    postmortem,
+    recall,
+    repro,
+    review,
+    trajectory,
+)
 from .config import CoreConfig
 from .knowledge import KnowledgeBase, Lesson
 from .models import ModelChoice, Task, select
@@ -109,6 +121,7 @@ def build_pr_body(
     trajectory_digest: str = "",
     recalled: tuple[str, ...] = (),
     review_verdict: str = "",
+    audit_verdict: str = "",
 ) -> str:
     """Assemble a PR body that satisfies the traceability invariants.
 
@@ -133,6 +146,11 @@ def build_pr_body(
     # Who checked the work, not just who wrote it: always rendered, so a PR that
     # skipped the gate says so out loud instead of staying silent about it.
     verdict = review_verdict or "_(no independent review recorded)_"
+    # Rendered only when the audit actually ran, so `audit.enabled: false`
+    # produces a PR body byte-for-byte identical to the pre-gate one.
+    audit_section = (
+        f"\n## Acceptance audit\n{audit_verdict}\n" if audit_verdict else ""
+    )
     return f"""Closes #{ticket}
 
 ## Model used
@@ -144,7 +162,7 @@ def build_pr_body(
 
 ## Independent review
 {verdict}
-
+{audit_section}
 ## Lesson learned
 {lesson_summary}
 
@@ -433,6 +451,7 @@ def run_once(
     agent_err = ""
     reverted_workflows: list[str] = []
     repro_result: repro.ReproResult | None = None
+    audit_report = audit.skip_audit("dry-run: nothing was produced to audit")
     if not dry_run:
         prompt = _task_prompt(kind, cfg, ticket_title, ticket_body, recalled.section)
         agent_started = time.time()
@@ -521,6 +540,42 @@ def run_once(
                 gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
                 return result
 
+        # 5b. Pre-PR acceptance audit: every gate so far proves the build is
+        # green, none proves the diff did what the ticket asked, and nothing at
+        # all inspects what the worker did to the worktree (a new dependency, a
+        # raised permission_mode, an edited `constraints:` block, a
+        # credential-shaped string, a diff that outgrew its size band). Layer A
+        # is deterministic and is the ONLY layer allowed to hard-fail; Layer B
+        # is a fresh-context semantic auditor that annotates and never blocks.
+        # Runs BEFORE any commit, so a refusal costs no push and no PR, and
+        # exactly once per iteration, so a refusal cannot loop.
+        audit_report = audit.run_audit(
+            cfg,
+            repo_root=repo_dir, wt=wt,
+            ticket_title=ticket_title, ticket_body=ticket_body,
+            labels=tuple(claimed_issue.labels) if claimed_issue else (),
+            iteration=iteration, block=block, ticket=ticket_num, attempts=attempts,
+            runner=runner, ai_runner=ai_runner,
+        )
+        if not audit_report.skipped:
+            result.notes.append(f"acceptance audit: {audit_report.summary()}")
+        if not audit_report.ok:
+            _recover_failed(
+                cfg, repo, 0, kind=kind, ticket_num=ticket_num,
+                claimed_issue=claimed_issue, login=login,
+                remote="AUDIT_FAILED", runner=runner,
+            )
+            result.recovered = True
+            # The worktree is discarded unpushed, so the auditor's concrete gap
+            # list has to survive somewhere durable: the ledger record is it.
+            _record_cost(
+                "audit_failed",
+                failure_class=postmortem.AUDIT_FAILED,
+                failure_detail=audit_report.failure_detail(),
+            )
+            gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
+            return result
+
     # 6. re-check CI
     ci_after = ci.run_local(cwd=wt, runner=runner) if not dry_run else ci_before
     result.ci_after = ci_after.ok
@@ -553,12 +608,18 @@ def run_once(
     result.review = verdict.status
     result.notes.append(f"independent review: {verdict.summary()}")
 
+    # A gate that did not run says nothing at all, rather than rendering an
+    # empty section: that keeps `audit.enabled: false` byte-identical to the
+    # pre-gate PR body and lesson.
+    audit_section = "" if audit_report.skipped else audit_report.render()
+
     # Evidence for the failure taxonomy (see hsai.postmortem): everything known
     # about this iteration so far. `remote_ci` is filled in once the PR's real
     # checks conclude (step 12), so callers before that pass it separately.
     def _failure_evidence(remote_ci: str = "") -> postmortem.FailureEvidence:
         return postmortem.FailureEvidence(
             agent_ok=agent_ok, agent_error=agent_err, ci_steps=ci_after.steps,
+            audit_ok=audit_report.ok,
             review_approved=None if verdict.skipped else verdict.approve,
             remote_ci=remote_ci,
         )
@@ -607,6 +668,7 @@ def run_once(
         repro_evidence=repro.render_evidence(repro_result) if repro_result else "",
         recalled=recalled.note_names,
         review_verdict=verdict.render(),
+        audit_verdict=audit_section,
         execution_trace=traj.execution_trace() if traj else "",
         failure_class=lesson_failure_class,
     )
@@ -666,6 +728,7 @@ def run_once(
         trajectory_digest=traj.digest() if traj else "",
         recalled=recalled.note_names,
         review_verdict=verdict.render(),
+        audit_verdict=audit_section,
     )
     pr_num = github.create_pr(
         repo, branch, f"{kind}: {ticket_title}"[:120], pr_body,
