@@ -4,35 +4,74 @@ Everything written here is Obsidian-ready:
 - YAML frontmatter with tags,
 - ``[[wikilinks]]`` between notes and up to their MOCs,
 so that cloning the repo and opening it as a vault yields a connected graph.
+
+A lesson has two distinct halves (see the module's synthesis ticket, "evidence-
+backed, model-authored lessons"):
+
+- :class:`LessonEvidence` - deterministic, machine-collected facts (files
+  touched, tier/model/wall-clock/tokens, a trimmed CI failure excerpt, a
+  provenance stamp). Never model-written, so it cannot be boilerplate.
+- :class:`LessonInterpretation` - the model's authored reading of that
+  evidence (:func:`author_lesson_interpretation`), gated against empty,
+  CI-restating, or near-duplicate answers (:func:`_boilerplate_reason`) and
+  falling back to a fixed template - tagged so the shortfall is countable -
+  rather than ever blocking the loop.
 """
 from __future__ import annotations
 
+import json
 import re
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from . import practices as practices_mod
+from .ai import run_agent
 from .config import CoreConfig
+from .models import ModelChoice
+from .proc import Runner, run
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _TAG_RE = re.compile(r"^\s*-\s+(\S.*)$", re.MULTILINE)
 _FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
 _TITLE_RE = re.compile(r"^# (.+)$", re.MULTILINE)
 _SECTION_RE = re.compile(r"^## (.+)$", re.MULTILINE)
+_SUBSECTION_RE = re.compile(r"^### (.+)$", re.MULTILINE)
 _WORD_RE = re.compile(r"[a-zA-Z][a-zA-Z-]{3,}")
-_STOPWORDS = {
-    "this", "that", "with", "from", "have", "been", "were", "will", "which",
-    "their", "there", "these", "those", "about", "would", "could", "should",
-    "being", "into", "when", "what", "while", "where", "before", "after",
-    "between", "over", "under", "more", "most", "some", "such", "than",
-    "then", "them", "they", "also", "each", "only", "just", "like", "need",
-    "needs", "keep", "keeps", "make", "makes", "made", "gets",
-    "using", "used", "uses", "here", "isnt", "doesnt", "wasnt",
-    "very", "even", "still", "much", "many", "both", "either", "without",
-    "through", "because", "same", "part", "kind", "lesson", "lessons",
-}
+_CI_EXCERPT_RE = re.compile(r"\*\*CI failure excerpt\*\*\n```\n(.*?)\n```", re.DOTALL)
+
+# The lesson-authoring pass's strict-JSON reply, mirroring hsai.review/hsai.audit.
+_JSON_BLOCK = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
+
+# Recognisable opening line for the lesson-authoring prompt - lets a fake AI
+# runner in tests (and a real transcript) tell this call apart from the
+# worker/review/audit ones.
+LESSON_AUTHOR_PROMPT_MARKER = "You are AUTHORING A LESSON"
+
+# Applied to a note whose interpretation was rejected twice (or never
+# attempted) and fell back to the fixed template - a countable signal, not a
+# silent one (see the block review brief's boilerplate-rate line).
+TEMPLATE_FALLBACK_TAG = "lesson/template-fallback"
+
+DEFAULT_LESSON_AUTHOR_TIER = "light"
+DEFAULT_LESSON_AUTHOR_TIMEOUT = 300.0
+DEFAULT_SIMILARITY_THRESHOLD = 0.82
+DEFAULT_DEDUPE_WINDOW = 20
+
+_PASS_FALLBACK_TEXT = "Change merged cleanly under a green build."
+_FAIL_FALLBACK_TEXT = (
+    "Change did not reach green; auto-merge will hold until CI passes. "
+    "Investigate the failure captured above before the next attempt."
+)
+_NOT_RECORDED = "_(not recorded)_"
+_CI_RESTATING_PHRASES = (
+    "change merged cleanly under a green build",
+    "change did not reach green",
+    "auto-merge will hold until ci passes",
+)
 
 
 def slugify(text: str) -> str:
@@ -43,6 +82,88 @@ def _today() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
+def _int(raw: str, default: int = 0) -> int:
+    raw = (raw or "").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+@dataclass
+class LessonEvidence:
+    """Deterministic, machine-collected facts about one iteration.
+
+    Never model-written - populated by the orchestrator from the same
+    :class:`hsai.ledger.LedgerRecord` inputs the iteration already builds, so
+    a lesson's model/tier/wall-clock/tokens are always consistent with that
+    iteration's ledger entry.
+    """
+
+    files_changed: tuple[str, ...] = ()  # "path (+ins/-del)", one per file
+    insertions: int = 0
+    deletions: int = 0
+    tier: str = ""
+    model: str = ""
+    wall_clock_seconds: float = 0.0
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    ci_failure_excerpt: str = ""  # trimmed; set only when outcome == "fail"
+    reverted_workflows: tuple[str, ...] = ()
+    hsai_sha: str = ""  # the hsai harness commit this iteration ran under
+    core_yaml_hash: str = ""  # short hash of .ai-swarm/core.yaml at that commit
+
+    def render(self) -> str:
+        files = "\n".join(f"- `{f}`" for f in self.files_changed) or "- _(no files reported)_"
+        tokens = (
+            f"{self.input_tokens if self.input_tokens is not None else '-'} in / "
+            f"{self.output_tokens if self.output_tokens is not None else '-'} out"
+        )
+        reverted = ", ".join(self.reverted_workflows) if self.reverted_workflows else "_(none)_"
+        table = (
+            "| field | value |\n| --- | --- |\n"
+            f"| model | `{self.model or '-'}` |\n"
+            f"| tier | `{self.tier or '-'}` |\n"
+            f"| wall-clock | {self.wall_clock_seconds:.1f}s |\n"
+            f"| tokens | {tokens} |\n"
+            f"| insertions / deletions | +{self.insertions}/-{self.deletions} |\n"
+            f"| reverted workflow edits | {reverted} |\n"
+            f"| provenance | hsai@`{self.hsai_sha or '-'}` "
+            f"core.yaml@`{self.core_yaml_hash or '-'}` |"
+        )
+        ci = (
+            f"\n\n**CI failure excerpt**\n```\n{self.ci_failure_excerpt}\n```"
+            if self.ci_failure_excerpt
+            else ""
+        )
+        return f"{table}\n\n**Files changed**\n{files}{ci}"
+
+
+@dataclass
+class LessonInterpretation:
+    """The model's authored reading of one iteration's :class:`LessonEvidence`.
+
+    ``template_fallback`` is set when authoring never produced an acceptable
+    answer (disabled, erroring, timing out, or twice rejected by the
+    anti-boilerplate gate) and the fixed template was used instead - see
+    :func:`author_lesson_interpretation`.
+    """
+
+    what_was_tried: str = ""
+    what_surprised: str = ""
+    what_to_do_differently: str = ""
+    reference_citation: str = "none"  # a specific reference-repo artifact, or "none"
+    template_fallback: bool = False
+
+    def render(self) -> str:
+        return (
+            f"### What was tried\n{self.what_was_tried or _NOT_RECORDED}\n\n"
+            f"### What surprised us\n{self.what_surprised or _NOT_RECORDED}\n\n"
+            f"### What to do differently\n{self.what_to_do_differently or _NOT_RECORDED}\n\n"
+            f"### Reference citation\n`{self.reference_citation or 'none'}`"
+        )
+
+
 @dataclass
 class Lesson:
     title: str
@@ -50,8 +171,8 @@ class Lesson:
     kind: str  # heal | implement | improve
     context: str
     what_happened: str
-    lesson: str
     iteration: int = 0
+    block: int = 0
     ticket: int | None = None
     pr: int | None = None
     model: str = ""
@@ -72,6 +193,8 @@ class Lesson:
     # (empty for a pass) - mirrored into frontmatter as a `failure/<class>` tag
     # so the Obsidian graph can filter failures by cause.
     failure_class: str = ""
+    evidence: LessonEvidence = field(default_factory=LessonEvidence)
+    interpretation: LessonInterpretation = field(default_factory=LessonInterpretation)
 
     def note_name(self) -> str:
         return f"{self.created}-{slugify(self.title)}"
@@ -91,6 +214,13 @@ class LessonRecord:
     body: str = ""  # everything after the frontmatter; what the recall index reads
     failure_class: str = ""  # "" when absent (pass, or a note predating this field)
     created: str = ""  # frontmatter `created:`, "" for notes that carry no date
+    block: int = 0
+    evidence: LessonEvidence = field(default_factory=LessonEvidence)
+    interpretation: LessonInterpretation = field(default_factory=LessonInterpretation)
+
+    @property
+    def template_fallback(self) -> bool:
+        return TEMPLATE_FALLBACK_TAG in self.tags
 
 
 def split_sections(text: str) -> dict[str, str]:
@@ -105,22 +235,39 @@ def split_sections(text: str) -> dict[str, str]:
     return sections
 
 
-def _frontmatter_tags(fm: str) -> tuple[str, ...]:
-    """List items under the ``tags:`` key only.
+def _split_subsections(text: str) -> dict[str, str]:
+    """Map lowercased ``### headings`` to their bodies (nested inside a ``##``)."""
+    parts = _SUBSECTION_RE.split(text)
+    subs: dict[str, str] = {}
+    for i in range(1, len(parts), 2):
+        heading = parts[i].strip().lower()
+        body = parts[i + 1] if i + 1 < len(parts) else ""
+        subs[heading] = body.strip()
+    return subs
 
-    Frontmatter now holds a second list (``recalled:``), so a blanket "every
-    ``- item`` line is a tag" scan would file recalled note names as tags.
+
+def _frontmatter_list(fm: str, key: str) -> tuple[str, ...]:
+    """List items under a top-level ``key:`` list in frontmatter.
+
+    Generic counterpart of the old ``tags``-only scan: frontmatter now holds
+    several list keys (``tags``, ``recalled``, ``evidence_files_changed``, ...),
+    so scanning every ``- item`` line regardless of which key it sits under
+    would file one key's items as another's.
     """
-    tags: list[str] = []
-    in_tags = False
+    items: list[str] = []
+    in_key = False
     for line in fm.splitlines():
         if line.strip() and not line.startswith((" ", "\t", "-")):
-            in_tags = line.strip() == "tags:"
+            in_key = line.strip() == f"{key}:"
             continue
         match = _TAG_RE.match(line)
-        if in_tags and match:
-            tags.append(match.group(1).strip())
-    return tuple(tags)
+        if in_key and match:
+            items.append(match.group(1).strip())
+    return tuple(items)
+
+
+def _frontmatter_tags(fm: str) -> tuple[str, ...]:
+    return _frontmatter_list(fm, "tags")
 
 
 def _frontmatter_scalar(fm: str, key: str) -> str:
@@ -135,6 +282,51 @@ def _frontmatter_scalar(fm: str, key: str) -> str:
         if line.startswith(prefix):
             return line[len(prefix):].strip()
     return ""
+
+
+def _parse_ci_excerpt(evidence_section: str) -> str:
+    m = _CI_EXCERPT_RE.search(evidence_section)
+    return m.group(1) if m else ""
+
+
+def _parse_evidence(fm: str, evidence_section: str) -> LessonEvidence:
+    input_raw = _frontmatter_scalar(fm, "evidence_input_tokens")
+    output_raw = _frontmatter_scalar(fm, "evidence_output_tokens")
+    wall_raw = _frontmatter_scalar(fm, "evidence_wall_clock_seconds")
+    try:
+        wall_clock = float(wall_raw) if wall_raw else 0.0
+    except ValueError:
+        wall_clock = 0.0
+    return LessonEvidence(
+        files_changed=_frontmatter_list(fm, "evidence_files_changed"),
+        insertions=_int(_frontmatter_scalar(fm, "evidence_insertions")),
+        deletions=_int(_frontmatter_scalar(fm, "evidence_deletions")),
+        tier=_frontmatter_scalar(fm, "evidence_tier"),
+        model=_frontmatter_scalar(fm, "evidence_model"),
+        wall_clock_seconds=wall_clock,
+        input_tokens=_int(input_raw) if input_raw.strip() else None,
+        output_tokens=_int(output_raw) if output_raw.strip() else None,
+        reverted_workflows=_frontmatter_list(fm, "evidence_reverted_workflows"),
+        hsai_sha=_frontmatter_scalar(fm, "evidence_hsai_sha"),
+        core_yaml_hash=_frontmatter_scalar(fm, "evidence_core_yaml_hash"),
+        ci_failure_excerpt=_parse_ci_excerpt(evidence_section),
+    )
+
+
+def _parse_interpretation(section_text: str) -> LessonInterpretation:
+    subs = _split_subsections(section_text)
+
+    def _val(key: str) -> str:
+        v = subs.get(key, "").strip()
+        return "" if v == _NOT_RECORDED else v
+
+    ref = subs.get("reference citation", "").strip().strip("`") or "none"
+    return LessonInterpretation(
+        what_was_tried=_val("what was tried"),
+        what_surprised=_val("what surprised us"),
+        what_to_do_differently=_val("what to do differently"),
+        reference_citation=ref,
+    )
 
 
 def parse_note(path: str | Path) -> LessonRecord:
@@ -168,7 +360,212 @@ def parse_note(path: str | Path) -> LessonRecord:
         body=body.strip(),
         failure_class=failure_class,
         created=_frontmatter_scalar(fm, "created"),
+        block=_int(_frontmatter_scalar(fm, "block")),
+        evidence=_parse_evidence(fm, sections.get("evidence", "")),
+        interpretation=_parse_interpretation(sections.get("lesson learned", "")),
     )
+
+
+# --- lesson authoring: evidence in, an interpretation the model cannot fake out --
+
+def build_lesson_author_prompt(
+    *, outcome: str, kind: str, ticket_title: str, ticket_body: str, evidence: LessonEvidence,
+) -> str:
+    """The authoring instruction: evidence-first, JSON-terminated (see hsai.review
+    for the sibling pattern this mirrors)."""
+    files = "\n".join(f"- `{f}`" for f in evidence.files_changed) or "- _(no files reported)_"
+    ci = (
+        f"\n\nCI failure excerpt:\n```\n{evidence.ci_failure_excerpt}\n```"
+        if evidence.ci_failure_excerpt
+        else ""
+    )
+    reverted = (
+        f"\n\nReverted off-spec workflow edits: {', '.join(evidence.reverted_workflows)}"
+        if evidence.reverted_workflows
+        else ""
+    )
+    return f"""{LESSON_AUTHOR_PROMPT_MARKER} for ai-hyperswarm-proto-core, an autonomous
+self-improving AI-swarm harness. Below is the deterministic EVIDENCE for one
+iteration, collected by the harness - not by you. You did not run this
+iteration; interpret the evidence below, do not invent facts it does not
+contain.
+
+Outcome: {outcome.upper()}
+Kind: {kind}
+Ticket: {ticket_title}
+
+{ticket_body[:2000]}
+
+Model: `{evidence.model}` (tier: `{evidence.tier}`)
+Wall-clock: {evidence.wall_clock_seconds:.1f}s
+Insertions/deletions: +{evidence.insertions}/-{evidence.deletions}
+
+Files changed:
+{files}{ci}{reverted}
+
+Write four fields, each 1-3 sentences, SPECIFIC to the evidence above:
+- what_was_tried: what the change actually did, concretely.
+- what_surprised: what was unexpected given the evidence - a real surprise,
+  not a restatement of the CI outcome. If genuinely nothing was surprising,
+  say what confirmed an existing expectation instead.
+- what_to_do_differently: one concrete, actionable change for the NEXT similar
+  ticket. Never the sentence "change merged cleanly" or "change did not reach
+  green" verbatim - say what to actually do differently.
+- reference_citation: a SPECIFIC artifact in a SPECIFIC reference-set repo
+  that informed this work (e.g. "assafelovic/gpt-researcher: costs.py cost
+  accounting"), or the exact string "none" if nothing from the reference set
+  was actually consulted. Never invent a citation.
+
+Answer with prose if you like, but END your reply with a fenced ```json block
+containing exactly this object:
+{{"what_was_tried": "...", "what_surprised": "...",
+  "what_to_do_differently": "...", "reference_citation": "..."}}
+"""
+
+
+def parse_lesson_interpretation(output: str) -> LessonInterpretation | None:
+    """Extract the authored interpretation from a model reply, or ``None``.
+
+    Unlike :func:`hsai.review.parse_verdict` this is NOT fail-closed: a
+    lesson-authoring failure must never block the loop, so the caller treats
+    ``None`` as "retry, then fall back to the template" rather than as a
+    negative verdict of its own.
+    """
+    text = (output or "").strip()
+    blocks = _JSON_BLOCK.findall(text)
+    if not blocks and text.startswith("{") and text.endswith("}"):
+        blocks = [text]
+    if not blocks:
+        return None
+    try:
+        raw = json.loads(blocks[-1])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    return LessonInterpretation(
+        what_was_tried=str(raw.get("what_was_tried", "")).strip(),
+        what_surprised=str(raw.get("what_surprised", "")).strip(),
+        what_to_do_differently=str(raw.get("what_to_do_differently", "")).strip(),
+        reference_citation=str(raw.get("reference_citation", "")).strip() or "none",
+    )
+
+
+def _normalize(text: str) -> str:
+    return " ".join(text.lower().split())
+
+
+def _similarity(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, _normalize(a), _normalize(b)).ratio()
+
+
+def _combined_text(interp: LessonInterpretation) -> str:
+    return " ".join(
+        [interp.what_was_tried, interp.what_surprised, interp.what_to_do_differently]
+    ).strip()
+
+
+def _boilerplate_reason(
+    interp: LessonInterpretation, prior_texts: Sequence[str], *, threshold: float,
+) -> str:
+    """Non-empty rejection reason, or "" when the interpretation passes the gate.
+
+    Three anti-boilerplate checks, in order: empty, CI-restating, near-duplicate
+    of a recent lesson (normalized similarity - see proposal item 3).
+    """
+    combined = _combined_text(interp)
+    if not combined or not interp.what_to_do_differently.strip():
+        return "empty interpretation"
+    norm = _normalize(combined)
+    if any(phrase in norm for phrase in _CI_RESTATING_PHRASES):
+        return "interpretation merely restates the CI outcome"
+    for prior in prior_texts:
+        if prior and _similarity(combined, prior) >= threshold:
+            return f"near-duplicate of a recent lesson (similarity >= {threshold:g})"
+    return ""
+
+
+def _template_interpretation(outcome: str) -> LessonInterpretation:
+    return LessonInterpretation(
+        what_was_tried="",
+        what_surprised="",
+        what_to_do_differently=_PASS_FALLBACK_TEXT if outcome == "pass" else _FAIL_FALLBACK_TEXT,
+        reference_citation="none",
+        template_fallback=True,
+    )
+
+
+def _lesson_author_choice(cfg: CoreConfig, lesson_cfg: dict) -> ModelChoice | None:
+    """The tier/model to author with, or ``None`` when none is usable.
+
+    Deliberately non-heavy (proposal item 2): a configured ``heavy`` tier (or
+    one core.yaml does not define) is discarded in favour of the light tier -
+    lesson authoring is not the kind of work that should compete with real
+    tickets for the heavy-tier budget.
+    """
+    tier = str(lesson_cfg.get("tier", DEFAULT_LESSON_AUTHOR_TIER))
+    if tier == "heavy" or tier not in cfg.tiers:
+        tier = "light" if "light" in cfg.tiers else cfg.default_tier
+    if tier not in cfg.tiers:
+        return None
+    return ModelChoice(
+        tier=tier, model=cfg.tiers[tier].model,
+        rationale="lesson authoring: interpret this iteration's evidence",
+        strategy="lesson-author-v1",
+    )
+
+
+def author_lesson_interpretation(
+    cfg: CoreConfig,
+    *,
+    outcome: str,
+    kind: str,
+    ticket_title: str,
+    ticket_body: str,
+    evidence: LessonEvidence,
+    prior_lesson_texts: Sequence[str] = (),
+    cwd: str | None = None,
+    ai_runner: Runner = run,
+) -> LessonInterpretation:
+    """Ask the model to interpret ``evidence``; anti-boilerplate-gated, retried
+    once, then falls back to the fixed template (proposal items 2-4).
+
+    Runs for PASS and FAIL alike - the failure case is where the durable
+    knowledge lives. Never blocks the loop: disabled config, no usable tier,
+    an erroring/timing-out run, an unparseable reply, or two boilerplate
+    verdicts in a row all fall back to :func:`_template_interpretation`
+    without raising.
+    """
+    lesson_cfg = cfg.knowledge.get("lesson_authoring", {}) if isinstance(cfg.knowledge, dict) else {}
+    if not lesson_cfg.get("enabled", True):
+        return _template_interpretation(outcome)
+
+    choice = _lesson_author_choice(cfg, lesson_cfg)
+    if choice is None:
+        return _template_interpretation(outcome)
+
+    timeout = float(lesson_cfg.get("timeout_seconds", DEFAULT_LESSON_AUTHOR_TIMEOUT))
+    threshold = float(lesson_cfg.get("similarity_threshold", DEFAULT_SIMILARITY_THRESHOLD))
+    prompt = build_lesson_author_prompt(
+        outcome=outcome, kind=kind, ticket_title=ticket_title, ticket_body=ticket_body,
+        evidence=evidence,
+    )
+
+    for _attempt in range(2):  # one retry, per proposal item 3
+        try:
+            ares = run_agent(prompt, choice, cfg, cwd=cwd, runner=ai_runner, timeout=timeout)
+        except Exception:
+            return _template_interpretation(outcome)
+        if not ares.ok:
+            continue
+        interp = parse_lesson_interpretation(ares.text)
+        if interp is None:
+            continue
+        if not _boilerplate_reason(interp, prior_lesson_texts, threshold=threshold):
+            return interp
+    return _template_interpretation(outcome)
 
 
 @dataclass
@@ -258,9 +655,33 @@ class KnowledgeBase:
     def _parse_lesson(self, note_name: str) -> LessonRecord:
         return parse_note(self.lessons_dir / f"{note_name}.md")
 
+    def recent_lesson_interpretation_texts(self, n: int | None = None) -> list[str]:
+        """The combined interpretation text of the last ``n`` lessons on disk.
+
+        What the anti-boilerplate gate's near-duplicate check compares a
+        freshly authored interpretation against (proposal item 3). Excludes
+        template-fallback notes - a duplicate template is not informative
+        evidence that a NEW interpretation is also boilerplate.
+        """
+        window = DEFAULT_DEDUPE_WINDOW if n is None else n
+        records = self.read_lessons()
+        recent = records[-window:] if window else records
+        return [
+            _combined_text(r.interpretation)
+            for r in recent
+            if not r.template_fallback and _combined_text(r.interpretation)
+        ]
+
     def synthesize_whitepaper(self, n: int | None = None) -> Whitepaper:
         """Synthesize a whitepaper by grouping the last `n` lessons by outcome/kind
         and surfacing themes that recur across more than one of them.
+
+        Themes come from the STRUCTURED interpretation fields (what surprised
+        the model, what it says to do differently, what it cited) rather than
+        word frequency over the whole free-text note - see proposal item 6. A
+        boilerplate template-fallback note contributes no vocabulary, so a
+        block dominated by fallbacks yields "not enough" rather than a false
+        theme built from the fallback sentence itself.
         """
         window = n if n is not None else self.whitepaper_every
         all_lessons = self.read_lessons()
@@ -271,13 +692,25 @@ class KnowledgeBase:
         failures = [r for r in covered if r.outcome == "fail"]
 
         word_sources: dict[str, set[str]] = {}
+        citation_sources: dict[str, set[str]] = {}
         for r in covered:
-            words = {w.lower() for w in _WORD_RE.findall(r.lesson_text)} - _STOPWORDS
-            for w in words:
+            if r.template_fallback:
+                continue
+            interp = r.interpretation
+            text = f"{interp.what_surprised} {interp.what_to_do_differently}"
+            for w in {w.lower() for w in _WORD_RE.findall(text)}:
                 word_sources.setdefault(w, set()).add(r.note_name)
+            citation = interp.reference_citation.strip()
+            if citation and citation.lower() != "none":
+                citation_sources.setdefault(citation, set()).add(r.note_name)
+
         recurring_themes = sorted(
             (w for w, notes in word_sources.items() if len(notes) >= 2),
             key=lambda w: (-len(word_sources[w]), w),
+        )[:5]
+        recurring_citations = sorted(
+            (c for c, notes in citation_sources.items() if len(notes) >= 2),
+            key=lambda c: (-len(citation_sources[c]), c),
         )[:5]
 
         outcome_table = "\n".join(f"| {k} | {v} |" for k, v in sorted(outcome_counts.items())) or "| _(none)_ | 0 |"
@@ -286,7 +719,7 @@ class KnowledgeBase:
         if failures:
             failure_lines = "\n".join(
                 f"- [[{r.note_name}]] ({r.kind}): "
-                f"{r.lesson_text.splitlines()[0] if r.lesson_text else '_(no lesson text recorded)_'}"
+                f"{r.interpretation.what_to_do_differently or '_(no interpretation recorded)_'}"
                 for r in failures
             )
         else:
@@ -294,10 +727,21 @@ class KnowledgeBase:
 
         if recurring_themes:
             theme_lines = "\n".join(
-                f"- **{w}** - appears in {len(word_sources[w])} lessons" for w in recurring_themes
+                f"- **{w}** - appears in {len(word_sources[w])} lessons: "
+                + ", ".join(f"[[{note}]]" for note in sorted(word_sources[w]))
+                for w in recurring_themes
             )
         else:
-            theme_lines = "_Not enough repeated vocabulary yet to call out a theme._"
+            theme_lines = "_Not enough recurring interpretation yet to call out a theme._"
+
+        if recurring_citations:
+            citation_lines = "\n".join(
+                f"- `{c}` - cited by {len(citation_sources[c])} lessons: "
+                + ", ".join(f"[[{note}]]" for note in sorted(citation_sources[c]))
+                for c in recurring_citations
+            )
+        else:
+            citation_lines = "_No reference-set artifact was cited by more than one lesson yet._"
 
         body = f"""## Outcomes in this window
 | outcome | count |
@@ -313,7 +757,10 @@ class KnowledgeBase:
 {failure_lines}
 
 ## Recurring themes
-{theme_lines}"""
+{theme_lines}
+
+## Recurring reference citations
+{citation_lines}"""
 
         summary = (
             f"Synthesis of the last {len(covered)} lesson(s): "
@@ -361,14 +808,33 @@ class KnowledgeBase:
         # passing note byte-for-byte identical to before this field existed.
         if lesson.outcome == "fail" and lesson.failure_class:
             tags = (*tags, f"failure/{lesson.failure_class}")
+        # Countable, not silent (proposal item 3): a block dominated by this
+        # tag is exactly what the review brief's boilerplate-rate line reports.
+        if lesson.interpretation.template_fallback:
+            tags = (*tags, TEMPLATE_FALLBACK_TAG)
         extra: dict[str, str | tuple[str, ...]] = {
             "created": lesson.created,
             "iteration": str(lesson.iteration),
+            "block": str(lesson.block),
         }
         # Only present when retrieval actually fired, so a run with recall
         # disabled renders byte-for-byte as it did before recall existed.
         if lesson.recalled:
             extra["recalled"] = lesson.recalled
+        ev = lesson.evidence
+        extra["evidence_model"] = ev.model
+        extra["evidence_tier"] = ev.tier
+        extra["evidence_wall_clock_seconds"] = f"{ev.wall_clock_seconds:.3f}"
+        extra["evidence_input_tokens"] = "" if ev.input_tokens is None else str(ev.input_tokens)
+        extra["evidence_output_tokens"] = "" if ev.output_tokens is None else str(ev.output_tokens)
+        extra["evidence_insertions"] = str(ev.insertions)
+        extra["evidence_deletions"] = str(ev.deletions)
+        extra["evidence_hsai_sha"] = ev.hsai_sha
+        extra["evidence_core_yaml_hash"] = ev.core_yaml_hash
+        if ev.files_changed:
+            extra["evidence_files_changed"] = ev.files_changed
+        if ev.reverted_workflows:
+            extra["evidence_reverted_workflows"] = ev.reverted_workflows
         fm = self._frontmatter(tags, extra)
         refs = "\n".join(f"- `{r}`" for r in lesson.references) or "- _(none cited)_"
         ticket = f"#{lesson.ticket}" if lesson.ticket else "_(none)_"
@@ -386,6 +852,12 @@ class KnowledgeBase:
         failure_row = (
             f"\n| failure class | `{lesson.failure_class}` |"
             if lesson.outcome == "fail" and lesson.failure_class
+            else ""
+        )
+        fallback_note = (
+            "\n\n> **Note:** lesson authoring fell back to the fixed template this "
+            f"iteration (tagged `{TEMPLATE_FALLBACK_TAG}`)."
+            if lesson.interpretation.template_fallback
             else ""
         )
         return f"""{fm}
@@ -410,8 +882,11 @@ class KnowledgeBase:
 ## What happened
 {lesson.what_happened}
 
+## Evidence
+{lesson.evidence.render()}
+
 ## Lesson learned
-{lesson.lesson}
+{lesson.interpretation.render()}{fallback_note}
 
 ## Execution trace
 {lesson.execution_trace or "_(no model run this iteration)_"}

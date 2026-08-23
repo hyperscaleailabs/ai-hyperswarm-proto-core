@@ -1,6 +1,7 @@
 """Load and validate .ai-swarm/core.yaml into typed objects."""
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -76,6 +77,19 @@ class CoreConfig:
 
     def goal_ids(self) -> list[str]:
         return [str(g.get("id")) for g in self.goals if g.get("id")]
+
+
+def core_yaml_hash(repo_root: str | Path) -> str:
+    """Short hash of ``.ai-swarm/core.yaml`` at ``repo_root`` ("" when absent).
+
+    Half of a lesson's provenance stamp (the other half is the hsai commit the
+    iteration ran under) - lets a reader tell whether two lessons ran under the
+    same governance config without diffing the whole file.
+    """
+    path = Path(repo_root) / CORE_PATH
+    if not path.is_file():
+        return ""
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:12]
 
 
 def _find_core(start: str | Path | None = None) -> Path:

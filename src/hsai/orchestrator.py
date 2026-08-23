@@ -29,8 +29,8 @@ from . import (
     review,
     trajectory,
 )
-from .config import CoreConfig
-from .knowledge import KnowledgeBase, Lesson
+from .config import CoreConfig, core_yaml_hash
+from .knowledge import KnowledgeBase, Lesson, LessonEvidence, author_lesson_interpretation
 from .models import ModelChoice, Task, select
 from .proc import Runner, run
 from .tickets import NEEDS_REFINEMENT, issue_well_formed

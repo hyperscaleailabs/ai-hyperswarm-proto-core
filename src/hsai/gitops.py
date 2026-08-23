@@ -95,6 +95,17 @@ def diff_text(base_ref: str, *, cwd: str | None = None, runner: Runner = run) ->
     return p.stdout
 
 
+def diff_numstat(base_ref: str, *, cwd: str | None = None, runner: Runner = run) -> str:
+    """Raw ``git diff --numstat`` between ``base_ref`` and HEAD.
+
+    The committed-branch counterpart of :func:`worktree_numstat` - what a
+    lesson's evidence half reads for its per-file insertion/deletion counts,
+    parsed by :func:`hsai.audit.parse_numstat`.
+    """
+    p = _git(["diff", "--numstat", f"{base_ref}...HEAD"], cwd=cwd, runner=runner)
+    return p.stdout
+
+
 def stage_intent_to_add(*, cwd: str, runner: Runner = run) -> Proc:
     """Record *intent to add* for every untracked file (``git add -N``).
 
