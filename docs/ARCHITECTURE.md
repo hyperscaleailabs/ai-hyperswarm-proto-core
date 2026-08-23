@@ -241,3 +241,12 @@ and `main`; green-gated auto-merge serializes the actual integration.
   to the backlog with an incremented `attempts:N` label. After
   `execution.max_ticket_attempts`, the ticket is labelled `blocked` and left for
   a human; blocked/assigned tickets are skipped by future workers.
+- **Infrastructure noise does not cost an attempt.** The retry policy is
+  taxonomy-aware (`hsai.postmortem.classify`). A run classified
+  `agent_timeout` or `remote_ci_timeout` never produced a verdict on the *work*
+  - a clock ran out - so the ticket is re-queued with `attempts:N` untouched,
+  tracked instead on its own `infra-requeues:N` label and bounded by
+  `execution.max_infra_requeues` so a permanently-timing-out ticket still
+  converges on the normal path. Every other class (including a genuine red
+  build, `remote_ci_fail`) spends an attempt exactly as before. The PR is
+  closed either way: a non-SUCCESS PR is never merged.

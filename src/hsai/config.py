@@ -7,6 +7,10 @@ from typing import Any
 
 import yaml
 
+# Safe to import here: trajectory is a leaf module that imports nothing from
+# the package. It owns STEP_CHARS; this file only surfaces it as a config knob.
+from . import trajectory
+
 CORE_PATH = ".ai-swarm/core.yaml"
 
 
@@ -43,10 +47,12 @@ class CoreConfig:
     permission_mode: str
     output_format: str
     trajectory_retention_blocks: int
+    trajectory_step_chars: int
     agent_timeout: float | None
     ci_remote_timeout: float
     ci_poll_interval: float
     max_ticket_attempts: int
+    max_infra_requeues: int
     tiers: dict[str, ModelTier]
     default_tier: str
     constraints: dict[str, Any]
@@ -136,10 +142,14 @@ def load_config(path: str | Path | None = None) -> CoreConfig:
         # YAML instead of shipping code: "text" (or empty) drops the flag entirely.
         output_format=str(execution.get("output_format", "json") or ""),
         trajectory_retention_blocks=int(execution.get("trajectory_retention_blocks", 8)),
+        trajectory_step_chars=int(
+            execution.get("trajectory_step_chars", trajectory.STEP_CHARS)
+        ),
         agent_timeout=execution.get("agent_timeout_seconds"),
         ci_remote_timeout=float(execution.get("ci_remote_timeout_seconds", 300)),
         ci_poll_interval=float(execution.get("ci_poll_interval_seconds", 10)),
         max_ticket_attempts=int(execution.get("max_ticket_attempts", 2)),
+        max_infra_requeues=int(execution.get("max_infra_requeues", 2)),
         tiers=tiers,
         default_tier=models.get("default_tier", "standard"),
         constraints=data.get("constraints", {}),

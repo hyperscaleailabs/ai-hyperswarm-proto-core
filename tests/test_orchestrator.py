@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from hsai import ledger, orchestrator, recall, review, trajectory
+from hsai import github, ledger, orchestrator, postmortem, recall, review, trajectory
 from hsai.config import load_config
 from hsai.models import ModelChoice
 from hsai.orchestrator import (
@@ -195,13 +195,15 @@ class FakeRunner:
         if cmd[:3] == ["gh", "pr", "merge"]:
             return Proc(cmd, 0, "", "")
         if cmd[:3] == ["gh", "pr", "view"]:
-            concl = "SUCCESS" if self.remote_ci == "SUCCESS" else "FAILURE"
-            rollup = {
-                "statusCheckRollup": [
-                    {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": concl}
-                ]
-            }
-            return Proc(cmd, 0, json.dumps(rollup), "")
+            if self.remote_ci == "TIMEOUT":
+                # Checks that never conclude: `ci.wait_remote` reduces this to
+                # PENDING and, once the deadline passes, returns TIMEOUT. Pair
+                # with `ci_remote_timeout=0` so the poll loop never sleeps.
+                check = {"__typename": "CheckRun", "status": "IN_PROGRESS", "conclusion": None}
+            else:
+                concl = "SUCCESS" if self.remote_ci == "SUCCESS" else "FAILURE"
+                check = {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": concl}
+            return Proc(cmd, 0, json.dumps({"statusCheckRollup": [check]}), "")
         if cmd[:3] == ["gh", "pr", "close"]:
             return Proc(cmd, 0, "", "")
         if cmd[:3] == ["gh", "issue", "view"]:
@@ -568,6 +570,135 @@ def test_run_once_recovers_when_remote_ci_fails(tmp_path):
     )
     # retry counter bumped (attempts:1, below max_ticket_attempts=2)
     assert any("attempts:1" in c for c in runner.calls)
+
+
+def test_issue_counters_are_read_from_independent_labels():
+    """`attempts:N` and `infra-requeues:N` must not shadow each other - the
+    whole point of the taxonomy-aware policy is that they move separately."""
+    issue = github.Issue(
+        7, "feat: thing",
+        ("priority:P2", "attempts:1", "infra-requeues:2"), (), "",
+    )
+    assert issue.attempts() == 1
+    assert issue.infra_requeues() == 2
+
+    bare = github.Issue(7, "feat: thing", ("priority:P2",), (), "")
+    assert bare.attempts() == 0 and bare.infra_requeues() == 0
+
+    # An interrupted relabel can leave both the old and new label attached;
+    # the highest wins, because over-counting a retry is safe and under-counting
+    # one is not. A malformed counter is ignored rather than crashing the loop.
+    messy = github.Issue(
+        7, "t", ("attempts:1", "attempts:2", "infra-requeues:oops"), (), "",
+    )
+    assert messy.attempts() == 2 and messy.infra_requeues() == 0
+
+
+def _label_args(runner) -> list[str]:
+    """Every label the run added or removed via `gh issue edit`."""
+    out: list[str] = []
+    for c in runner.calls:
+        if c[:3] != ["gh", "issue", "edit"]:
+            continue
+        for flag in ("--add-label", "--remove-label"):
+            out += [c[i + 1] for i, a in enumerate(c) if a == flag]
+    return out
+
+
+def _timeout_cfg(**overrides):
+    """A config whose remote-CI poll gives up immediately (no test sleeps)."""
+    return replace(load_config(), ci_remote_timeout=0.0, **overrides)
+
+
+def test_remote_timeout_requeues_without_spending_an_attempt(tmp_path):
+    """An infrastructure TIMEOUT must not cost the ticket an attempt.
+
+    Before the taxonomy-aware retry policy, a runner that never concluded
+    burned an attempt exactly like a genuine red build, so two slow blocks
+    pushed real work to `blocked` for human triage on pure noise.
+    """
+    cfg = _timeout_cfg()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[dict(WIDGET_ISSUE)], remote_ci="TIMEOUT",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.remote == "TIMEOUT"
+    assert result.merged is False and result.recovered is True
+    # A non-SUCCESS PR is still closed, and is NEVER merged.
+    assert any(c[:3] == ["gh", "pr", "close"] for c in runner.calls)
+    assert not any(c[:3] == ["gh", "pr", "merge"] for c in runner.calls)
+    # The attempt counter is untouched; the free re-queue counter moves instead.
+    labels = _label_args(runner)
+    assert not any(lbl.startswith("attempts:") for lbl in labels)
+    assert "blocked" not in labels
+    assert "infra-requeues:1" in labels
+    # ...and the ticket goes back to the backlog unassigned, ready to be reclaimed.
+    assert any(
+        c[:3] == ["gh", "issue", "edit"] and "--remove-assignee" in c for c in runner.calls
+    )
+    assert any("disposition=requeued-infra" in n for n in result.notes)
+
+    # The class is recorded on the ledger AND on the replayable trajectory.
+    record = _iteration_records(cfg, tmp_path)[-1]
+    assert record.failure_class == postmortem.REMOTE_CI_TIMEOUT
+    assert trajectory.load(tmp_path, "1").failure_class == postmortem.REMOTE_CI_TIMEOUT
+
+
+def test_remote_failure_still_spends_an_attempt_and_closes_the_pr(tmp_path):
+    """A genuine red build keeps today's behaviour exactly - no free re-queue."""
+    cfg = _timeout_cfg()
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[dict(WIDGET_ISSUE)], remote_ci="FAILURE",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.remote == "FAILURE"
+    assert result.merged is False and result.recovered is True
+    assert any(c[:3] == ["gh", "pr", "close"] for c in runner.calls)
+    assert not any(c[:3] == ["gh", "pr", "merge"] for c in runner.calls)
+
+    labels = _label_args(runner)
+    assert "attempts:1" in labels
+    assert not any(lbl.startswith("infra-requeues:") for lbl in labels)
+    assert any("disposition=retry" in n for n in result.notes)
+
+    record = _iteration_records(cfg, tmp_path)[-1]
+    assert record.failure_class == postmortem.REMOTE_CI_FAIL
+    assert trajectory.load(tmp_path, "1").failure_class == postmortem.REMOTE_CI_FAIL
+
+
+def test_infra_requeues_are_bounded_so_a_timeout_cannot_loop_forever(tmp_path):
+    """Past `max_infra_requeues`, a timeout falls back to the normal attempt path."""
+    cfg = _timeout_cfg()
+    exhausted = dict(
+        WIDGET_ISSUE,
+        labels=[{"name": "priority:P2"}, {"name": f"infra-requeues:{cfg.max_infra_requeues}"}],
+    )
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True],
+        open_issues=[exhausted], remote_ci="TIMEOUT",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    labels = _label_args(runner)
+    assert "attempts:1" in labels                      # the free path is spent
+    assert f"infra-requeues:{cfg.max_infra_requeues + 1}" not in labels
+    assert any("disposition=retry" in n for n in result.notes)
 
 
 def test_workflow_edits_are_reverted(tmp_path):

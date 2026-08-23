@@ -11,7 +11,11 @@ run is captured, including the ones a guard aborts moments later.
 Sharding by block is what makes the store bounded: :func:`prune` drops whole
 block directories beyond ``execution.trajectory_retention_blocks`` on each
 cycle, so forensics stay available for the recent past without growing without
-limit.
+limit. Within one record, ``execution.trajectory_step_chars`` caps each step's
+transcript on the way *in*, so a single runaway tool result cannot bloat the
+store either. Writes are lock-protected, like the ledger's appends, because up
+to ``execution.max_parallel`` workers share this store and a settled iteration
+re-writes the record its agent step already wrote.
 
 Two audiences, deliberately separated:
 
@@ -34,6 +38,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,10 +47,16 @@ from typing import Any
 TRAJECTORY_DIR = ".hsai/traj"
 
 # Per-step text is clipped so one runaway tool result cannot bloat the store.
+# This is the default for `execution.trajectory_step_chars`; callers holding a
+# CoreConfig pass that value through instead.
 STEP_CHARS = 2000
 # What the committed lesson may quote: a short tail, tightly clipped.
 EXCERPT_STEPS = 5
 EXCERPT_CHARS = 240
+
+# Serializes writes so a reader never observes a half-written record,
+# mirroring the ledger's append discipline (see hsai.ledger).
+_TRAJECTORY_LOCK = threading.Lock()
 
 REDACTED = "[redacted]"
 
@@ -137,22 +148,26 @@ def _block_text(value: Any) -> str:
     return "" if value is None else str(value)
 
 
-def steps_from_output(raw: dict[str, Any] | None, output: str) -> list[Step]:
+def steps_from_output(
+    raw: dict[str, Any] | None, output: str, *, step_chars: int = STEP_CHARS
+) -> list[Step]:
     """Derive the step stream from a parsed ``claude -p`` envelope.
 
     ``raw`` is ``None`` whenever the CLI did not emit JSON (an older binary, a
     crash); the whole plain-text output then becomes a single step so the
-    trajectory is still a valid, replayable record.
+    trajectory is still a valid, replayable record. Every step's text is
+    clipped to ``step_chars`` on the way in, so the cap bounds what reaches
+    disk rather than only what is rendered back out.
     """
     if not isinstance(raw, dict):
-        text = _clip(redact(output or ""))
+        text = _clip(redact(output or ""), step_chars)
         return [Step(index=1, kind="output", text=text)] if text else []
 
     steps: list[Step] = []
 
     def add(kind: str, text: str, name: str = "") -> None:
         steps.append(Step(index=len(steps) + 1, kind=kind, name=name,
-                          text=_clip(redact(text))))
+                          text=_clip(redact(text), step_chars)))
 
     messages = raw.get("messages")
     if isinstance(messages, list):
@@ -197,6 +212,11 @@ class Trajectory:
     num_turns: int | None = None
     duration_seconds: float = 0.0
     outcome: str = "ran"
+    # Causal class from hsai.postmortem.classify, stamped once the iteration
+    # settles. Empty means "nothing went wrong" (or not yet classified); the
+    # same value is carried on the ledger record and in the lesson note, so a
+    # class can be traced from the histogram back to a replayable run.
+    failure_class: str = ""
     created: str = field(default_factory=_now)
 
     @property
@@ -346,12 +366,32 @@ def find(repo_root: str | Path, identifier: str) -> Path | None:
     return matches[0] if matches else None
 
 
+def count_for_block(repo_root: str | Path, block: int) -> int:
+    """How many agent runs this block left a trajectory for.
+
+    The ledger counts *iterations*; a single iteration can spend two model runs
+    (the author plus the independent reviewer). Folding this into
+    :meth:`hsai.ledger.BlockAggregate.summary` is what makes the gap between
+    the two visible in the review brief.
+    """
+    target = block_dir(repo_root, block)
+    return sum(1 for p in target.glob("*.json")) if target.is_dir() else 0
+
+
 def write(traj: Trajectory, repo_root: str | Path) -> Path:
-    """Persist (or refresh) one trajectory as a single redacted JSON file."""
+    """Persist (or refresh) one trajectory as a single redacted JSON file.
+
+    Lock-protected like :func:`hsai.ledger.append_record`: up to
+    ``execution.max_parallel`` workers write here concurrently, and a
+    terminal path re-writes a record the agent step already wrote, so a
+    reader must never observe a half-serialized file.
+    """
     path = path_for(repo_root, traj.identifier, traj.block)
-    path.parent.mkdir(parents=True, exist_ok=True)
     # to_json() redacts: nothing reaches disk before the scrub pass.
-    path.write_text(traj.to_json(), encoding="utf-8")
+    payload = traj.to_json()
+    with _TRAJECTORY_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(payload, encoding="utf-8")
     return path
 
 
@@ -413,6 +453,7 @@ def record(
     block: int = 0,
     duration_seconds: float = 0.0,
     outcome: str = "ran",
+    step_chars: int = STEP_CHARS,
 ) -> Trajectory:
     """Build a trajectory from an :class:`hsai.ai.AIResult` and persist it.
 
@@ -431,10 +472,12 @@ def record(
         block=block,
         prompt_digest=prompt_digest(prompt),
         session_id=str(getattr(result, "session_id", "") or ""),
-        steps=steps_from_output(payload, getattr(result, "output", "")),
+        steps=steps_from_output(
+            payload, getattr(result, "output", ""), step_chars=step_chars
+        ),
         ok=bool(getattr(result, "ok", False)),
         exit_status="ok" if getattr(result, "ok", False) else "error",
-        error=redact(_clip(getattr(result, "error", "") or "")),
+        error=redact(_clip(getattr(result, "error", "") or "", step_chars)),
         usage=getattr(result, "usage", None),
         num_turns=int(num_turns) if isinstance(num_turns, int) else None,
         duration_seconds=round(max(0.0, duration_seconds), 3),

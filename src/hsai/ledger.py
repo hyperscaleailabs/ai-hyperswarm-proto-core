@@ -10,7 +10,9 @@ measure locally and never issue a metered API call.
   output exposes them), appended to an append-only file under ``knowledge/`` so
   it is auditable and Obsidian-adjacent.
 - **Aggregate** - per half-day block we fold the records into a summary
-  (heavy-tier count, total seconds, token totals) surfaced in the review brief.
+  (heavy-tier count, total seconds, token totals, the per-class failure
+  histogram, and how many agent runs left a trajectory) surfaced in the review
+  brief, so the block shows not just what it spent but where it lost the spend.
 - **Budget gate** - config-driven ceilings (max heavy-tier iterations and max
   cumulative seconds per block). A *soft* breach warns and biases subsequent
   selection toward cheaper tiers; a *hard* breach halts starting NEW work for
@@ -154,6 +156,10 @@ class BlockAggregate:
     # Per-class failure counts this block (see hsai.postmortem.pareto_table for
     # the richer share/exemplar breakdown the review brief renders).
     failure_histogram: dict[str, int] = field(default_factory=dict)
+    # Agent runs that left a replayable record (hsai.trajectory.count_for_block).
+    # Counted separately from `iterations` because one iteration can spend more
+    # than one model run - an author plus an independent reviewer.
+    trajectories: int = 0
 
     @property
     def total_tokens(self) -> int:
@@ -169,10 +175,20 @@ class BlockAggregate:
             return None
         return self.total_tokens / self.merged_iterations
 
+    def failure_summary(self) -> str:
+        """The block's failure classes, highest count first (ties alphabetical).
+
+        Deterministic ordering so two runs of the same block render the same
+        brief - and so "where the block lost time" reads off the front.
+        """
+        items = sorted(self.failure_histogram.items(), key=lambda kv: (-kv[1], kv[0]))
+        return ", ".join(f"{cls}={n}" for cls, n in items)
+
     def summary(self) -> str:
         tiers = ", ".join(f"{t}={self.tier_counts[t]}" for t in sorted(self.tier_counts))
         toks = self.total_tokens
         per_pr = self.tokens_per_merged_pr()
+        failures = self.failure_summary()
         return (
             f"{self.iterations} iterations, heavy-tier={self.heavy_iterations}, "
             f"{self.total_seconds:.0f}s wall-clock, {self.total_attempts} attempts"
@@ -183,12 +199,22 @@ class BlockAggregate:
             + (f", tiers[{tiers}]" if tiers else "")
             + (f", {toks} tokens" if toks else "")
             + (f", {per_pr:.0f} tokens/merged PR" if per_pr else "")
+            + (f", {self.trajectories} trajectories" if self.trajectories else "")
+            + (f", failures[{failures}]" if failures else "")
         )
 
 
-def aggregate_block(records: list[LedgerRecord], block: int) -> BlockAggregate:
-    """Fold every record belonging to ``block`` into a :class:`BlockAggregate`."""
-    agg = BlockAggregate(block=block)
+def aggregate_block(
+    records: list[LedgerRecord], block: int, *, trajectories: int = 0
+) -> BlockAggregate:
+    """Fold every record belonging to ``block`` into a :class:`BlockAggregate`.
+
+    ``trajectories`` is passed in rather than read here (see
+    :func:`hsai.trajectory.count_for_block`) so this stays a pure fold over the
+    ledger and callers that only hold records - the budget gate, most tests -
+    need no filesystem at all.
+    """
+    agg = BlockAggregate(block=block, trajectories=trajectories)
     for r in records:
         if r.block != block:
             continue

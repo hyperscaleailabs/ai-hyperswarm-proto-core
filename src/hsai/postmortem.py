@@ -54,6 +54,15 @@ FAILURE_CLASSES = (
     REMOTE_CI_FAIL, REMOTE_CI_TIMEOUT, MERGE_CONFLICT, BUDGET_HALT, UNKNOWN,
 )
 
+# The classes where nothing ever rendered a verdict on the *work*: a clock ran
+# out. Every other class is evidence the change itself is wrong (a red build, a
+# guard, a blocking review), so only these are eligible for a free re-queue -
+# see hsai.orchestrator._recover_failed and `execution.max_infra_requeues`.
+# REMOTE_CI_FAIL is deliberately absent: a genuine red build must cost an
+# attempt, or a doomed ticket would retry until the requeue bound alone stopped
+# it.
+INFRA_CLASSES = (AGENT_TIMEOUT, REMOTE_CI_TIMEOUT)
+
 # `hsai.proc.run` stamps a timed-out subprocess's stderr with exactly this
 # phrase (see proc.py's `subprocess.TimeoutExpired` handler), so it is a
 # reliable, code-derived signal rather than a guess about agent error text.
@@ -156,6 +165,16 @@ def classify_with_detail(evidence: FailureEvidence) -> tuple[str, str]:
     """:func:`classify` plus :func:`default_detail` in one call."""
     failure_class = classify(evidence)
     return failure_class, default_detail(failure_class, evidence)
+
+
+def is_infrastructure(failure_class: str) -> bool:
+    """True when ``failure_class`` is a timeout rather than a verdict on the work.
+
+    The predicate the retry policy branches on: see
+    :func:`hsai.orchestrator._recover_failed`, which spends a free re-queue
+    (bounded by ``execution.max_infra_requeues``) instead of a ticket attempt.
+    """
+    return failure_class in INFRA_CLASSES
 
 
 # --- Pareto analysis ----------------------------------------------------------

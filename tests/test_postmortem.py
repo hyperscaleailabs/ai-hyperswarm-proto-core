@@ -11,6 +11,7 @@ from hsai.postmortem import (
     BUDGET_HALT,
     FAILURE_CLASSES,
     INCOMPLETE_DIFF,
+    INFRA_CLASSES,
     LINT_FAIL,
     MERGE_CONFLICT,
     NO_REPRO,
@@ -25,6 +26,7 @@ from hsai.postmortem import (
     default_detail,
     dominant_failure,
     file_postmortem_ticket,
+    is_infrastructure,
     pareto_table,
     postmortem_ticket_title,
     render_pareto_table,
@@ -96,6 +98,28 @@ def test_classify_merge_conflict():
 def test_classify_budget_halt():
     ev = FailureEvidence(budget_halted=True)
     assert classify(ev) == BUDGET_HALT
+
+
+# --- the infrastructure partition (drives the retry policy) ------------------
+
+
+def test_infrastructure_classes_are_exactly_the_timeouts():
+    """Only a class where no verdict on the WORK was ever rendered is 'infra'.
+
+    This partition is what `orchestrator._recover_failed` spends a free
+    re-queue on, so widening it would silently stop charging a real defect an
+    attempt.
+    """
+    assert set(INFRA_CLASSES) == {AGENT_TIMEOUT, REMOTE_CI_TIMEOUT}
+    assert all(c in FAILURE_CLASSES for c in INFRA_CLASSES)
+    for cls in INFRA_CLASSES:
+        assert is_infrastructure(cls)
+    # Every other class is a verdict on the change, and must cost an attempt.
+    for cls in set(FAILURE_CLASSES) - set(INFRA_CLASSES):
+        assert not is_infrastructure(cls)
+    # Most importantly: a genuine red build is never treated as noise.
+    assert not is_infrastructure(REMOTE_CI_FAIL)
+    assert not is_infrastructure("")
 
 
 def test_classify_unknown_is_an_explicit_fallback_not_a_silent_default():

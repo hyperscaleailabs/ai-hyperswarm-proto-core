@@ -1,4 +1,5 @@
 import json
+import threading
 
 import pytest
 
@@ -98,6 +99,38 @@ def test_long_step_text_is_clipped():
     assert "chars]" in text
 
 
+def test_step_cap_is_configurable(tmp_path):
+    """The cap is a config knob (`execution.trajectory_step_chars`), and it
+    bounds what reaches DISK - not merely what is rendered back out."""
+    payload = {"result": "x" * 5000, "messages": [
+        {"role": "user", "content": [{"type": "tool_result", "content": "y" * 5000}]},
+    ]}
+    steps = steps_from_output(payload, "", step_chars=50)
+    assert steps and all(len(s.text) < 120 for s in steps)   # 50 + the "+N chars]" note
+    assert all("chars]" in s.text for s in steps)
+
+    traj = trajectory.record(
+        tmp_path,
+        iteration=31, ticket=7, kind="implement", tier="standard", model="sonnet",
+        prompt="p", result=AIResult(
+            ok=True, model="sonnet", output="", error="", cmd=[], payload=payload,
+        ),
+        step_chars=50,
+    )
+    stored = json.loads(trajectory.path_for(tmp_path, "31", 0).read_text())
+    assert traj.steps and len(stored["steps"]) == len(traj.steps)
+    for step in stored["steps"]:
+        assert len(step["text"]) < 120
+
+
+def test_a_larger_cap_keeps_more_of_the_transcript():
+    long_result = {"result": "x" * 5000}
+    short = steps_from_output(long_result, "", step_chars=100)[0].text
+    long = steps_from_output(long_result, "", step_chars=4000)[0].text
+    assert len(short) < len(long)
+    assert "x" * 4000 in long
+
+
 # --- persistence ------------------------------------------------------------
 
 def test_write_read_roundtrip(tmp_path):
@@ -135,6 +168,66 @@ def test_load_accepts_id_or_path(tmp_path):
 def test_load_missing_raises(tmp_path):
     with pytest.raises(FileNotFoundError):
         trajectory.load(tmp_path, "999")
+
+
+def test_failure_class_round_trips(tmp_path):
+    """The causal class rides on the trajectory too, not just the ledger, so a
+    histogram entry can be traced back to a replayable run."""
+    path = trajectory.write(_traj(failure_class="remote_ci_timeout"), tmp_path)
+    assert trajectory.read(path).failure_class == "remote_ci_timeout"
+    assert json.loads(path.read_text())["failure_class"] == "remote_ci_timeout"
+    # Absent by default: a merged run has no failure class.
+    assert _traj().failure_class == ""
+
+
+def test_count_for_block_counts_agent_runs(tmp_path):
+    assert trajectory.count_for_block(tmp_path, 7) == 0      # nothing written yet
+    trajectory.write(_traj(iteration=701, block=7), tmp_path)
+    trajectory.write(_traj(iteration=702, block=7), tmp_path)
+    trajectory.write(_traj(iteration=801, block=8), tmp_path)
+    assert trajectory.count_for_block(tmp_path, 7) == 2
+    assert trajectory.count_for_block(tmp_path, 8) == 1
+    # Re-writing a run (a terminal path refreshing its outcome) is not a new run.
+    trajectory.write(_traj(iteration=701, block=7, outcome="merged"), tmp_path)
+    assert trajectory.count_for_block(tmp_path, 7) == 2
+
+
+def test_concurrent_writes_never_leave_a_partial_record(tmp_path):
+    """Up to `execution.max_parallel` workers write here at once, and `run_once`
+    re-writes a run's record when its outcome settles - so writes are
+    lock-protected like the ledger's appends and every artifact stays parseable.
+    """
+    # Big transcripts: a torn write would be visible as unparseable JSON.
+    trajectories = [
+        _traj(iteration=i, block=3, steps=[Step(index=1, kind="output", text="z" * 20_000)])
+        for i in range(1, 7)
+    ]
+    # Two threads per trajectory, so the SAME path is contended - which is the
+    # case an unsynchronized `write_text` truncate-then-write would tear.
+    contenders = trajectories * 2
+    barrier = threading.Barrier(len(contenders))
+    errors: list[Exception] = []
+
+    def worker(traj):
+        try:
+            barrier.wait()
+            for _ in range(5):
+                trajectory.write(traj, tmp_path)
+        except Exception as exc:                    # pragma: no cover - failure path
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(t,)) for t in contenders]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors
+    assert trajectory.count_for_block(tmp_path, 3) == len(trajectories)
+    # Every artifact parses back to exactly what was written: no interleaving,
+    # no truncation, and no lost record.
+    for traj in trajectories:
+        assert trajectory.load(tmp_path, str(traj.iteration)) == traj
 
 
 # --- redaction happens before anything reaches disk -------------------------
