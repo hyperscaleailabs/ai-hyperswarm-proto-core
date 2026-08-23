@@ -233,6 +233,65 @@ def get_issue(repo: str, number: int, *, runner: Runner = run) -> Issue | None:
     )
 
 
+@dataclass(frozen=True)
+class TicketOutcome:
+    """What actually became of a ticket - open, merged, or closed unmerged.
+
+    The ground truth behind a practice's status (see
+    :func:`hsai.practices.sync_statuses`): a ticket is only "adopted" when a
+    pull request that closes it really merged, which is a fact GitHub holds and
+    no prose can assert.
+    """
+
+    number: int
+    state: str = ""                 # OPEN | CLOSED
+    labels: tuple[str, ...] = ()
+    merged_pr: int | None = None
+
+    @property
+    def is_open(self) -> bool:
+        return self.state.upper() == "OPEN"
+
+    @property
+    def is_blocked(self) -> bool:
+        return "blocked" in self.labels
+
+    @property
+    def merged(self) -> bool:
+        return self.merged_pr is not None
+
+
+def ticket_outcome(repo: str, number: int, *, runner: Runner = run) -> TicketOutcome | None:
+    """Read a ticket's state, labels, and the PR (if any) that merged it."""
+    p = _gh(
+        [
+            "issue", "view", str(number), "--repo", repo,
+            "--json", "number,state,labels,closedByPullRequestsReferences",
+        ],
+        runner=runner,
+    )
+    try:
+        item = json.loads(p.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    if not item:
+        return None
+    merged_pr = next(
+        (
+            ref.get("number")
+            for ref in item.get("closedByPullRequestsReferences") or []
+            if str(ref.get("state", "")).upper() == "MERGED"
+        ),
+        None,
+    )
+    return TicketOutcome(
+        number=item.get("number", number),
+        state=str(item.get("state", "")),
+        labels=tuple(lb.get("name", "") for lb in item.get("labels", [])),
+        merged_pr=merged_pr,
+    )
+
+
 @dataclass
 class Pr:
     number: int

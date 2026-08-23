@@ -25,12 +25,38 @@ CHECKBOX = re.compile(r"^\s*-\s*\[[ xX]?\]\s+\S", re.MULTILINE)
 # render identically.
 NO_PRIOR_ART = "No prior art found"
 
+# The reference projects whose artifacts were actually mined for this ticket.
+# Written into the ticket's Meta block by the planner and read back out by the
+# orchestrator, so the PR's "Reference-set evidence" cites what was studied
+# rather than whichever repos happen to sit first in core.yaml.
+STUDIED_KEY = "studied"
+_STUDIED_RE = re.compile(rf"^-\s*{STUDIED_KEY}:\s*(.+)$", re.MULTILINE)
+
 NEEDS_REFINEMENT = "needs-refinement"
 SIZE_LABELS = ("size:S", "size:M", "size:L")
 
 # Kinds of tickets exempt from the substantial-schema gate (docs and chores may
 # be legitimately small; heal tickets are filed by the loop itself mid-incident).
 _EXEMPT_PREFIXES = ("docs:", "chore:", "ci: main is red")
+
+
+def studied_repos(body: str) -> tuple[str, ...]:
+    """The repos a ticket records as actually studied (``()`` when it says none).
+
+    Deliberately returns empty rather than a plausible default: a heal ticket
+    filed mid-incident studied nothing, and a PR that says so is more use than
+    one that names three repos nobody read.
+    """
+    match = _STUDIED_RE.search(body or "")
+    if not match:
+        return ()
+    names = (part.strip().strip("`") for part in match.group(1).split(","))
+    return tuple(name for name in names if name and name != "-")
+
+
+def render_studied(repos: tuple[str, ...] | list[str]) -> str:
+    """The Meta line :func:`studied_repos` reads back."""
+    return f"- {STUDIED_KEY}: {', '.join(repos) or '-'}"
 
 
 @dataclass(frozen=True)
@@ -50,12 +76,18 @@ class TicketSpec:
     # (``[[note-name]] (outcome) - title``); see :mod:`hsai.retrieval`.
     prior_art: tuple[str, ...] = ()
     labels: tuple[str, ...] = ()
+    # The reference projects whose artifacts this ticket was actually mined
+    # from, and the harness that mined them (git SHA + core.yaml hash).
+    studied_repos: tuple[str, ...] = ()
+    provenance: str = ""
 
     def render(self) -> str:
         ac = "\n".join(f"- [ ] {c}" for c in self.acceptance_criteria)
         vp = "\n".join(f"- [ ] {v}" for v in self.verification_plan)
         goals = ", ".join(self.goal_ids) or "-"
         practices = ", ".join(self.practice_ids) or "-"
+        studied = render_studied(self.studied_repos)
+        stamp = f"\n- provenance: `{self.provenance}`" if self.provenance else ""
         prior = "\n".join(f"- {p}" for p in self.prior_art) or NO_PRIOR_ART
         synth = (
             f"\n## Synthesis rationale\n{self.synthesis_rationale}\n"
@@ -81,6 +113,7 @@ class TicketSpec:
 - goals: {goals}
 - size: {self.size}
 - practice_ids: {practices}
+{studied}{stamp}
 """
 
     def all_labels(self) -> list[str]:

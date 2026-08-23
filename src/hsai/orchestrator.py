@@ -16,7 +16,19 @@ import time
 from dataclasses import dataclass, field
 from uuid import uuid4
 
-from . import ai, ci, github, gitops, ledger, postmortem, recall, repro, review, trajectory
+from . import (
+    ai,
+    ci,
+    github,
+    gitops,
+    ledger,
+    postmortem,
+    recall,
+    repro,
+    review,
+    tickets,
+    trajectory,
+)
 from .config import CoreConfig
 from .knowledge import KnowledgeBase, Lesson
 from .models import ModelChoice, Task, select
@@ -237,14 +249,17 @@ def _improvement_idea(cfg: CoreConfig) -> tuple[str, str]:
     v0: deterministic, evidence-anchored suggestion. Improving this selection is
     itself a tracked skill (see seeded backlog).
     """
+    repos = [r.repo for r in cfg.reference_top10]
     title = "chore: refresh reference-set snapshot and extract one practice"
     body = (
         "Backlog is empty. Toward goal G1, revisit the pinned reference set in "
         ".ai-swarm/core.yaml, pick ONE concrete practice observed in those "
         "projects (code, CI, or issue-handling), and adopt a small version of it "
         "here. Cite the source project in the lesson.\n\n"
-        "Reference set: "
-        + ", ".join(r.repo for r in cfg.reference_top10)
+        "Reference set: " + ", ".join(repos) + "\n\n"
+        # The whole pinned set IS what this ticket hands the worker, so the PR's
+        # reference-set evidence can honestly name all of it.
+        "## Meta\n" + tickets.render_studied(repos) + "\n"
     )
     return title, body
 
@@ -571,7 +586,14 @@ def run_once(
         # refines it to the merge outcome once that is settled.
         traj.outcome = outcome
     kb = KnowledgeBase.from_config(cfg, wt)
-    references = tuple(r.repo for r in cfg.reference_top10[:3])
+    # Reference-set evidence for the lesson and the PR: the repos this ticket
+    # was ACTUALLY mined from, read back off the ticket body (see
+    # `hsai.tickets.studied_repos`). This used to be a fixed leading slice of
+    # the pinned reference set - the first three repos in core.yaml, which are
+    # usually NOT the ones that cycle studied, i.e. fabricated traceability
+    # sitting in a PR body. A ticket that studied nothing (a heal filed
+    # mid-incident) now cites nothing.
+    references = tickets.studied_repos(ticket_body)
     lesson = Lesson(
         title=f"{kind}: {ticket_title}"[:120],
         outcome=outcome,

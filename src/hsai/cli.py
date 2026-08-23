@@ -7,8 +7,9 @@ Commands:
   hsai cycle [--cycle-index N] [--resume] [--dry-run]          one governance block
   hsai reindex [--root DIR]                                    rebuild knowledge MOCs + notes.json
   hsai recall "<query>" [--k N] [--kind K]                     rank prior lessons/ADRs
-  hsai practices list                                          show the adopted-practice registry
-  hsai practices add --title T --source-project P ...          record a new adopted practice
+  hsai practices list                                          show the reference-practice catalog
+  hsai practices add --title T --source-project P ...          record a practice by hand
+  hsai practices sync [--dry-run]                              recompute statuses from GitHub
   hsai postmortem [--block N]                                  print the failure-class Pareto for a block
   hsai doctor                                                  verify environment + invariants
   hsai traj <iteration> [--json]                               print a stored agent run
@@ -125,7 +126,7 @@ def cmd_recall(args: argparse.Namespace) -> int:
 
 
 def cmd_practices_list(args: argparse.Namespace) -> int:
-    """Print the adopted-practice registry (pure reading, no quota spent)."""
+    """Print the reference-practice catalog (pure reading, no quota spent)."""
     cfg = _load(args)
     records = practices.load(args.root, cfg)
     if not records:
@@ -133,7 +134,32 @@ def cmd_practices_list(args: argparse.Namespace) -> int:
         return 0
     for p in records:
         pr = f"#{p.adopted_pr}" if p.adopted_pr else "-"
-        print(f"{p.id}  [{p.status}]  {p.title}  <- {p.source_project} ({p.source_artifact})  PR {pr}")
+        ticket = f"#{p.ticket}" if p.ticket else "-"
+        print(
+            f"{p.id}  [{p.status}]  {p.title}  <- {p.source_project} "
+            f"({p.source_artifact})  ticket {ticket}  PR {pr}"
+        )
+    return 0
+
+
+def cmd_practices_sync(args: argparse.Namespace) -> int:
+    """Recompute every linked practice's status from the real state of its ticket.
+
+    The one command that can move a practice to `adopted` or `rejected`: those
+    statuses are facts about merged/closed tickets, so they are read back off
+    GitHub rather than asserted by whoever wrote the note.
+    """
+    cfg = _load(args)
+    changes = practices.sync(
+        args.root, repo=cfg.repo_slug, cfg=cfg, dry_run=args.dry_run
+    )
+    if not changes:
+        print("practices sync: no status changed")
+        return 0
+    for change in changes:
+        print(change.render())
+    suffix = " (dry-run: nothing written)" if args.dry_run else ""
+    print(f"practices sync: {len(changes)} practice(s) updated{suffix}")
     return 0
 
 
@@ -149,6 +175,8 @@ def cmd_practices_add(args: argparse.Namespace) -> int:
         adopted_pr=args.adopted_pr,
         adopted_date=args.adopted_date or "",
         notes=args.notes or "",
+        ticket=args.ticket,
+        provenance=practices.current_provenance(args.root).stamp(),
     )
     try:
         path = practices.append(args.root, practice, cfg=cfg)
@@ -211,6 +239,8 @@ def cmd_synthesize(args: argparse.Namespace) -> int:
     res = synthesize(cfg, cycle_index=args.index)
     print(f"studied: {', '.join(res.studied)}")
     print(f"filed tickets: {res.filed or 'none'}")
+    print(f"practices observed: {', '.join(res.observed) or 'none'}")
+    print(f"practices proposed: {', '.join(res.proposed) or 'none'}")
     if res.rejected:
         print(f"duplicates rejected: {res.rejected} (matched: {', '.join(res.rejected_titles)})")
     for flag in res.risk_flags:
@@ -330,7 +360,7 @@ def build_parser() -> argparse.ArgumentParser:
     rl.add_argument("--root", default=".", help="repo root holding knowledge/ and docs/adr")
     rl.set_defaults(func=cmd_recall)
 
-    pr = sub.add_parser("practices", help="the adopted-practice registry (see hsai.practices)")
+    pr = sub.add_parser("practices", help="the reference-practice catalog (see hsai.practices)")
     pr_sub = pr.add_subparsers(dest="practices_command", required=True)
 
     pr_list = pr_sub.add_parser("list", help="print every registered practice")
@@ -351,7 +381,17 @@ def build_parser() -> argparse.ArgumentParser:
     pr_add.add_argument("--adopted-pr", type=int, default=None)
     pr_add.add_argument("--adopted-date", default="", help="YYYY-MM-DD (default: today)")
     pr_add.add_argument("--notes", default="")
+    pr_add.add_argument("--ticket", type=int, default=None, help="ticket proposing this practice")
     pr_add.set_defaults(func=cmd_practices_add)
+
+    pr_sync = pr_sub.add_parser(
+        "sync", help="recompute statuses from the real state of each linked ticket"
+    )
+    pr_sync.add_argument("--root", default=".", help="repo root holding knowledge/practices")
+    pr_sync.add_argument(
+        "--dry-run", action="store_true", help="print the transitions without writing notes"
+    )
+    pr_sync.set_defaults(func=cmd_practices_sync)
 
     pm = sub.add_parser(
         "postmortem", help="print the failure-class Pareto for a block (spends no quota)"
