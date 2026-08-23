@@ -3,6 +3,7 @@ import json
 from hsai import cli as cli_module
 from hsai import trajectory
 from hsai.cli import build_parser, main
+from hsai.github import TicketOutcome
 from hsai.repro import ReproResult
 from hsai.trajectory import Step, Trajectory
 
@@ -227,6 +228,48 @@ def test_practices_add_refuses_a_duplicate(tmp_path, capsys):
     assert "refused" in err
     notes = list((tmp_path / "knowledge" / "practices").glob("*.md"))
     assert len(notes) == 1  # the duplicate attempt never wrote a second note
+
+
+def test_parser_practices_sync():
+    parser = build_parser()
+    args = parser.parse_args(["practices", "sync", "--root", "/tmp/x", "--dry-run"])
+    assert args.practices_command == "sync"
+    assert args.dry_run is True
+    assert parser.parse_args(["practices", "sync"]).dry_run is False
+
+
+def test_practices_sync_recomputes_status_from_the_ticket(tmp_path, capsys, monkeypatch):
+    from hsai import practices as practices_mod
+
+    practices_mod.append(
+        tmp_path,
+        practices_mod.build_practice(
+            title="pr size gate", source_project="crewAIInc/crewAI",
+            source_artifact="ci_cd", evidence="PR #412", status="proposed", ticket=412,
+        ),
+    )
+
+    def fake_outcome(repo, number, *, runner=None):
+        assert number == 412
+        return TicketOutcome(number, "CLOSED", (), merged_pr=777)
+
+    monkeypatch.setattr(practices_mod.github, "ticket_outcome", fake_outcome)
+
+    rc = main(["practices", "sync", "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "proposed -> adopted" in out
+    assert "1 practice(s) updated" in out
+
+    on_disk = practices_mod.load(tmp_path)[0]
+    assert on_disk.status == "adopted"
+    assert on_disk.adopted_pr == 777
+
+
+def test_practices_sync_reports_a_quiet_catalog(tmp_path, capsys):
+    rc = main(["practices", "sync", "--root", str(tmp_path)])
+    assert rc == 0
+    assert "no status changed" in capsys.readouterr().out
 
 
 def test_parser_repro_check_defaults():

@@ -5,24 +5,29 @@ from pathlib import Path
 from hsai import ai, retrieval
 from hsai.config import load_config
 from hsai.models import ModelChoice
-from hsai.practices import ADOPTED_HEADING, build_practice
+from hsai.practices import ADOPTED_HEADING, REJECTED_RULE, build_practice
 from hsai.proc import Proc
 from hsai.retrieval import PRIOR_ART_HEADING, PriorArt
 from hsai.synthesis import (
     DEFAULT_MEMORY_MAX_CHARS,
     DUPLICATE_JACCARD_THRESHOLD,
+    LABELS_CHARS,
     MEMORY_HEADING,
+    README_CHARS,
+    WORKFLOW_BODY_CHARS,
     ContextPack,
     MemoryPack,
+    build_context_pack,
     build_prompt,
     gather_prior_art,
     goal_queries,
     is_duplicate,
+    parse_observed_practices,
     parse_ticket_specs,
     pick_rotation,
     synthesize,
 )
-from hsai.tickets import NO_PRIOR_ART, TicketSpec
+from hsai.tickets import NO_PRIOR_ART, TicketSpec, studied_repos
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -120,6 +125,41 @@ def test_prompt_includes_adopted_practices_and_do_not_repropose_instruction():
     empty_prompt = build_prompt(cfg, pack)
     assert ADOPTED_HEADING in empty_prompt
     assert "no practices recorded yet" in empty_prompt.lower()
+
+
+def test_prompt_names_adopted_ids_and_visibly_discourages_re_proposing_them():
+    """A seeded catalog must reach the planner by id, with an explicit rule."""
+    cfg = _cfg()
+    pack = ContextPack(repos=["a/b"], sections={"a/b": "digest"})
+    catalog = [
+        build_practice(
+            title="a hard numeric CI gate", source_project="run-llama/llama_index",
+            source_artifact="ci_cd", evidence="PR #47", status="adopted", adopted_pr=47,
+        ),
+        build_practice(
+            title="per-worker vector memory", source_project="microsoft/JARVIS",
+            source_artifact="harness_design", evidence="tried in PR #61, reverted",
+            status="rejected",
+        ),
+    ]
+    prompt = build_prompt(cfg, pack, practices=catalog)
+
+    for practice in catalog:
+        assert f"`{practice.id}`" in prompt
+    assert "status: adopted" in prompt and "status: rejected" in prompt
+    # re-proposing an adopted practice is forbidden outright...
+    assert "do NOT" in prompt or "Do NOT" in prompt
+    assert "re-adopts one of these" in prompt
+    # ...and resurrecting a rejected one needs new evidence, not just optimism
+    assert REJECTED_RULE in prompt
+
+
+def test_prompt_asks_for_the_observed_practice_catalog():
+    prompt = build_prompt(_cfg(), ContextPack(repos=["a/b"], sections={"a/b": "d"}))
+    assert '"source_artifact"' in prompt
+    assert "ci_cd" in prompt          # the artifact vocabulary is spelled out
+    assert "FIRST json block" in prompt
+    assert "LAST fenced block" in prompt
 
 
 def test_synthesize_feeds_the_practices_registry_to_the_model(tmp_path):
@@ -651,3 +691,253 @@ def test_synthesis_drops_a_candidate_that_restates_a_failed_lesson(tmp_path):
     assert "[[2026-01-04-vector-memory]]" in dropped
     kept = next(f for f in res.risk_flags if f.startswith("feat: signed provenance"))
     assert "keep" in kept
+
+
+# --- deeper mining: workflow CONTENTS, templates, label taxonomy -------------
+
+WORKFLOW_YAML = (
+    "name: pr-size\non: pull_request\njobs:\n  size:\n    runs-on: ubuntu-latest\n"
+    "    steps:\n      - uses: actions/labeler@v5\n"
+)
+
+FAKE_REPO = {
+    "readme": "# crewAI\nFramework for orchestrating role-playing agents.\n",
+    "commits": "feat: record the running release on every emitted span\nfix: retry\n",
+    "labels": "bug\nenhancement\ngood first issue\n",
+    "dirs": {
+        ".github/workflows": (
+            "vulnerability-scan.yml\npr-title.yml\npr-size.yml\ntype-checker.yml\n"
+        ),
+        ".github/ISSUE_TEMPLATE": "bug.yml\nfeature.yml\n",
+    },
+    "files": {
+        ".github/workflows/pr-size.yml": WORKFLOW_YAML,
+        ".github/workflows/pr-title.yml": "name: pr-title\n",
+        ".github/workflows/type-checker.yml": "name: type-checker\n",
+        ".github/workflows/vulnerability-scan.yml": "name: vulnerability-scan\n",
+        ".github/ISSUE_TEMPLATE/bug.yml": "name: Bug report\nbody:\n  - type: textarea\n",
+        ".github/ISSUE_TEMPLATE/feature.yml": "name: Feature request\n",
+        ".github/PULL_REQUEST_TEMPLATE.md": "## Why\n## How\n## Checklist\n",
+    },
+}
+
+
+def _mining_runner(repo_data=None):
+    """A fake `gh api` serving one repo's README, commits, tree and labels."""
+    data = FAKE_REPO if repo_data is None else repo_data
+    calls: list[list[str]] = []
+
+    def runner(cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None):
+        calls.append(list(cmd))
+        if cmd[:2] != ["gh", "api"]:
+            return Proc(cmd, 0, "", "")
+        path = cmd[2]
+        if path.endswith("/readme"):
+            return Proc(cmd, 0, data["readme"], "")
+        if "/commits?" in path:
+            return Proc(cmd, 0, data["commits"], "")
+        if "/labels?" in path:
+            return Proc(cmd, 0, data["labels"], "")
+        rel = path.split("/contents/", 1)[1] if "/contents/" in path else ""
+        source = data["files"] if "-H" in cmd else data["dirs"]
+        body = source.get(rel)
+        return Proc(cmd, 0, body, "") if body else Proc(cmd, 1, "", "Not Found")
+
+    runner.calls = calls  # type: ignore[attr-defined]
+    return runner
+
+
+def test_context_pack_fetches_workflow_contents_not_just_filenames():
+    pack = build_context_pack(["crewAIInc/crewAI"], runner=_mining_runner())
+    digest = pack.sections["crewAIInc/crewAI"]
+
+    # the inventory survives...
+    assert "CI workflows:" in digest
+    assert "vulnerability-scan.yml" in digest
+    # ...but the point is what the workflow actually gates on
+    assert "Workflow `pr-size.yml`" in digest
+    assert "uses: actions/labeler@v5" in digest
+
+
+def test_context_pack_caps_how_many_workflow_bodies_it_pulls():
+    """Bodies are capped by count as well as size; the inventory still lists all."""
+    pack = build_context_pack(["crewAIInc/crewAI"], runner=_mining_runner())
+    digest = pack.sections["crewAIInc/crewAI"]
+
+    fetched = sorted(
+        name for name in FAKE_REPO["dirs"][".github/workflows"].split()
+        if f"Workflow `{name}`" in digest
+    )
+    # sorted order decides WHICH three, so the pack is reproducible run to run
+    assert fetched == ["pr-size.yml", "pr-title.yml", "type-checker.yml"]
+    assert "Workflow `vulnerability-scan.yml`" not in digest
+
+
+def test_context_pack_fetches_issue_and_pr_templates_and_labels():
+    digest = build_context_pack(
+        ["crewAIInc/crewAI"], runner=_mining_runner()
+    ).sections["crewAIInc/crewAI"]
+
+    assert "Issue template `bug.yml`" in digest
+    assert "type: textarea" in digest
+    assert "PR template" in digest and "## Checklist" in digest
+    assert "Label taxonomy:" in digest and "good first issue" in digest
+
+
+def test_context_pack_size_caps_every_section():
+    huge = dict(FAKE_REPO)
+    huge["readme"] = "R" * (README_CHARS + 500)
+    huge["labels"] = "\n".join(f"label-{i}" for i in range(500))
+    huge["files"] = dict(FAKE_REPO["files"], **{
+        ".github/workflows/pr-size.yml": "W" * (WORKFLOW_BODY_CHARS + 500),
+    })
+
+    digest = build_context_pack(
+        ["crewAIInc/crewAI"], runner=_mining_runner(huge)
+    ).sections["crewAIInc/crewAI"]
+
+    assert "R" * README_CHARS in digest
+    assert "R" * (README_CHARS + 1) not in digest
+    assert "W" * WORKFLOW_BODY_CHARS in digest
+    assert "W" * (WORKFLOW_BODY_CHARS + 1) not in digest
+    labels_section = digest.split("Label taxonomy:\n", 1)[1]
+    assert len(labels_section) <= LABELS_CHARS
+
+
+def test_context_pack_degrades_when_a_repo_has_no_ci_or_templates():
+    bare = dict(FAKE_REPO, dirs={}, files={}, labels="")
+    digest = build_context_pack(
+        ["crewAIInc/crewAI"], runner=_mining_runner(bare)
+    ).sections["crewAIInc/crewAI"]
+
+    assert "README (truncated)" in digest
+    assert "CI workflows:" not in digest
+    assert "Issue template" not in digest
+    assert "Label taxonomy:" not in digest
+
+
+# --- PHASE 1 observations become durable catalog entries ---------------------
+
+OBSERVED_OUTPUT = """PHASE 1 - DIVERGE: ten candidates considered.
+```json
+[
+  {"practice_id": "crewaiinc-crewai--pr-size-gate", "title": "PR size gate in CI",
+   "source_project": "crewAIInc/crewAI", "source_artifact": "ci_cd",
+   "evidence": ".github/workflows/pr-size.yml labels a PR by diff size"},
+  {"practice_id": "run-llama-llama-index--issue-classifier",
+   "title": "automated issue classifier", "source_project": "run-llama/llama_index",
+   "source_artifact": "issue_history",
+   "evidence": ".github/workflows/issue_classifier.yml"}
+]
+```
+PHASE 2 - REFLECT: one survived.
+PHASE 3 - CONVERGE:
+```json
+[{"title": "feat: diff-size gate on every hsai pull request", "problem": "p",
+  "proposal": "pp", "acceptance_criteria": ["a", "b", "c"],
+  "verification_plan": ["v1", "v2"], "size": "M", "goal_ids": ["G4"],
+  "synthesis_rationale": "combines crewAI + llama_index + MetaGPT",
+  "practice_ids": ["crewaiinc-crewai--pr-size-gate"], "prior_art": []}]
+```"""
+
+
+def test_parse_observed_practices_reads_the_phase_one_catalog():
+    observed = parse_observed_practices(OBSERVED_OUTPUT)
+    assert [o.resolved_id() for o in observed] == [
+        "crewaiinc-crewai--pr-size-gate", "run-llama-llama-index--issue-classifier",
+    ]
+    assert observed[0].source_artifact == "ci_cd"
+    assert "pr-size.yml" in observed[0].evidence
+
+
+def test_parse_observed_practices_never_mistakes_a_ticket_for_a_practice():
+    """The PHASE 3 block has no source_project and always has acceptance criteria."""
+    assert parse_observed_practices(PLAIN_TEXT_OUTPUT) == []
+    assert parse_observed_practices("no json at all") == []
+    assert parse_observed_practices("```json\n[{\"title\": \"no project\"}]\n```") == []
+
+
+def _observing_runner(output: str = OBSERVED_OUTPUT):
+    calls: list[list[str]] = []
+    issue_numbers = iter(range(900, 999))
+
+    def runner(cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None):
+        calls.append(list(cmd))
+        if cmd[:1] == ["claude"]:
+            return Proc(cmd, 0, output, "")
+        if cmd[:2] == ["git", "rev-parse"]:
+            return Proc(cmd, 0, "abc1234\n", "")
+        if cmd[:3] == ["gh", "issue", "create"]:
+            return Proc(cmd, 0, f"https://github.com/o/r/issues/{next(issue_numbers)}\n", "")
+        return Proc(cmd, 0, "", "")
+
+    runner.calls = calls  # type: ignore[attr-defined]
+    return runner
+
+
+def test_synthesize_writes_observed_practice_notes_that_reach_the_moc(tmp_path):
+    """The `hsai synthesize` path, with a fake `gh`: the study becomes durable."""
+    from hsai.knowledge import KnowledgeBase
+
+    cfg = _cfg()
+    runner = _observing_runner()
+    res = synthesize(cfg, cycle_index=7, root=str(tmp_path), runner=runner, ai_runner=runner)
+
+    notes = sorted(p.stem for p in (tmp_path / "knowledge" / "practices").glob("*.md"))
+    assert notes == [
+        "crewaiinc-crewai--pr-size-gate", "run-llama-llama-index--issue-classifier",
+    ]
+    assert sorted(res.observed) == notes
+
+    catalog = {p.id: p for p in KnowledgeBase.from_config(cfg, tmp_path).read_practices()}
+    # the practice a filed ticket cites is `proposed`, and names that ticket...
+    proposed = catalog["crewaiinc-crewai--pr-size-gate"]
+    assert proposed.status == "proposed"
+    assert proposed.ticket == res.filed[0]
+    assert res.proposed == ["crewaiinc-crewai--pr-size-gate"]
+    # ...while one nobody ticketed stays `observed`, still remembered.
+    assert catalog["run-llama-llama-index--issue-classifier"].status == "observed"
+
+    # every note is stamped and dated to the cycle that saw it
+    for practice in catalog.values():
+        assert practice.first_seen_cycle == 7
+        assert practice.provenance.startswith("hsai@abc1234 core.yaml@")
+
+    moc = [p for p in KnowledgeBase.from_config(cfg, tmp_path).reindex_mocs()
+           if p.name == "Practices MOC.md"][0].read_text()
+    assert "[[crewaiinc-crewai--pr-size-gate]]" in moc
+    assert "[[run-llama-llama-index--issue-classifier]]" in moc
+
+
+def test_synthesize_re_observing_a_practice_does_not_duplicate_or_downgrade(tmp_path):
+    from hsai.practices import load
+
+    cfg = _cfg()
+    first = _observing_runner()
+    res_a = synthesize(cfg, cycle_index=7, root=str(tmp_path), runner=first, ai_runner=first)
+
+    second = _observing_runner()
+    res_b = synthesize(cfg, cycle_index=8, root=str(tmp_path), runner=second, ai_runner=second)
+
+    assert res_b.observed == []          # nothing new was learned the second time
+    assert res_b.proposed == []          # and the existing claim was not repointed
+    assert len(list((tmp_path / "knowledge" / "practices").glob("*.md"))) == 2
+    catalog = {p.id: p for p in load(tmp_path, cfg)}
+    # still pointing at the FIRST ticket, and still first seen in cycle 7
+    assert catalog["crewaiinc-crewai--pr-size-gate"].ticket == res_a.filed[0]
+    assert catalog["crewaiinc-crewai--pr-size-gate"].first_seen_cycle == 7
+    assert res_b.filed  # the ticket itself is still filed
+
+
+# --- the studied repos travel with the ticket --------------------------------
+
+def test_filed_tickets_record_the_repos_actually_studied(tmp_path):
+    cfg = _cfg()
+    runner = _observing_runner()
+    res = synthesize(cfg, cycle_index=7, root=str(tmp_path), runner=runner, ai_runner=runner)
+
+    body = _created_bodies(runner)[0]
+    assert studied_repos(body) == tuple(res.studied)
+    # and NOT the first three repos in config, which is what used to be claimed
+    assert tuple(r.repo for r in cfg.reference_top10[:3]) != tuple(res.studied)
+    assert "hsai@abc1234" in body   # harness provenance stamped on the ticket too

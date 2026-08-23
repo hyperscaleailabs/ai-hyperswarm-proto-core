@@ -1,5 +1,12 @@
 from hsai.github import Issue
-from hsai.tickets import NO_PRIOR_ART, TicketSpec, check_well_formed, issue_well_formed
+from hsai.tickets import (
+    NO_PRIOR_ART,
+    TicketSpec,
+    check_well_formed,
+    issue_well_formed,
+    render_studied,
+    studied_repos,
+)
 
 
 def test_spec_renders_all_required_sections():
@@ -48,6 +55,41 @@ def test_spec_practice_ids_defaults_to_empty_and_still_renders():
     )
     assert spec.practice_ids == ()
     assert "- practice_ids: -" in spec.render()
+
+
+def test_spec_records_the_studied_repos_and_harness_provenance():
+    spec = TicketSpec(
+        title="feat: thing", problem="p", proposal="pp",
+        acceptance_criteria=("a", "b"), verification_plan=("v",),
+        studied_repos=("crewAIInc/crewAI", "run-llama/llama_index"),
+        provenance="hsai@abc1234 core.yaml@0123456789ab",
+    )
+    body = spec.render()
+    assert "- studied: crewAIInc/crewAI, run-llama/llama_index" in body
+    assert "- provenance: `hsai@abc1234 core.yaml@0123456789ab`" in body
+    assert studied_repos(body) == spec.studied_repos
+    assert check_well_formed(spec.title, body).ok
+
+
+def test_studied_repos_round_trips_through_an_unstudied_ticket():
+    spec = TicketSpec(
+        title="feat: thing", problem="p", proposal="pp",
+        acceptance_criteria=("a", "b"), verification_plan=("v",),
+    )
+    body = spec.render()
+    assert "- studied: -" in body
+    assert "- provenance:" not in body   # unstamped stays silent, not "unknown"
+    assert studied_repos(body) == ()
+
+
+def test_studied_repos_of_a_body_that_never_had_the_marker():
+    assert studied_repos("CI failing on main.\n\n```\nruff=fail\n```") == ()
+    assert studied_repos("") == ()
+
+
+def test_render_studied_round_trips_every_shape():
+    for repos in ((), ("a/b",), ("a/b", "c/d", "e/f")):
+        assert studied_repos(render_studied(repos)) == repos
 
 
 def test_vague_feature_ticket_is_malformed():

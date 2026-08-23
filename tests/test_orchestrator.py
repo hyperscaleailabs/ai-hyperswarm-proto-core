@@ -275,6 +275,56 @@ def test_build_pr_body_contains_traceability():
     assert "openai/swarm" in body
 
 
+def test_pr_body_cites_the_repos_the_ticket_actually_studied():
+    """The reference list is the synthesized ticket's own studied set, not a
+    fixed slice of core.yaml that nobody read this cycle."""
+    from hsai.tickets import TicketSpec, studied_repos
+
+    cfg = load_config()
+    studied = ("crewAIInc/crewAI", "run-llama/llama_index", "FoundationAgents/MetaGPT")
+    assert studied != tuple(r.repo for r in cfg.reference_top10[:3])
+
+    spec = TicketSpec(
+        title="feat: diff-size gate", problem="p", proposal="pp",
+        acceptance_criteria=("a", "b", "c"), verification_plan=("v1", "v2"),
+        studied_repos=studied,
+    )
+    # what the orchestrator does: read the studied set back off the ticket body
+    references = studied_repos(spec.render())
+    assert references == studied
+
+    body = build_pr_body(
+        ticket=42, choice=ModelChoice(tier="heavy", model="opus", rationale="x"),
+        lesson_note="n", lesson_summary="s", ci_summary="green", references=references,
+    )
+    evidence = body.split("## Reference-set evidence\n", 1)[1]
+    for repo in studied:
+        assert f"`{repo}`" in evidence
+    for repo in (r.repo for r in cfg.reference_top10[:3]):
+        if repo not in studied:
+            assert repo not in evidence
+
+
+def test_a_ticket_that_studied_nothing_claims_no_reference_set_evidence():
+    """A heal ticket filed mid-incident read no reference project; saying so is
+    the whole point (the old static slice claimed three either way)."""
+    from hsai.tickets import studied_repos
+
+    body = build_pr_body(
+        ticket=7, choice=ModelChoice(tier="light", model="haiku", rationale="x"),
+        lesson_note="n", lesson_summary="s", ci_summary="red",
+        references=studied_repos("CI failing on main.\n\n```\nruff=fail\n```"),
+    )
+    assert "## Reference-set evidence\n_(none)_" in body
+
+
+def test_no_code_path_still_passes_the_static_reference_slice():
+    """Acceptance criterion, encoded: `reference_top10[:3]` is gone for good."""
+    source = (Path(__file__).resolve().parents[1] / "src" / "hsai").rglob("*.py")
+    offenders = [p.name for p in source if "reference_top10[:3]" in p.read_text()]
+    assert offenders == []
+
+
 def test_build_pr_body_includes_phase_artifacts():
     choice = ModelChoice(tier="standard", model="sonnet", rationale="x")
     body = build_pr_body(
