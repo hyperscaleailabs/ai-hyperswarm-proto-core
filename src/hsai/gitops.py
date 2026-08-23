@@ -95,6 +95,22 @@ def diff_text(base_ref: str, *, cwd: str | None = None, runner: Runner = run) ->
     return p.stdout
 
 
+def diff_numstat(base_ref: str, *, cwd: str | None = None, runner: Runner = run) -> str:
+    """Per-file added/deleted line counts between ``base_ref`` and HEAD.
+
+    The committed counterpart of :func:`worktree_numstat`: what the lesson's
+    deterministic evidence (see :mod:`hsai.knowledge`) reports as "files
+    changed", read once the agent's work is already on the branch.
+    """
+    p = _git(["diff", "--numstat", f"{base_ref}...HEAD"], cwd=cwd, runner=runner)
+    return p.stdout
+
+
+def current_sha(*, cwd: str | None = None, runner: Runner = run) -> str:
+    """The commit HEAD currently points at - half of a lesson's provenance stamp."""
+    return _git(["rev-parse", "HEAD"], cwd=cwd, runner=runner).stdout.strip()
+
+
 def stage_intent_to_add(*, cwd: str, runner: Runner = run) -> Proc:
     """Record *intent to add* for every untracked file (``git add -N``).
 

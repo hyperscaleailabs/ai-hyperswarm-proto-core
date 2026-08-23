@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from hsai import audit, ledger, orchestrator, postmortem, recall, review, trajectory
+from hsai import audit, knowledge, ledger, orchestrator, postmortem, recall, review, trajectory
 from hsai.config import load_config
 from hsai.models import ModelChoice
 from hsai.orchestrator import (
@@ -120,6 +120,28 @@ ESCALATING_DIFF = (
 )
 ESCALATING_NUMSTAT = "1\t1\t.ai-swarm/core.yaml\n"
 
+# What the fake lesson author prints: a well-formed, non-boilerplate
+# interpretation that passes the anti-boilerplate gate on the first attempt,
+# so a test that does not care about authoring content sees exactly one
+# `claude` call for it (not the two the gate's retry would spend on a
+# rejection).
+AUTHOR_OK = json.dumps(
+    {
+        "type": "result",
+        "result": "Authored the lesson.\n\n```json\n"
+        + json.dumps(
+            {
+                "what_was_tried": "Implemented the widget end-to-end and wired it into the CLI.",
+                "what_surprised": "The existing harness already covered most of the edge cases.",
+                "what_to_do_differently": "Add the regression test before the implementation next time.",
+                "reference_citation": "none",
+            }
+        )
+        + "\n```\n",
+        "usage": {"input_tokens": 150, "output_tokens": 40},
+    }
+)
+
 
 def _claude_prompts(runner) -> list[str]:
     return [c[2] for c in runner.calls if c[:1] == ["claude"]]
@@ -128,7 +150,9 @@ def _claude_prompts(runner) -> list[str]:
 def _worker_prompts(runner) -> list[str]:
     return [
         p for p in _claude_prompts(runner)
-        if review.PROMPT_MARKER not in p and audit.PROMPT_MARKER not in p
+        if review.PROMPT_MARKER not in p
+        and audit.PROMPT_MARKER not in p
+        and knowledge.AUTHOR_PROMPT_MARKER not in p
     ]
 
 
@@ -138,6 +162,10 @@ def _review_prompts(runner) -> list[str]:
 
 def _audit_prompts(runner) -> list[str]:
     return [p for p in _claude_prompts(runner) if audit.PROMPT_MARKER in p]
+
+
+def _author_prompts(runner) -> list[str]:
+    return [p for p in _claude_prompts(runner) if knowledge.AUTHOR_PROMPT_MARKER in p]
 
 
 def _iteration_records(cfg, root) -> list[ledger.LedgerRecord]:
@@ -170,6 +198,7 @@ class FakeRunner:
         agent_output: str = AGENT_JSON,
         review_output: str = REVIEW_APPROVE,
         audit_output: str = AUDIT_PASS,
+        author_output: str = AUTHOR_OK,
         diff_text: str = BRANCH_DIFF,
         diff_numstat: str = BRANCH_NUMSTAT,
     ) -> None:
@@ -177,6 +206,7 @@ class FakeRunner:
         self.agent_output = agent_output
         self.review_output = review_output
         self.audit_output = audit_output
+        self.author_output = author_output
         self.diff_text = diff_text
         self.diff_numstat = diff_numstat
         self.ci_sequence = ci_sequence
@@ -207,6 +237,9 @@ class FakeRunner:
             return Proc(cmd, 0, "", "")
         if cmd[:3] == ["git", "rev-parse", "--show-toplevel"]:
             return Proc(cmd, 0, f"{self.repo_root}\n", "")
+        if cmd[:2] == ["git", "rev-parse"]:
+            # The lesson's provenance stamp (see hsai.knowledge.LessonEvidence).
+            return Proc(cmd, 0, "abc123fakesha\n", "")
         if cmd[:2] == ["git", "merge-base"]:
             return Proc(cmd, 0, "parentsha\n", "")
         if cmd[:2] == ["git", "diff"]:

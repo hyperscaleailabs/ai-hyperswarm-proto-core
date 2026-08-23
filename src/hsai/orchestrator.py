@@ -22,6 +22,7 @@ from . import (
     ci,
     github,
     gitops,
+    knowledge,
     ledger,
     postmortem,
     recall,
@@ -421,9 +422,22 @@ def run_once(
     tokens: tuple[int, int] | None = None
     traj: trajectory.Trajectory | None = None
 
-    def _record_cost(outcome: str, *, failure_class: str = "", failure_detail: str = "") -> None:
+    def _elapsed() -> float:
+        return round(max(0.0, time.time() - started), 3)
+
+    def _record_cost(
+        outcome: str,
+        *,
+        failure_class: str = "",
+        failure_detail: str = "",
+        wall_clock_seconds: float | None = None,
+    ) -> None:
         # Every terminal path passes through here, so it is also where the
-        # trajectory learns how its run ended.
+        # trajectory learns how its run ended. `wall_clock_seconds`, when
+        # given, is the exact value the lesson's evidence already recorded
+        # (see hsai.knowledge.LessonEvidence) - passed through rather than
+        # recomputed so the two never drift apart by the few milliseconds
+        # between one `time.time()` call and the next.
         if traj is not None:
             traj.outcome = outcome
             trajectory.write(traj, repo_dir)
@@ -436,7 +450,9 @@ def run_once(
                 kind=kind,
                 tier=choice.tier,
                 model=choice.model,
-                wall_clock_seconds=round(max(0.0, time.time() - started), 3),
+                wall_clock_seconds=(
+                    wall_clock_seconds if wall_clock_seconds is not None else _elapsed()
+                ),
                 attempts=attempts,
                 outcome=outcome,
                 input_tokens=tokens[0] if tokens else None,
@@ -586,17 +602,21 @@ def run_once(
     # first because the reviewer reads `git diff <merge-base>...HEAD`; nothing is
     # pushed until the verdict is in, so a blocking verdict never opens a PR.
     verdict = review.skip_review("dry-run: nothing was committed to review")
+    # Computed unconditionally (not just on a green `ci_after`) because the
+    # lesson's deterministic evidence (see hsai.knowledge) needs the same
+    # base ref to diff the committed change against, pass or fail.
+    base_ref = ""
     if not dry_run:
         commit_msg = f"{kind}: {ticket_title}\n\nRefs #{ticket_num}\nModel: {choice.model}"
         gitops.commit_all(commit_msg, cwd=wt, runner=runner)
+        base_ref = gitops.merge_base(
+            "HEAD", f"origin/{cfg.default_branch}", cwd=wt, runner=runner,
+        ) or f"origin/{cfg.default_branch}"
         if not ci_after.ok:
             # A red branch is already headed for _recover_failed via remote CI;
             # spending review quota on it would buy nothing.
             verdict = review.skip_review("local CI is red; the CI gate decides this one")
         else:
-            base_ref = gitops.merge_base(
-                "HEAD", f"origin/{cfg.default_branch}", cwd=wt, runner=runner,
-            ) or f"origin/{cfg.default_branch}"
             verdict = review.review_change(
                 cfg,
                 repo_root=repo_dir, wt=wt, base_ref=base_ref,
@@ -633,6 +653,55 @@ def run_once(
         traj.outcome = outcome
     kb = KnowledgeBase.from_config(cfg, wt)
     references = tuple(r.repo for r in cfg.reference_top10[:3])
+    lesson_wall_clock_seconds = _elapsed()
+
+    # Deterministic evidence (see hsai.knowledge.LessonEvidence): everything a
+    # future reader can check against the repo's own history, never a model's
+    # opinion. Skipped in a dry run - there is no committed diff to diff.
+    files_changed: tuple[str, ...] = ()
+    provenance_sha = ""
+    if not dry_run and base_ref:
+        files_changed = tuple(
+            f"{s.path} +{s.added}/-{s.deleted}"
+            for s in audit.parse_numstat(gitops.diff_numstat(base_ref, cwd=wt, runner=runner))
+        )
+        provenance_sha = gitops.current_sha(cwd=wt, runner=runner)
+    ci_failure_excerpt = knowledge.trim_ci_excerpt(ci_after.log) if outcome == "fail" else ""
+    evidence = knowledge.LessonEvidence(
+        files_changed=files_changed,
+        tier=choice.tier,
+        model=choice.model,
+        wall_clock_seconds=lesson_wall_clock_seconds,
+        input_tokens=tokens[0] if tokens else None,
+        output_tokens=tokens[1] if tokens else None,
+        ci_failure_excerpt=ci_failure_excerpt,
+        reverted_workflows=tuple(reverted_workflows),
+        provenance_sha=provenance_sha,
+        provenance_config_hash=knowledge.config_hash(cfg),
+    )
+
+    # Authored interpretation: a model reads ONLY the evidence above (never
+    # the raw trajectory) and answers what was tried, what surprised it, what
+    # to do differently, and what it would cite. Never blocks the loop - see
+    # hsai.knowledge.author_interpretation - and never runs in a dry run,
+    # which must stay side-effect-free.
+    if dry_run:
+        interpretation, template_fallback = knowledge.LessonInterpretation(), True
+    else:
+        recent_texts = tuple(
+            r.interpretation.combined_text()
+            for r in kb.read_lessons()[-knowledge.DEFAULT_SIMILARITY_WINDOW:]
+            if not r.template_fallback
+        )
+        interpretation, template_fallback = knowledge.author_interpretation(
+            cfg,
+            ticket_title=ticket_title, ticket_body=ticket_body, outcome=outcome,
+            evidence=evidence, ci_summary=ci_after.summary(), recent_texts=recent_texts,
+            reference_repos=references, ai_runner=ai_runner,
+        )
+    if template_fallback:
+        result.notes.append("lesson authoring: fell back to the template")
+
     lesson = Lesson(
         title=f"{kind}: {ticket_title}"[:120],
         outcome=outcome,
@@ -656,21 +725,29 @@ def run_once(
             )
         ),
         lesson=(
-            "Change merged cleanly under a green build."
-            if outcome == "pass"
-            else "Change did not reach green; auto-merge will hold until CI passes. "
-            "Investigate the failure captured above before the next attempt."
+            interpretation.what_to_do_differently
+            if not template_fallback
+            else (
+                "Change merged cleanly under a green build."
+                if outcome == "pass"
+                else "Change did not reach green; auto-merge will hold until CI passes. "
+                "Investigate the failure captured above before the next attempt."
+            )
         ),
         iteration=iteration,
         ticket=ticket_num,
         model=choice.model,
         references=references,
+        tags=(knowledge.TEMPLATE_FALLBACK_TAG,) if template_fallback else (),
         repro_evidence=repro.render_evidence(repro_result) if repro_result else "",
         recalled=recalled.note_names,
         review_verdict=verdict.render(),
         audit_verdict=audit_section,
         execution_trace=traj.execution_trace() if traj else "",
         failure_class=lesson_failure_class,
+        block=block,
+        evidence=evidence,
+        interpretation=interpretation,
     )
     # Each PR commits ONLY its own uniquely-named lesson file. The MOC indexes
     # and whitepapers are regenerated by the serialized `hsai reindex`
@@ -684,9 +761,12 @@ def run_once(
         result.notes.append("dry-run: skipped commit/push/PR/merge")
         if outcome == "fail":
             fclass, detail = postmortem.classify_with_detail(_failure_evidence())
-            _record_cost(outcome, failure_class=fclass, failure_detail=detail)
+            _record_cost(
+                outcome, failure_class=fclass, failure_detail=detail,
+                wall_clock_seconds=lesson_wall_clock_seconds,
+            )
         else:
-            _record_cost(outcome)
+            _record_cost(outcome, wall_clock_seconds=lesson_wall_clock_seconds)
         return result
 
     # 7b. A blocking verdict stops here: nothing is pushed, no PR is opened, and
@@ -707,6 +787,7 @@ def run_once(
             "review_blocked",
             failure_class=postmortem.AGENT_ERROR,
             failure_detail="; ".join(verdict.blocking) or "independent review blocked the change",
+            wall_clock_seconds=lesson_wall_clock_seconds,
         )
         gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
         return result
@@ -748,8 +829,14 @@ def run_once(
     result.notes.append(f"remote CI={remote}")
 
     # Record the true remote outcome in the lesson itself, then push that
-    # update so it lands in the knowledge base once the PR merges.
+    # update so it lands in the knowledge base once the PR merges. The
+    # evidence's wall-clock is refreshed to this same moment - the remote CI
+    # poll above can take a while - so it stays "consistent with that
+    # iteration's ledger record" (see hsai.knowledge.LessonEvidence) even
+    # though real time passed between the first write and this one.
     lesson.remote_ci = remote
+    lesson_wall_clock_seconds = _elapsed()
+    lesson.evidence.wall_clock_seconds = lesson_wall_clock_seconds
     kb.write_lesson(lesson)
     gitops.commit_all(
         f"docs: record remote CI outcome ({remote}) in lesson\n\nRefs #{ticket_num}",
@@ -770,10 +857,13 @@ def run_once(
         result.notes.append("recovered: closed PR, returned ticket to backlog")
 
     if result.merged:
-        _record_cost("merged")
+        _record_cost("merged", wall_clock_seconds=lesson_wall_clock_seconds)
     else:
         fclass, detail = postmortem.classify_with_detail(_failure_evidence(remote))
-        _record_cost("recovered", failure_class=fclass, failure_detail=detail)
+        _record_cost(
+            "recovered", failure_class=fclass, failure_detail=detail,
+            wall_clock_seconds=lesson_wall_clock_seconds,
+        )
 
     # 13. cleanup worktree
     gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
