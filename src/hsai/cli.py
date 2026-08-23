@@ -11,6 +11,7 @@ Commands:
   hsai practices add --title T --source-project P ...          record a new adopted practice
   hsai postmortem [--block N]                                  print the failure-class Pareto for a block
   hsai doctor                                                  verify environment + invariants
+  hsai verify [--strict] [--root DIR]                          knowledge/ledger integrity gate
   hsai traj <iteration> [--json]                               print a stored agent run
   hsai replay <iteration> [--json]                              alias of `hsai traj`
 """
@@ -31,6 +32,7 @@ from . import (
     repro,
     retrieval,
     trajectory,
+    verify,
 )
 from .config import CoreConfig, load_config, validate
 from .knowledge import KnowledgeBase
@@ -82,6 +84,24 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print(f"  constraints: subscription_only={cfg.subscription_only}, "
           f"require_ticket_per_pr={cfg.constraints.get('require_ticket_per_pr')}")
     return 0 if ok else 1
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    """Knowledge-base and audit-trail integrity gate (see hsai.verify).
+
+    Pure reading: no model call, no network, and (unlike `hsai reindex`) no
+    write to the checked repo. Exits non-zero on any error-severity finding;
+    `--strict` also fails on the warning-severity legacy allowlist so a
+    cleanup pass can prove it closed every entry.
+    """
+    cfg = _load(args)
+    report = verify.verify_repo(args.root, cfg)
+    print(report.render())
+    if not report.ok:
+        return 1
+    if args.strict and report.warnings():
+        return 1
+    return 0
 
 
 def cmd_reindex(args: argparse.Namespace) -> int:
@@ -318,6 +338,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     dr = sub.add_parser("doctor", help="verify environment and safety invariants")
     dr.set_defaults(func=cmd_doctor)
+
+    vf = sub.add_parser(
+        "verify", help="knowledge-base + audit-trail integrity gate (see hsai.verify)"
+    )
+    vf.add_argument("--root", default=".", help="repo root holding knowledge/")
+    vf.add_argument(
+        "--strict", action="store_true",
+        help="also fail on warning-severity findings (e.g. the legacy allowlist)",
+    )
+    vf.set_defaults(func=cmd_verify)
 
     ri = sub.add_parser("reindex", help="rebuild knowledge-base MOCs + the retrieval index")
     ri.add_argument("--root", default=".", help="repo root holding knowledge/ and docs/adr")
