@@ -274,7 +274,10 @@ def run_cycle(
     # Fold the block's ledger records into the summary the review brief surfaces.
     # Derived from the durable ledger, so it needs no journal record of its own.
     block_records = ledger.read_records(ledger_file)
-    report.cost = ledger.aggregate_block(block_records, idx)
+    report.cost = ledger.aggregate_block(
+        block_records, idx,
+        trajectories=trajectory.count_for_block(repo_root, idx),
+    )
 
     # Failure-class Pareto for the brief (see hsai.postmortem). Pure reading -
     # like `report.cost` above, it needs no journal record of its own; only the

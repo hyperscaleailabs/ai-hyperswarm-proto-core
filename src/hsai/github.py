@@ -29,7 +29,14 @@ STANDARD_LABELS = {
     "attempts:1": ("ededed", "hsai retry counter"),
     "attempts:2": ("d4c5f9", "hsai retry counter"),
     "attempts:3": ("c2a3f5", "hsai retry counter"),
+    "infra-requeues:1": ("e8eef7", "hsai infrastructure re-queue counter"),
+    "infra-requeues:2": ("cfe0f2", "hsai infrastructure re-queue counter"),
+    "infra-requeues:3": ("b6d2ed", "hsai infrastructure re-queue counter"),
 }
+
+# Label prefixes carrying an integer counter (`<prefix>:N`).
+ATTEMPTS_PREFIX = "attempts"
+INFRA_REQUEUES_PREFIX = "infra-requeues"
 
 
 @dataclass
@@ -50,16 +57,34 @@ class Issue:
     def is_blocked(self) -> bool:
         return "blocked" in self.labels
 
-    def attempts(self) -> int:
-        """Read the current retry count from an ``attempts:N`` label (0 if none)."""
+    def counter(self, prefix: str) -> int:
+        """Read a ``<prefix>:N`` counter label off this issue (0 if none).
+
+        The highest wins: an interrupted relabel can leave both the old and
+        the new label attached, and over-counting a retry is safe where
+        under-counting one is not.
+        """
         best = 0
         for lbl in self.labels:
-            if lbl.startswith("attempts:"):
+            if lbl.startswith(f"{prefix}:"):
                 try:
                     best = max(best, int(lbl.split(":", 1)[1]))
                 except ValueError:
                     continue
         return best
+
+    def attempts(self) -> int:
+        """How many times a worker has spent an attempt on this ticket."""
+        return self.counter(ATTEMPTS_PREFIX)
+
+    def infra_requeues(self) -> int:
+        """How many times this ticket was re-queued for an INFRASTRUCTURE failure.
+
+        Counted apart from :meth:`attempts` precisely so it does not consume
+        one: a run that timed out never produced a verdict on the work, so
+        charging the ticket for it pushes real work to ``blocked`` on noise.
+        """
+        return self.counter(INFRA_REQUEUES_PREFIX)
 
 
 def _gh(args: list[str], *, cwd: str | None = None, runner: Runner = run) -> Proc:

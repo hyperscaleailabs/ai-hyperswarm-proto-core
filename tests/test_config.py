@@ -1,4 +1,4 @@
-from hsai import review
+from hsai import review, trajectory
 from hsai.config import load_config, validate
 
 
@@ -29,6 +29,17 @@ def test_execution_telemetry_defaults_when_keys_absent(tmp_path):
     cfg = load_config(core / "core.yaml")
     assert cfg.output_format == "json"          # structured envelope by default
     assert cfg.trajectory_retention_blocks == 8
+    assert cfg.trajectory_step_chars == trajectory.STEP_CHARS
+    assert cfg.max_infra_requeues == 2
+
+
+def test_retry_policy_knobs_are_config():
+    """How much noise a ticket tolerates before it burns an attempt is config."""
+    cfg = load_config()
+    # A timeout must be re-queueable at least once, and the escape hatch must
+    # be bounded, or a permanently-timing-out ticket would loop forever.
+    assert 1 <= cfg.max_infra_requeues < 10
+    assert cfg.trajectory_step_chars > 0
 
 
 def test_review_gate_is_configured_and_enabled():

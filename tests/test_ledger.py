@@ -159,6 +159,39 @@ def test_aggregate_block_folds_a_per_class_failure_histogram():
     assert agg.failure_histogram == {"remote_ci_fail": 2, "incomplete_diff": 1}
 
 
+def test_summary_surfaces_where_the_block_lost_time():
+    """The review brief reads off `summary()`, so the histogram must be in it.
+
+    Ordered by count (ties alphabetical) so the dominant cause reads first and
+    two renderings of the same block are byte-identical.
+    """
+    records = [
+        _rec(block=1, outcome="recovered", failure_class="remote_ci_timeout"),
+        _rec(block=1, outcome="recovered", failure_class="agent_error"),
+        _rec(block=1, outcome="recovered", failure_class="agent_error"),
+        _rec(block=1, outcome="merged"),
+    ]
+    agg = aggregate_block(records, block=1, trajectories=6)
+    summary = agg.summary()
+    assert agg.trajectories == 6
+    assert "6 trajectories" in summary
+    assert "failures[agent_error=2, remote_ci_timeout=1]" in summary
+
+
+def test_summary_omits_empty_trajectory_and_failure_sections():
+    """A clean block must not render noise like `failures[]` or `0 trajectories`."""
+    summary = aggregate_block([_rec(block=1, outcome="merged")], block=1).summary()
+    assert "failures[" not in summary
+    assert "trajectories" not in summary
+
+
+def test_aggregate_block_stays_a_pure_fold_over_the_ledger():
+    """`trajectories` is passed in, never read from disk: callers that only hold
+    records (the budget gate, most tests) need no filesystem at all."""
+    agg = aggregate_block([_rec(block=1)], block=1)
+    assert agg.trajectories == 0
+
+
 # --- budget gate transitions ------------------------------------------------
 
 BUDGET = {"max_heavy_iterations_per_block": 3, "max_seconds_per_block": 100, "soft_ratio": 0.8}

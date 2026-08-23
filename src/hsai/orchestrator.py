@@ -405,9 +405,11 @@ def run_once(
 
     def _record_cost(outcome: str, *, failure_class: str = "", failure_detail: str = "") -> None:
         # Every terminal path passes through here, so it is also where the
-        # trajectory learns how its run ended.
+        # trajectory learns how its run ended - and under which failure class,
+        # so the histogram in the review brief points back at a replayable run.
         if traj is not None:
             traj.outcome = outcome
+            traj.failure_class = failure_class
             trajectory.write(traj, repo_dir)
         ledger.append_record(
             ledger.ledger_path(cfg, repo_dir),
@@ -448,6 +450,7 @@ def run_once(
             iteration=iteration, ticket=ticket_num, kind=kind,
             tier=choice.tier, model=choice.model, prompt=prompt, result=ares,
             block=block, duration_seconds=time.time() - agent_started,
+            step_chars=cfg.trajectory_step_chars,
         )
         result.notes.append(f"trajectory={traj.identifier}")
         agent_ok, agent_err = ares.ok, ares.error
@@ -479,7 +482,8 @@ def run_once(
                 _recover_failed(
                     cfg, repo, 0, kind=kind, ticket_num=ticket_num,
                     claimed_issue=claimed_issue, login=login,
-                    remote="INCOMPLETE", runner=runner,
+                    remote="INCOMPLETE", failure_class=postmortem.INCOMPLETE_DIFF,
+                    runner=runner,
                 )
                 result.recovered = True
                 _record_cost(
@@ -510,7 +514,8 @@ def run_once(
                 _recover_failed(
                     cfg, repo, 0, kind=kind, ticket_num=ticket_num,
                     claimed_issue=claimed_issue, login=login,
-                    remote="NO_REPRO", runner=runner,
+                    remote="NO_REPRO", failure_class=postmortem.NO_REPRO,
+                    runner=runner,
                 )
                 result.recovered = True
                 _record_cost(
@@ -634,7 +639,8 @@ def run_once(
         _recover_failed(
             cfg, repo, 0, kind=kind, ticket_num=ticket_num,
             claimed_issue=claimed_issue, login=login,
-            remote="REVIEW_BLOCKED", runner=runner,
+            remote="REVIEW_BLOCKED", failure_class=postmortem.AGENT_ERROR,
+            runner=runner,
         )
         result.recovered = True
         result.notes.append("recovered: independent review blocked the change")
@@ -697,19 +703,20 @@ def run_once(
     if remote == ci.SUCCESS:
         github.merge_pr(repo, pr_num, auto=True, runner=runner)
         result.merged = True
-    else:
-        result.merged = False
-        _recover_failed(
-            cfg, repo, pr_num, kind=kind, ticket_num=ticket_num,
-            claimed_issue=claimed_issue, login=login, remote=remote, runner=runner,
-        )
-        result.recovered = True
-        result.notes.append("recovered: closed PR, returned ticket to backlog")
-
-    if result.merged:
         _record_cost("merged")
     else:
+        result.merged = False
+        # Classify BEFORE recovering: the retry policy is taxonomy-aware, so an
+        # infrastructure timeout re-queues without spending a ticket attempt
+        # while a genuine red build still does. The PR is closed either way.
         fclass, detail = postmortem.classify_with_detail(_failure_evidence(remote))
+        disposition = _recover_failed(
+            cfg, repo, pr_num, kind=kind, ticket_num=ticket_num,
+            claimed_issue=claimed_issue, login=login, remote=remote,
+            failure_class=fclass, runner=runner,
+        )
+        result.recovered = True
+        result.notes.append(f"recovered: closed PR, ticket disposition={disposition}")
         _record_cost("recovered", failure_class=fclass, failure_detail=detail)
 
     # 13. cleanup worktree
@@ -727,10 +734,25 @@ def _recover_failed(
     claimed_issue: github.Issue | None,
     login: str,
     remote: str,
+    failure_class: str = "",
     runner: Runner,
-) -> None:
+) -> str:
     """A PR did not go green (or never got one): close it, and either return the
-    ticket to the backlog for another attempt or mark it ``blocked``."""
+    ticket to the backlog for another attempt or mark it ``blocked``.
+
+    The retry policy is taxonomy-aware (see :mod:`hsai.postmortem`). An
+    INFRASTRUCTURE class - a timeout, where no verdict on the work was ever
+    rendered - re-queues the ticket *without* spending an attempt, so a slow
+    runner cannot push real work to ``blocked`` for human triage. That escape
+    hatch is bounded by ``execution.max_infra_requeues`` and tracked on its own
+    ``infra-requeues:N`` label, so a ticket that only ever times out still
+    converges on the normal attempt-counting path instead of looping forever.
+    Every other class keeps the original behaviour exactly.
+
+    The PR is closed either way: a non-SUCCESS PR is never merged, whatever
+    the cause. Returns the disposition (``requeued-infra`` | ``retry`` |
+    ``blocked`` | ``no-ticket``) for the caller's notes.
+    """
     if pr_num:
         github.close_pr(
             repo, pr_num,
@@ -738,27 +760,44 @@ def _recover_failed(
             delete_branch=True, runner=runner,
         )
     if not ticket_num:
-        return
+        return "no-ticket"
+
+    issue = claimed_issue or github.get_issue(repo, ticket_num, runner=runner)
+
+    def _bump(prefix: str, prior: int) -> None:
+        """Advance a ``<prefix>:N`` counter label, dropping the stale one."""
+        github.edit_labels(
+            repo, ticket_num,
+            add=[f"{prefix}:{prior + 1}"],
+            remove=[f"{prefix}:{prior}"] if prior else None,
+            runner=runner,
+        )
+
+    # Infrastructure noise: re-queue on the free path while the budget lasts.
+    if postmortem.is_infrastructure(failure_class):
+        prior_requeues = issue.infra_requeues() if issue else 0
+        if prior_requeues < cfg.max_infra_requeues:
+            _bump(github.INFRA_REQUEUES_PREFIX, prior_requeues)
+            # Unassigned, un-blocked, and with `attempts:N` untouched: the next
+            # worker picks it up exactly as if this run had never happened.
+            github.unassign(repo, ticket_num, login, runner=runner)
+            return "requeued-infra"
 
     # Determine how many attempts this ticket has already had.
-    issue = claimed_issue or github.get_issue(repo, ticket_num, runner=runner)
     prior = issue.attempts() if issue else 0
-    nxt = prior + 1
 
-    if nxt >= cfg.max_ticket_attempts:
+    if prior + 1 >= cfg.max_ticket_attempts:
         github.edit_labels(
-            repo, ticket_num, add=["blocked"], remove=[f"attempts:{prior}"] if prior else None,
+            repo, ticket_num, add=["blocked"],
+            remove=[f"{github.ATTEMPTS_PREFIX}:{prior}"] if prior else None,
             runner=runner,
         )
         # Leave it unassigned but blocked so no worker retries it.
         github.unassign(repo, ticket_num, login, runner=runner)
-    else:
-        github.edit_labels(
-            repo, ticket_num,
-            add=[f"attempts:{nxt}"], remove=[f"attempts:{prior}"] if prior else None,
-            runner=runner,
-        )
-        github.unassign(repo, ticket_num, login, runner=runner)
+        return "blocked"
+    _bump(github.ATTEMPTS_PREFIX, prior)
+    github.unassign(repo, ticket_num, login, runner=runner)
+    return "retry"
 
 
 def run_loop(
