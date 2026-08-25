@@ -24,7 +24,7 @@ recalled:
 | ticket | #353 |
 | pull request | _(none)_ |
 | model | `opus` |
-| remote CI | _(pending)_ |
+| remote CI | FAILURE |
 | failure class | `agent_timeout` |
 
 ## Context
