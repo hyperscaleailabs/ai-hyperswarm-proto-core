@@ -493,7 +493,7 @@ Periodic syntheses of accumulated lessons. Total: **{len(notes)}**.
         if records:
             groups: dict[str, list[practices_mod.Practice]] = {}
             for p in records:
-                groups.setdefault(p.source_project, []).append(p)
+                groups.setdefault(p.source_repo, []).append(p)
             sections = []
             for project in sorted(groups):
                 lines = "\n".join(

@@ -6,7 +6,7 @@ The registry (see :mod:`hsai.practices`) started empty; every entry below is a
 practice this loop had already adopted before the registry existed, cited to
 the PR that shipped it and the module docstring that named the source project.
 Re-running this script is safe: :func:`hsai.practices.append` refuses a
-duplicate ``(source_project, title)`` pair, so an already-recorded practice is
+duplicate ``(source_repo, title)`` pair, so an already-recorded practice is
 skipped rather than overwritten.
 
 Usage: ``python scripts/backfill_practices.py`` from the repo root.
@@ -22,7 +22,7 @@ from hsai.practices import DuplicatePracticeError, append, build_practice  # noq
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# (title, source_project, source_artifact, evidence, adopted_pr, adopted_date, notes, related)
+# (title, source_repo, dimension, evidence, adopted_pr, adopted_date, notes, related)
 ENTRIES = [
     (
         "session durability", "OpenBMB/ChatDev", "harness_design",
@@ -137,9 +137,9 @@ ENTRIES = [
 
 def main() -> int:
     written, skipped = 0, 0
-    for title, project, artifact, evidence, pr, date, notes, related in ENTRIES:
+    for title, repo, dimension, evidence, pr, date, notes, related in ENTRIES:
         practice = build_practice(
-            title=title, source_project=project, source_artifact=artifact,
+            title=title, source_repo=repo, dimension=dimension,
             evidence=evidence, adopted_pr=pr, adopted_date=date, notes=notes,
             related=related,
         )

@@ -51,7 +51,7 @@ class BlockReport:
     notes: list[str] = field(default_factory=list)
     # New entries in the practices registry (see hsai.practices) that showed up
     # during this block - each a plain dict (JSON-serializable for the journal):
-    # {"id", "title", "source_project", "source_artifact", "status", "evidence"}.
+    # {"id", "title", "source_repo", "dimension", "status", "evidence"}.
     practices_adopted: list[dict] = field(default_factory=list)
 
 
@@ -183,7 +183,7 @@ def render_brief(cfg: CoreConfig, report: BlockReport) -> str:
     )
     extra = "\n".join(f"- {n}" for n in report.notes)
     practices = "\n".join(
-        f"- **{p.get('title')}** (from `{p.get('source_project')}`, {p.get('status')}) "
+        f"- **{p.get('title')}** (from `{p.get('source_repo')}`, {p.get('status')}) "
         f"[id: `{p.get('id')}`] - {p.get('evidence') or 'no evidence recorded'}"
         for p in report.practices_adopted
     ) or "_none this block_"

@@ -297,29 +297,29 @@ def test_synthesize_whitepaper_groups_outcomes_and_surfaces_recurring_failures(t
     assert "[[Whitepapers MOC]]" in path.read_text()
 
 
-# --- Practices MOC: grouped by source project, linked from the root MOC ------
+# --- Practices MOC: grouped by source repo, linked from the root MOC ---------
 
-def test_practices_moc_groups_by_source_project(tmp_path):
+def test_practices_moc_groups_by_source_repo(tmp_path):
     kb = KnowledgeBase(tmp_path)
     practices_mod.append(
         tmp_path,
         practices_mod.build_practice(
-            title="session durability", source_project="OpenBMB/ChatDev",
-            source_artifact="harness_design", evidence="PR #104", adopted_pr=104,
+            title="session durability", source_repo="OpenBMB/ChatDev",
+            dimension="harness_design", evidence="PR #104", adopted_pr=104,
         ),
     )
     practices_mod.append(
         tmp_path,
         practices_mod.build_practice(
-            title="reconciliation discipline", source_project="OpenBMB/ChatDev",
-            source_artifact="harness_design", evidence="PR #104", adopted_pr=104,
+            title="reconciliation discipline", source_repo="OpenBMB/ChatDev",
+            dimension="harness_design", evidence="PR #104", adopted_pr=104,
         ),
     )
     practices_mod.append(
         tmp_path,
         practices_mod.build_practice(
-            title="cost accounting", source_project="assafelovic/gpt-researcher",
-            source_artifact="source_code", evidence="PR #47", adopted_pr=47,
+            title="cost accounting", source_repo="assafelovic/gpt-researcher",
+            dimension="source_code", evidence="PR #47", adopted_pr=47,
         ),
     )
 
@@ -339,14 +339,37 @@ def test_practices_moc_groups_by_source_project(tmp_path):
     assert "[[Practices MOC]] - 3 practice(s)" in root_moc
 
 
+def test_practices_moc_links_every_practice_note(tmp_path):
+    """`hsai reindex` must leave no practice note orphaned in the Obsidian graph."""
+    kb = KnowledgeBase(tmp_path)
+    registry = practices_mod.PracticeRegistry(tmp_path)
+    for repo, title, status in [
+        ("FoundationAgents/MetaGPT", "explicit phase artifacts", "adopted"),
+        ("run-llama/llama_index", "docs as a maintained artifact", "observed"),
+        ("microsoft/JARVIS", "an idea we dropped", "rejected"),
+    ]:
+        registry.write(practices_mod.build_practice(
+            title=title, source_repo=repo, dimension="harness_design", evidence="e",
+            status=status,
+        ))
+
+    kb.reindex_mocs()
+    moc = (kb.mocs_dir / "Practices MOC.md").read_text()
+
+    for practice in registry.read():
+        assert f"[[{practice.note_name()}]]" in moc
+        assert f"### `{practice.source_repo}`" in moc
+    assert "Total: **3**" in moc
+
+
 def test_practices_moc_reindex_is_deterministic(tmp_path):
     """`hsai reindex` run twice on an unchanged registry must not diff."""
     kb = KnowledgeBase(tmp_path)
     practices_mod.append(
         tmp_path,
         practices_mod.build_practice(
-            title="hard numeric CI gate", source_project="run-llama/llama_index",
-            source_artifact="ci_cd", evidence="PR #47",
+            title="hard numeric CI gate", source_repo="run-llama/llama_index",
+            dimension="ci_cd", evidence="PR #47",
         ),
     )
     kb.reindex_mocs()

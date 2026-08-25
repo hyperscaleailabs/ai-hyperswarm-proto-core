@@ -167,12 +167,18 @@ def test_parser_practices_subcommands():
     assert args.root == "/tmp/x"
 
     add_args = parser.parse_args([
-        "practices", "add", "--title", "t", "--source-project", "o/r",
-        "--source-artifact", "source_code", "--evidence", "PR #1",
+        "practices", "add", "--title", "t", "--source-repo", "o/r",
+        "--dimension", "source_code", "--evidence", "PR #1",
     ])
     assert add_args.practices_command == "add"
     assert add_args.status == "adopted"
     assert add_args.adopted_pr is None
+
+    # Bare `hsai practices` is the list, so the common read costs one word.
+    bare = parser.parse_args(["practices", "--root", "/tmp/x"])
+    assert bare.practices_command is None
+    assert bare.coverage is False
+    assert bare.func is not None
 
 
 def test_practices_list_prints_the_registry(tmp_path, capsys):
@@ -181,8 +187,8 @@ def test_practices_list_prints_the_registry(tmp_path, capsys):
     append(
         tmp_path,
         build_practice(
-            title="session durability", source_project="OpenBMB/ChatDev",
-            source_artifact="harness_design", evidence="PR #104", adopted_pr=104,
+            title="session durability", source_repo="OpenBMB/ChatDev",
+            dimension="harness_design", evidence="PR #104", adopted_pr=104,
         ),
     )
     rc = main(["practices", "list", "--root", str(tmp_path)])
@@ -191,6 +197,42 @@ def test_practices_list_prints_the_registry(tmp_path, capsys):
     assert "session durability" in out
     assert "OpenBMB/ChatDev" in out
     assert "PR #104" in out
+
+
+def test_practices_coverage_prints_the_matrix_for_every_pinned_repo(tmp_path, capsys):
+    """`hsai practices --coverage` must answer the question the registry exists for."""
+    from hsai.config import load_config
+    from hsai.practices import append, build_practice
+
+    append(
+        tmp_path,
+        build_practice(
+            title="hard numeric CI gate", source_repo="run-llama/llama_index",
+            dimension="ci_cd", evidence="sync-docs.yml",
+        ),
+    )
+    rc = main(["practices", "--root", str(tmp_path), "--coverage"])
+    out = capsys.readouterr().out
+    assert rc == 0
+
+    cfg = load_config()
+    # Every pinned repo gets a row and every learn_from dimension a column -
+    # the zero rows ARE the answer to "which projects have we never studied".
+    for ref in cfg.reference_top10:
+        assert ref.repo in out
+    for dim in cfg.raw["reference_set"]["learn_from"]:
+        assert dim in out
+    assert "least covered:" in out
+    # The one repo with a practice is not among the three thinnest.
+    thin = out.rsplit("least covered:", 1)[1]
+    assert "run-llama/llama_index" not in thin
+
+
+def test_practices_coverage_works_on_an_empty_registry(tmp_path, capsys):
+    rc = main(["practices", "--root", str(tmp_path), "--coverage"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "0 practice(s)" in out
 
 
 def test_practices_list_reports_an_empty_registry(tmp_path, capsys):
@@ -203,8 +245,8 @@ def test_practices_list_reports_an_empty_registry(tmp_path, capsys):
 def test_practices_add_writes_a_note(tmp_path, capsys):
     rc = main([
         "practices", "add", "--root", str(tmp_path),
-        "--title", "cost accounting", "--source-project", "assafelovic/gpt-researcher",
-        "--source-artifact", "source_code", "--evidence", "PR #47",
+        "--title", "cost accounting", "--source-repo", "assafelovic/gpt-researcher",
+        "--dimension", "source_code", "--evidence", "PR #47",
     ])
     out = capsys.readouterr().out
     assert rc == 0
@@ -217,8 +259,8 @@ def test_practices_add_writes_a_note(tmp_path, capsys):
 def test_practices_add_refuses_a_duplicate(tmp_path, capsys):
     args = [
         "practices", "add", "--root", str(tmp_path),
-        "--title", "cost accounting", "--source-project", "assafelovic/gpt-researcher",
-        "--source-artifact", "source_code", "--evidence", "PR #47",
+        "--title", "cost accounting", "--source-repo", "assafelovic/gpt-researcher",
+        "--dimension", "source_code", "--evidence", "PR #47",
     ]
     assert main(args) == 0
     rc = main(args)

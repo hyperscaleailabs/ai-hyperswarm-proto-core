@@ -5,7 +5,16 @@ from types import SimpleNamespace
 
 import pytest
 
-from hsai import audit, ledger, orchestrator, postmortem, recall, review, trajectory
+from hsai import (
+    audit,
+    ledger,
+    orchestrator,
+    postmortem,
+    practices,
+    recall,
+    review,
+    trajectory,
+)
 from hsai.config import load_config
 from hsai.models import ModelChoice
 from hsai.orchestrator import (
@@ -556,6 +565,122 @@ def test_run_once_implement_path_with_fake_runner(tmp_path):
     assert len(_worker_prompts(runner)) == 1
     assert len(_review_prompts(runner)) == 1
     assert all(c[0] in {"git", "gh", "ruff", "pytest", "claude"} for c in runner.calls)
+
+
+def _observed_practice(root, cfg, *, ticket: int, repo: str, title: str):
+    """What synthesis leaves behind when it files a ticket citing `repo`."""
+    registry = practices.PracticeRegistry(root, cfg)
+    registry.write(practices.build_practice(
+        title=title, source_repo=repo, dimension="harness_design",
+        evidence=f"cited by the rationale of #{ticket}", status="observed", ticket=ticket,
+    ))
+    return registry
+
+
+def test_merged_iteration_flips_its_practices_to_adopted(tmp_path):
+    """The provenance join: observed at file time, adopted at merge time."""
+    cfg = load_config()
+    registry = _observed_practice(
+        tmp_path, cfg, ticket=7, repo="FoundationAgents/MetaGPT",
+        title="explicit phase artifacts",
+    )
+    # A second ticket's practice must not be swept along.
+    other = _observed_practice(
+        tmp_path, cfg, ticket=8, repo="OpenBMB/ChatDev", title="cheaper review agents",
+    ).for_ticket(8)[0]
+
+    open_issues = [
+        {
+            "number": 7,
+            "title": "add widget",
+            "labels": [{"name": "priority:P2"}],
+            "assignees": [],
+            "body": WELL_FORMED_BODY,
+        }
+    ]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+        remote_ci="SUCCESS",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.merged is True
+    assert result.ticket == 7
+    assert result.adopted_practices == ["foundationagents-metagpt--explicit-phase-artifacts"]
+
+    adopted = registry.for_ticket(7)[0]
+    assert adopted.status == "adopted"
+    assert adopted.adopted_pr == result.pr
+    # The lesson note is carried across, and wikilinked so the graph connects
+    # the practice to the iteration that proved it.
+    assert adopted.lesson_note
+    assert adopted.lesson_note in adopted.related
+    assert f"[[{adopted.lesson_note}]]" in (
+        registry.dir / f"{adopted.id}.md"
+    ).read_text()
+
+    # The other ticket's practice is untouched.
+    assert registry.get(other.id).status == "observed"
+
+
+def test_unmerged_iteration_leaves_its_practices_observed(tmp_path):
+    """A red PR proves nothing, so nothing is promoted."""
+    cfg = load_config()
+    registry = _observed_practice(
+        tmp_path, cfg, ticket=7, repo="FoundationAgents/MetaGPT",
+        title="explicit phase artifacts",
+    )
+    open_issues = [
+        {
+            "number": 7,
+            "title": "add widget",
+            "labels": [{"name": "priority:P2"}],
+            "assignees": [],
+            "body": WELL_FORMED_BODY,
+        }
+    ]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+        remote_ci="FAILURE",
+    )
+
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+
+    assert result.merged is False
+    assert result.adopted_practices == []
+    practice = registry.for_ticket(7)[0]
+    assert practice.status == "observed"
+    assert practice.adopted_pr is None
+
+
+def test_run_once_merges_cleanly_with_an_empty_practice_registry(tmp_path):
+    """The registry is memory, never a gate: an empty one blocks nothing."""
+    cfg = load_config()
+    open_issues = [
+        {
+            "number": 7,
+            "title": "add widget",
+            "labels": [{"name": "priority:P2"}],
+            "assignees": [],
+            "body": WELL_FORMED_BODY,
+        }
+    ]
+    runner = FakeRunner(
+        repo_root=str(tmp_path), ci_sequence=[True, True], open_issues=open_issues,
+    )
+    result = run_once(
+        cfg, repo_dir=str(tmp_path), dry_run=False,
+        runner=runner, ai_runner=runner, iteration=1,
+    )
+    assert result.merged is True
+    assert result.adopted_practices == []
 
 
 def test_run_once_records_remote_ci_in_lesson_before_merging(tmp_path):

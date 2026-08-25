@@ -111,8 +111,8 @@ def test_brief_reports_practices_adopted_this_block():
             {
                 "id": "openbmb-chatdev--session-durability",
                 "title": "session durability",
-                "source_project": "OpenBMB/ChatDev",
-                "source_artifact": "harness_design",
+                "source_repo": "OpenBMB/ChatDev",
+                "dimension": "harness_design",
                 "status": "adopted",
                 "evidence": "PR #104",
             }

@@ -55,7 +55,7 @@ knowledge/
 ├── MOCs/          # Maps of Content: Knowledge Base / Lessons / Whitepapers / Practices
 ├── lessons/       # one article per iteration (pass or fail)
 ├── whitepapers/   # periodic syntheses (every N lessons)
-├── practices/     # adopted-practice registry (see hsai.practices)
+├── practices/     # reference-practice registry (see hsai.practices)
 └── templates/     # note templates
 ```
 

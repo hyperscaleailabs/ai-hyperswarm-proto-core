@@ -7,8 +7,8 @@ Commands:
   hsai cycle [--cycle-index N] [--resume] [--dry-run]          one governance block
   hsai reindex [--root DIR]                                    rebuild knowledge MOCs + notes.json
   hsai recall "<query>" [--k N] [--kind K]                     rank prior lessons/ADRs
-  hsai practices list                                          show the adopted-practice registry
-  hsai practices add --title T --source-project P ...          record a new adopted practice
+  hsai practices [--coverage]                                  the reference-practice registry
+  hsai practices add --title T --source-repo P ...             record a new practice
   hsai postmortem [--block N]                                  print the failure-class Pareto for a block
   hsai doctor                                                  verify environment + invariants
   hsai traj <iteration> [--json]                               print a stored agent run
@@ -125,30 +125,45 @@ def cmd_recall(args: argparse.Namespace) -> int:
 
 
 def cmd_practices_list(args: argparse.Namespace) -> int:
-    """Print the adopted-practice registry (pure reading, no quota spent)."""
+    """Print the reference-practice registry, or its coverage matrix.
+
+    Pure reading, no quota spent. ``--coverage`` answers the question the
+    registry exists for: which of the ten pinned projects have we actually
+    learned from, and along which ``learn_from`` dimension?
+    """
     cfg = _load(args)
     records = practices.load(args.root, cfg)
+    if getattr(args, "coverage", False):
+        print(practices.render_coverage(cfg, records))
+        thin = practices.least_covered(cfg, records, k=3)
+        print("least covered: " + (", ".join(thin) or "-"))
+        return 0
     if not records:
         print("practices: registry is empty")
         return 0
     for p in records:
         pr = f"#{p.adopted_pr}" if p.adopted_pr else "-"
-        print(f"{p.id}  [{p.status}]  {p.title}  <- {p.source_project} ({p.source_artifact})  PR {pr}")
+        ticket = f"#{p.ticket}" if p.ticket else "-"
+        print(
+            f"{p.id}  [{p.status}]  {p.title}  <- {p.source_repo} ({p.dimension})  "
+            f"ticket {ticket}  PR {pr}"
+        )
     return 0
 
 
 def cmd_practices_add(args: argparse.Namespace) -> int:
-    """Record a new adopted practice - refuses a (source_project, title) duplicate."""
+    """Record a new practice - refuses a (source_repo, title) duplicate."""
     cfg = _load(args)
     practice = practices.build_practice(
         title=args.title,
-        source_project=args.source_project,
-        source_artifact=args.source_artifact,
+        source_repo=args.source_repo,
+        dimension=args.dimension,
         evidence=args.evidence,
         status=args.status,
         adopted_pr=args.adopted_pr,
         adopted_date=args.adopted_date or "",
         notes=args.notes or "",
+        ticket=args.ticket,
     )
     try:
         path = practices.append(args.root, practice, cfg=cfg)
@@ -330,24 +345,36 @@ def build_parser() -> argparse.ArgumentParser:
     rl.add_argument("--root", default=".", help="repo root holding knowledge/ and docs/adr")
     rl.set_defaults(func=cmd_recall)
 
-    pr = sub.add_parser("practices", help="the adopted-practice registry (see hsai.practices)")
-    pr_sub = pr.add_subparsers(dest="practices_command", required=True)
+    # Bare `hsai practices` lists the registry, so the common read is one word;
+    # `list` stays as an explicit alias and `add` as the write path.
+    pr = sub.add_parser("practices", help="the reference-practice registry (see hsai.practices)")
+    pr.add_argument("--root", default=".", help="repo root holding knowledge/practices")
+    pr.add_argument(
+        "--coverage", action="store_true",
+        help="print the pinned-repo x learn_from-dimension coverage matrix instead of the list",
+    )
+    pr.set_defaults(func=cmd_practices_list)
+    pr_sub = pr.add_subparsers(dest="practices_command")
 
     pr_list = pr_sub.add_parser("list", help="print every registered practice")
     pr_list.add_argument("--root", default=".", help="repo root holding knowledge/practices")
+    pr_list.add_argument(
+        "--coverage", action="store_true", help="print the coverage matrix instead of the list"
+    )
     pr_list.set_defaults(func=cmd_practices_list)
 
-    pr_add = pr_sub.add_parser("add", help="record a new adopted practice")
+    pr_add = pr_sub.add_parser("add", help="record a new practice")
     pr_add.add_argument("--root", default=".", help="repo root holding knowledge/practices")
     pr_add.add_argument("--title", required=True)
-    pr_add.add_argument("--source-project", required=True, help="e.g. langchain-ai/langchain")
+    pr_add.add_argument("--source-repo", required=True, help="e.g. langchain-ai/langchain")
     pr_add.add_argument(
-        "--source-artifact", required=True,
+        "--dimension", required=True,
         help="one of core.yaml reference_set.learn_from "
         "(source_code, commit_history, ci_cd, issue_history, harness_design, readme)",
     )
-    pr_add.add_argument("--evidence", required=True, help="URL or commit/PR reference")
+    pr_add.add_argument("--evidence", required=True, help="commit subject, workflow file, or URL")
     pr_add.add_argument("--status", default="adopted", choices=list(practices.STATUSES))
+    pr_add.add_argument("--ticket", type=int, default=None, help="ticket this practice was cited by")
     pr_add.add_argument("--adopted-pr", type=int, default=None)
     pr_add.add_argument("--adopted-date", default="", help="YYYY-MM-DD (default: today)")
     pr_add.add_argument("--notes", default="")

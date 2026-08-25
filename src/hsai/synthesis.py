@@ -6,8 +6,9 @@ copied from one project, a heavy model:
 1. receives a context pack built from a rotating subset of the reference set
    (README, recent commit subjects, CI workflow inventory - fetched via `gh`),
    plus the :mod:`hsai.practices` registry of what this loop has already
-   adopted from that set, rendered as ground it must not re-propose, plus the
-   prior art :mod:`hsai.retrieval` finds in this repo's OWN lessons,
+   adopted from that set, rendered as ground it must not re-propose AND as a
+   coverage map pointing at the projects it has learned the least from, plus
+   the prior art :mod:`hsai.retrieval` finds in this repo's OWN lessons,
    whitepapers and ADRs for the goals being planned against,
 2. generates ~``ideas_target`` candidate improvements, each required to COMBINE
    practices from >= ``min_projects_combined`` different reference projects,
@@ -19,6 +20,14 @@ copied from one project, a heavy model:
    structured tickets (schema in :mod:`hsai.tickets`, each naming the
    practice(s) it adds or extends and citing the prior art it builds on),
    which are filed on GitHub for the cheaper implementation agents to pick up.
+
+Step 4 passes through an evidence gate first: :func:`evidence_gap` refuses any
+candidate whose ``synthesis_rationale`` does not name at least
+``min_projects_combined`` of the PINNED reference repos, so "combines three
+projects" can no longer be asserted without being checkable. What survives is
+filed, and :func:`record_observed` writes one ``status: observed`` practice
+note per cited repo, stamped with the ticket number - the join key
+:mod:`hsai.orchestrator` flips to ``adopted`` when that ticket's PR merges.
 
 The model call goes through :mod:`hsai.ai`, so it stays subscription-only.
 """
@@ -34,7 +43,19 @@ from .ai import run_agent
 from .config import CoreConfig
 from .knowledge import KnowledgeBase
 from .models import ModelChoice
-from .practices import ADOPTED_HEADING, Practice, render_adopted_section
+from .practices import (
+    ADOPTED_HEADING,
+    TARGETING_HEADING,
+    Practice,
+    PracticeRegistry,
+    build_practice,
+    citation_for,
+    coverage_order,
+    infer_dimension,
+    render_adopted_section,
+    render_targeting_section,
+    repos_named_in,
+)
 from .proc import Runner, run
 from .retrieval import PRIOR_ART_HEADING, NoteIndex, PriorArt
 from .tickets import TicketSpec, check_well_formed
@@ -66,10 +87,26 @@ class ContextPack:
         return retrieval.render_prior_art(self.prior_art)
 
 
-def pick_rotation(cfg: CoreConfig, cycle_index: int) -> list[str]:
-    """Rotate deterministically through the top-10 so every cycle studies a
-    different subset and the whole set is covered over consecutive cycles."""
-    repos = [r.repo for r in cfg.reference_top10]
+def pick_rotation(
+    cfg: CoreConfig, cycle_index: int, practices: list[Practice] | None = None
+) -> list[str]:
+    """Which reference projects this cycle studies.
+
+    Still a rotation - the modular walk guarantees the whole pinned set is
+    covered over consecutive cycles - but the ORDER it walks is biased by the
+    registry: with practices recorded, repos are visited thinnest-coverage
+    first (:func:`hsai.practices.coverage_order`), so cycle 0 studies exactly
+    the projects this loop has learned the least from. Without a registry the
+    order is plain rank order, which is the pre-registry behavior.
+
+    Pure and deterministic in ``(cycle_index, registry contents)``: no clock,
+    no randomness, no filesystem iteration order (coverage ties break on rank).
+    """
+    repos = (
+        coverage_order(cfg, practices)
+        if practices
+        else [r.repo for r in cfg.reference_top10]
+    )
     if not repos:
         return []
     k = int(cfg.synthesis.get("refs_per_cycle", 3))
@@ -306,6 +343,38 @@ def is_duplicate(
     return False, ""
 
 
+def render_practices_block(cfg: CoreConfig, practices: list[Practice]) -> str:
+    """The registry's two prompt sections - or nothing at all.
+
+    An empty registry renders NOTHING (not a placeholder): on an early cycle
+    there is no ground to avoid and no thin cell to aim at, and a section that
+    says only "nothing recorded yet" spends prompt budget to tell the planner
+    something it cannot act on. Once the registry is non-empty both sections
+    appear together, because they are two halves of one instruction - here is
+    what you already know, so go look over there instead.
+    """
+    if not practices:
+        return ""
+    # "Already adopted" is about SETTLED ground. An `observed` practice is only
+    # a filed ticket's citation; the open-ticket list in the memory section
+    # already covers it, and listing it here would read as "shipped".
+    settled = [p for p in practices if p.status != "observed"]
+    return f"""
+{ADOPTED_HEADING} - the registry of practices this loop has already pulled
+from the reference set, each cited to its source project and evidence. Do NOT
+propose a candidate that just re-adopts one of these; if a candidate genuinely
+EXTENDS one, name its id in "practice_ids" instead of restating it as new:
+{render_adopted_section(settled)}
+
+{TARGETING_HEADING} - the pinned projects this loop has learned the LEAST
+from, with the artifact dimensions it has never studied there. All else equal,
+prefer a candidate whose evidence comes from one of these; naming an
+unexplored dimension is worth more than a fourth practice from a project
+already mined:
+{render_targeting_section(cfg, practices)}
+"""
+
+
 def build_prompt(
     cfg: CoreConfig,
     pack: ContextPack,
@@ -320,7 +389,7 @@ def build_prompt(
     memory = memory or MemoryPack()
     max_chars = int(cfg.synthesis.get("memory_max_chars", DEFAULT_MEMORY_MAX_CHARS))
     memory_section = memory.render(max_chars=max_chars)
-    practices_section = render_adopted_section(practices or [])
+    practices_block = render_practices_block(cfg, list(practices or []))
     prior_art_section = pack.render_prior_art()
     return f"""You are the SYNTHESIS planner for ai-hyperswarm-proto-core, an
 autonomous self-improving AI-swarm harness. Your job is NOT to copy one idea
@@ -336,13 +405,7 @@ that substantially overlaps anything listed below must be DROPPED in PHASE 2
 (reflect) and its slot refilled with a genuinely new idea. Never duplicate the
 title of a ticket that is still open or already closed; build on them instead:
 {memory_section}
-
-{ADOPTED_HEADING} - the registry of practices this loop has already pulled
-from the reference set, each cited to its source project and evidence. Do NOT
-propose a candidate that just re-adopts one of these; if a candidate genuinely
-EXTENDS one, name its id in "practice_ids" instead of restating it as new:
-{practices_section}
-
+{practices_block}
 {PRIOR_ART_HEADING} - notes retrieved from OUR OWN knowledge base (lessons,
 whitepapers, ADRs) for the goals above, each shown as an Obsidian wikilink with
 the outcome it recorded. A note marked `fail` is an idea this repo already
@@ -377,7 +440,12 @@ block: a JSON array where each element has exactly these keys:
   "verification_plan" (array of 2-4 concrete check strings),
   "size" ("M" or "L" - substantial work, never "S"),
   "goal_ids" (array like ["G1","G4"]),
-  "synthesis_rationale" (string naming the >= {combine} projects combined and how),
+  "synthesis_rationale" (string naming the >= {combine} projects combined and
+    how, each by its FULL `owner/name` slug exactly as it appears in the pinned
+    reference set, with the concrete artifact that taught it - a commit
+    subject, a workflow filename, a README anchor. This is checked
+    mechanically before the ticket is filed: a rationale that names fewer than
+    {combine} pinned projects is REJECTED and the ticket is never opened),
   "practice_ids" (array of strings - ids from the "{ADOPTED_HEADING}" section
     above that this ticket EXTENDS, or new slug-style ids it INTRODUCES for the
     practice(s) it adds to the registry; empty array if none apply),
@@ -388,15 +456,56 @@ block: a JSON array where each element has exactly these keys:
 The JSON block must be the LAST fenced block in your reply."""
 
 
-def parse_ticket_specs(output: str) -> list[TicketSpec]:
-    """Extract the final JSON block and convert it into TicketSpecs."""
+def evidence_gap(spec: TicketSpec, cfg: CoreConfig) -> str:
+    """Why `spec`'s rationale fails the evidence gate - empty when it passes.
+
+    G1 requires every improvement to trace back to something observed in a
+    reference project, and ``synthesis_rationale`` is where that trace lives.
+    Free text nobody parses is not a trace: this counts how many of the ten
+    PINNED repos the rationale actually names (:func:`hsai.practices.repos_named_in`)
+    and holds it to ``synthesis.min_projects_combined``. Naming three plausible
+    but unpinned projects, or asserting "combines three projects" without
+    naming any, no longer passes for evidence.
+    """
+    combine = int(cfg.synthesis.get("min_projects_combined", 3))
+    named = repos_named_in(spec.synthesis_rationale, cfg)
+    if len(named) >= combine:
+        return ""
+    return (
+        f"{spec.title!r}: synthesis_rationale names {len(named)} pinned reference "
+        f"project(s) [{', '.join(named) or 'none'}], needs >= {combine}"
+    )
+
+
+@dataclass
+class ParsedSpecs:
+    """What survived parsing, and the recorded reason for anything that did not."""
+
+    specs: list[TicketSpec] = field(default_factory=list)
+    evidence_rejected: list[str] = field(default_factory=list)
+
+
+def parse_ticket_specs(output: str, cfg: CoreConfig | None = None) -> list[TicketSpec]:
+    """Extract the final JSON block and convert it into TicketSpecs.
+
+    With `cfg`, specs failing the evidence gate (:func:`evidence_gap`) are
+    dropped here rather than filed. Callers that need the rejection reasons
+    use :func:`parse_ticket_specs_detailed`.
+    """
+    return parse_ticket_specs_detailed(output, cfg).specs
+
+
+def parse_ticket_specs_detailed(
+    output: str, cfg: CoreConfig | None = None
+) -> ParsedSpecs:
+    """:func:`parse_ticket_specs`, keeping every rejection reason for the audit trail."""
     blocks = _JSON_BLOCK.findall(output)
     if not blocks:
-        return []
+        return ParsedSpecs()
     try:
         raw = json.loads(blocks[-1])
     except json.JSONDecodeError:
-        return []
+        return ParsedSpecs()
     specs: list[TicketSpec] = []
     for item in raw:
         try:
@@ -417,7 +526,47 @@ def parse_ticket_specs(output: str) -> list[TicketSpec]:
             )
         except (KeyError, TypeError):
             continue
-    return specs
+    if cfg is None:
+        return ParsedSpecs(specs=specs)
+
+    survivors: list[TicketSpec] = []
+    rejected: list[str] = []
+    for spec in specs:
+        gap = evidence_gap(spec, cfg)
+        if gap:
+            _logger.info("synthesis: dropping unevidenced candidate - %s", gap)
+            rejected.append(gap)
+        else:
+            survivors.append(spec)
+    return ParsedSpecs(specs=survivors, evidence_rejected=rejected)
+
+
+def record_observed(
+    spec: TicketSpec, ticket: int, cfg: CoreConfig, registry: PracticeRegistry
+) -> list[Practice]:
+    """Turn a filed ticket's rationale into `status: observed` practice notes.
+
+    One note per pinned repo the rationale names, each stamped with the ticket
+    number - the join key :meth:`PracticeRegistry.adopt` uses when that ticket's
+    PR merges. This is the step that stops the evidence being thrown away: the
+    READMEs and commit subjects :func:`build_context_pack` fetched are gone
+    after one prompt, but the claim they supported now has a durable note.
+    """
+    recorded: list[Practice] = []
+    for repo in repos_named_in(spec.synthesis_rationale, cfg):
+        citation = citation_for(spec.synthesis_rationale, repo)
+        practice = build_practice(
+            title=spec.title,
+            source_repo=repo,
+            dimension=infer_dimension(citation),
+            evidence=citation or spec.synthesis_rationale[:300],
+            status="observed",
+            ticket=ticket,
+            notes=f"Cited by the synthesis rationale of #{ticket}.",
+        )
+        registry.write(practice)
+        recorded.append(practice)
+    return recorded
 
 
 @dataclass
@@ -432,6 +581,9 @@ class SynthesisResult:
     # keep/drop decision that followed - the reflection phase's audit trail.
     risk_flags: list[str] = field(default_factory=list)
     risk_dropped: int = 0                          # candidates dropped as restated failures
+    # Candidates refused by the evidence gate, one reason each (see evidence_gap).
+    evidence_rejected: list[str] = field(default_factory=list)
+    observed: list[str] = field(default_factory=list)  # practice ids written this pass
 
 
 def _filter_duplicates(
@@ -510,14 +662,17 @@ def synthesize(
     the prompt, and the citations of what each filed ticket builds on come back
     OUT of it (deterministically, from the same index).
     """
-    repos = pick_rotation(cfg, cycle_index)
+    registry = PracticeRegistry(root, cfg)
+    try:
+        practices = registry.read()
+    except OSError:
+        practices = []
+    # Rotation is biased by the registry, so a thin repo is studied before a
+    # well-mined one - the read side of the coverage map, closing G1's loop.
+    repos = pick_rotation(cfg, cycle_index, practices)
     index = retrieval.load_index(root, cfg)
     pack = build_context_pack(repos, runner=runner, prior_art=gather_prior_art(cfg, index))
     memory = MemoryPack.gather(cfg, root=root, runner=runner)
-    try:
-        practices = KnowledgeBase.from_config(cfg, root).read_practices()
-    except OSError:
-        practices = []
     tier = cfg.synthesis.get("tier", "heavy")
     model = cfg.tiers[tier].model if tier in cfg.tiers else cfg.tiers[cfg.default_tier].model
     choice = ModelChoice(
@@ -533,7 +688,8 @@ def synthesize(
     if not ares.ok:
         return SynthesisResult(ok=False, studied=repos, filed=[], error=ares.error[:500])
 
-    specs = parse_ticket_specs(ares.output)
+    parsed = parse_ticket_specs_detailed(ares.output, cfg)
+    specs = parsed.specs
     threshold = float(cfg.synthesis.get("duplicate_threshold", DUPLICATE_JACCARD_THRESHOLD))
     survivors, rejected_titles = _filter_duplicates(specs, memory, threshold=threshold)
     grounded = ground_prior_art(survivors, index)
@@ -541,6 +697,7 @@ def synthesize(
     risk_dropped = len(grounded) - len(survivors)
 
     filed: list[int] = []
+    observed: list[str] = []
     for spec in survivors:
         body = spec.render()
         # Belt and braces: a synthesis-filed ticket without its citations would
@@ -554,8 +711,19 @@ def synthesize(
         )
         if num:
             filed.append(num)
+            # The registry is memory, not a gate: a write failure must never
+            # cost us a ticket that is already filed on GitHub.
+            try:
+                observed.extend(p.id for p in record_observed(spec, num, cfg, registry))
+            except OSError as exc:
+                _logger.warning("synthesis: could not record practices for #%s - %s", num, exc)
 
-    if not specs:
+    if not specs and parsed.evidence_rejected:
+        error = (
+            f"all {len(parsed.evidence_rejected)} candidate(s) refused by the evidence "
+            f"gate: {'; '.join(parsed.evidence_rejected)}"[:500]
+        )
+    elif not specs:
         error = "no parseable ticket specs in output"
     elif not survivors:
         error = (
@@ -568,4 +736,5 @@ def synthesize(
         ok=bool(filed), studied=repos, filed=filed, error=error,
         rejected=len(rejected_titles), rejected_titles=rejected_titles,
         risk_flags=risk_flags, risk_dropped=risk_dropped,
+        evidence_rejected=parsed.evidence_rejected, observed=observed,
     )

@@ -182,8 +182,8 @@ def test_practices_adopted_this_block_is_empty_when_the_registry_is_unchanged(
     append(
         tmp_path,
         build_practice(
-            title="pre-existing practice", source_project="openai/swarm",
-            source_artifact="source_code", evidence="PR #1",
+            title="pre-existing practice", source_repo="openai/swarm",
+            dimension="source_code", evidence="PR #1",
         ),
     )
 
@@ -215,8 +215,8 @@ def test_practices_adopted_this_block_surfaces_new_registry_entries(tmp_path, mo
         append(
             repo_root,
             build_practice(
-                title="session durability", source_project="OpenBMB/ChatDev",
-                source_artifact="harness_design", evidence="PR #104", adopted_pr=104,
+                title="session durability", source_repo="OpenBMB/ChatDev",
+                dimension="harness_design", evidence="PR #104", adopted_pr=104,
             ),
         )
         return cfg.default_branch
@@ -228,13 +228,79 @@ def test_practices_adopted_this_block_surfaces_new_registry_entries(tmp_path, mo
     assert len(res.report.practices_adopted) == 1
     item = res.report.practices_adopted[0]
     assert item["title"] == "session durability"
-    assert item["source_project"] == "OpenBMB/ChatDev"
+    assert item["source_repo"] == "OpenBMB/ChatDev"
     assert item["adopted_pr"] == 104
 
     brief = runner.review_bodies[-1]
     assert "## Practices adopted this block" in brief
     assert "session durability" in brief
     assert "OpenBMB/ChatDev" in brief
+
+
+def test_observed_practices_are_not_reported_as_adopted(tmp_path, monkeypatch):
+    """A ticket's citation is a proposal; only a merge makes it an adoption."""
+    from hsai.practices import PracticeRegistry, build_practice
+
+    cfg = load_config()
+    cfg.budget.clear()
+    cfg.cycle["block_size"] = 0
+
+    runner = _Runner()
+    monkeypatch.setattr(cycle, "_well_formed_backlog", lambda cfg, *, runner: 999)
+    monkeypatch.setattr(cycle, "_governance_pr", lambda *a, **k: 0)
+
+    def fake_sync_main(cfg, *, repo_root, runner):
+        PracticeRegistry(repo_root, cfg).write(build_practice(
+            title="not yet proven", source_repo="microsoft/JARVIS",
+            dimension="harness_design", evidence="cited by #77",
+            status="observed", ticket=77,
+        ))
+        return cfg.default_branch
+
+    monkeypatch.setattr(cycle, "_sync_main", fake_sync_main)
+
+    res = cycle.run_cycle(cfg, repo_dir=str(tmp_path), cycle_index=1, runner=runner)
+
+    assert res.report.practices_adopted == []
+    assert "_none this block_" in runner.review_bodies[-1]
+
+
+def test_a_practice_adopted_this_block_is_reported_even_if_observed_earlier(
+    tmp_path, monkeypatch
+):
+    """The block diff is keyed on adopted-ness, so a promotion in place counts."""
+    from hsai.practices import PracticeRegistry, build_practice
+
+    cfg = load_config()
+    cfg.budget.clear()
+    cfg.cycle["block_size"] = 0
+
+    # Observed BEFORE the block starts: not in the adopted baseline.
+    registry = PracticeRegistry(tmp_path, cfg)
+    registry.write(build_practice(
+        title="explicit phase artifacts", source_repo="FoundationAgents/MetaGPT",
+        dimension="harness_design", evidence="SOP artifacts",
+        status="observed", ticket=77,
+    ))
+
+    runner = _Runner()
+    monkeypatch.setattr(cycle, "_well_formed_backlog", lambda cfg, *, runner: 999)
+    monkeypatch.setattr(cycle, "_governance_pr", lambda *a, **k: 0)
+    monkeypatch.setattr(
+        cycle, "_sync_main",
+        lambda cfg, *, repo_root, runner: (
+            PracticeRegistry(repo_root, cfg).adopt(77, pr=104, lesson_note="2026-08-25-lesson"),
+            cfg.default_branch,
+        )[1],
+    )
+
+    res = cycle.run_cycle(cfg, repo_dir=str(tmp_path), cycle_index=1, runner=runner)
+
+    assert len(res.report.practices_adopted) == 1
+    item = res.report.practices_adopted[0]
+    assert item["title"] == "explicit phase artifacts"
+    assert item["status"] == "adopted"
+    assert item["adopted_pr"] == 104
 
 
 # --- plain-text agent output must not break article generation --------------

@@ -2,10 +2,17 @@ import json
 import re
 from pathlib import Path
 
+import pytest
+
 from hsai import ai, retrieval
 from hsai.config import load_config
 from hsai.models import ModelChoice
-from hsai.practices import ADOPTED_HEADING, build_practice
+from hsai.practices import (
+    ADOPTED_HEADING,
+    TARGETING_HEADING,
+    PracticeRegistry,
+    build_practice,
+)
 from hsai.proc import Proc
 from hsai.retrieval import PRIOR_ART_HEADING, PriorArt
 from hsai.synthesis import (
@@ -15,11 +22,14 @@ from hsai.synthesis import (
     ContextPack,
     MemoryPack,
     build_prompt,
+    evidence_gap,
     gather_prior_art,
     goal_queries,
     is_duplicate,
     parse_ticket_specs,
+    parse_ticket_specs_detailed,
     pick_rotation,
+    record_observed,
     synthesize,
 )
 from hsai.tickets import NO_PRIOR_ART, TicketSpec
@@ -29,6 +39,16 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 def _cfg():
     return load_config()
+
+
+# The rationale names three PINNED repos: anything less is refused by the
+# evidence gate before it is ever filed (see synthesis.evidence_gap). Defined
+# here because the gate's table-driven test needs it at collection time.
+EVIDENCED_RATIONALE = (
+    "langchain-ai/langchain contributes its callback layer at one choke point. "
+    "OpenBMB/ChatDev contributes cheaper agents for review phases. "
+    "assafelovic/gpt-researcher contributes persisted research memory."
+)
 
 
 def test_rotation_covers_the_set_over_cycles():
@@ -107,8 +127,8 @@ def test_prompt_includes_adopted_practices_and_do_not_repropose_instruction():
     cfg = _cfg()
     pack = ContextPack(repos=["a/b"], sections={"a/b": "digest"})
     practice = build_practice(
-        title="session durability", source_project="OpenBMB/ChatDev",
-        source_artifact="harness_design", evidence="PR #104",
+        title="session durability", source_repo="OpenBMB/ChatDev",
+        dimension="harness_design", evidence="PR #104",
     )
     prompt = build_prompt(cfg, pack, practices=[practice])
     assert ADOPTED_HEADING in prompt
@@ -116,10 +136,11 @@ def test_prompt_includes_adopted_practices_and_do_not_repropose_instruction():
     assert "do not" in ADOPTED_HEADING.lower() or "not re-propose" in prompt.lower()
     assert "practice_ids" in prompt
 
-    # the heading survives with no practices recorded yet
+    # An empty registry renders NEITHER section: there is no settled ground to
+    # avoid and no thin cell to aim at, so both would be pure prompt overhead.
     empty_prompt = build_prompt(cfg, pack)
-    assert ADOPTED_HEADING in empty_prompt
-    assert "no practices recorded yet" in empty_prompt.lower()
+    assert ADOPTED_HEADING not in empty_prompt
+    assert TARGETING_HEADING not in empty_prompt
 
 
 def test_synthesize_feeds_the_practices_registry_to_the_model(tmp_path):
@@ -131,8 +152,8 @@ def test_synthesize_feeds_the_practices_registry_to_the_model(tmp_path):
     append(
         tmp_path,
         build_practice(
-            title="cost accounting", source_project="assafelovic/gpt-researcher",
-            source_artifact="source_code", evidence="PR #47",
+            title="cost accounting", source_repo="assafelovic/gpt-researcher",
+            dimension="source_code", evidence="PR #47",
         ),
         cfg=cfg,
     )
@@ -145,6 +166,194 @@ def test_synthesize_feeds_the_practices_registry_to_the_model(tmp_path):
     assert ADOPTED_HEADING in claude_call[2]
 
 
+def test_prompt_targets_the_least_covered_areas_when_the_registry_is_non_empty():
+    cfg = _cfg()
+    pack = ContextPack(repos=["a/b"], sections={"a/b": "digest"})
+    practice = build_practice(
+        title="observability at one choke point", source_repo="langchain-ai/langchain",
+        dimension="source_code", evidence="PR #94",
+    )
+    prompt = build_prompt(cfg, pack, practices=[practice])
+
+    assert TARGETING_HEADING in prompt
+    targeting = prompt.split(TARGETING_HEADING, 1)[1].split(PRIOR_ART_HEADING, 1)[0]
+    # The one mined repo is NOT a target; untouched ones with their gaps are.
+    assert "langchain-ai/langchain" not in targeting
+    assert "FoundationAgents/MetaGPT" in targeting
+    assert "issue_history" in targeting
+
+
+def test_prompt_omits_observed_practices_from_the_already_adopted_list():
+    """`observed` means "a ticket cites it", not "we ship it" - the open-ticket
+    list already covers that, and listing it here would read as settled."""
+    cfg = _cfg()
+    pack = ContextPack(repos=["a/b"], sections={"a/b": "digest"})
+    observed = build_practice(
+        title="not yet proven", source_repo="microsoft/JARVIS",
+        dimension="harness_design", evidence="cited by #77", status="observed", ticket=77,
+    )
+    prompt = build_prompt(cfg, pack, practices=[observed])
+
+    # Both sections render (the registry is non-empty)...
+    assert ADOPTED_HEADING in prompt and TARGETING_HEADING in prompt
+    adopted = prompt.split(ADOPTED_HEADING, 1)[1].split(TARGETING_HEADING, 1)[0]
+    # ...but the unproven claim is not presented as settled ground.
+    assert "not yet proven" not in adopted
+    # It still counts as coverage, so JARVIS is no longer an untouched target.
+    targeting = prompt.split(TARGETING_HEADING, 1)[1].split(PRIOR_ART_HEADING, 1)[0]
+    assert "microsoft/JARVIS" not in targeting
+
+
+def test_pick_rotation_biases_toward_the_least_covered_repos():
+    cfg = _cfg()
+    top3 = [r.repo for r in cfg.reference_top10[:3]]
+    assert pick_rotation(cfg, 0) == top3  # unbiased default: plain rank order
+
+    # Mine the first three heavily; cycle 0 must now study somebody else.
+    practices = [
+        build_practice(
+            title=f"p{i}", source_repo=repo, dimension="source_code", evidence="e",
+        )
+        for i, repo in enumerate(top3)
+    ]
+    biased = pick_rotation(cfg, 0, practices)
+    assert biased != top3
+    assert not set(biased) & set(top3)
+
+    # Pure in (cycle_index, registry): same inputs, same answer, and registry
+    # order cannot change it.
+    assert biased == pick_rotation(cfg, 0, practices)
+    assert biased == pick_rotation(cfg, 0, list(reversed(practices)))
+
+    # Still a rotation: consecutive cycles keep covering the whole pinned set.
+    seen: set[str] = set()
+    for i in range(4):
+        seen.update(pick_rotation(cfg, i, practices))
+    assert len(seen) >= 10
+
+
+# --- the evidence gate: a rationale must cite the pinned set ------------------
+
+def _rationale_spec(rationale: str) -> TicketSpec:
+    return TicketSpec(
+        title="feat: something", problem="p", proposal="pp",
+        acceptance_criteria=("a", "b", "c"), verification_plan=("v1", "v2"),
+        synthesis_rationale=rationale,
+    )
+
+
+@pytest.mark.parametrize(
+    "rationale, accepted",
+    [
+        # Three pinned repos by full slug - the contract the prompt states.
+        (EVIDENCED_RATIONALE, True),
+        # Bare project names are legitimate citations too.
+        ("Combines MetaGPT, crewAI and llama_index.", True),
+        # Exactly at the floor.
+        ("From langchain-ai/langchain, OpenBMB/ChatDev and microsoft/JARVIS.", True),
+        # One short of the floor.
+        ("Combines MetaGPT and crewAI.", False),
+        # Plausible projects that are not in the pinned set prove nothing.
+        ("Combines AutoGen, BabyAGI and CAMEL.", False),
+        # The classic unfalsifiable assertion.
+        ("combines x+y+z", False),
+        ("", False),
+    ],
+)
+def test_evidence_gate_accepts_only_rationales_that_cite_the_pinned_set(rationale, accepted):
+    cfg = _cfg()
+    spec = _rationale_spec(rationale)
+    gap = evidence_gap(spec, cfg)
+    assert (gap == "") is accepted
+    if not accepted:
+        assert "needs >= 3" in gap
+
+
+def test_parse_ticket_specs_drops_unevidenced_specs_and_records_why():
+    cfg = _cfg()
+    output = """```json
+[
+  {"title": "feat: evidenced", "problem": "p", "proposal": "pp",
+   "acceptance_criteria": ["a", "b", "c"], "verification_plan": ["v1", "v2"],
+   "synthesis_rationale": "EVIDENCED"},
+  {"title": "feat: unevidenced", "problem": "p", "proposal": "pp",
+   "acceptance_criteria": ["a", "b", "c"], "verification_plan": ["v1", "v2"],
+   "synthesis_rationale": "combines three great projects"}
+]
+```""".replace("EVIDENCED", EVIDENCED_RATIONALE)
+
+    # Without a cfg there is no pinned set to check against: parsing only.
+    assert len(parse_ticket_specs(output)) == 2
+
+    parsed = parse_ticket_specs_detailed(output, cfg)
+    assert [s.title for s in parsed.specs] == ["feat: evidenced"]
+    assert len(parsed.evidence_rejected) == 1
+    reason = parsed.evidence_rejected[0]
+    assert "feat: unevidenced" in reason and "names 0 pinned" in reason
+    assert parse_ticket_specs(output, cfg) == parsed.specs
+
+
+def test_synthesize_reports_evidence_rejections_instead_of_filing(tmp_path):
+    """An unevidenced block files nothing and says exactly why."""
+    unevidenced = PLAIN_TEXT_OUTPUT.replace(EVIDENCED_RATIONALE, "combines x+y+z")
+    calls: list[list[str]] = []
+
+    def runner(cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None):
+        calls.append(list(cmd))
+        return Proc(cmd, 0, unevidenced if cmd[:1] == ["claude"] else "", "")
+
+    res = synthesize(_cfg(), cycle_index=0, root=str(tmp_path), runner=runner, ai_runner=runner)
+
+    assert res.ok is False
+    assert res.filed == []
+    assert not any(c[:3] == ["gh", "issue", "create"] for c in calls)
+    assert len(res.evidence_rejected) == 1
+    assert "evidence gate" in res.error
+    # Nothing unproven leaked into the registry either.
+    assert not list((tmp_path / "knowledge" / "practices").glob("*.md"))
+
+
+# --- observed practice notes, stamped with the ticket ------------------------
+
+def test_record_observed_writes_one_note_per_cited_repo(tmp_path):
+    cfg = _cfg()
+    registry = PracticeRegistry(tmp_path, cfg)
+    spec = _rationale_spec(
+        "run-llama/llama_index contributes its sync-docs.yml workflow discipline. "
+        "crewAIInc/crewAI contributes the commit subject feat(events): report project "
+        "creation. OpenBMB/ChatDev contributes cheaper review agents."
+    )
+
+    recorded = record_observed(spec, 42, cfg, registry)
+
+    assert {p.source_repo for p in recorded} == {
+        "run-llama/llama_index", "crewAIInc/crewAI", "OpenBMB/ChatDev"
+    }
+    assert all(p.status == "observed" and p.ticket == 42 for p in recorded)
+    # The dimension is inferred from the sentence that cited THAT repo.
+    by_repo = {p.source_repo: p for p in recorded}
+    assert by_repo["run-llama/llama_index"].dimension == "ci_cd"
+    assert by_repo["crewAIInc/crewAI"].dimension == "commit_history"
+    # ...and the evidence is that sentence, not the whole paragraph.
+    assert "sync-docs.yml" in by_repo["run-llama/llama_index"].evidence
+    assert "crewAIInc/crewAI" not in by_repo["run-llama/llama_index"].evidence
+
+    assert registry.for_ticket(42) == sorted(recorded, key=lambda p: p.id)
+
+
+def test_synthesize_stamps_observed_practices_with_the_filed_ticket(tmp_path):
+    runner = _plain_text_runner()
+    res = synthesize(_cfg(), cycle_index=0, root=str(tmp_path), runner=runner, ai_runner=runner)
+
+    assert res.filed
+    ticket = res.filed[0]
+    registry = PracticeRegistry(tmp_path, _cfg())
+    recorded = registry.for_ticket(ticket)
+    assert len(recorded) == 3  # one per repo EVIDENCED_RATIONALE names
+    assert {p.id for p in recorded} == set(res.observed)
+    assert all(p.status == "observed" and p.adopted_pr is None for p in recorded)
+
+
 # --- plain-text (non-JSON) CLI output must never break synthesis -------------
 
 PLAIN_TEXT_OUTPUT = """PHASE 1 - DIVERGE: ten candidates considered.
@@ -153,8 +362,8 @@ PHASE 3 - PRIORITIZE:
 ```json
 [{"title": "feat: adaptive budget", "problem": "p", "proposal": "pp",
   "acceptance_criteria": ["a", "b", "c"], "verification_plan": ["v1", "v2"],
-  "size": "L", "goal_ids": ["G4"], "synthesis_rationale": "combines x+y+z"}]
-```"""
+  "size": "L", "goal_ids": ["G4"], "synthesis_rationale": "RATIONALE"}]
+```""".replace("RATIONALE", EVIDENCED_RATIONALE)
 
 
 def _plain_text_runner():
@@ -174,7 +383,7 @@ def _plain_text_runner():
     return runner
 
 
-def test_synthesize_survives_output_without_a_json_envelope():
+def test_synthesize_survives_output_without_a_json_envelope(tmp_path):
     """`payload is None` is a supported state, not a failure mode."""
     cfg = _cfg()
     runner = _plain_text_runner()
@@ -187,7 +396,7 @@ def test_synthesize_survives_output_without_a_json_envelope():
     assert result.text == PLAIN_TEXT_OUTPUT      # falls back to raw stdout
 
     # ...and synthesis still parses its ticket specs off the raw text and files them.
-    res = synthesize(cfg, cycle_index=0, runner=runner, ai_runner=runner)
+    res = synthesize(cfg, cycle_index=0, root=str(tmp_path), runner=runner, ai_runner=runner)
     assert res.ok is True
     assert res.filed == [321]
     assert res.error == ""
@@ -325,10 +534,10 @@ def test_prompt_puts_memory_section_before_the_study_digest():
     assert "nothing recorded yet" in build_prompt(cfg, pack)
 
 
-def test_synthesize_feeds_memory_to_the_model():
+def test_synthesize_feeds_memory_to_the_model(tmp_path):
     cfg = _cfg()
     runner = _plain_text_runner()
-    synthesize(cfg, cycle_index=0, root=".", runner=runner, ai_runner=runner)
+    synthesize(cfg, cycle_index=0, root=str(tmp_path), runner=runner, ai_runner=runner)
     claude_call = next(c for c in runner.calls if c[:1] == ["claude"])
     assert MEMORY_HEADING in claude_call[2]
 
@@ -516,10 +725,13 @@ def test_gather_prior_art_grounds_the_cycle_in_the_real_vault():
     assert rendered.startswith("- [[")
 
 
-def test_synthesize_feeds_prior_art_citations_from_the_real_vault_to_the_model():
+def test_synthesize_feeds_prior_art_citations_from_the_real_vault_to_the_model(monkeypatch):
     """The captured prompt cites this repo's own notes, by name and outcome."""
     cfg = _cfg()
     runner = _plain_text_runner()
+    # This one reads the REAL vault (that is the point), so the registry write
+    # is stubbed out - a prompt assertion must not leave notes in the repo.
+    monkeypatch.setattr("hsai.synthesis.record_observed", lambda *a, **k: [])
     synthesize(cfg, cycle_index=0, root=str(REPO_ROOT), runner=runner, ai_runner=runner)
 
     prompt = next(c for c in runner.calls if c[:1] == ["claude"])[2]
@@ -546,16 +758,18 @@ RESTATED_AND_NOVEL_OUTPUT = """PHASE 1 ... PHASE 2 ... PHASE 3:
   {"title": "feat: agent situation store", "problem": "PROBLEM",
    "proposal": "PROPOSAL",
    "acceptance_criteria": ["a", "b", "c"], "verification_plan": ["v1", "v2"],
-   "size": "L", "goal_ids": ["G4"], "synthesis_rationale": "combines x+y+z",
+   "size": "L", "goal_ids": ["G4"], "synthesis_rationale": "RATIONALE",
    "prior_art": ["2026-01-04-vector-memory", "2099-12-31-invented"]},
   {"title": "feat: signed provenance attestation per merged pull request",
    "problem": "Downstream consumers cannot verify which model produced a diff.",
    "proposal": "Publish a signed attestation naming the model, ticket and PR.",
    "acceptance_criteria": ["a", "b", "c"], "verification_plan": ["v1", "v2"],
-   "size": "M", "goal_ids": ["G2"], "synthesis_rationale": "combines a+b+c",
+   "size": "M", "goal_ids": ["G2"], "synthesis_rationale": "RATIONALE",
    "prior_art": []}
 ]
-```""".replace("PROBLEM", FAILED_IDEA).replace("PROPOSAL", FAILED_IDEA)
+```""".replace("PROBLEM", FAILED_IDEA).replace("PROPOSAL", FAILED_IDEA).replace(
+    "RATIONALE", EVIDENCED_RATIONALE
+)
 
 
 def _prior_art_runner(output: str):

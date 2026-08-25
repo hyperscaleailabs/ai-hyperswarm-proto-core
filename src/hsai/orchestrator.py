@@ -11,6 +11,7 @@ performs the real side effects through the wrapper modules.
 """
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
@@ -24,6 +25,7 @@ from . import (
     gitops,
     ledger,
     postmortem,
+    practices,
     recall,
     repro,
     review,
@@ -34,6 +36,8 @@ from .knowledge import KnowledgeBase, Lesson
 from .models import ModelChoice, Task, select
 from .proc import Runner, run
 from .tickets import NEEDS_REFINEMENT, issue_well_formed
+
+_logger = logging.getLogger(__name__)
 
 HEAL = "heal"
 IMPLEMENT = "implement"
@@ -191,6 +195,8 @@ class IterationResult:
     lesson_path: str = ""
     recalled: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    # Practice ids flipped observed -> adopted by this iteration's merge.
+    adopted_practices: list[str] = field(default_factory=list)
 
     def describe(self) -> str:
         parts = [
@@ -760,6 +766,12 @@ def run_once(
     if remote == ci.SUCCESS:
         github.merge_pr(repo, pr_num, auto=True, runner=runner)
         result.merged = True
+        result.adopted_practices = _adopt_practices(
+            cfg, repo_dir,
+            ticket=ticket_num, pr=pr_num, lesson_note=lesson.note_name(),
+        )
+        if result.adopted_practices:
+            result.notes.append(f"adopted {len(result.adopted_practices)} practice(s)")
     else:
         result.merged = False
         _recover_failed(
@@ -778,6 +790,38 @@ def run_once(
     # 13. cleanup worktree
     gitops.remove_worktree(wt, cwd=repo_dir, runner=runner)
     return result
+
+
+def _adopt_practices(
+    cfg: CoreConfig,
+    repo_dir: str,
+    *,
+    ticket: int | None,
+    pr: int,
+    lesson_note: str,
+) -> list[str]:
+    """Close the provenance loop: a merged ticket's practices become ``adopted``.
+
+    Synthesis wrote one ``observed`` note per reference project it cited when it
+    filed this ticket (:func:`hsai.synthesis.record_observed`); the merge is the
+    moment that citation stops being a proposal and becomes something this repo
+    demonstrably does. Stamping the PR and the lesson note here is what lets
+    `hsai practices` answer "which project taught us this, and where is the
+    proof" without reading a single PR description.
+
+    Written to the REPO ROOT, not the worktree - the worktree is discarded
+    moments later, and (exactly like the quota ledger) the block's governance PR
+    is what commits the registry. Never fatal: the merge has already happened,
+    so a registry that cannot be written costs a note, not the iteration.
+    """
+    if not ticket:
+        return []
+    try:
+        registry = practices.PracticeRegistry(repo_dir, cfg)
+        return [p.id for p in registry.adopt(ticket, pr=pr, lesson_note=lesson_note)]
+    except OSError as exc:
+        _logger.warning("could not adopt practices for #%s: %s", ticket, exc)
+        return []
 
 
 def _recover_failed(
