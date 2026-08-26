@@ -61,7 +61,9 @@ def test_wait_remote_times_out_when_pending():
 
 
 def test_run_local_matches_workflow_steps():
-    # Local CI runs exactly ruff + pytest, mirroring .github/workflows/ci.yml.
+    # Local CI runs ruff + pytest (mirroring .github/workflows/ci.yml) plus a
+    # kb-lint pre-flight the remote workflow does not have yet - see the
+    # ci.yml patch this ticket's PR body carries for the architect to apply.
     calls = []
 
     def fake(cmd, **kwargs):
@@ -72,3 +74,16 @@ def test_run_local_matches_workflow_steps():
     assert result.ok
     assert ["ruff", "check", "."] in calls
     assert ["pytest"] in calls
+    assert ["hsai", "kb-lint"] in calls
+    assert result.steps == {"ruff": True, "pytest": True, "kb-lint": True}
+
+
+def test_run_local_fails_when_kb_lint_reports_an_error():
+    def fake(cmd, **kwargs):
+        if cmd == ["hsai", "kb-lint"]:
+            return Proc(cmd, 1, "", "knowledge/lessons/x.md:KB001: dangling wikilink\n")
+        return Proc(cmd, 0, "", "")
+
+    result = ci.run_local(runner=fake)
+    assert not result.ok
+    assert result.steps["kb-lint"] is False

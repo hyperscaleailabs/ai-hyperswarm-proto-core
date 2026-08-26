@@ -1,9 +1,12 @@
 """Continuous-integration gate.
 
-``run_local`` mirrors what the GitHub Actions workflow does (ruff + pytest) so
-the loop can pre-flight a change before it ever opens a PR. ``wait_remote``
-blocks until a PR's real GitHub checks conclude - that remote result is the
-source of truth for whether a change may merge.
+``run_local`` mirrors what the GitHub Actions workflow does (ruff + pytest),
+plus a `kb-lint` pre-flight the remote workflow does not yet have (see the
+module docstring of :mod:`hsai.kblint` and the ``ci.yml`` patch this ticket's
+PR body carries for the architect to apply) so the loop can pre-flight a
+change before it ever opens a PR. ``wait_remote`` blocks until a PR's real
+GitHub checks conclude - that remote result is the source of truth for
+whether a change may merge.
 """
 from __future__ import annotations
 
@@ -36,7 +39,13 @@ class CIResult:
 
 
 def run_local(*, cwd: str | None = None, runner: Runner = run) -> CIResult:
-    """Run ruff + pytest locally. This defines what a 'green build' means."""
+    """Run ruff + pytest + kb-lint locally. This defines what a 'green build' means.
+
+    ``kb-lint`` runs last: it is cheap and structural (MetaGPT's pre-commit
+    discipline - a fast check before anything expensive), but it also depends
+    on the vault as the worktree left it, so it comes after the code gates
+    rather than racing them.
+    """
     steps: dict[str, bool] = {}
     logs: list[str] = []
 
@@ -47,6 +56,10 @@ def run_local(*, cwd: str | None = None, runner: Runner = run) -> CIResult:
     tests = runner(["pytest"], cwd=cwd)
     steps["pytest"] = tests.ok
     logs.append(f"$ pytest\n{tests.stdout}\n{tests.stderr}")
+
+    kb_lint = runner(["hsai", "kb-lint"], cwd=cwd)
+    steps["kb-lint"] = kb_lint.ok
+    logs.append(f"$ hsai kb-lint\n{kb_lint.stdout}\n{kb_lint.stderr}")
 
     return CIResult(ok=all(steps.values()), steps=steps, log="\n\n".join(logs))
 

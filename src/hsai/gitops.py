@@ -147,6 +147,22 @@ def changed_paths(*, cwd: str, runner: Runner = run) -> list[str]:
     return paths
 
 
+def diff_pathspec(pathspec: str, *, cwd: str, runner: Runner = run) -> str:
+    """Diff of the working tree against HEAD, scoped to ``pathspec``.
+
+    Call this BEFORE :func:`restore_pathspec` discards the edits it captures -
+    it exists so a change the loop is about to revert (worker edits under
+    ``.github/workflows/``, which only the architect may apply - see
+    :func:`hsai.orchestrator.run_once`) is not lost, just relocated into the PR
+    body as a patch for the architect to apply by hand. Stages *intent to add*
+    for the pathspec first (see :func:`stage_intent_to_add`) so a brand-new
+    file under it renders as a full addition instead of being invisible to a
+    plain ``git diff``.
+    """
+    _git(["add", "-N", "--", pathspec], cwd=cwd, runner=runner)
+    return _git(["diff", "HEAD", "--", pathspec], cwd=cwd, runner=runner).stdout
+
+
 def restore_pathspec(pathspec: str, *, cwd: str, runner: Runner = run) -> None:
     """Discard both tracked edits and new files under ``pathspec``."""
     _git(["checkout", "HEAD", "--", pathspec], cwd=cwd, runner=runner)

@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import github, gitops, journal, ledger, postmortem, retrieval, trajectory
+from . import github, gitops, journal, kblint, ledger, postmortem, retrieval, trajectory
 from .ai import run_agent
 from .config import CoreConfig
 from .governance import BlockReport, open_review_issue, write_direction
@@ -87,7 +87,12 @@ def _persona_articles(
             out = articles_dir / f"{whitepaper_note}-{pid}.md"
             out.write_text(
                 f"---\ntags:\n  - article\n  - persona/{pid}\n---\n\n"
-                + ares.output.strip() + "\n"
+                + ares.output.strip()
+                # Without this backlink an article was reachable from no MOC -
+                # exactly the KB003 orphan `hsai kb-lint` exists to catch (see
+                # `hsai reindex` / `KnowledgeBase.reindex_mocs`, which indexes
+                # the articles directory into `[[Articles MOC]]`).
+                + "\n\n---\nPart of [[Knowledge Base MOC]].\n"
             )
             written.append(str(out.relative_to(repo_root)))
     return written
@@ -334,10 +339,14 @@ def run_cycle(
             cfg, kb, report.whitepaper, repo_root=repo_root, ai_runner=ai_runner
         )},
     )["paths"]
-    journal.once(
+    direction = journal.once(
         jr, "direction", "block",
         lambda: _direction_step(cfg, kb, repo_root=repo_root, runner=runner),
     )
+    # `.get`, not `[...]`: a journal written before kb-lint existed must still
+    # replay (see the `risk_flags` precedent above).
+    for f in direction.get("kblint_findings") or []:
+        report.notes.append(f"kb-lint {f['severity']}: {f['path']}:{f['code']}: {f['message']}")
 
     # A resumed block says so in the brief, in one line, before it is rendered.
     if jr.replayed:
@@ -393,16 +402,26 @@ def _direction_step(
     cfg: CoreConfig, kb: KnowledgeBase, *, repo_root: Path, runner: Runner
 ) -> dict:
     """Rebuild the derived indexes: knowledge MOCs, the retrieval index, then
-    the steering doc.
+    the steering doc - then lint the vault the reindex just regenerated.
 
-    All three are shared derived files, so they are rebuilt here - once, at the
-    end of the block - rather than by the parallel workers, which would collide
-    on them in concurrent PRs.
+    All three indexes are shared derived files, so they are rebuilt here -
+    once, at the end of the block - rather than by the parallel workers, which
+    would collide on them in concurrent PRs. The lint pass runs last, against
+    the freshly-reindexed MOCs, so a block that broke the graph (a dangling
+    link, an unindexed note) surfaces it in THIS block's review issue rather
+    than staying invisible until a human opens the vault.
     """
     mocs = [str(p) for p in kb.reindex_mocs()]
     notes_index = str(retrieval.write_index(repo_root, cfg))
     path = write_direction(cfg, repo_root=repo_root, runner=runner)
-    return {"path": str(path), "mocs": mocs, "notes_index": notes_index}
+    findings = [
+        {"path": f.path, "code": f.code, "message": f.message, "severity": f.severity}
+        for f in kblint.lint(repo_root, cfg)
+    ]
+    return {
+        "path": str(path), "mocs": mocs, "notes_index": notes_index,
+        "kblint_findings": findings,
+    }
 
 
 def _governance_pr(

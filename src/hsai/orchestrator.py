@@ -122,6 +122,7 @@ def build_pr_body(
     recalled: tuple[str, ...] = (),
     review_verdict: str = "",
     audit_verdict: str = "",
+    workflow_patch: str = "",
 ) -> str:
     """Assemble a PR body that satisfies the traceability invariants.
 
@@ -151,6 +152,21 @@ def build_pr_body(
     audit_section = (
         f"\n## Acceptance audit\n{audit_verdict}\n" if audit_verdict else ""
     )
+    # Only rendered when a worker actually touched `.github/workflows/` (the
+    # common case never grows this section - byte-identical to before the
+    # governance-patch mechanism existed). The loop reverts that edit rather
+    # than committing it, so this fenced diff is the only place it survives -
+    # apply it to bring remote CI back into parity with what local CI (see
+    # `ci.run_local`) now checks.
+    patch_section = (
+        "\n## Governance: CI workflow patch needed\n"
+        "This worker's edit to `.github/workflows/` was reverted (the loop never "
+        "commits changes to remote CI itself - only the architect may). Apply this "
+        "patch by hand so local and remote CI stop diverging:\n\n"
+        f"```diff\n{workflow_patch.strip(chr(10))}\n```\n"
+        if workflow_patch.strip()
+        else ""
+    )
     return f"""Closes #{ticket}
 
 ## Model used
@@ -159,7 +175,7 @@ def build_pr_body(
 
 ## CI
 {ci_summary}
-
+{patch_section}
 ## Independent review
 {verdict}
 {audit_section}
@@ -450,6 +466,7 @@ def run_once(
     agent_ok = True
     agent_err = ""
     reverted_workflows: list[str] = []
+    reverted_workflow_diff: str = ""
     repro_result: repro.ReproResult | None = None
     audit_report = audit.skip_audit("dry-run: nothing was produced to audit")
     if not dry_run:
@@ -478,12 +495,20 @@ def run_once(
 
         # Guard: a task must not change the CI checks, or local and remote CI
         # would diverge (as happened once when a worker added mypy). Revert any
-        # workflow edits before they are committed and note it in the lesson.
+        # workflow edits before they are committed and note it in the lesson -
+        # but capture the diff FIRST, so the change is not simply lost: it
+        # reaches the PR body as a ready-to-apply patch (see build_pr_body's
+        # `workflow_patch`) for the architect to apply by hand, bringing local
+        # and remote CI back to parity through a governance change instead of
+        # letting them silently diverge.
         reverted_workflows = [
             p for p in gitops.changed_paths(cwd=wt, runner=runner)
             if p.startswith(".github/workflows/")
         ]
         if reverted_workflows:
+            reverted_workflow_diff = gitops.diff_pathspec(
+                ".github/workflows", cwd=wt, runner=runner
+            )
             gitops.restore_pathspec(".github/workflows", cwd=wt, runner=runner)
             result.notes.append(f"reverted workflow edits: {reverted_workflows}")
 
@@ -729,6 +754,7 @@ def run_once(
         recalled=recalled.note_names,
         review_verdict=verdict.render(),
         audit_verdict=audit_section,
+        workflow_patch=reverted_workflow_diff,
     )
     pr_num = github.create_pr(
         repo, branch, f"{kind}: {ticket_title}"[:120], pr_body,

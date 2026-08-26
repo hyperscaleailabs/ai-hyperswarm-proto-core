@@ -232,6 +232,11 @@ class FakeRunner:
             ok = self.ci_sequence[self._ci_round]
             self._ci_round += 1
             return Proc(cmd, 0 if ok else 1, "", "" if ok else "pytest: fake test failure\n")
+        if cmd == ["hsai", "kb-lint"]:
+            # Vault integrity is exercised by tests/test_kblint.py, not the
+            # orchestrator's fake-runner harness - always clean here so
+            # `ci_sequence` alone still decides ci_before/ci_after outcomes.
+            return Proc(cmd, 0, "", "")
         if cmd[:1] == ["pytest"]:
             # Targeted repro-guard run: distinguish fix-branch from the
             # detached pre-fix (parent) worktree by its cwd.
@@ -659,6 +664,14 @@ def test_workflow_edits_are_reverted(tmp_path):
     assert any(c[:2] == ["git", "clean"] for c in runner.calls)
     assert any("reverted workflow edits" in n for n in result.notes)
 
+    # The reverted edit is not simply lost - it survives as a fenced patch in
+    # the PR body, for the architect to apply by hand (governance, not code,
+    # brings remote CI back into parity).
+    pr_create = next(c for c in runner.calls if c[:3] == ["gh", "pr", "create"])
+    body = pr_create[pr_create.index("--body") + 1]
+    assert "## Governance: CI workflow patch needed" in body
+    assert "```diff" in body
+
 
 def test_completeness_guard_blocks_knowledge_only_diff_on_code_ticket(tmp_path):
     cfg = load_config()
@@ -1023,6 +1036,24 @@ def test_build_pr_body_renders_the_audit_only_when_the_gate_ran():
     plain = build_pr_body(**kwargs)
     assert "## Acceptance audit" not in plain
     assert plain == build_pr_body(**kwargs, audit_verdict="")
+
+
+def test_build_pr_body_renders_the_workflow_patch_only_when_something_was_reverted():
+    choice = ModelChoice(tier="standard", model="sonnet", rationale="x")
+    kwargs = dict(
+        ticket=42, choice=choice, lesson_note="2026-08-23-note",
+        lesson_summary="kept it small", ci_summary="green", kind=IMPLEMENT,
+    )
+    patch = "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n+kb-lint\n"
+    body = build_pr_body(**kwargs, workflow_patch=patch)
+    assert "## Governance: CI workflow patch needed" in body
+    assert patch.strip() in body
+    assert "```diff" in body
+
+    # No reverted edit -> byte-for-byte the pre-governance-patch body.
+    plain = build_pr_body(**kwargs)
+    assert "## Governance" not in plain
+    assert plain == build_pr_body(**kwargs, workflow_patch="")
 
 
 # --- trajectory store (one durable record per agent run) --------------------

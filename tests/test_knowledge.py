@@ -162,7 +162,8 @@ def test_write_lesson_and_reindex(tmp_path):
     written = kb.reindex_mocs()
     names = {p.name for p in written}
     assert names == {
-        "Lessons MOC.md", "Whitepapers MOC.md", "Practices MOC.md", "Knowledge Base MOC.md",
+        "Lessons MOC.md", "Whitepapers MOC.md", "Practices MOC.md", "Articles MOC.md",
+        "Knowledge Base MOC.md",
     }
     lessons_moc = (kb.mocs_dir / "Lessons MOC.md").read_text()
     assert f"[[{lesson.note_name()}]]" in lessons_moc
@@ -361,4 +362,34 @@ def test_practices_moc_placeholder_when_empty(tmp_path):
     kb.reindex_mocs()
     text = (kb.mocs_dir / "Practices MOC.md").read_text()
     assert "No practices recorded yet" in text
+
+
+# --- Articles MOC: persona articles must not silently drop out of the graph --
+
+def test_articles_moc_indexes_the_articles_directory(tmp_path):
+    """Persona articles are written by `cycle._persona_articles`, not through
+    `KnowledgeBase` - so reindex has to discover them off disk, exactly the way
+    `hsai kb-lint` (KB003) will discover them too."""
+    kb = KnowledgeBase(tmp_path)
+    (kb.articles_dir / "2026-08-23-synthesis-after-37-lessons-architect.md").write_text(
+        "---\ntags:\n  - article\n  - persona/architect\n---\n\n# For the architect\n\nBody.\n"
+    )
+
+    written = kb.reindex_mocs()
+    names = {p.name for p in written}
+    assert "Articles MOC.md" in names
+
+    text = (kb.mocs_dir / "Articles MOC.md").read_text()
+    assert "[[2026-08-23-synthesis-after-37-lessons-architect]]" in text
+    assert "Total: **1**" in text
+
+    root_moc = (kb.mocs_dir / "Knowledge Base MOC.md").read_text()
+    assert "[[Articles MOC]] - 1 article(s)" in root_moc
+
+
+def test_articles_moc_placeholder_when_empty(tmp_path):
+    kb = KnowledgeBase(tmp_path)
+    kb.reindex_mocs()
+    text = (kb.mocs_dir / "Articles MOC.md").read_text()
+    assert "No persona articles yet" in text
     assert "Total: **0**" in text

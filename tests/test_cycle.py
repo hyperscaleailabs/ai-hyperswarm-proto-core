@@ -167,6 +167,40 @@ def test_synthesis_duplicate_rejections_surface_in_block_notes(tmp_path, monkeyp
     assert note in runner.review_bodies[-1]
 
 
+# --- kb-lint findings reach the review brief ----------------------------------
+
+def test_kblint_findings_surface_in_block_notes_and_brief(tmp_path, monkeypatch):
+    """A block that regenerates the MOCs onto a broken vault must say so in the
+    SAME block's review issue - not stay invisible until a human opens Obsidian."""
+    cfg = load_config()
+    cfg.budget.clear()
+    cfg.cycle["block_size"] = 0  # isolate: no implementation iterations needed
+
+    kb = KnowledgeBase.from_config(cfg, tmp_path)
+    kb.write_lesson(Lesson(
+        title="dangling reference",
+        outcome="pass",
+        kind="improve",
+        context="c",
+        what_happened="w",
+        lesson="See [[does-not-exist]] for the full writeup.",
+    ))
+
+    runner = _Runner()
+    monkeypatch.setattr(cycle, "_well_formed_backlog", lambda cfg, *, runner: 999)
+    monkeypatch.setattr(cycle, "_governance_pr", lambda *a, **k: 0)
+
+    res = cycle.run_cycle(
+        cfg, repo_dir=str(tmp_path), cycle_index=1, runner=runner, ai_runner=runner,
+    )
+
+    note = next(n for n in res.report.notes if n.startswith("kb-lint error:") and "KB001" in n)
+    assert "does-not-exist" in note
+
+    assert runner.review_bodies, "a review issue should have been opened"
+    assert note in runner.review_bodies[-1]
+
+
 # --- practices adopted this block reach the review brief ---------------------
 
 def test_practices_adopted_this_block_is_empty_when_the_registry_is_unchanged(
@@ -259,6 +293,24 @@ def test_persona_articles_survive_output_without_a_json_envelope(tmp_path):
     for rel in written:
         text = (tmp_path / rel).read_text()
         assert "Plain text, no JSON envelope." in text
+
+
+def test_persona_articles_carry_a_knowledge_base_moc_backlink(tmp_path):
+    """Without this backlink an article is reachable from no MOC - the KB003
+    orphan `hsai kb-lint` (see hsai.kblint) exists to catch."""
+    cfg = load_config()
+    kb = KnowledgeBase.from_config(cfg, tmp_path)
+    kb.whitepapers_dir.mkdir(parents=True, exist_ok=True)
+    (kb.whitepapers_dir / "2026-08-04-block-1.md").write_text("# Block paper\n\nBody.\n")
+
+    def ai_runner(cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None):
+        return Proc(cmd, 0, "# For the reader\n\nBody.\n", "")
+
+    written = cycle._persona_articles(
+        cfg, kb, "2026-08-04-block-1", repo_root=tmp_path, ai_runner=ai_runner
+    )
+    for rel in written:
+        assert "[[Knowledge Base MOC]]" in (tmp_path / rel).read_text()
 
 
 # --- trajectory retention ---------------------------------------------------

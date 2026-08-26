@@ -195,6 +195,7 @@ class KnowledgeBase:
         whitepapers_dir: str = "knowledge/whitepapers",
         mocs_dir: str = "knowledge/MOCs",
         practices_dir: str = practices_mod.PRACTICES_DIR_DEFAULT,
+        articles_dir: str = "knowledge/articles",
         whitepaper_every: int = 10,
     ) -> None:
         self.root = Path(root)
@@ -202,8 +203,12 @@ class KnowledgeBase:
         self.whitepapers_dir = self.root / whitepapers_dir
         self.mocs_dir = self.root / mocs_dir
         self.practices_dir = self.root / practices_dir
+        self.articles_dir = self.root / articles_dir
         self.whitepaper_every = whitepaper_every
-        for d in (self.lessons_dir, self.whitepapers_dir, self.mocs_dir, self.practices_dir):
+        for d in (
+            self.lessons_dir, self.whitepapers_dir, self.mocs_dir,
+            self.practices_dir, self.articles_dir,
+        ):
             d.mkdir(parents=True, exist_ok=True)
 
     @classmethod
@@ -215,6 +220,7 @@ class KnowledgeBase:
             whitepapers_dir=k.get("whitepapers_dir", "knowledge/whitepapers"),
             mocs_dir=k.get("mocs_dir", "knowledge/MOCs"),
             practices_dir=k.get("practices_dir", practices_mod.PRACTICES_DIR_DEFAULT),
+            articles_dir=k.get("articles_dir", "knowledge/articles"),
             whitepaper_every=int(k.get("whitepaper_every_lessons", 10)),
         )
 
@@ -238,6 +244,9 @@ class KnowledgeBase:
 
     def practice_notes(self) -> list[str]:
         return sorted(p.stem for p in self.practices_dir.glob("*.md"))
+
+    def article_notes(self) -> list[str]:
+        return sorted(p.stem for p in self.articles_dir.glob("*.md"))
 
     def read_practices(self) -> list[practices_mod.Practice]:
         """Parse every practice note on disk, sorted by id (see :func:`hsai.practices.load`)."""
@@ -334,6 +343,7 @@ class KnowledgeBase:
             self._write_lessons_moc(),
             self._write_whitepapers_moc(),
             self._write_practices_moc(),
+            self._write_articles_moc(),
             self._write_root_moc(),
         ]
         return written
@@ -481,6 +491,30 @@ Periodic syntheses of accumulated lessons. Total: **{len(notes)}**.
         path.write_text(content)
         return path
 
+    def _write_articles_moc(self) -> Path:
+        """Persona-article index. Until this existed, articles were written
+        with no MOC link at all and dropped out of the graph the moment they
+        were generated - the exact orphan gap `hsai kb-lint` (KB003) exists to
+        catch (see :mod:`hsai.kblint`).
+        """
+        notes = self.article_notes()
+        fm = self._frontmatter(("moc", "articles"), {"updated": _today()})
+        links = "\n".join(f"- [[{n}]]" for n in notes) or "- _No persona articles yet._"
+        content = f"""{fm}
+
+# Articles MOC
+
+Up: [[Knowledge Base MOC]]
+
+Persona rewrites of each block's whitepaper - one per audience in
+`personas` (core.yaml). Total: **{len(notes)}**.
+
+{links}
+"""
+        path = self.mocs_dir / "Articles MOC.md"
+        path.write_text(content)
+        return path
+
     def _write_practices_moc(self) -> Path:
         """Adopted-practice registry, grouped by source project.
 
@@ -524,6 +558,7 @@ project - the durable record behind G1's traceability claim. Total: **{len(recor
         n_lessons = len(self.lesson_notes())
         n_papers = len(self.whitepaper_notes())
         n_practices = len(self.practice_notes())
+        n_articles = len(self.article_notes())
         content = f"""{fm}
 
 # Knowledge Base MOC
@@ -535,6 +570,7 @@ vault and use the graph view to explore how lessons connect.
 - [[Lessons MOC]] - {n_lessons} lesson(s)
 - [[Whitepapers MOC]] - {n_papers} whitepaper(s)
 - [[Practices MOC]] - {n_practices} practice(s)
+- [[Articles MOC]] - {n_articles} article(s)
 
 ## How this is maintained
 - Each PR the [[hsai]] loop opens contributes exactly one lesson.

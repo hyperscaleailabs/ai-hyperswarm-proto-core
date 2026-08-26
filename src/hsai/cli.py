@@ -6,6 +6,7 @@ Commands:
   hsai status                                                  config + backlog snapshot
   hsai cycle [--cycle-index N] [--resume] [--dry-run]          one governance block
   hsai reindex [--root DIR]                                    rebuild knowledge MOCs + notes.json
+  hsai kb-lint [--strict] [--root DIR]                          integrity gate for the knowledge base
   hsai recall "<query>" [--k N] [--kind K]                     rank prior lessons/ADRs
   hsai practices list                                          show the adopted-practice registry
   hsai practices add --title T --source-project P ...          record a new adopted practice
@@ -24,6 +25,7 @@ import time
 from . import (
     __version__,
     ai,
+    kblint,
     ledger,
     postmortem,
     practices,
@@ -102,6 +104,22 @@ def cmd_reindex(args: argparse.Namespace) -> int:
     index = retrieval.write_index(root, cfg)
     print(f"reindexed {index} ({len(retrieval.note_paths(root, cfg))} note(s))")
     return 0
+
+
+def cmd_kb_lint(args: argparse.Namespace) -> int:
+    """Integrity gate for the Obsidian knowledge base (see hsai.kblint).
+
+    Pure reading: no writes, no quota spent. Exits 1 when any error-severity
+    finding survives (KB001/KB003, plus every KB002/KB004 warning when
+    ``--strict`` promotes them).
+    """
+    cfg = _load(args)
+    findings = kblint.lint(args.root, cfg)
+    for f in kblint.sorted_by_severity(findings, strict=args.strict):
+        print(f.render())
+    if not findings:
+        print("kb-lint: clean")
+    return 1 if kblint.has_errors(findings, strict=args.strict) else 0
 
 
 def cmd_recall(args: argparse.Namespace) -> int:
@@ -322,6 +340,13 @@ def build_parser() -> argparse.ArgumentParser:
     ri = sub.add_parser("reindex", help="rebuild knowledge-base MOCs + the retrieval index")
     ri.add_argument("--root", default=".", help="repo root holding knowledge/ and docs/adr")
     ri.set_defaults(func=cmd_reindex)
+
+    kl = sub.add_parser("kb-lint", help="integrity gate for the Obsidian knowledge base")
+    kl.add_argument("--root", default=".", help="repo root holding knowledge/")
+    kl.add_argument(
+        "--strict", action="store_true", help="promote KB002/KB004 warnings to errors"
+    )
+    kl.set_defaults(func=cmd_kb_lint)
 
     rl = sub.add_parser("recall", help="rank prior lessons/whitepapers/ADRs for a query")
     rl.add_argument("query", help="what the task is about, in plain words")
