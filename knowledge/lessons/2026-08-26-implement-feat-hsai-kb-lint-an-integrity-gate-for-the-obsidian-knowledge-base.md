@@ -24,7 +24,7 @@ recalled:
 | ticket | #355 |
 | pull request | _(none)_ |
 | model | `sonnet` |
-| remote CI | _(pending)_ |
+| remote CI | TIMEOUT |
 | failure class | `agent_timeout` |
 
 ## Context
