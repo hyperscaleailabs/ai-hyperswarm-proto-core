@@ -1,0 +1,867 @@
+{
+  "nodes": [
+    {
+      "id_": "0001-two-phase-engine-and-governance-rhythm",
+      "metadata": {
+        "created": "2026-07-26",
+        "failure_class": "",
+        "kind": "unknown",
+        "note_name": "0001-two-phase-engine-and-governance-rhythm",
+        "outcome": "unknown",
+        "source": "adr",
+        "tags": [],
+        "title": "ADR-0001: Two-phase engine and twice-daily governance rhythm"
+      },
+      "text": "# ADR-0001: Two-phase engine and twice-daily governance rhythm\n\n- **Status**: accepted\n- **Date**: 2026-07-26\n- **Source**: architect steering session 2026-07-26 (first governance review)\n\n## Context\nThe first autonomous runs produced working but shallow changes. Evidence:\nPR #17 (haiku) closed feature ticket #4 with a knowledge-only diff - zero code;\nimprovement ideas were single-step copies from one reference project; tickets\nwere unstructured, so a trivial diff could \"satisfy\" them. The architect had no\nsurface through which to steer.\n\n## Decision\n1. **Two-phase engine.** Idea generation is separated from implementation.\n   A heavy model (`synthesis.tier: heavy`) studies a rotating subset of the\n   reference projects and must COMBINE practices from >= 3 of them, run an\n   explicit reflection/critique pass, prioritize by impact x effort, and file\n   structured tickets. Cheaper models implement against acceptance criteria.\n2. **Structured tickets are enforced, not encouraged.** Feature/skill tickets\n   without acceptance criteria (>= 2 checkboxes) + a verification plan are\n   labeled `needs-refinement` and refused by the orchestrator.\n3. **Completeness guard.** A code ticket cannot be closed by a knowledge-only\n   diff; such attempts are auto-recovered and counted against retry attempts.\n4. **Governance rhythm.** Work runs in sequential half-day blocks\n   (`cycle.block_size`, sequential to protect the local machine). Each block\n   ends with a whitepaper, persona articles (CTO / architect / DevOps),\n   a refreshed `governance/DIRECTION.md`, and a review issue. The architect\n   reviews twice daily via `/review-next`; feedback is encoded as ADRs and\n   tickets; each session ends with a merged PR.\n5. **Publishing is pull-based.** agentic-atlas ingests hyperswarm whitepapers\n   through its own pipeline (source entry), keeping the repos loosely coupled.\n\n## Consequences\n- Substantial synthesis costs heavy-model quota twice daily - accepted; it is\n  the learning engine, and implementation stays on cheaper tiers.\n- haiku is demoted to genuinely mechanical, narrow edits (and size-labeled\n  tickets can never route light).\n- Enforced where: orchestrator guards (`tickets.py`, completeness guard),\n  CI evidence step (`ci.yml`), `hsai cycle`/`synthesize` (engine),\n  `/review-next` skill (review discipline), `core.yaml` (configuration)."
+    },
+    {
+      "id_": "2026-07-25-bootstrap-the-hsai-loop",
+      "metadata": {
+        "created": "2026-07-25",
+        "failure_class": "",
+        "kind": "improve",
+        "note_name": "2026-07-25-bootstrap-the-hsai-loop",
+        "outcome": "pass",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/pass",
+          "kind/improve"
+        ],
+        "title": "Bootstrap the hsai loop"
+      },
+      "text": "# Bootstrap the hsai loop\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **pass** |\n| kind | improve |\n| iteration | 0 |\n| ticket | _(founding)_ |\n| pull request | _(founding)_ |\n| model | `n/a (human + Claude Code scaffold)` |\n\n## Context\nIteration 0 - the scaffolding itself. Before the loop can improve the repo, the\nrepo needs a loop, a CI gate, a knowledge base, and a pinned reference set.\n\n## What happened\nBuilt `hsai` (config → models → ai → gitops → github → ci → knowledge →\norchestrator → swarm → cli) with the decision logic kept pure and unit-tested,\nand side effects isolated in wrappers. Pinned the top-10 reference set and wrote\nthe [[2026-07-25-founding-study-top-10-ai-swarm-projects|founding study]].\n\n## Lesson learned\nStart with the invariants, not the features: ticket-linked PRs, green-gated\nmerges, subscription-only model use, and a lesson per iteration. Everything else\n(better model routing, deeper reference mining) can be grown by the loop once\nthose rails exist. Keep the core tiny - a practice borrowed from `openai/swarm`.\n\n## References (reference-set evidence)\n- `SWE-agent/SWE-agent`\n- `openai/swarm`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-07-25-founding-study-top-10-ai-swarm-projects",
+      "metadata": {
+        "created": "2026-07-25",
+        "failure_class": "",
+        "kind": "unknown",
+        "note_name": "2026-07-25-founding-study-top-10-ai-swarm-projects",
+        "outcome": "unknown",
+        "source": "whitepaper",
+        "tags": [
+          "whitepaper",
+          "reference-set"
+        ],
+        "title": "Founding Study: What the Top-10 AI Swarm Projects Teach Us"
+      },
+      "text": "# Founding Study: What the Top-10 AI Swarm Projects Teach Us\n\n> Part of [[Whitepapers MOC]] - [[Knowledge Base MOC]]\n\n## Summary\nThe reference set pinned in `.ai-swarm/core.yaml` (all ≥10k stars, MIT/Apache-2.0)\nis our field to learn from. This founding note records *why* each was chosen and\nthe concrete practice we intend to borrow first. It anchors goal **G1**\n(learn from the top-10) so future lessons can cite specific evidence.\n\n## The set and one practice from each\n\n| repo | practice worth adopting |\n| --- | --- |\n| `langchain-ai/langchain` | clean separation of orchestration from tool/provider adapters |\n| `FoundationAgents/MetaGPT` | role-based agents with explicit hand-off artifacts |\n| `crewAIInc/crewAI` | declarative \"crew\" config as the unit of work (mirrors our `core.yaml`) |\n| `run-llama/llama_index` | pluggable retrieval so context assembly is swappable |\n| `OpenBMB/ChatDev` | a phased pipeline (design → code → test) with gates between phases |\n| `assafelovic/gpt-researcher` | plan-then-execute with an explicit synthesis step |\n| `microsoft/semantic-kernel` | planners + typed \"skills\" as first-class, composable units |\n| `microsoft/JARVIS` | an LLM controller that routes sub-tasks to the right model |\n| `openai/swarm` | minimal, ergonomic hand-off primitives - keep the core tiny |\n| `SWE-agent/SWE-agent` | turn a GitHub issue directly into a validated PR |\n\n## Practices to adopt first\n1. **Issue → validated PR** (from SWE-agent) - already the spine of the `hsai`\n   loop; keep every change ticket-linked and CI-gated.\n2. **Model routing** (from JARVIS) - our `hsai.models.select` is the seed;\n   improving it is a tracked skill.\n3. **Keep the core tiny** (from openai/swarm) - resist framework sprawl; wrappers\n   stay thin and the decision logic stays pure.\n4. **Config-as-crew** (from crewAI) - `core.yaml` is the single declarative\n   source of mission, goals, and execution limits.\n\n## How we will learn deeper\nBeyond READMEs, future iterations should mine each project's **commit history,\nCI/CD config, and issue history** for patterns, and record each borrowed\npractice as a [[Lessons MOC|lesson]] that cites its source.\n\n## Lessons synthesized\n- [[2026-07-25-bootstrap-the-hsai-loop]]"
+    },
+    {
+      "id_": "2026-07-26-architect-steering-quality-over-throughput",
+      "metadata": {
+        "created": "2026-07-26",
+        "failure_class": "",
+        "kind": "improve",
+        "note_name": "2026-07-26-architect-steering-quality-over-throughput",
+        "outcome": "pass",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/pass",
+          "kind/improve",
+          "governance"
+        ],
+        "title": "Architect steering: quality over throughput"
+      },
+      "text": "# Architect steering: quality over throughput\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **pass** (steering absorbed into the system) |\n| kind | improve (governance) |\n| source | architect review, 2026-07-26 |\n| encoded as | ADR-0001, governance layer PR |\n\n## Context\nFirst day of autonomous operation: 6 PRs merged, 2 gated. The architect's\nreview found the merged work real but shallow - the loop optimized for\ncompleting iterations, not for learning.\n\n## What happened\nThe architect observed: (1) tasks were too simple and one \"completed\" ticket\nshipped no code; (2) light models prefer minimal diffs, so unstructured tickets\ninvite hollow work; (3) single-project copying is not learning - synthesis must\nCOMBINE ideas across many reference projects with reflection and creativity;\n(4) there was no steering surface, no review rhythm, and no evidence-leaving\nSDLC encoded in the pipeline.\n\n## Lesson learned\nAn autonomous loop optimizes exactly what its gates measure. Green CI alone\nmeasures \"didn't break anything\", so the loop drifted toward minimal safe\ndiffs. Learning requires: substantial tickets with acceptance criteria\n(enforced, not suggested), idea generation separated from implementation\n(heavy-model synthesis with reflection; cheap-model execution), completeness\nguards (code tickets need code), and a human steering cadence (twice-daily\nreview -> ADRs -> tickets) so quality judgments a machine can't make enter the\nsystem on schedule. Throughput without synthesis is motion without learning.\n\n## References (reference-set evidence)\n- `SWE-agent/SWE-agent` (validated issue->PR discipline)\n- `microsoft/JARVIS` (route by capability: planner model != worker model)\n- `OpenBMB/ChatDev` (phased pipeline with gates between phases)"
+    },
+    {
+      "id_": "2026-07-26-first-3-parallel-swarm-run",
+      "metadata": {
+        "created": "2026-07-26",
+        "failure_class": "",
+        "kind": "improve",
+        "note_name": "2026-07-26-first-3-parallel-swarm-run",
+        "outcome": "mixed",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/mixed",
+          "kind/improve",
+          "swarm"
+        ],
+        "title": "First 3-parallel swarm run"
+      },
+      "text": "# First 3-parallel swarm run\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **mixed** (1 merged, 2 gated) |\n| kind | improve (retrospective) |\n| iteration | first ramp to `max_parallel: 3` |\n| tickets | #2, #3, #4 |\n| model | haiku x2, sonnet x1 |\n\n## Context\nAfter a single iteration was proven (PR #7, ticket #1), the loop ramped to three\nconcurrent workers, each in its own worktree, claiming tickets #2/#3/#4.\n\n## What happened\n- **Concurrency was clean.** Three distinct worktrees, three distinct claimed\n  tickets - the serialize-the-prologue lock and unassigned-only claim held; no\n  two workers touched the same ticket or raced on git's index.\n- **PR #8 (ticket #2, model-selection skill) merged.** A real self-improvement:\n  `models.py` moved to `heuristic-v1` with better thresholds and tests. The loop\n  improved its own code through the gate.\n- **PR #9 (ticket #4) was correctly BLOCKED.** The worker went off-spec - it\n  added a mypy step to CI instead of building the reference-set miner. Local CI\n  (ruff+pytest) was green, but the agent's own workflow edit failed on GitHub.\n- **PR #10 (ticket #3) was correctly BLOCKED.** A real feature, but shipped one\n  failing unit test (`assert 1 == 3`); local CI caught it too.\n\n## Lesson learned\nThe safety model works: green-gated auto-merge let exactly the good change in and\nheld both broken ones out. But full-auto at N>1 surfaced three real gaps, now\nfiled as backlog:\n1. **No retry/recovery** for a ticket whose PR fails - it strands as claimed\n   with a dead PR ([[Lessons MOC|#11]]).\n2. **Local CI must match remote** - a worker can mislabel a change \"pass\" when\n   local and remote checks diverge (#12).\n3. **Off-spec drift** - a weak model can ignore its ticket; needs a relevance\n   guard (#13).\nAlso: the model-selection heuristic put `haiku` on non-trivial tickets. Improving\ntier calibration (the very subject of #2) remains the highest-leverage next step.\n\n## References (reference-set evidence)\n- `SWE-agent/SWE-agent` (issue→validated PR; the gate is the point)\n- `openai/swarm` (keep the concurrency core tiny)\n- `microsoft/JARVIS` (route the right model to the task)"
+    },
+    {
+      "id_": "2026-07-26-implement-add-structured-execution-context-to-error-messages",
+      "metadata": {
+        "created": "2026-07-26",
+        "failure_class": "",
+        "kind": "implement",
+        "note_name": "2026-07-26-implement-add-structured-execution-context-to-error-messages",
+        "outcome": "pass",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/pass",
+          "kind/implement",
+          "reference-set-practice"
+        ],
+        "title": "implement: add structured execution context to error messages"
+      },
+      "text": "# implement: add structured execution context to error messages\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **pass** |\n| kind | implement |\n| iteration | 4 |\n| ticket | _(self-improve)_ |\n| pull request | _(merged inline)_ |\n| model | `haiku` |\n\n## Context\nSelf-improvement task toward G2 (Stay auditable and traceable end to end). Observed practice from reference set: openai/swarm's lightweight orchestration includes contextual information with errors to make failures traceable to which execution step failed and why.\n\n## What happened\nAdded `_format_error_with_context()` helper to orchestrator.py that wraps agent execution errors with phase (heal/implement/improve) and ticket number. When an agent fails, the error message now includes `[phase=X, ticket=#N]` prefix, making it immediately clear what operation was running when the error occurred. Added unit test coverage.\n\nCI passes: ruff=pass, pytest=pass (including new test).\n\n## Lesson learned\n**Execution context makes failures traceable.** Adopted from openai/swarm: when a function or agent fails in a complex orchestration, the error message should include contextual metadata (phase, ticket, request ID, etc.) so operators don't have to hunt through logs to figure out what was running when the failure happened.\n\nThis is a small change but improves the audit trail for operator debugging and supports G2's goal of end-to-end traceability.\n\n## References (reference-set evidence)\n- `openai/swarm` - lightweight, ergonomic multi-agent orchestration; context is carried through function calls and errors for observability"
+    },
+    {
+      "id_": "2026-07-26-implement-chore-reference-set-miner-extract-one-practice-from-a-top-10-project-s-history",
+      "metadata": {
+        "created": "2026-07-26",
+        "failure_class": "",
+        "kind": "implement",
+        "note_name": "2026-07-26-implement-chore-reference-set-miner-extract-one-practice-from-a-top-10-project-s-history",
+        "outcome": "fail",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/fail",
+          "kind/implement"
+        ],
+        "title": "implement: chore: reference-set miner - extract one practice from a top-10 project's history"
+      },
+      "text": "# implement: chore: reference-set miner - extract one practice from a top-10 project's history\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **fail** |\n| kind | implement |\n| iteration | 3 |\n| ticket | #4 |\n| pull request | _(none)_ |\n| model | `haiku` |\n\n## Context\nIteration 3. Ticket #4. CI before: CI green (ruff=pass, pytest=pass).\n\n## What happened\nModel `haiku` (light) ran the task. Agent ok=False. CI after: CI green (ruff=pass, pytest=pass).\n\nAgent error:\n```\ntimeout after 1200s\n```\n\n## Lesson learned\nChange did not reach green; auto-merge will hold until CI passes. Investigate the failure captured above before the next attempt.\n\n## References (reference-set evidence)\n- `langchain-ai/langchain`\n- `FoundationAgents/MetaGPT`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-07-26-implement-docs-add-a-one-iteration-sequence-diagram-to-architecture-md",
+      "metadata": {
+        "created": "2026-07-26",
+        "failure_class": "",
+        "kind": "implement",
+        "note_name": "2026-07-26-implement-docs-add-a-one-iteration-sequence-diagram-to-architecture-md",
+        "outcome": "pass",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/pass",
+          "kind/implement"
+        ],
+        "title": "implement: docs: add a one-iteration sequence diagram to ARCHITECTURE.md"
+      },
+      "text": "# implement: docs: add a one-iteration sequence diagram to ARCHITECTURE.md\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **pass** |\n| kind | implement |\n| iteration | 2 |\n| ticket | #6 |\n| pull request | _(none)_ |\n| model | `sonnet` |\n| remote CI | SUCCESS |\n\n## Context\nIteration 2. Ticket #6. CI before: CI green (ruff=pass, pytest=pass).\n\n## What happened\nModel `sonnet` (standard) ran the task. Agent ok=True. CI after: CI green (ruff=pass, pytest=pass).\n\n## Lesson learned\nChange merged cleanly under a green build.\n\n## References (reference-set evidence)\n- `langchain-ai/langchain`\n- `FoundationAgents/MetaGPT`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-07-26-implement-feat-deepen-the-whitepaper-synthesizer",
+      "metadata": {
+        "created": "2026-07-26",
+        "failure_class": "",
+        "kind": "implement",
+        "note_name": "2026-07-26-implement-feat-deepen-the-whitepaper-synthesizer",
+        "outcome": "pass",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/pass",
+          "kind/implement"
+        ],
+        "title": "implement: feat: deepen the whitepaper synthesizer"
+      },
+      "text": "# implement: feat: deepen the whitepaper synthesizer\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **pass** |\n| kind | implement |\n| iteration | 1 |\n| ticket | #5 |\n| pull request | _(none)_ |\n| model | `sonnet` |\n\n## Context\nIteration 1. Ticket #5. CI before: CI green (ruff=pass, pytest=pass).\n\n## What happened\nModel `sonnet` (standard) ran the task. Agent ok=True. CI after: CI green (ruff=pass, pytest=pass).\n\n## Lesson learned\nChange merged cleanly under a green build.\n\n## References (reference-set evidence)\n- `langchain-ai/langchain`\n- `FoundationAgents/MetaGPT`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-07-26-implement-feat-poll-remote-ci-gh-checks-as-an-explicit-pre-merge-gate",
+      "metadata": {
+        "created": "2026-07-26",
+        "failure_class": "",
+        "kind": "implement",
+        "note_name": "2026-07-26-implement-feat-poll-remote-ci-gh-checks-as-an-explicit-pre-merge-gate",
+        "outcome": "pass",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/pass",
+          "kind/implement"
+        ],
+        "title": "implement: feat: poll remote CI (gh checks) as an explicit pre-merge gate"
+      },
+      "text": "# implement: feat: poll remote CI (gh checks) as an explicit pre-merge gate\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **pass** |\n| kind | implement |\n| iteration | 2 |\n| ticket | #3 |\n| pull request | _(none)_ |\n| model | `sonnet` |\n\n## Context\nIteration 2. Ticket #3. CI before: CI green (ruff=pass, pytest=pass).\n\n## What happened\nModel `sonnet` (standard) ran the task. Agent ok=True. CI after: CI green (ruff=pass, pytest=pass).\n\n## Lesson learned\nChange merged cleanly under a green build.\n\n## References (reference-set evidence)\n- `langchain-ai/langchain`\n- `FoundationAgents/MetaGPT`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-07-26-implement-feat-quota-cost-telemetry-ledger-with-a-warn-then-halt-per-block-budget-gate",
+      "metadata": {
+        "created": "2026-07-26",
+        "failure_class": "",
+        "kind": "implement",
+        "note_name": "2026-07-26-implement-feat-quota-cost-telemetry-ledger-with-a-warn-then-halt-per-block-budget-gate",
+        "outcome": "pass",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/pass",
+          "kind/implement"
+        ],
+        "title": "implement: feat: quota/cost telemetry ledger with a warn-then-halt per-block budget gate"
+      },
+      "text": "# implement: feat: quota/cost telemetry ledger with a warn-then-halt per-block budget gate\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **pass** |\n| kind | implement |\n| iteration | 103 |\n| ticket | #44 |\n| pull request | _(none)_ |\n| model | `opus` |\n| remote CI | SUCCESS |\n\n## Context\nIteration 103. Ticket #44. CI before: CI green (ruff=pass, pytest=pass).\n\n## What happened\nModel `opus` (heavy) ran the task. Agent ok=True. CI after: CI green (ruff=pass, pytest=pass).\n\n## Lesson learned\nChange merged cleanly under a green build.\n\n## References (reference-set evidence)\n- `langchain-ai/langchain`\n- `FoundationAgents/MetaGPT`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-07-26-implement-feat-reproduce-before-fix-regression-guard-for-heal-and-bugfix-tickets",
+      "metadata": {
+        "created": "2026-07-26",
+        "failure_class": "",
+        "kind": "implement",
+        "note_name": "2026-07-26-implement-feat-reproduce-before-fix-regression-guard-for-heal-and-bugfix-tickets",
+        "outcome": "pass",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/pass",
+          "kind/implement"
+        ],
+        "title": "implement: feat: reproduce-before-fix regression guard for heal and bugfix tickets"
+      },
+      "text": "# implement: feat: reproduce-before-fix regression guard for heal and bugfix tickets\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **pass** |\n| kind | implement |\n| iteration | 102 |\n| ticket | #43 |\n| pull request | _(none)_ |\n| model | `sonnet` |\n| remote CI | SUCCESS |\n\n## Context\nIteration 102. Ticket #43. CI before: CI green (ruff=pass, pytest=pass).\n\n## What happened\nModel `sonnet` (standard) ran the task. Agent ok=True. CI after: CI green (ruff=pass, pytest=pass).\n\nReverted off-spec workflow edits: ['.github/workflows/ci.yml'].\n\n## Lesson learned\nChange merged cleanly under a green build.\n\n## References (reference-set evidence)\n- `langchain-ai/langchain`\n- `FoundationAgents/MetaGPT`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-07-26-implement-skill-task-complexity-based-model-selection-learned",
+      "metadata": {
+        "created": "2026-07-26",
+        "failure_class": "",
+        "kind": "implement",
+        "note_name": "2026-07-26-implement-skill-task-complexity-based-model-selection-learned",
+        "outcome": "pass",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/pass",
+          "kind/implement"
+        ],
+        "title": "implement: skill: task-complexity-based model selection (learned)"
+      },
+      "text": "# implement: skill: task-complexity-based model selection (learned)\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **pass** |\n| kind | implement |\n| iteration | 1 |\n| ticket | #2 |\n| pull request | _(none)_ |\n| model | `haiku` |\n\n## Context\nIteration 1. Ticket #2. CI before: CI green (ruff=pass, pytest=pass).\n\n## What happened\nModel `haiku` (light) ran the task. Agent ok=True. CI after: CI green (ruff=pass, pytest=pass).\n\n## Lesson learned\nChange merged cleanly under a green build.\n\n## References (reference-set evidence)\n- `langchain-ai/langchain`\n- `FoundationAgents/MetaGPT`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-07-26-implement-test-fake-runner-integration-tests-for-orchestrator-run-once-heal-implement-paths",
+      "metadata": {
+        "created": "2026-07-26",
+        "failure_class": "",
+        "kind": "implement",
+        "note_name": "2026-07-26-implement-test-fake-runner-integration-tests-for-orchestrator-run-once-heal-implement-paths",
+        "outcome": "pass",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/pass",
+          "kind/implement"
+        ],
+        "title": "implement: test: fake-runner integration tests for orchestrator.run_once (heal & implement paths)"
+      },
+      "text": "# implement: test: fake-runner integration tests for orchestrator.run_once (heal & implement paths)\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **pass** |\n| kind | implement |\n| iteration | 1 |\n| ticket | #1 |\n| pull request | _(none)_ |\n| model | `sonnet` |\n\n## Context\nIteration 1. Ticket #1. CI before: CI green (ruff=pass, pytest=pass).\n\n## What happened\nModel `sonnet` (standard) ran the task. Agent ok=True. CI after: CI green (ruff=pass, pytest=pass).\n\n## Lesson learned\nChange merged cleanly under a green build.\n\n## References (reference-set evidence)\n- `langchain-ai/langchain`\n- `FoundationAgents/MetaGPT`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-07-26-improve-chore-refresh-reference-set-snapshot-and-extract-one-practice",
+      "metadata": {
+        "created": "2026-07-26",
+        "failure_class": "",
+        "kind": "improve",
+        "note_name": "2026-07-26-improve-chore-refresh-reference-set-snapshot-and-extract-one-practice",
+        "outcome": "pass",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/pass",
+          "kind/improve"
+        ],
+        "title": "improve: chore: refresh reference-set snapshot and extract one practice"
+      },
+      "text": "# improve: chore: refresh reference-set snapshot and extract one practice\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **pass** |\n| kind | improve |\n| iteration | 104 |\n| ticket | #48 |\n| pull request | _(none)_ |\n| model | `haiku` |\n| remote CI | SUCCESS |\n\n## Context\nIteration 104. Ticket #48. CI before: CI green (ruff=pass, pytest=pass).\n\n## What happened\nModel `haiku` (light) ran the task. Agent ok=True. CI after: CI green (ruff=pass, pytest=pass).\n\n## Lesson learned\nChange merged cleanly under a green build.\n\n## References (reference-set evidence)\n- `langchain-ai/langchain`\n- `FoundationAgents/MetaGPT`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-07-26-improve-explicit-phase-artifacts-from-metagpt",
+      "metadata": {
+        "created": "2026-07-26",
+        "failure_class": "",
+        "kind": "improve",
+        "note_name": "2026-07-26-improve-explicit-phase-artifacts-from-metagpt",
+        "outcome": "pass",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/pass",
+          "kind/improve",
+          "reference-set-practice"
+        ],
+        "title": "improve: explicit phase artifacts - adopted from MetaGPT"
+      },
+      "text": "# improve: explicit phase artifacts - adopted from MetaGPT\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **pass** |\n| kind | improve |\n| iteration | 5 |\n| ticket | _(self-improve)_ |\n| pull request | _(merged inline)_ |\n| model | `haiku` |\n\n## Context\n\nSelf-improvement task toward G2 (Stay auditable and traceable end to end). Observed practice from reference set: FoundationAgents/MetaGPT defines agent roles with explicit output deliverables. Each agent (Product Manager, Architect, Engineer) has a documented set of artifacts it produces, making work outputs concrete and auditable.\n\n## What happened\n\nAdded `_phase_artifacts()` helper to orchestrator.py that documents what each phase (heal / implement / improve) produces:\n\n- **HEAL**: Root cause identified, regression test added, fix applied, CI green\n- **IMPLEMENT**: Feature/fix end-to-end, tests added, code scoped, passing\n- **IMPROVE**: Practice extracted, implementation added, lesson recorded, tests passing\n\nThe helper is integrated into `build_pr_body()` so every PR now includes a \"## Phase artifacts\" section listing what this phase produced.\n\nAdded comprehensive unit tests to verify:\n- Each phase returns expected artifact descriptions\n- PR body includes artifacts section when kind is provided\n- PR body omits artifacts section when kind is empty\n\nCI passes: ruff=pass, pytest=pass (including 5 new tests).\n\n## Lesson learned\n\n**Explicit phase outputs make work auditable.** Adopted from FoundationAgents/MetaGPT: orchestrated multi-agent systems benefit from declaring what each phase/role produces. This transforms implicit work (\"run the worker\") into visible deliverables (\"produced: X, Y, Z\"), supporting G2's traceability goal.\n\nThe practice is small but high-leverage: every PR now documents what artifacts the phase produced, making it immediately clear what the worker was responsible for delivering. This improves debugging and auditing of failed or suspicious changes.\n\n## References (reference-set evidence)\n\n- `FoundationAgents/MetaGPT` - multi-agent software company with explicit role-based agents; each role (ProductManager, Architect, Engineer) defines its output artifacts, making the work of orchestrated agents concrete and verifiable"
+    },
+    {
+      "id_": "2026-07-26-loop-reliability-retry-and-ci-parity",
+      "metadata": {
+        "created": "2026-07-26",
+        "failure_class": "",
+        "kind": "improve",
+        "note_name": "2026-07-26-loop-reliability-retry-and-ci-parity",
+        "outcome": "pass",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/pass",
+          "kind/improve",
+          "reliability"
+        ],
+        "title": "Loop reliability: retry/recovery and CI parity"
+      },
+      "text": "# Loop reliability: retry/recovery and CI parity\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **pass** |\n| kind | improve |\n| tickets | #11, #12 |\n| model | `n/a (human maintainer, via PR)` |\n\n## Context\nThe first 3-parallel run (see [[2026-07-26-first-3-parallel-swarm-run]]) surfaced\ntwo reliability gaps: a failed PR stranded its ticket as permanently-claimed\n(#11), and a worker passed local CI while failing remote CI after editing the\nworkflow (#12).\n\n## What happened\n- **Remote CI is now the source of truth.** `run_once` waits for the PR's real\n  GitHub check rollup (`ci.wait_remote`) before deciding the outcome.\n- **CI parity guard.** Edits under `.github/workflows/**` are reverted before\n  commit, so a task can't change the checks it is judged by.\n- **Recovery.** On a non-green remote result, the PR is closed and the ticket\n  returns to the backlog with an `attempts:N` label; after\n  `max_ticket_attempts` it is `blocked` for a human. Blocked/assigned tickets\n  are skipped by future workers.\n- Added unit tests (fake-runner) for the recovery and revert paths, plus\n  `tests/test_ci.py` for the rollup reducer and `wait_remote`.\n\n## Lesson learned\nAutonomy needs a truthful signal and a way to fail safely. Gating on *remote*\nCI (not a local approximation an agent can perturb) closes the trust gap, and\nbounded retry-then-block keeps the backlog self-healing without infinite loops -\na discipline borrowed from how `SWE-agent` treats the issue→validated-PR cycle.\n\n## References (reference-set evidence)\n- `SWE-agent/SWE-agent`\n- `openai/swarm`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-07-26-synthesis-after-14-lessons",
+      "metadata": {
+        "created": "2026-07-26",
+        "failure_class": "",
+        "kind": "unknown",
+        "note_name": "2026-07-26-synthesis-after-14-lessons",
+        "outcome": "unknown",
+        "source": "whitepaper",
+        "tags": [
+          "whitepaper"
+        ],
+        "title": "Synthesis after 14 lessons"
+      },
+      "text": "# Synthesis after 14 lessons\n\n> Part of [[Whitepapers MOC]] - [[Knowledge Base MOC]]\n\n## Summary\nSynthesis of the last 5 lesson(s): 5 pass / 0 fail, across kinds implement, improve.\n\n## Outcomes in this window\n| outcome | count |\n| --- | --- |\n| pass | 5 |\n\n## Work by kind\n| kind | count |\n| --- | --- |\n| implement | 3 |\n| improve | 2 |\n\n## Recurring failures\n_No failures in this window - the loop stayed green throughout._\n\n## Recurring themes\n- **build** - appears in 4 lessons\n- **change** - appears in 4 lessons\n- **cleanly** - appears in 4 lessons\n- **green** - appears in 4 lessons\n- **merged** - appears in 4 lessons\n\n## Lessons synthesized\n- [[2026-07-26-implement-feat-reproduce-before-fix-regression-guard-for-heal-and-bugfix-tickets]]\n- [[2026-07-26-implement-skill-task-complexity-based-model-selection-learned]]\n- [[2026-07-26-implement-test-fake-runner-integration-tests-for-orchestrator-run-once-heal-implement-paths]]\n- [[2026-07-26-improve-chore-refresh-reference-set-snapshot-and-extract-one-practice]]\n- [[2026-07-26-loop-reliability-retry-and-ci-parity]]"
+    },
+    {
+      "id_": "2026-08-02-synthesis-after-15-lessons",
+      "metadata": {
+        "created": "2026-08-02",
+        "failure_class": "",
+        "kind": "unknown",
+        "note_name": "2026-08-02-synthesis-after-15-lessons",
+        "outcome": "unknown",
+        "source": "whitepaper",
+        "tags": [
+          "whitepaper"
+        ],
+        "title": "Synthesis after 15 lessons"
+      },
+      "text": "# Synthesis after 15 lessons\n\n> Part of [[Whitepapers MOC]] - [[Knowledge Base MOC]]\n\n## Summary\nSynthesis of the last 5 lesson(s): 5 pass / 0 fail, across kinds implement, improve.\n\n## Outcomes in this window\n| outcome | count |\n| --- | --- |\n| pass | 5 |\n\n## Work by kind\n| kind | count |\n| --- | --- |\n| implement | 2 |\n| improve | 3 |\n\n## Recurring failures\n_No failures in this window - the loop stayed green throughout._\n\n## Recurring themes\n- **build** - appears in 3 lessons\n- **change** - appears in 3 lessons\n- **cleanly** - appears in 3 lessons\n- **green** - appears in 3 lessons\n- **merged** - appears in 3 lessons\n\n## Lessons synthesized\n- [[2026-07-26-implement-skill-task-complexity-based-model-selection-learned]]\n- [[2026-07-26-implement-test-fake-runner-integration-tests-for-orchestrator-run-once-heal-implement-paths]]\n- [[2026-07-26-improve-chore-refresh-reference-set-snapshot-and-extract-one-practice]]\n- [[2026-07-26-improve-explicit-phase-artifacts-from-metagpt]]\n- [[2026-07-26-loop-reliability-retry-and-ci-parity]]"
+    },
+    {
+      "id_": "2026-08-04-implement-feat-worker-trajectory-capture-and-working-token-cost-telemetry",
+      "metadata": {
+        "created": "2026-08-04",
+        "failure_class": "",
+        "kind": "implement",
+        "note_name": "2026-08-04-implement-feat-worker-trajectory-capture-and-working-token-cost-telemetry",
+        "outcome": "pass",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/pass",
+          "kind/implement"
+        ],
+        "title": "implement: feat: worker trajectory capture and working token/cost telemetry"
+      },
+      "text": "# implement: feat: worker trajectory capture and working token/cost telemetry\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **pass** |\n| kind | implement |\n| iteration | 4133902 |\n| ticket | #90 |\n| pull request | _(none)_ |\n| model | `opus` |\n| remote CI | SUCCESS |\n\n## Context\nIteration 4133902. Ticket #90. CI before: CI green (ruff=pass, pytest=pass).\n\n## What happened\nModel `opus` (heavy) ran the task. Agent ok=True. CI after: CI green (ruff=pass, pytest=pass).\n\n## Lesson learned\nChange merged cleanly under a green build.\n\n## Reproduction evidence\n_(not applicable: not a heal/bugfix ticket)_\n\n## References (reference-set evidence)\n- `langchain-ai/langchain`\n- `FoundationAgents/MetaGPT`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-08-04-implement-feat-worker-trajectory-store-json-agent-output-and-hsai-replay",
+      "metadata": {
+        "created": "2026-08-04",
+        "failure_class": "",
+        "kind": "implement",
+        "note_name": "2026-08-04-implement-feat-worker-trajectory-store-json-agent-output-and-hsai-replay",
+        "outcome": "pass",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/pass",
+          "kind/implement"
+        ],
+        "title": "implement: feat: worker trajectory store, JSON agent output, and `hsai replay`"
+      },
+      "text": "# implement: feat: worker trajectory store, JSON agent output, and `hsai replay`\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **pass** |\n| kind | implement |\n| iteration | 4133903 |\n| ticket | #79 |\n| pull request | _(none)_ |\n| model | `opus` |\n| remote CI | SUCCESS |\n\n## Context\nIteration 4133903. Ticket #79. CI before: CI green (ruff=pass, pytest=pass).\n\n## What happened\nModel `opus` (heavy) ran the task. Agent ok=True. CI after: CI green (ruff=pass, pytest=pass).\n\n## Lesson learned\nChange merged cleanly under a green build.\n\n## Reproduction evidence\n_(not applicable: not a heal/bugfix ticket)_\n\n## References (reference-set evidence)\n- `langchain-ai/langchain`\n- `FoundationAgents/MetaGPT`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-08-04-synthesis-after-17-lessons",
+      "metadata": {
+        "created": "2026-08-04",
+        "failure_class": "",
+        "kind": "unknown",
+        "note_name": "2026-08-04-synthesis-after-17-lessons",
+        "outcome": "unknown",
+        "source": "whitepaper",
+        "tags": [
+          "whitepaper"
+        ],
+        "title": "Synthesis after 17 lessons"
+      },
+      "text": "# Synthesis after 17 lessons\n\n> Part of [[Whitepapers MOC]] - [[Knowledge Base MOC]]\n\n## Summary\nSynthesis of the last 5 lesson(s): 5 pass / 0 fail, across kinds implement, improve.\n\n## Outcomes in this window\n| outcome | count |\n| --- | --- |\n| pass | 5 |\n\n## Work by kind\n| kind | count |\n| --- | --- |\n| implement | 2 |\n| improve | 3 |\n\n## Recurring failures\n_No failures in this window - the loop stayed green throughout._\n\n## Recurring themes\n- **trajectory** - appears in 2 lessons\n- **replay** - appears in 2 lessons\n- **telemetry** - appears in 2 lessons\n- **artifact** - appears in 2 lessons\n- **reference** - appears in 2 lessons\n\n## Lessons synthesized\n- [[2026-07-26-improve-chore-refresh-reference-set-snapshot-and-extract-one-practice]]\n- [[2026-07-26-improve-explicit-phase-artifacts-from-metagpt]]\n- [[2026-07-26-loop-reliability-retry-and-ci-parity]]\n- [[2026-08-04-implement-feat-worker-trajectory-capture-and-working-token-cost-telemetry]]\n- [[2026-08-04-implement-feat-worker-trajectory-store-json-agent-output-and-hsai-replay]]"
+    },
+    {
+      "id_": "2026-08-05-implement-chore-governance-artifacts-for-block-41339",
+      "metadata": {
+        "created": "2026-08-05",
+        "failure_class": "",
+        "kind": "implement",
+        "note_name": "2026-08-05-implement-chore-governance-artifacts-for-block-41339",
+        "outcome": "pass",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/pass",
+          "kind/implement"
+        ],
+        "title": "implement: chore: governance artifacts for block 41339"
+      },
+      "text": "# implement: chore: governance artifacts for block 41339\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **pass** |\n| kind | implement |\n| iteration | 4134101 |\n| ticket | #97 |\n| pull request | _(none)_ |\n| model | `haiku` |\n| remote CI | SUCCESS |\n\n## Context\nIteration 4134101. Ticket #97. CI before: CI green (ruff=pass, pytest=pass).\n\n## What happened\nModel `haiku` (light) ran the task. Agent ok=True. CI after: CI green (ruff=pass, pytest=pass).\n\n## Lesson learned\nChange merged cleanly under a green build.\n\n## Reproduction evidence\n_(not applicable: not a heal/bugfix ticket)_\n\n## References (reference-set evidence)\n- `langchain-ai/langchain`\n- `FoundationAgents/MetaGPT`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-08-05-implement-feat-durable-cycle-journal-with-idempotent-resume-for-interrupted-blocks",
+      "metadata": {
+        "created": "2026-08-05",
+        "failure_class": "",
+        "kind": "implement",
+        "note_name": "2026-08-05-implement-feat-durable-cycle-journal-with-idempotent-resume-for-interrupted-blocks",
+        "outcome": "pass",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/pass",
+          "kind/implement"
+        ],
+        "title": "implement: feat: durable cycle journal with idempotent --resume for interrupted blocks"
+      },
+      "text": "# implement: feat: durable cycle journal with idempotent --resume for interrupted blocks\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **pass** |\n| kind | implement |\n| iteration | 4134102 |\n| ticket | #100 |\n| pull request | _(none)_ |\n| model | `opus` |\n| remote CI | SUCCESS |\n\n## Context\nIteration 4134102. Ticket #100. CI before: CI green (ruff=pass, pytest=pass).\n\n## What happened\nModel `opus` (heavy) ran the task. Agent ok=True. CI after: CI green (ruff=pass, pytest=pass).\n\n## Lesson learned\nChange merged cleanly under a green build.\n\n## Reproduction evidence\n_(not applicable: not a heal/bugfix ticket)_\n\n## References (reference-set evidence)\n- `langchain-ai/langchain`\n- `FoundationAgents/MetaGPT`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-08-08-implement-chore-governance-artifacts-for-block-41343",
+      "metadata": {
+        "created": "2026-08-08",
+        "failure_class": "",
+        "kind": "implement",
+        "note_name": "2026-08-08-implement-chore-governance-artifacts-for-block-41343",
+        "outcome": "fail",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/fail",
+          "kind/implement"
+        ],
+        "title": "implement: chore: governance artifacts for block 41343"
+      },
+      "text": "# implement: chore: governance artifacts for block 41343\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **fail** |\n| kind | implement |\n| iteration | 4134702 |\n| ticket | #124 |\n| pull request | _(none)_ |\n| model | `haiku` |\n| remote CI | SUCCESS |\n\n## Context\nIteration 4134702. Ticket #124. CI before: CI green (ruff=pass, pytest=pass).\n\n## What happened\nModel `haiku` (light) ran the task. Agent ok=False. CI after: CI green (ruff=pass, pytest=pass).\n\n## Lesson learned\nChange did not reach green; auto-merge will hold until CI passes. Investigate the failure captured above before the next attempt.\n\n## Reproduction evidence\n_(not applicable: not a heal/bugfix ticket)_\n\n## References (reference-set evidence)\n- `langchain-ai/langchain`\n- `FoundationAgents/MetaGPT`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-08-08-implement-chore-governance-artifacts-for-block-41345",
+      "metadata": {
+        "created": "2026-08-08",
+        "failure_class": "",
+        "kind": "implement",
+        "note_name": "2026-08-08-implement-chore-governance-artifacts-for-block-41345",
+        "outcome": "pass",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/pass",
+          "kind/implement"
+        ],
+        "title": "implement: chore: governance artifacts for block 41345"
+      },
+      "text": "# implement: chore: governance artifacts for block 41345\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **pass** |\n| kind | implement |\n| iteration | 4134704 |\n| ticket | #133 |\n| pull request | _(none)_ |\n| model | `haiku` |\n| remote CI | SUCCESS |\n\n## Context\nIteration 4134704. Ticket #133. CI before: CI green (ruff=pass, pytest=pass).\n\n## What happened\nModel `haiku` (light) ran the task. Agent ok=True. CI after: CI green (ruff=pass, pytest=pass).\n\n## Lesson learned\nChange merged cleanly under a green build.\n\n## Reproduction evidence\n_(not applicable: not a heal/bugfix ticket)_\n\n## References (reference-set evidence)\n- `langchain-ai/langchain`\n- `FoundationAgents/MetaGPT`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-08-08-synthesis-after-20-lessons",
+      "metadata": {
+        "created": "2026-08-08",
+        "failure_class": "",
+        "kind": "unknown",
+        "note_name": "2026-08-08-synthesis-after-20-lessons",
+        "outcome": "unknown",
+        "source": "whitepaper",
+        "tags": [
+          "whitepaper"
+        ],
+        "title": "Synthesis after 20 lessons"
+      },
+      "text": "# Synthesis after 20 lessons\n\n> Part of [[Whitepapers MOC]] - [[Knowledge Base MOC]]\n\n## Summary\nSynthesis of the last 5 lesson(s): 4 pass / 1 fail, across kinds implement.\n\n## Outcomes in this window\n| outcome | count |\n| --- | --- |\n| pass | 4 |\n| fail | 1 |\n\n## Work by kind\n| kind | count |\n| --- | --- |\n| implement | 5 |\n\n## Recurring failures\n- [[2026-08-08-implement-chore-governance-artifacts-for-block-41343]] (implement): Change did not reach green; auto-merge will hold until CI passes.\n\n## Recurring themes\n- **governance** - appears in 2 lessons\n- **artifacts** - appears in 2 lessons\n- **trajectory** - appears in 2 lessons\n- **journal** - appears in 2 lessons\n- **cycle** - appears in 2 lessons\n\n## Lessons synthesized\n- [[2026-08-04-implement-feat-worker-trajectory-capture-and-working-token-cost-telemetry]]\n- [[2026-08-04-implement-feat-worker-trajectory-store-json-agent-output-and-hsai-replay]]\n- [[2026-08-05-implement-chore-governance-artifacts-for-block-41339]]\n- [[2026-08-05-implement-feat-durable-cycle-journal-with-idempotent-resume-for-interrupted-blocks]]\n- [[2026-08-08-implement-chore-governance-artifacts-for-block-41343]]"
+    },
+    {
+      "id_": "2026-08-09-implement-chore-governance-artifacts-for-block-41347",
+      "metadata": {
+        "created": "2026-08-09",
+        "failure_class": "",
+        "kind": "implement",
+        "note_name": "2026-08-09-implement-chore-governance-artifacts-for-block-41347",
+        "outcome": "pass",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/pass",
+          "kind/implement"
+        ],
+        "title": "implement: chore: governance artifacts for block 41347"
+      },
+      "text": "# implement: chore: governance artifacts for block 41347\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **pass** |\n| kind | implement |\n| iteration | 4134901 |\n| ticket | #138 |\n| pull request | _(none)_ |\n| model | `haiku` |\n| remote CI | SUCCESS |\n\n## Context\nIteration 4134901. Ticket #138. CI before: CI green (ruff=pass, pytest=pass).\n\n## What happened\nModel `haiku` (light) ran the task. Agent ok=True. CI after: CI green (ruff=pass, pytest=pass).\n\n## Lesson learned\nChange merged cleanly under a green build.\n\n## Reproduction evidence\n_(not applicable: not a heal/bugfix ticket)_\n\n## References (reference-set evidence)\n- `langchain-ai/langchain`\n- `FoundationAgents/MetaGPT`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-08-09-synthesis-after-22-lessons",
+      "metadata": {
+        "created": "2026-08-09",
+        "failure_class": "",
+        "kind": "unknown",
+        "note_name": "2026-08-09-synthesis-after-22-lessons",
+        "outcome": "unknown",
+        "source": "whitepaper",
+        "tags": [
+          "whitepaper"
+        ],
+        "title": "Synthesis after 22 lessons"
+      },
+      "text": "# Synthesis after 22 lessons\n\n> Part of [[Whitepapers MOC]] - [[Knowledge Base MOC]]\n\n## Summary\nSynthesis of the last 3 lesson(s): 3 pass / 0 fail, across kinds implement, chore.\n\n## Outcomes in this window\n| outcome | count |\n| --- | --- |\n| pass | 3 |\n\n## Work by kind\n| kind | count |\n| --- | --- |\n| implement | 3 |\n\n## Recurring failures\n_No failures in this window - the loop stayed green throughout._\n\n## Recurring themes\n- **trajectory** - appears in 2 lessons\n- **merge** - appears in 2 lessons\n- **governance** - appears in 1 lesson\n- **artifacts** - appears in 1 lesson\n\n## Lessons synthesized\n- [[2026-08-04-implement-feat-worker-trajectory-capture-and-working-token-cost-telemetry]]\n- [[2026-08-04-implement-feat-worker-trajectory-store-json-agent-output-and-hsai-replay]]\n- [[2026-08-05-implement-chore-governance-artifacts-for-block-41339]]"
+    },
+    {
+      "id_": "2026-08-10-implement-feat-lesson-retrieval-memory-inject-prior-lessons-into-worker-and-synthesis-prompts",
+      "metadata": {
+        "created": "2026-08-10",
+        "failure_class": "",
+        "kind": "implement",
+        "note_name": "2026-08-10-implement-feat-lesson-retrieval-memory-inject-prior-lessons-into-worker-and-synthesis-prompts",
+        "outcome": "fail",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/fail",
+          "kind/implement"
+        ],
+        "title": "implement: feat: lesson-retrieval memory - inject prior lessons into worker and synthesis prompts"
+      },
+      "text": "# implement: feat: lesson-retrieval memory - inject prior lessons into worker and synthesis prompts\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **fail** |\n| kind | implement |\n| iteration | 4135102 |\n| ticket | #166 |\n| pull request | _(none)_ |\n| model | `opus` |\n| remote CI | SUCCESS |\n\n## Context\nIteration 4135102. Ticket #166. CI before: CI green (ruff=pass, pytest=pass).\n\n## What happened\nModel `opus` (heavy) ran the task. Agent ok=False. CI after: CI green (ruff=pass, pytest=pass).\n\nAgent error:\n```\n[phase=implement, ticket=#166] timeout after 1200s\n```\n\n## Lesson learned\nChange did not reach green; auto-merge will hold until CI passes. Investigate the failure captured above before the next attempt.\n\n## Reproduction evidence\n_(not applicable: not a heal/bugfix ticket)_\n\n## References (reference-set evidence)\n- `langchain-ai/langchain`\n- `FoundationAgents/MetaGPT`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-08-11-implement-feat-vault-and-backlog-hygiene-watchdog-that-files-its-own-tickets",
+      "metadata": {
+        "created": "2026-08-11",
+        "failure_class": "",
+        "kind": "implement",
+        "note_name": "2026-08-11-implement-feat-vault-and-backlog-hygiene-watchdog-that-files-its-own-tickets",
+        "outcome": "fail",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/fail",
+          "kind/implement"
+        ],
+        "title": "implement: feat: vault and backlog hygiene watchdog that files its own tickets"
+      },
+      "text": "# implement: feat: vault and backlog hygiene watchdog that files its own tickets\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **fail** |\n| kind | implement |\n| iteration | 4135305 |\n| ticket | #182 |\n| pull request | _(none)_ |\n| model | `sonnet` |\n| remote CI | SUCCESS |\n\n## Context\nIteration 4135305. Ticket #182. CI before: CI green (ruff=pass, pytest=pass).\n\n## What happened\nModel `sonnet` (standard) ran the task. Agent ok=False. CI after: CI green (ruff=pass, pytest=pass).\n\n## Lesson learned\nChange did not reach green; auto-merge will hold until CI passes. Investigate the failure captured above before the next attempt.\n\n## Reproduction evidence\n_(not applicable: not a heal/bugfix ticket)_\n\n## References (reference-set evidence)\n- `langchain-ai/langchain`\n- `FoundationAgents/MetaGPT`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-08-12-implement-chore-governance-artifacts-for-block-41353",
+      "metadata": {
+        "created": "2026-08-12",
+        "failure_class": "",
+        "kind": "implement",
+        "note_name": "2026-08-12-implement-chore-governance-artifacts-for-block-41353",
+        "outcome": "fail",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/fail",
+          "kind/implement"
+        ],
+        "title": "implement: chore: governance artifacts for block 41353"
+      },
+      "text": "# implement: chore: governance artifacts for block 41353\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **fail** |\n| kind | implement |\n| iteration | 4135501 |\n| ticket | #192 |\n| pull request | _(none)_ |\n| model | `haiku` |\n| remote CI | SUCCESS |\n\n## Context\nIteration 4135501. Ticket #192. CI before: CI green (ruff=pass, pytest=pass).\n\n## What happened\nModel `haiku` (light) ran the task. Agent ok=False. CI after: CI green (ruff=pass, pytest=pass).\n\n## Lesson learned\nChange did not reach green; auto-merge will hold until CI passes. Investigate the failure captured above before the next attempt.\n\n## Reproduction evidence\n_(not applicable: not a heal/bugfix ticket)_\n\n## References (reference-set evidence)\n- `langchain-ai/langchain`\n- `FoundationAgents/MetaGPT`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-08-12-implement-chore-governance-artifacts-for-block-41355",
+      "metadata": {
+        "created": "2026-08-12",
+        "failure_class": "",
+        "kind": "implement",
+        "note_name": "2026-08-12-implement-chore-governance-artifacts-for-block-41355",
+        "outcome": "pass",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/pass",
+          "kind/implement"
+        ],
+        "title": "implement: chore: governance artifacts for block 41355"
+      },
+      "text": "# implement: chore: governance artifacts for block 41355\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **pass** |\n| kind | implement |\n| iteration | 4135501 |\n| ticket | #196 |\n| pull request | _(none)_ |\n| model | `haiku` |\n| remote CI | SUCCESS |\n\n## Context\nIteration 4135501. Ticket #196. CI before: CI green (ruff=pass, pytest=pass).\n\n## What happened\nModel `haiku` (light) ran the task. Agent ok=True. CI after: CI green (ruff=pass, pytest=pass).\n\n## Lesson learned\nChange merged cleanly under a green build.\n\n## Reproduction evidence\n_(not applicable: not a heal/bugfix ticket)_\n\n## References (reference-set evidence)\n- `langchain-ai/langchain`\n- `FoundationAgents/MetaGPT`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-08-12-implement-feat-adversarial-cross-model-pr-review-gate-with-a-merge-gatekeeper",
+      "metadata": {
+        "created": "2026-08-12",
+        "failure_class": "",
+        "kind": "implement",
+        "note_name": "2026-08-12-implement-feat-adversarial-cross-model-pr-review-gate-with-a-merge-gatekeeper",
+        "outcome": "pass",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/pass",
+          "kind/implement"
+        ],
+        "title": "implement: feat: adversarial cross-model PR review gate with a merge gatekeeper"
+      },
+      "text": "# implement: feat: adversarial cross-model PR review gate with a merge gatekeeper\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **pass** |\n| kind | implement |\n| iteration | 4135502 |\n| ticket | #199 |\n| pull request | _(none)_ |\n| model | `opus` |\n| remote CI | SUCCESS |\n\n## Context\nIteration 4135502. Ticket #199. CI before: CI green (ruff=pass, pytest=pass).\n\n## What happened\nModel `opus` (heavy) ran the task. Agent ok=True. CI after: CI green (ruff=pass, pytest=pass).\n\n## Lesson learned\nChange merged cleanly under a green build.\n\n## Reproduction evidence\n_(not applicable: not a heal/bugfix ticket)_\n\n## References (reference-set evidence)\n- `langchain-ai/langchain`\n- `FoundationAgents/MetaGPT`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-08-12-synthesis-after-25-lessons",
+      "metadata": {
+        "created": "2026-08-12",
+        "failure_class": "",
+        "kind": "unknown",
+        "note_name": "2026-08-12-synthesis-after-25-lessons",
+        "outcome": "unknown",
+        "source": "whitepaper",
+        "tags": [
+          "whitepaper"
+        ],
+        "title": "Synthesis after 25 lessons"
+      },
+      "text": "# Synthesis after 25 lessons\n\n> Part of [[Whitepapers MOC]] - [[Knowledge Base MOC]]\n\n## Summary\nSynthesis of the last 3 lesson(s): 0 pass / 3 fail, across kinds implement, implement, implement.\n\n## Outcomes in this window\n| outcome | count |\n| --- | --- |\n| fail | 3 |\n\n## Work by kind\n| kind | count |\n| --- | --- |\n| implement | 3 |\n\n## Recurring failures\n- **timeout / resource constraints** - block 41349 (lesson 23): lesson-retrieval memory implementation timed out at 1200s during phase=implement\n- **implementation incomplete** - block 41351 (lesson 24): vault and backlog watchdog feature did not merge; agent ok=False despite CI passing\n- **governance artifacts missed** - block 41353 (lesson 25): chore ticket to create governance artifacts failed; only a lesson was recorded, not the full artifact set\n\n## Recurring themes\n- **timeout** - appears in 1 lesson\n- **incomplete** - appears in 2 lessons\n- **feature** - appears in 2 lessons\n\n## Lessons synthesized\n- [[2026-08-10-implement-feat-lesson-retrieval-memory-inject-prior-lessons-into-worker-and-synthesis-prompts]]\n- [[2026-08-11-implement-feat-vault-and-backlog-hygiene-watchdog-that-files-its-own-tickets]]\n- [[2026-08-12-implement-chore-governance-artifacts-for-block-41353]]\n\n## Analysis: the stall at 25 lessons\n\nThe three-failure sequence points to a resource or capability boundary we've hit. The first failure (lesson 23, timeout) suggests the synthesis engine's context window or iteration budget became exhausted when attempting to inject full prior-lesson history into worker prompts—a scaling challenge in the reference set that became manifest in ours.\n\nLessons 24 and 25 show a secondary pattern: the loop can create a lesson (outcome recorded), but the actual work doesn't materialize (agent ok=False, no PR). This differs from a crash or explicit refusal; it's a silent halt. This may indicate the worker is running out of meaningful work to do, or the synthesized tickets are malformed in a way that doesn't trigger early validation.\n\nThe implication is structural: at 25 lessons of history, the per-worker prompt is expensive enough to cause timeouts, and the synthesis phase may be generating tickets that don't parse cleanly. Both are addressable (prompt compression, validation gates), but both point to the same underlying need: a tighter feedback loop earlier in the pipeline."
+    },
+    {
+      "id_": "2026-08-13-implement-feat-synthesis-memory-and-duplicate-proposal-rejection",
+      "metadata": {
+        "created": "2026-08-13",
+        "failure_class": "",
+        "kind": "implement",
+        "note_name": "2026-08-13-implement-feat-synthesis-memory-and-duplicate-proposal-rejection",
+        "outcome": "pass",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/pass",
+          "kind/implement"
+        ],
+        "title": "implement: feat: synthesis memory and duplicate-proposal rejection"
+      },
+      "text": "# implement: feat: synthesis memory and duplicate-proposal rejection\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **pass** |\n| kind | implement |\n| iteration | 4135702 |\n| ticket | #211 |\n| pull request | _(none)_ |\n| model | `sonnet` |\n| remote CI | SUCCESS |\n\n## Context\nIteration 4135702. Ticket #211. CI before: CI green (ruff=pass, pytest=pass).\n\n## What happened\nModel `sonnet` (standard) ran the task. Agent ok=True. CI after: CI green (ruff=pass, pytest=pass).\n\n## Lesson learned\nChange merged cleanly under a green build.\n\n## Reproduction evidence\n_(not applicable: not a heal/bugfix ticket)_\n\n## References (reference-set evidence)\n- `langchain-ai/langchain`\n- `FoundationAgents/MetaGPT`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-08-14-implement-chore-governance-artifacts-for-block-41357",
+      "metadata": {
+        "created": "2026-08-14",
+        "failure_class": "",
+        "kind": "implement",
+        "note_name": "2026-08-14-implement-chore-governance-artifacts-for-block-41357",
+        "outcome": "pass",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/pass",
+          "kind/implement"
+        ],
+        "title": "implement: chore: governance artifacts for block 41357"
+      },
+      "text": "# implement: chore: governance artifacts for block 41357\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **pass** |\n| kind | implement |\n| iteration | 4135904 |\n| ticket | #227 |\n| pull request | _(none)_ |\n| model | `haiku` |\n| remote CI | SUCCESS |\n\n## Context\nIteration 4135904. Ticket #227. CI before: CI green (ruff=pass, pytest=pass).\n\n## What happened\nModel `haiku` (light) ran the task. Agent ok=True. CI after: CI green (ruff=pass, pytest=pass).\n\n## Lesson learned\nChange merged cleanly under a green build.\n\n## Reproduction evidence\n_(not applicable: not a heal/bugfix ticket)_\n\n## References (reference-set evidence)\n- `langchain-ai/langchain`\n- `FoundationAgents/MetaGPT`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-08-14-implement-feat-verifiable-subscription-only-execution-and-real-agent-telemetry",
+      "metadata": {
+        "created": "2026-08-14",
+        "failure_class": "",
+        "kind": "implement",
+        "note_name": "2026-08-14-implement-feat-verifiable-subscription-only-execution-and-real-agent-telemetry",
+        "outcome": "fail",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/fail",
+          "kind/implement"
+        ],
+        "title": "implement: feat: verifiable subscription-only execution and real agent telemetry"
+      },
+      "text": "# implement: feat: verifiable subscription-only execution and real agent telemetry\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **fail** |\n| kind | implement |\n| iteration | 4135901 |\n| ticket | #220 |\n| pull request | _(none)_ |\n| model | `sonnet` |\n| remote CI | SUCCESS |\n\n## Context\nIteration 4135901. Ticket #220. CI before: CI green (ruff=pass, pytest=pass).\n\n## What happened\nModel `sonnet` (standard) ran the task. Agent ok=False. CI after: CI green (ruff=pass, pytest=pass).\n\nAgent error:\n```\n[phase=implement, ticket=#220] timeout after 1200s\n```\n\n## Lesson learned\nChange did not reach green; auto-merge will hold until CI passes. Investigate the failure captured above before the next attempt.\n\n## Reproduction evidence\n_(not applicable: not a heal/bugfix ticket)_\n\n## References (reference-set evidence)\n- `langchain-ai/langchain`\n- `FoundationAgents/MetaGPT`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-08-14-synthesis-after-29-lessons",
+      "metadata": {
+        "created": "2026-08-14",
+        "failure_class": "",
+        "kind": "unknown",
+        "note_name": "2026-08-14-synthesis-after-29-lessons",
+        "outcome": "unknown",
+        "source": "whitepaper",
+        "tags": [
+          "whitepaper"
+        ],
+        "title": "Synthesis after 29 lessons"
+      },
+      "text": "# Synthesis after 29 lessons\n\n> Part of [[Whitepapers MOC]] - [[Knowledge Base MOC]]\n\n## Summary\nSynthesis of the last 3 lesson(s): 2 pass / 1 fail, across kinds implement, implement, implement.\n\n## Outcomes in this window\n| outcome | count |\n| --- | --- |\n| pass | 2 |\n| fail | 1 |\n\n## Work by kind\n| kind | count |\n| --- | --- |\n| implement | 3 |\n\n## Recurring failures\n- **timeout / resource constraints** - block 41357 (lesson 29): verifiable subscription-only execution feature timed out at 1200s during phase=implement, despite CI passing\n\n## Recurring themes\n- **gate** - appears in 2 lessons\n- **synthesis** - appears in 2 lessons\n- **memory** - appears in 1 lesson\n- **review** - appears in 1 lesson\n\n## Lessons synthesized\n- [[2026-08-12-implement-feat-adversarial-cross-model-pr-review-gate-with-a-merge-gatekeeper]]\n- [[2026-08-13-implement-feat-synthesis-memory-and-duplicate-proposal-rejection]]\n- [[2026-08-14-implement-feat-verifiable-subscription-only-execution-and-real-agent-telemetry]]\n\n## Analysis: recovery after the stall\n\nAfter the three-failure sequence at lessons 23–25 (timeout, incomplete, missed artifacts), the loop rebounded strongly at lessons 26–28: governance artifacts merged cleanly, adversarial review gate shipped, and synthesis memory feature with duplicate-idea rejection landed — all without incident. That's a 3-0 clean run.\n\nLesson 29 (verifiable subscription-only execution) timed out at exactly 1200s, but importantly: CI passed. The agent ran out of wall-clock budget inside the implementation phase, but did not crash or produce garbage. This is categorically different from the lesson-23 timeout, which was a hard collision with context limits during a retry loop.\n\nThe implication: the loop is recovering from the scaling ceiling it hit at 25 lessons, but not decisively. Two solid wins followed by one timeout suggests we're oscillating near the boundary, not safely past it. The timeout on lesson 29 was *not* a regression from lesson 26–28; it's more likely a matter of ticket complexity or model choice. Lesson 29 required `sonnet` (standard model) on a complex feature; lesson 28 required `sonnet` on a similar feature and landed cleanly. The difference is workload variance, not a systematic degradation.\n\n## What worked: synthesis and governance\n\nLessons 27–28 (adversarial review gate, synthesis memory) both shipped with zero iteration. This suggests:\n- The gate-based pattern (pre-merge validation, catching problems early) is maturing as an architectural pattern\n- Synthesis memory itself — storing prior decisions to avoid re-proposing the same idea — is working as intended\n- The loop's ability to self-improve via these meta-features is intact\n\nThe recovery from lesson 25's \"governance artifacts missed\" to lesson 26's \"governance artifacts pass\" was fast and clean, with no backtracking. This indicates the governance layer itself (tracking, MOC reindexing, DIRECTION refresh) is now solid and not a liability.\n\n## What deteriorated: unbounded work complexity\n\nLesson 29's timeout despite CI green points to a known gap: the worker's budget (1200s wall-clock) is not necessarily the same as CI's budget. A 1200s timeout in the worker means the agent reached its deployment limit, but it doesn't mean the ticket is truly impossible — only that it exceeded the agent's personal budget.\n\nThis is a stepping stone to the next generation of the loop: **bounded complexity with escalation**. If a ticket times out in a worker, it shouldn't disappear; it should escalate to a human, or be split into smaller tickets, or be routed to a heavier model with a larger budget. The loop currently treats 1200s-timeout as a failure, records it, and moves on. A mature loop would treat it as a signal to adjust the assignment.\n\n## Takeaway for the block\n\nBlock 41357 is the inflection point: after recovering from scaling problems, the loop is encountering workload variance at the edge of what autonomous agents can handle. Two clean wins and one timeout is a stronger signal than it looks — it means the loop's self-repair mechanisms are working (synthesis gates, duplicate rejection, governance tracking), but the scheduling mechanism (model selection, budget assignment, ticket decomposition) needs the next improvement.\n\nThe path forward is not to raise the 1200s limit (that's a temporary patch), but to make the loop conscious of its own capacity and willing to escalate, split, or defer work that doesn't fit. That's the work for the next block."
+    },
+    {
+      "id_": "2026-08-16-implement-chore-governance-artifacts-for-block-41361",
+      "metadata": {
+        "created": "2026-08-16",
+        "failure_class": "",
+        "kind": "implement",
+        "note_name": "2026-08-16-implement-chore-governance-artifacts-for-block-41361",
+        "outcome": "pass",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/pass",
+          "kind/implement"
+        ],
+        "title": "implement: chore: governance artifacts for block 41361"
+      },
+      "text": "# implement: chore: governance artifacts for block 41361\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **pass** |\n| kind | implement |\n| iteration | 4136301 |\n| ticket | #258 |\n| pull request | _(none)_ |\n| model | `haiku` |\n| remote CI | SUCCESS |\n\n## Context\nIteration 4136301. Ticket #258. CI before: CI green (ruff=pass, pytest=pass).\n\n## What happened\nModel `haiku` (light) ran the task. Agent ok=True. CI after: CI green (ruff=pass, pytest=pass).\n\n## Lesson learned\nChange merged cleanly under a green build.\n\n## Reproduction evidence\n_(not applicable: not a heal/bugfix ticket)_\n\n## References (reference-set evidence)\n- `langchain-ai/langchain`\n- `FoundationAgents/MetaGPT`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-08-16-implement-chore-governance-artifacts-for-block-41363",
+      "metadata": {
+        "created": "2026-08-16",
+        "failure_class": "",
+        "kind": "implement",
+        "note_name": "2026-08-16-implement-chore-governance-artifacts-for-block-41363",
+        "outcome": "pass",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/pass",
+          "kind/implement"
+        ],
+        "title": "implement: chore: governance artifacts for block 41363"
+      },
+      "text": "# implement: chore: governance artifacts for block 41363\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **pass** |\n| kind | implement |\n| iteration | 4136304 |\n| ticket | #268 |\n| pull request | _(none)_ |\n| model | `haiku` |\n| remote CI | SUCCESS |\n\n## Context\nIteration 4136304. Ticket #268. CI before: CI green (ruff=pass, pytest=pass).\n\n## What happened\nModel `haiku` (light) ran the task. Agent ok=True. CI after: CI green (ruff=pass, pytest=pass).\n\n## Lesson learned\nGovernance artifacts synthesized lessons 29–31, captured the escalation decision point, and updated DIRECTION for block 41363. Synthesis identified three escalation paths for blocking ticket #220 (verifiable subscription-only execution). Change merged cleanly under a green build.\n\n## Reproduction evidence\n_(not applicable: not a heal/bugfix ticket)_\n\n## References (reference-set evidence)\n- `langchain-ai/langchain`\n- `FoundationAgents/MetaGPT`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-08-16-synthesis-after-30-lessons",
+      "metadata": {
+        "created": "2026-08-16",
+        "failure_class": "",
+        "kind": "unknown",
+        "note_name": "2026-08-16-synthesis-after-30-lessons",
+        "outcome": "unknown",
+        "source": "whitepaper",
+        "tags": [
+          "whitepaper"
+        ],
+        "title": "Synthesis after 30 lessons"
+      },
+      "text": "# Synthesis after 30 lessons\n\n> Part of [[Whitepapers MOC]] - [[Knowledge Base MOC]]\n\n## Summary\nSynthesis of the last 3 lesson(s): 1 pass / 2 fail, across kinds implement, implement, implement.\n\n## Outcomes in this window\n| outcome | count |\n| --- | --- |\n| pass | 1 |\n| fail | 2 |\n\n## Work by kind\n| kind | count |\n| --- | --- |\n| implement | 3 |\n\n## Recurring failures\n- **timeout / resource constraints** - lesson 30 (verifiable subscription-only execution and real agent telemetry): agent timed out at 1200s during phase=implement, despite CI passing\n- **timeout / resource constraints** - lesson 29 (same feature, prior attempt): agent timed out at 1200s during phase=implement, despite CI passing\n\n## Recurring themes\n- **execution** - appears in 2 lessons\n- **subscription** - appears in 2 lessons\n- **telemetry** - appears in 1 lesson\n\n## Lessons synthesized\n- [[2026-08-12-implement-feat-adversarial-cross-model-pr-review-gate-with-a-merge-gatekeeper]]\n- [[2026-08-13-implement-feat-synthesis-memory-and-duplicate-proposal-rejection]]\n- [[2026-08-14-implement-feat-verifiable-subscription-only-execution-and-real-agent-telemetry]]\n\n## Analysis: holding at the complexity boundary\n\nAfter lesson 28 shipped cleanly (synthesis memory and duplicate-idea rejection), the loop encountered a hard boundary: lesson 29 (verifiable subscription-only execution) timed out at 1200s wall-clock. Lesson 30 — a retry of the same ticket with the same model (`sonnet`) — also timed out at the exact same point.\n\nThis is not variance; it's a signal. Two consecutive timeouts on the same ticket with the same model is not a one-off. It indicates that the ticket complexity genuinely exceeds the per-agent budget under the current model assignment.\n\nWhat matters: **CI passed both times**. The timeout was not a crash or a resource leak — the CI harness completed normally, tests passed, but the worker exceeded its 1200s wall-clock limit during the implementation phase. This is distinctly different from failure modes like context explosion or infinite loops.\n\n## What shifted from lesson 29 to lesson 30\n\nLesson 29 timed out and was recorded. Lesson 30 is a retry of the same ticket. The agent made it to the same timeout point — suggesting either:\n1. The ticket is genuinely too large for 1200s with `sonnet`\n2. The worker's phase is too ambitious (attempting too much before checkpointing)\n3. The model choice is sub-optimal for this class of work\n\nAll three are distinct problems, and all three are *solvable*. None indicate the loop is broken.\n\n## The architecture inflection\n\nAt lesson 28, the loop proved it can self-modify without breaking: it added synthesis memory (duplicate-idea rejection) and landed it on the first try. That's the moment the loop crossed from \"can this work?\" to \"can this improve itself?\"\n\nLessons 29–30 are the answer to the next question: \"what happens when the loop hits its own limits?\"\n\nThe loop doesn't crash. It doesn't produce garbage. It reaches a boundary and stops. That's actually good engineering — a system that hits its limits gracefully is easier to scale than one that falls over unpredictably.\n\n## What worked: governance and gates\n\nAll prior lessons landed cleanly through the governance layer:\n- Ticket → ADR → PR → green CI → merge\n- Synthesis is submitting valid tickets\n- The review gate (lesson 27) is catching issues before merge\n- MOCs stay up to date\n- DIRECTION refreshes after each block\n\nThis infrastructure is load-bearing. Lessons 27–28 depended on it to land features that modify the loop itself. Without this governance foundation, you couldn't safely add gates and memory to your own execution engine.\n\n## What deteriorated: scheduling clarity\n\nThe loop doesn't have a policy for ticket-too-complex or worker-out-of-budget. When lesson 29 timed out, it was recorded as a failure, and lesson 30 was filed as a retry without any indication that the retry would face the same boundary.\n\nA mature loop would:\n1. **Detect** that a ticket timed out (✓ logged)\n2. **Diagnose** whether it's a regression, a one-off variance, or a genuine capacity problem (✗ no analysis step)\n3. **Decide** what to do: escalate, decompose, or route to a heavier model (✗ no policy)\n4. **Execute** the decision (✗ defaults to \"retry with same approach\")\n\nRight now you have steps 1 but not 2–4.\n\n## Takeaway for block 41361\n\nBlock 41361 is the inflection point: the loop is encountering **bounded complexity**. It's not hitting resource exhaustion (CI passed), not crashing (timeout is graceful), not generating garbage — it's hitting a scheduling boundary.\n\nThis is progress. It means you've solved the correctness layer (governance, gates, synthesis) and moved to the scheduling layer (complexity estimation, model routing, escalation).\n\nThe path forward is not to raise the 1200s limit or switch to a heavier model by default. It's to make the loop conscious of its own capacity:\n- **Capacity detection**: When wall-clock exceeds threshold, is it worth retrying, or should we escalate?\n- **Ticket decomposition**: Can synthesis split \"verifiable subscription execution\" into smaller tickets?\n- **Model routing**: Would `opus` (heavy) finish in 1200s where `sonnet` doesn't?\n\nPick one and iterate. My recommendation: start with capacity detection (detect timeout, propose escalation, let a human or a heavier model take it), because it's the least invasive and most robust."
+    },
+    {
+      "id_": "2026-08-16-synthesis-after-31-lessons",
+      "metadata": {
+        "created": "2026-08-16",
+        "failure_class": "",
+        "kind": "unknown",
+        "note_name": "2026-08-16-synthesis-after-31-lessons",
+        "outcome": "unknown",
+        "source": "whitepaper",
+        "tags": [
+          "whitepaper"
+        ],
+        "title": "Synthesis after 31 lessons"
+      },
+      "text": "# Synthesis after 31 lessons\n\n> Part of [[Whitepapers MOC]] - [[Knowledge Base MOC]]\n\n## Summary\nSynthesis of the last 3 lesson(s): 2 pass / 1 fail, across kinds implement, implement, implement.\n\n## Outcomes in this window\n| outcome | count |\n| --- | --- |\n| pass | 2 |\n| fail | 1 |\n\n## Work by kind\n| kind | count |\n| --- | --- |\n| implement | 3 |\n\n## Recurring failures\n- **timeout / resource constraints** - lesson 30 (verifiable subscription-only execution and real agent telemetry): agent timed out at 1200s during phase=implement, despite CI passing\n\n## Recurring themes\n- **memory** - appears in 2 lessons\n- **governance** - appears in 2 lessons\n- **execution** - appears in 1 lesson\n\n## Lessons synthesized\n- [[2026-08-13-implement-feat-synthesis-memory-and-duplicate-proposal-rejection]]\n- [[2026-08-14-implement-feat-verifiable-subscription-only-execution-and-real-agent-telemetry]]\n- [[2026-08-16-implement-chore-governance-artifacts-for-block-41361]]\n\n## Analysis: governance hardening after boundary detection\n\nLessons 28–30 exposed a scheduling boundary: verifiable subscription-only execution timed out at 1200s with sonnet, twice, despite CI passing. This was NOT a capability failure — it was a timing one. The loop remained graceful under resource exhaustion, which is critical infrastructure behavior.\n\nLesson 31 (governance artifacts for 41361) marked the turning point: instead of retrying the same approach, the loop halted and synthesized. It documented the boundary, analyzed its causes, and proposed three escalation paths:\n- **Option A**: Escalation with human judgment (fast, low-risk)\n- **Option B**: Model routing (complex, but scalable)\n- **Option C**: Decomposition (requires stronger synthesis)\n\nThe synthesis itself was high-quality: it was accurate about what happened, precise about why it happened, and clear about what options exist. Most importantly, the loop didn't panic or retry blindly. It slowed down to understand.\n\n## What shifted from lessons 29–30 to lesson 31\n\nLesson 29 (synthesis memory) landed cleanly. It added duplicate-proposal rejection to prevent the loop from re-synthesizing work it had already rejected. That's architectural maturity: the loop now has memory of its own decision-making.\n\nLesson 30 hit the timeout boundary and recorded it clearly. Lesson 31 did NOT just file another ticket to retry — it stopped and synthesized. The synthesis was comprehensive enough that the architect reading it knew exactly what the issue was and what the options were.\n\nThis is the inflection point. The loop moved from \"can we execute things?\" to \"can we understand our own limits?\"\n\n## The infrastructure play\n\nThree governance lessons in a row (31 is the third, if we count 29 as synthesis memory and 30 as timeout evidence) show that the loop is now investing in understanding itself, not just executing. This is not overhead — it's load-bearing infrastructure.\n\n- **Lesson 29** (synthesis memory): Loop learns to avoid re-proposing rejected ideas\n- **Lesson 30** (timeout evidence): Loop encounters its own limit gracefully\n- **Lesson 31** (synthesis and analysis): Loop stops to understand and propose solutions\n\nThis pattern is rare in autonomous systems. Most either crash at step 30 or retry blindly forever. This one stops, synthesizes, and asks for guidance. That's the difference between a tool that works and a system you can trust.\n\n## What deteriorated: model selection still reactive\n\nThe loop doesn't yet have proactive model selection. Lesson 29 succeeded under sonnet (synthesis memory is smaller). Lesson 30 timed out under sonnet (subscription-only execution is larger). The loop didn't predict this — it experienced it.\n\nA more mature loop would have estimated task complexity and routed lesson 30 to opus *before* attempting it with sonnet. That capability is in the roadmap (#42, learned heuristic), but it hasn't landed yet.\n\n## Takeaway for block 41363\n\nBlock 41363 is the inflection moment: the loop has solid governance and self-understanding. What it needs now is not more analysis, but action on the escalation policy.\n\nThe verifiable-subscription-only-execution ticket is blocked (issue #220) waiting for an escalation decision. Options:\n1. **Route to human** (architect reviews and decides)\n2. **Route to opus** (try with a heavier model)\n3. **Decompose** (synthesis breaks it into smaller tickets)\n\nPick one and move forward. The analysis is done; now it's scheduling and execution.\n\n## Lessons for the next worker\n\nWhen you pick up lesson 32 (the next task in block 41363), you'll have:\n- Clear evidence of where the loop's limits are\n- A synthesized analysis of why those limits exist\n- Three concrete options for how to push past them\n\nUse lesson 31's synthesis as your starting point, not as the end state. The loop is asking for help; give it a path forward."
+    },
+    {
+      "id_": "2026-08-17-implement-chore-governance-artifacts-for-block-41363",
+      "metadata": {
+        "created": "2026-08-17",
+        "failure_class": "",
+        "kind": "implement",
+        "note_name": "2026-08-17-implement-chore-governance-artifacts-for-block-41363",
+        "outcome": "pass",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/pass",
+          "kind/implement"
+        ],
+        "title": "implement: chore: governance artifacts for block 41363"
+      },
+      "text": "# implement: chore: governance artifacts for block 41363\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **pass** |\n| kind | implement |\n| iteration | 4136304 |\n| ticket | #268 |\n| pull request | _(none)_ |\n| model | `haiku` |\n| remote CI | SUCCESS |\n\n## Context\nIteration 4136304. Ticket #268. CI before: CI green (ruff=pass, pytest=pass).\n\n## What happened\nModel `haiku` (light) ran the task. Agent ok=True. CI after: CI green (ruff=pass, pytest=pass).\n\n## Lesson learned\nChange merged cleanly under a green build.\n\n## Reproduction evidence\n_(not applicable: not a heal/bugfix ticket)_\n\n## References (reference-set evidence)\n- `langchain-ai/langchain`\n- `FoundationAgents/MetaGPT`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-08-17-implement-feat-adopted-practice-registry-with-provenance-wired-into-the-synthesis-context-pack",
+      "metadata": {
+        "created": "2026-08-17",
+        "failure_class": "",
+        "kind": "implement",
+        "note_name": "2026-08-17-implement-feat-adopted-practice-registry-with-provenance-wired-into-the-synthesis-context-pack",
+        "outcome": "fail",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/fail",
+          "kind/implement"
+        ],
+        "title": "implement: feat: adopted-practice registry with provenance, wired into the synthesis context pack"
+      },
+      "text": "# implement: feat: adopted-practice registry with provenance, wired into the synthesis context pack\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **fail** |\n| kind | implement |\n| iteration | 4136501 |\n| ticket | #272 |\n| pull request | _(none)_ |\n| model | `sonnet` |\n| remote CI | SUCCESS |\n\n## Context\nIteration 4136501. Ticket #272. CI before: CI green (ruff=pass, pytest=pass).\n\n## What happened\nModel `sonnet` (standard) ran the task. Agent ok=False. CI after: CI green (ruff=pass, pytest=pass).\n\nAgent error:\n```\n[phase=implement, ticket=#272] timeout after 1200s\n```\n\n## Lesson learned\nChange did not reach green; auto-merge will hold until CI passes. Investigate the failure captured above before the next attempt.\n\n## Reproduction evidence\n_(not applicable: not a heal/bugfix ticket)_\n\n## References (reference-set evidence)\n- `langchain-ai/langchain`\n- `FoundationAgents/MetaGPT`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-08-17-implement-feat-failure-taxonomy-in-the-ledger-plus-a-postmortem-driven-backlog-trigger",
+      "metadata": {
+        "created": "2026-08-17",
+        "failure_class": "",
+        "kind": "implement",
+        "note_name": "2026-08-17-implement-feat-failure-taxonomy-in-the-ledger-plus-a-postmortem-driven-backlog-trigger",
+        "outcome": "fail",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/fail",
+          "kind/implement"
+        ],
+        "title": "implement: feat: failure taxonomy in the ledger plus a postmortem-driven backlog trigger"
+      },
+      "text": "# implement: feat: failure taxonomy in the ledger plus a postmortem-driven backlog trigger\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **fail** |\n| kind | implement |\n| iteration | 4136502 |\n| ticket | #273 |\n| pull request | _(none)_ |\n| model | `sonnet` |\n| remote CI | SUCCESS |\n\n## Context\nIteration 4136502. Ticket #273. CI before: CI green (ruff=pass, pytest=pass).\n\n## What happened\nModel `sonnet` (standard) ran the task. Agent ok=False. CI after: CI green (ruff=pass, pytest=pass).\n\nAgent error:\n```\n[phase=implement, ticket=#273] timeout after 1200s\n```\n\n## Lesson learned\nChange did not reach green; auto-merge will hold until CI passes. Investigate the failure captured above before the next attempt.\n\n## Reproduction evidence\n_(not applicable: not a heal/bugfix ticket)_\n\n## References (reference-set evidence)\n- `langchain-ai/langchain`\n- `FoundationAgents/MetaGPT`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-08-18-implement-feat-retrieval-grounded-synthesis-the-planner-must-read-and-cite-its-own-lessons-before-filing-tickets",
+      "metadata": {
+        "created": "2026-08-18",
+        "failure_class": "",
+        "kind": "implement",
+        "note_name": "2026-08-18-implement-feat-retrieval-grounded-synthesis-the-planner-must-read-and-cite-its-own-lessons-before-filing-tickets",
+        "outcome": "fail",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/fail",
+          "kind/implement"
+        ],
+        "title": "implement: feat: retrieval-grounded synthesis - the planner must read and cite its own lessons before filing tickets"
+      },
+      "text": "# implement: feat: retrieval-grounded synthesis - the planner must read and cite its own lessons before filing tickets\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **fail** |\n| kind | implement |\n| iteration | 4136701 |\n| ticket | #292 |\n| pull request | _(none)_ |\n| model | `opus` |\n| remote CI | SUCCESS |\n\n## Context\nIteration 4136701. Ticket #292. CI before: CI green (ruff=pass, pytest=pass).\n\n## What happened\nModel `opus` (heavy) ran the task. Agent ok=False. CI after: CI green (ruff=pass, pytest=pass).\n\nAgent error:\n```\n[phase=implement, ticket=#292] timeout after 1200s\n```\n\n## Lesson learned\nChange did not reach green; auto-merge will hold until CI passes. Investigate the failure captured above before the next attempt.\n\n## Reproduction evidence\n_(not applicable: not a heal/bugfix ticket)_\n\n## References (reference-set evidence)\n- `langchain-ai/langchain`\n- `FoundationAgents/MetaGPT`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-08-23-implement-feat-pre-pr-acceptance-audit-and-diff-hygiene-gate",
+      "metadata": {
+        "created": "2026-08-23",
+        "failure_class": "",
+        "kind": "implement",
+        "note_name": "2026-08-23-implement-feat-pre-pr-acceptance-audit-and-diff-hygiene-gate",
+        "outcome": "fail",
+        "source": "lesson",
+        "tags": [
+          "lesson",
+          "outcome/fail",
+          "kind/implement"
+        ],
+        "title": "implement: feat: pre-PR acceptance audit and diff-hygiene gate"
+      },
+      "text": "# implement: feat: pre-PR acceptance audit and diff-hygiene gate\n\n> Part of [[Lessons MOC]] - [[Knowledge Base MOC]]\n\n| field | value |\n| --- | --- |\n| outcome | **fail** |\n| kind | implement |\n| iteration | 4137705 |\n| ticket | #343 |\n| pull request | _(none)_ |\n| model | `opus` |\n| remote CI | SUCCESS |\n\n## Context\nIteration 4137705. Ticket #343. CI before: CI green (ruff=pass, pytest=pass).\n\n## What happened\nModel `opus` (heavy) ran the task. Agent ok=False. CI after: CI green (ruff=pass, pytest=pass).\n\nAgent error:\n```\n[phase=implement, ticket=#343] timeout after 1200s\n```\n\n## Lesson learned\nChange did not reach green; auto-merge will hold until CI passes. Investigate the failure captured above before the next attempt.\n\n## Reproduction evidence\n_(not applicable: not a heal/bugfix ticket)_\n\n## References (reference-set evidence)\n- `langchain-ai/langchain`\n- `FoundationAgents/MetaGPT`\n- `crewAIInc/crewAI`"
+    },
+    {
+      "id_": "2026-08-27-synthesis-after-37-lessons",
+      "metadata": {
+        "created": "2026-08-27",
+        "failure_class": "",
+        "kind": "unknown",
+        "note_name": "2026-08-27-synthesis-after-37-lessons",
+        "outcome": "unknown",
+        "source": "whitepaper",
+        "tags": [
+          "whitepaper"
+        ],
+        "title": "Synthesis after 37 lessons"
+      },
+      "text": "# Synthesis after 37 lessons\n\n> Part of [[Whitepapers MOC]] - [[Knowledge Base MOC]]\n\n## Summary\nSynthesis of the last 5 lesson(s): 1 pass / 4 fail, across kinds implement.\n\n## Outcomes in this window\n| outcome | count |\n| --- | --- |\n| fail | 4 |\n| pass | 1 |\n\n## Work by kind\n| kind | count |\n| --- | --- |\n| implement | 5 |\n\n## Recurring failures\n- [[2026-08-17-implement-feat-adopted-practice-registry-with-provenance-wired-into-the-synthesis-context-pack]] (implement): Change did not reach green; auto-merge will hold until CI passes. Investigate the failure captured above before the next attempt.\n- [[2026-08-17-implement-feat-failure-taxonomy-in-the-ledger-plus-a-postmortem-driven-backlog-trigger]] (implement): Change did not reach green; auto-merge will hold until CI passes. Investigate the failure captured above before the next attempt.\n- [[2026-08-18-implement-feat-retrieval-grounded-synthesis-the-planner-must-read-and-cite-its-own-lessons-before-filing-tickets]] (implement): Change did not reach green; auto-merge will hold until CI passes. Investigate the failure captured above before the next attempt.\n- [[2026-08-23-implement-feat-pre-pr-acceptance-audit-and-diff-hygiene-gate]] (implement): Change did not reach green; auto-merge will hold until CI passes. Investigate the failure captured above before the next attempt.\n\n## Recurring themes\n- **change** - appears in 5 lessons\n- **green** - appears in 5 lessons\n- **above** - appears in 4 lessons\n- **attempt** - appears in 4 lessons\n- **auto-merge** - appears in 4 lessons\n\n## Lessons synthesized\n- [[2026-08-17-implement-chore-governance-artifacts-for-block-41363]]\n- [[2026-08-17-implement-feat-adopted-practice-registry-with-provenance-wired-into-the-synthesis-context-pack]]\n- [[2026-08-17-implement-feat-failure-taxonomy-in-the-ledger-plus-a-postmortem-driven-backlog-trigger]]\n- [[2026-08-18-implement-feat-retrieval-grounded-synthesis-the-planner-must-read-and-cite-its-own-lessons-before-filing-tickets]]\n- [[2026-08-23-implement-feat-pre-pr-acceptance-audit-and-diff-hygiene-gate]]"
+    }
+  ],
+  "schema_version": 1
+}
