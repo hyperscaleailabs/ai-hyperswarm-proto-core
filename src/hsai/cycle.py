@@ -128,15 +128,30 @@ def _synthesis_step(
     low_water = int(cfg.cycle.get("backlog_low_watermark", 4))
     if dry_run or _well_formed_backlog(cfg, runner=runner) >= low_water:
         return {
-            "ran": False, "filed": [], "error": "", "rejected": 0, "rejected_titles": [],
+            "ran": False, "filed": [], "error": "", "rejected": [], "memory": "",
             "risk_flags": [], "risk_dropped": 0,
         }
     sres = synthesize(cfg, cycle_index=idx, runner=runner, ai_runner=ai_runner)
     return {
         "ran": True, "filed": list(sres.filed), "error": sres.error,
-        "rejected": sres.rejected, "rejected_titles": list(sres.rejected_titles),
+        "rejected": [r.line() for r in sres.rejected], "memory": sres.memory.summary(),
         "risk_flags": list(sres.risk_flags), "risk_dropped": sres.risk_dropped,
     }
+
+
+def _rejection_lines(synth: dict) -> list[str]:
+    """Suppressed candidates as `title - reason` lines.
+
+    A journal written before rejections carried reasons stored a bare count
+    plus the matched titles; replaying one must still render, so both shapes
+    are accepted here.
+    """
+    rejected = synth.get("rejected") or []
+    if isinstance(rejected, int):
+        return [
+            f"{title} - duplicates prior work" for title in synth.get("rejected_titles") or []
+        ]
+    return list(rejected)
 
 
 def _grade_budget(ledger_file: Path, idx: int, budget: dict) -> dict:
@@ -253,11 +268,14 @@ def run_cycle(
     report.synthesized = list(synth["filed"])
     if synth["ran"] and not report.synthesized:
         report.notes.append(f"synthesis produced no tickets: {synth['error']}")
-    if synth["rejected"]:
-        matched = "; ".join(f'"{t}"' for t in synth["rejected_titles"] if t) or "-"
+    report.synthesis_memory = synth.get("memory") or (
+        "_(this block's journal predates memory provenance)_" if synth["ran"] else ""
+    )
+    report.synthesis_rejections = _rejection_lines(synth)
+    if report.synthesis_rejections:
         report.notes.append(
-            f"synthesis: {synth['rejected']} duplicate(s) rejected (matched: {matched}) - "
-            f"filed {len(report.synthesized)} survivor(s), no back-fill"
+            f"synthesis: {len(report.synthesis_rejections)} candidate(s) rejected before "
+            f"filing - filed {len(report.synthesized)} survivor(s), no back-fill"
         )
     # `.get`, not `[...]`: a journal written before prior-art grounding existed
     # must still replay. Every verdict is recorded, kept and dropped alike.

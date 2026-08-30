@@ -25,7 +25,7 @@ from hsai.config import load_config
 from hsai.knowledge import KnowledgeBase, Lesson
 from hsai.orchestrator import IterationResult
 from hsai.proc import Proc
-from hsai.synthesis import SynthesisResult
+from hsai.synthesis import MemoryProvenance, RejectedSpec, SynthesisResult
 
 
 class _Runner:
@@ -138,8 +138,8 @@ def test_block_soft_biases_then_hard_halts_but_inflight_merges(tmp_path, monkeyp
 
 # --- synthesis duplicate rejections reach the review brief -------------------
 
-def test_synthesis_duplicate_rejections_surface_in_block_notes(tmp_path, monkeypatch):
-    """`SynthesisResult.rejected` must reach `BlockReport.notes` (and the brief)."""
+def test_synthesis_rejections_and_provenance_surface_in_the_brief(tmp_path, monkeypatch):
+    """`SynthesisResult.rejected` and `.memory` must reach the review brief."""
     cfg = load_config()
     cfg.budget.clear()
     cfg.cycle["block_size"] = 0  # isolate: no implementation iterations needed
@@ -147,7 +147,13 @@ def test_synthesis_duplicate_rejections_surface_in_block_notes(tmp_path, monkeyp
     def fake_synthesize(cfg, *, cycle_index, runner, ai_runner):
         return SynthesisResult(
             ok=True, studied=["a/b"], filed=[901],
-            rejected=1, rejected_titles=["feat: already open ticket"],
+            rejected=[RejectedSpec(
+                title="feat: already open ticket",
+                reason='exact duplicate of prior work "feat: already open ticket"',
+            )],
+            memory=MemoryProvenance(
+                lessons=4, failed_lessons=1, open_tickets=2, closed_tickets=3, blocks=1
+            ),
         )
 
     runner = _Runner()
@@ -159,12 +165,24 @@ def test_synthesis_duplicate_rejections_surface_in_block_notes(tmp_path, monkeyp
 
     assert res.report.synthesized == [901]
     note = next(n for n in res.report.notes if n.startswith("synthesis:"))
-    assert "1 duplicate(s) rejected" in note
-    assert "feat: already open ticket" in note
+    assert "1 candidate(s) rejected before filing" in note
 
-    # The review brief renders every note verbatim.
+    # The brief carries the note, what the planner was shown, and what it suppressed.
     assert runner.review_bodies, "a review issue should have been opened"
-    assert note in runner.review_bodies[-1]
+    brief = runner.review_bodies[-1]
+    assert note in brief
+    assert "4 lesson(s) (1 recorded as fail)" in brief
+    assert "2 open + 3 recently closed ticket(s)" in brief
+    assert 'feat: already open ticket - exact duplicate of prior work' in brief
+
+
+def test_a_journal_written_before_rejections_carried_reasons_still_replays(tmp_path):
+    """Old journals stored a bare count plus matched titles - still renderable."""
+    lines = cycle._rejection_lines(
+        {"rejected": 1, "rejected_titles": ["feat: already open ticket"]}
+    )
+    assert lines == ["feat: already open ticket - duplicates prior work"]
+    assert cycle._rejection_lines({"ran": False}) == []
 
 
 # --- practices adopted this block reach the review brief ---------------------

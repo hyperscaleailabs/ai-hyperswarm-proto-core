@@ -130,3 +130,27 @@ def test_brief_reports_no_practices_adopted_when_none():
     body = render_brief(cfg, BlockReport(cycle_index=7))
     assert "## Practices adopted this block" in body
     assert "_none this block_" in body
+
+
+# --- synthesis memory provenance + suppressed candidates ----------------------
+
+def test_brief_reports_what_the_planner_was_shown_and_what_it_suppressed():
+    cfg = load_config()
+    report = BlockReport(
+        cycle_index=7,
+        synthesis_memory="4 lesson(s) (1 recorded as fail), 2 open + 3 recently "
+                         "closed ticket(s), 1 ledger block(s) summarized",
+        synthesis_rejections=['feat: adaptive budget - exact duplicate of prior work'],
+    )
+    body = render_brief(cfg, report)
+    assert "### What the planner was shown (synthesis memory)" in body
+    assert "4 lesson(s) (1 recorded as fail)" in body
+    assert "### Candidates suppressed by the novelty gate" in body
+    assert "feat: adaptive budget - exact duplicate of prior work" in body
+
+
+def test_brief_says_when_synthesis_did_not_run_or_suppressed_nothing():
+    cfg = load_config()
+    body = render_brief(cfg, BlockReport(cycle_index=7))
+    assert "_synthesis did not run this block_" in body
+    assert "_none - every candidate was novel_" in body

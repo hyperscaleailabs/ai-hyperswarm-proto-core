@@ -85,14 +85,19 @@ closes the loop.
   whole notes are dropped to fit, never truncated mid-line. An empty corpus or
   `enabled: false` renders nothing at all.
 - **Plan.** `synthesis.build_prompt` carries a *What this loop has already
-  tried* section (`synthesis.MemoryPack`) - open tickets, recently closed
-  tickets, and lesson outcomes, titles only and hard-capped - ahead of the
-  reference-project digest, so the planner stops re-proposing dead ideas.
-  `synthesis.is_duplicate` then filters the model's own output before filing:
+  learned / already tried / must not repeat* section
+  (`synthesis.SynthesisMemory`) - open tickets (flagged `BLOCKED` /
+  `NEEDS-REFINEMENT`), recently closed tickets, lesson outcomes with the reason
+  behind every failure, and recent block economics from the quota ledger -
+  ahead of the reference-project digest, so the planner stops re-proposing dead
+  ideas. It is hard-capped at `synthesis.memory_max_chars` and truncates
+  oldest-first, stating the elision rather than silently swallowing it.
+  `synthesis.is_novel` then filters the model's own output before filing:
   a candidate whose title exactly matches, or whose normalized-token overlap
-  with a prior title clears the configured Jaccard threshold, is dropped and
-  its slot is never back-filled - `SynthesisResult.rejected` and
-  `.rejected_titles` carry the count and matches into `BlockReport.notes`.
+  with a prior title clears `synthesis.novelty_threshold`, is dropped and
+  its slot is never back-filled - `SynthesisResult.rejected` (title + reason)
+  and `.memory` (what the planner was shown) reach the review brief through
+  `BlockReport.synthesis_rejections` / `.synthesis_memory`.
 - **Audit.** What was retrieved is recorded three times: on `IterationResult`,
   as a `recalled:` list in the lesson's frontmatter, and as a
   *Prior lessons consulted* section on the PR. `hsai recall "<query>"` prints
