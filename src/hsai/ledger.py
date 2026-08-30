@@ -64,6 +64,13 @@ class LedgerRecord:
     outcome: str
     input_tokens: int | None = None
     output_tokens: int | None = None
+    # Behavioural dimensions folded out of the run's trajectory (see
+    # hsai.trajectory.TrajectorySummary). None means "not recorded" - the
+    # trajectory was disabled or the stream was unparseable - which is a
+    # different fact from a run that genuinely made zero tool calls. Both
+    # default to None so read_records() parses pre-existing records.
+    tool_calls: int | None = None
+    turns: int | None = None
     # Causal taxonomy (see hsai.postmortem): empty for a merged/passing
     # iteration; else a member of hsai.postmortem.FAILURE_CLASSES. Both default
     # to "" so read_records() parses pre-existing records that lack them.
@@ -106,30 +113,68 @@ def read_records(path: str | Path) -> list[LedgerRecord]:
     return records
 
 
-def parse_tokens(output: str | dict | None) -> tuple[int, int] | None:
-    """Best-effort ``(input, output)`` token counts from a ``claude -p`` run.
-
-    Accepts either the raw stdout or the already-parsed envelope
-    (:attr:`hsai.ai.AIResult.payload`) - callers that have the parsed form pass
-    it directly rather than re-parsing the text. Subscription-safe either way:
-    this only reads what the CLI already printed (its JSON ``--output-format``
-    carries a ``usage`` object) and never issues a metered call. Returns
-    ``None`` when no counts are exposed.
-    """
-    if isinstance(output, dict):
-        data: object = output
-    else:
-        text = (output or "").strip()
-        if not text.startswith("{"):
-            return None
-        try:
-            data = json.loads(text)
-        except (ValueError, TypeError):
-            return None
+def _usage_of(data: object) -> dict | None:
+    """The usage object on an envelope or a single stream event, if any."""
     if not isinstance(data, dict):
         return None
     usage = data.get("usage")
-    if not isinstance(usage, dict):
+    if isinstance(usage, dict):
+        return usage
+    # A stream-json `assistant` event nests its per-message usage one level
+    # down, under the message envelope; only the `result` event hoists it up.
+    message = data.get("message")
+    if isinstance(message, dict) and isinstance(message.get("usage"), dict):
+        return message["usage"]
+    return None
+
+
+def _usage_from_text(text: str) -> dict | None:
+    """The usage object in a ``claude -p`` stdout, whichever shape it is in."""
+    try:
+        return _usage_of(json.loads(text))
+    except (ValueError, TypeError):
+        pass
+    # stream-json: one JSON object per line, so the whole-text parse above
+    # fails. The terminal `result` event carries the run's cumulative usage;
+    # an assistant event's per-message usage is the fallback when the stream
+    # was cut short before that event arrived.
+    result_usage: dict | None = None
+    last_usage: dict | None = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        usage = _usage_of(event)
+        if usage is None:
+            continue
+        last_usage = usage
+        if isinstance(event, dict) and event.get("type") == "result":
+            result_usage = usage
+    return result_usage or last_usage
+
+
+def parse_tokens(output: str | dict | None) -> tuple[int, int] | None:
+    """Best-effort ``(input, output)`` token counts from a ``claude -p`` run.
+
+    Accepts the already-parsed envelope (:attr:`hsai.ai.AIResult.payload`) or
+    the raw stdout in either of the CLI's two shapes: the single JSON object
+    ``--output-format json`` prints, and the JSONL event stream
+    ``--output-format stream-json`` prints. The stream shape was previously
+    unparseable here, which is why the ledger's token columns stayed empty on
+    every real iteration. Subscription-safe either way: this only reads text the
+    CLI already printed and never issues a metered call. Returns ``None`` when
+    no counts are exposed.
+    """
+    if isinstance(output, dict):
+        usage = _usage_of(output)
+    else:
+        text = (output or "").strip()
+        usage = _usage_from_text(text) if text.startswith("{") else None
+    if usage is None:
         return None
     inp, out = usage.get("input_tokens"), usage.get("output_tokens")
     if inp is None and out is None:

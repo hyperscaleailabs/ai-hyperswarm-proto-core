@@ -121,12 +121,21 @@ renderers - is tested directly.
 
 ## Observability: trajectories
 
-`claude -p` is invoked with `--output-format <execution.output_format>`
-(default `json`), so every run returns a structured envelope (final result,
-message stream, token usage, session id) instead of an opaque blob. The flag is
-config-driven rather than hardcoded so a CLI change is a YAML edit, not a code
-change: setting the key to `text` drops the flag and every consumer falls back
-to the plain-text path.
+`claude -p` is invoked with a structured `--output-format`, so every run returns
+a machine-readable envelope (final result, token usage, session id) instead of
+an opaque blob. Two config keys decide which one, with one precedence rule
+(`ai.resolve_output_format`): `execution.output_format: text` is the escape
+hatch and always wins - it drops the flag entirely and every consumer falls back
+to the plain-text path, so a CLI flag change is a YAML edit, not a code change.
+Otherwise `execution.trajectories.enabled` upgrades the format to `stream-json`
+(plus the `--verbose` the CLI requires under `-p`), because only the event
+stream carries the per-tool-call detail a trajectory is made of - the
+single-object envelope reports the outcome and nothing about the path to it.
+
+`ai.parse_output` lifts the stream's terminal `result` event out as the payload,
+so `AIResult.text`, `.session_id` and `.usage` behave identically on both
+shapes; `trajectory.steps_from_stream` reads the per-turn detail out of the
+JSONL that the single-envelope `messages` list would otherwise have carried.
 
 `orchestrator.run_once` hands that envelope to `trajectory.record` at the
 single choke point right after `ai.run_agent` - *before* the completeness and
@@ -151,11 +160,37 @@ Two audiences, deliberately split:
   last few steps. The audit trail is visible on the PR; the knowledge base
   gains signal without mirroring the working tree.
 
-The same envelope feeds `ledger.parse_tokens` (which accepts the parsed payload
-directly), so the quota ledger's token columns - and the block aggregate in the
-review brief, including **tokens per merged PR** - report real numbers instead
-of nulls. Output that is not JSON (an older `claude` binary) degrades to a
-single-step trajectory with null usage rather than breaking the loop.
+The same envelope feeds `ledger.parse_tokens`, which accepts the parsed payload,
+the single-object stdout, *and* the JSONL stream (whose terminal `result` event
+carries the cumulative usage, falling back to the last per-message usage when a
+run was cut short). That is what keeps the quota ledger's token columns - and
+the block aggregate in the review brief, including **tokens per merged PR** -
+reporting real numbers instead of nulls. Output that is not JSON at all (an
+older `claude` binary) degrades to a single-step trajectory with null usage
+rather than breaking the loop.
+
+### The raw event stream
+
+Beside the parsed per-run record sits the run's verbatim stdout, written by
+`ai.run_agent` to `.hsai/trajectories/<branch>.jsonl` in the **repo root** (not
+the ephemeral worktree, so it outlives the worktree's removal). It is redacted
+on the way to disk, capped at `execution.trajectories.max_bytes` by head/tail
+truncation whose splice marker is itself a JSON line - a capped file is still
+valid JSONL - and gitignored, since it quotes repo content.
+
+`trajectory.parse_stream` folds it into a `TrajectorySummary` (tool-call counts
+by name, files touched, error events, turns, final usage) which is deliberately
+total: an unknown event type, a truncated line, or a wholesale CLI format change
+yields an *empty* summary rather than raising into the iteration. That summary
+supplies the ledger's `tool_calls`/`turns` columns, the collapsed `##
+Trajectory` table on the PR (`trajectory.digest`), and the stream digest in the
+lesson. `hsai replay <branch>` prints the tool-call sequence back; `hsai traj
+<iteration>` still resolves the parsed record. Same command, two stores.
+
+Synthesis: SWE-agent (a `.traj` per run as the primary artifact, with replay
+tooling on top), microsoft/JARVIS (`/results` exposing per-stage intermediate
+results, not only the final answer) and openai/swarm (`run()` returning the
+complete message list so the interaction is inspectable client-side).
 
 ## Durability: the cycle journal
 

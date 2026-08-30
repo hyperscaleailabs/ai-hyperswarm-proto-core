@@ -195,6 +195,48 @@ def test_synthesize_survives_output_without_a_json_envelope():
     assert res.rejected_titles == []
 
 
+def _stream_json_runner():
+    """A `claude -p --output-format stream-json --verbose`: JSONL events.
+
+    The fenced ticket blocks live inside the terminal `result` event, so the
+    spec parser has to read the UNWRAPPED text, not the raw stdout.
+    """
+    calls: list[list[str]] = []
+    issue_numbers = iter(range(321, 400))
+    stream = "\n".join([
+        json.dumps({"type": "system", "subtype": "init", "session_id": "s-8"}),
+        json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "PHASE 1 - DIVERGE: thinking out loud."},
+        ]}}),
+        json.dumps({"type": "result", "subtype": "success", "num_turns": 2,
+                    "session_id": "s-8", "result": PLAIN_TEXT_OUTPUT,
+                    "usage": {"input_tokens": 4000, "output_tokens": 900}}),
+    ])
+
+    def runner(cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None):
+        calls.append(list(cmd))
+        if cmd[:1] == ["claude"]:
+            return Proc(cmd, 0, stream, "")
+        if cmd[:3] == ["gh", "issue", "create"]:
+            return Proc(cmd, 0, f"https://github.com/o/r/issues/{next(issue_numbers)}\n", "")
+        return Proc(cmd, 0, "", "")
+
+    runner.calls = calls  # type: ignore[attr-defined]
+    return runner
+
+
+def test_synthesize_parses_specs_out_of_a_stream_json_envelope():
+    """Enabling trajectories must not silently stop the planner filing tickets."""
+    cfg = _cfg()
+    runner = _stream_json_runner()
+
+    res = synthesize(cfg, cycle_index=0, runner=runner, ai_runner=runner)
+
+    assert res.ok is True
+    assert res.filed == [321]
+    assert res.error == ""
+
+
 # --- MemoryPack: what this loop already knows about its own state ------------
 
 OPEN_ISSUES = [

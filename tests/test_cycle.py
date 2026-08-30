@@ -261,6 +261,38 @@ def test_persona_articles_survive_output_without_a_json_envelope(tmp_path):
         assert "Plain text, no JSON envelope." in text
 
 
+def test_persona_articles_unwrap_a_stream_json_envelope(tmp_path):
+    """A committed article must be the prose, never the raw JSONL event log."""
+    cfg = load_config()
+    kb = KnowledgeBase.from_config(cfg, tmp_path)
+    kb.whitepapers_dir.mkdir(parents=True, exist_ok=True)
+    (kb.whitepapers_dir / "2026-08-04-block-1.md").write_text("# Block paper\n\nBody.\n")
+
+    article = "# What this block changed\n\nThe prose the model actually wrote.\n"
+    stream = "\n".join([
+        json.dumps({"type": "system", "subtype": "init", "session_id": "s-3"}),
+        json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "Drafting."},
+        ]}}),
+        json.dumps({"type": "result", "subtype": "success", "num_turns": 1,
+                    "result": article, "usage": {"input_tokens": 9, "output_tokens": 4}}),
+    ])
+
+    def ai_runner(cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None):
+        return Proc(cmd, 0, stream, "")
+
+    written = cycle._persona_articles(
+        cfg, kb, "2026-08-04-block-1", repo_root=tmp_path, ai_runner=ai_runner
+    )
+
+    assert len(written) == len(cfg.personas)
+    for rel in written:
+        text = (tmp_path / rel).read_text()
+        assert "The prose the model actually wrote." in text
+        assert '"type": "assistant"' not in text     # not the event log
+        assert "session_id" not in text
+
+
 # --- trajectory retention ---------------------------------------------------
 
 def test_cycle_prunes_trajectory_blocks_beyond_retention(tmp_path, monkeypatch):

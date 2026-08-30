@@ -4,6 +4,9 @@
 # with `hsai traj <iteration>`); only a digest line and a redacted tail are
 # committed, inside the lesson and the PR body.
 .hsai/traj/
+# Raw per-branch event streams (`--output-format stream-json`): same rule, same
+# reason. Read one with `hsai replay <branch>`; only its digest is committed.
+.hsai/trajectories/
 *.log
 
 # Python

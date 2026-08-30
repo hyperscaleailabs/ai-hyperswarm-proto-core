@@ -11,12 +11,13 @@ Commands:
   hsai practices add --title T --source-project P ...          record a new adopted practice
   hsai postmortem [--block N]                                  print the failure-class Pareto for a block
   hsai doctor                                                  verify environment + invariants
-  hsai traj <iteration> [--json]                               print a stored agent run
-  hsai replay <iteration> [--json]                              alias of `hsai traj`
+  hsai traj <branch|iteration> [--json]                        print a stored agent run
+  hsai replay <branch|iteration> [--json]                      alias of `hsai traj`
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -240,15 +241,44 @@ def cmd_repro_check(args: argparse.Namespace) -> int:
     return 0 if result.ok else 1
 
 
+def _print_stream(args: argparse.Namespace) -> int | None:
+    """Print the raw event stream stored for a BRANCH, if there is one.
+
+    Returns ``None`` when the identifier does not name a stored stream, so the
+    caller can fall through to the iteration store.
+    """
+    directory = getattr(args, "trajectories_dir", "") or trajectory.STREAM_DIR
+    path = trajectory.stream_path(args.root, args.trajectory_id, directory)
+    if path is None or not path.is_file():
+        return None
+    summary = trajectory.parse_stream(trajectory.read_stream(path))
+    if args.json:
+        print(json.dumps(summary.to_dict(), indent=2, sort_keys=True))
+    else:
+        print(trajectory.render_summary(summary, source=str(path)))
+    return 0
+
+
 def _print_trajectory(args: argparse.Namespace, label: str) -> int:
     """Reconstruct a stored agent run from the local trajectory store.
 
-    Pure reading: no ``claude`` subprocess, no network, no quota spent.
+    Two stores, one entrance: a BRANCH resolves to the raw event stream
+    ``<execution.trajectories.dir>/<branch>.jsonl``, an ITERATION number to the
+    parsed per-run record under ``.hsai/traj``. Pure reading either way: no
+    ``claude`` subprocess, no network, no quota spent.
     """
+    streamed = _print_stream(args)
+    if streamed is not None:
+        return streamed
     try:
         traj = trajectory.load(args.root, args.trajectory_id)
     except (FileNotFoundError, ValueError) as exc:
-        print(f"{label}: {exc}", file=sys.stderr)
+        print(
+            f"{label}: no stored trajectory for {args.trajectory_id!r} "
+            f"({exc}); looked for a branch stream under "
+            f"{trajectory.stream_dir(args.root, getattr(args, 'trajectories_dir', ''))} too",
+            file=sys.stderr,
+        )
         return 1
     print(traj.to_json() if args.json else traj.render())
     return 0
@@ -384,9 +414,13 @@ def build_parser() -> argparse.ArgumentParser:
         ("replay", "reconstruct a stored agent run (alias of `traj`)", cmd_replay),
     ):
         tp = sub.add_parser(name, help=f"{help_text} (spends no quota)")
-        tp.add_argument("trajectory_id", metavar="iteration",
-                        help="iteration number, or a path to a trajectory file")
-        tp.add_argument("--root", default=".", help="repo root holding .hsai/traj")
+        tp.add_argument("trajectory_id", metavar="branch|iteration",
+                        help="branch name (raw event stream), iteration number, "
+                             "or a path to a trajectory file")
+        tp.add_argument("--root", default=".",
+                        help="repo root holding .hsai/traj and .hsai/trajectories")
+        tp.add_argument("--trajectories-dir", dest="trajectories_dir", default="",
+                        help=f"where branch streams live (default: {trajectory.STREAM_DIR})")
         tp.add_argument("--json", action="store_true", help="print the raw trajectory JSON")
         tp.set_defaults(func=func)
 

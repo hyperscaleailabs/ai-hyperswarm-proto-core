@@ -29,6 +29,38 @@ def test_execution_telemetry_defaults_when_keys_absent(tmp_path):
     cfg = load_config(core / "core.yaml")
     assert cfg.output_format == "json"          # structured envelope by default
     assert cfg.trajectory_retention_blocks == 8
+    # An absent `execution.trajectories` block keeps the recorder's defaults
+    # rather than silently disabling it.
+    assert cfg.trajectories.enabled is True
+    assert cfg.trajectories.dir == ".hsai/trajectories"
+    assert cfg.trajectories.max_bytes > 0
+    assert cfg.trajectories.redact_prompt is True
+
+
+def test_trajectories_are_configured_and_enabled():
+    """The stream recorder is config, not code (see hsai.trajectory)."""
+    cfg = load_config()
+    assert cfg.trajectories.enabled is True
+    assert cfg.trajectories.dir == ".hsai/trajectories"
+    assert cfg.trajectories.max_bytes >= 100_000
+    assert cfg.trajectories.redact_prompt is True
+
+
+def test_trajectories_can_be_switched_off_in_yaml(tmp_path):
+    core = tmp_path / ".ai-swarm"
+    core.mkdir()
+    (core / "core.yaml").write_text(
+        "identity:\n  owner: someone\n"
+        "execution:\n  trajectories:\n    enabled: false\n"
+        "    dir: .hsai/elsewhere\n    max_bytes: 4096\n    redact_prompt: false\n"
+        "models:\n  tiers:\n    standard:\n      model: sonnet\n"
+        "  default_tier: standard\n"
+    )
+    cfg = load_config(core / "core.yaml")
+    assert cfg.trajectories.enabled is False
+    assert cfg.trajectories.dir == ".hsai/elsewhere"
+    assert cfg.trajectories.max_bytes == 4096
+    assert cfg.trajectories.redact_prompt is False
 
 
 def test_review_gate_is_configured_and_enabled():

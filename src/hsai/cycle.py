@@ -83,11 +83,14 @@ def _persona_articles(
             f"article markdown, starting with a # title.\n\n{paper[:6000]}"
         )
         ares = run_agent(prompt, choice, cfg, runner=ai_runner, timeout=600)
-        if ares.ok and ares.output.strip():
+        # `.text` unwraps the envelope; `.output` is the raw stdout, which under
+        # `--output-format stream-json` is a JSONL event log, not the article.
+        article = ares.text.strip()
+        if ares.ok and article:
             out = articles_dir / f"{whitepaper_note}-{pid}.md"
             out.write_text(
                 f"---\ntags:\n  - article\n  - persona/{pid}\n---\n\n"
-                + ares.output.strip() + "\n"
+                + article + "\n"
             )
             written.append(str(out.relative_to(repo_root)))
     return written

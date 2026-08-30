@@ -91,6 +91,16 @@ execution:
                                  # feeds the quota ledger + trajectory store. Set to `text`
                                  # to drop the flag if a CLI change ever breaks it.
   trajectory_retention_blocks: 8 # how many blocks of .hsai/traj/ to keep (0 = keep all)
+  # Raw agent stream capture (see src/hsai/trajectory.py). When enabled the
+  # worker is driven with `--output-format stream-json --verbose` and the whole
+  # JSONL event stream is kept at <dir>/<branch>.jsonl. The raw payload is
+  # gitignored (it quotes repo content); only the digest reaches the PR body and
+  # the lesson. Set enabled: false to fall back to the single-object envelope.
+  trajectories:
+    enabled: true
+    dir: .hsai/trajectories
+    max_bytes: 2000000           # per-run cap; the middle is dropped, head+tail kept
+    redact_prompt: true          # scrub credentials/home paths before anything hits disk
   agent_timeout_seconds: 1200    # hard cap per claude -p worker so a hang cannot stall the loop
   ci_remote_timeout_seconds: 300 # how long to wait for a PR's remote CI to conclude
   ci_poll_interval_seconds: 10   # poll cadence while waiting for remote CI
