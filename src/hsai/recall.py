@@ -51,6 +51,11 @@ _SKIP_SUFFIXES = (" MOC",)
 # Where a note states its conclusion, best first.
 _SNIPPET_SECTIONS = ("lesson learned", "summary", "decision", "what happened", "context")
 
+# Line starts that mark template scaffolding rather than a note's own prose:
+# headings, metadata tables, the "> Part of [[...]]" breadcrumb, code fences
+# and horizontal rules. See :func:`strip_boilerplate`.
+_BOILERPLATE_PREFIXES = ("#", "|", ">", "```", "---", "***", "___")
+
 
 @dataclass(frozen=True)
 class RecallConfig:
@@ -186,6 +191,41 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: max(0, limit - 3)].rstrip() + "..."
 
 
+def strip_boilerplate(text: str) -> str:
+    """Drop the scaffolding every note shares, keeping only its prose.
+
+    Lessons are all rendered from one template
+    (:meth:`hsai.knowledge.KnowledgeBase._render_lesson`), so every note carries
+    the same headings, the same breadcrumb up to its MOC, and the same metadata
+    table. None of that is evidence of relevance, and indexing it actively
+    misranks:
+
+    * the row ``| remote CI | SUCCESS |`` is in *every* lesson ever written, so
+      a query about remote CI would match the whole corpus on scaffolding alone;
+    * the headings contribute the same tokens to every document, so BM25's
+      length normalisation starts penalising short, on-point notes for the
+      boilerplate they were obliged to carry.
+
+    Removed: headings, table rows, blockquote breadcrumbs, fences and rules,
+    and the ``_(none)_``-style placeholders the template emits for empty
+    fields. Frontmatter never reaches here - :func:`hsai.knowledge.parse_note`
+    has already split it off.
+    """
+    kept: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(_BOILERPLATE_PREFIXES):
+            continue
+        # A line that is nothing but an italic placeholder - bare
+        # ("_(no model run this iteration)_") or bulleted ("- _(none cited)_",
+        # as the references list emits when a run cited nothing.)
+        bare = line.lstrip("-*").strip()
+        if bare.startswith("_(") and bare.endswith(")_"):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
 def _to_document(path: Path, source: str) -> Document:
     record = parse_note(path)
     return Document(
@@ -195,9 +235,15 @@ def _to_document(path: Path, source: str) -> Document:
         kind=record.kind,
         source=source,
         snippet=_snippet(record),
-        # The whole note is indexed - a lesson's value is often in what
-        # happened, not only in its one-line conclusion.
-        tokens=tuple(tokenize(f"{record.title}\n{' '.join(record.tags)}\n{record.body}")),
+        # All of a note's PROSE is indexed - a lesson's value is often in what
+        # happened, not only in its one-line conclusion - but none of the
+        # template scaffolding it shares with every other note.
+        tokens=tuple(
+            tokenize(
+                f"{record.title}\n{' '.join(record.tags)}\n"
+                f"{strip_boilerplate(record.body)}"
+            )
+        ),
     )
 
 

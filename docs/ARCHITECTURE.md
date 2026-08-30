@@ -76,6 +76,11 @@ closes the loop.
   memory, over `knowledge/lessons`, `knowledge/whitepapers` and `docs/adr`.
   No third-party dependency, no model call, no network - so retrieval is free
   and its ranking is exactly reproducible (ties break on note name).
+  `strip_boilerplate` first removes the scaffolding every note shares - the
+  headings, the breadcrumb up to its MOC, the metadata table - so that
+  identical template text cannot score. Without it the row
+  `| remote CI | SUCCESS |`, present in every lesson ever written, would make a
+  query about remote CI match the entire corpus.
 - **Bias.** Notes tagged `outcome/fail` are up-weighted by
   `knowledge.recall.fail_weight`; notes whose `kind/` matches the current task
   are up-weighted by `kind_weight`. Failures are the expensive knowledge, and a
@@ -97,6 +102,20 @@ closes the loop.
   as a `recalled:` list in the lesson's frontmatter, and as a
   *Prior lessons consulted* section on the PR. `hsai recall "<query>"` prints
   the same ranking by hand.
+- **Visibility.** `hsai reindex` tallies those `recalled:` lists into a
+  *Most-recalled lessons* section on the Lessons MOC (`most_recalled`), so the
+  architect can see which notes are actually earning their keep. Only names
+  that still resolve to a lesson are listed - a MOC must never emit a broken
+  `[[wikilink]]`.
+- **Measurement.** Retrieval costs prompt budget on every run, so it has to
+  justify itself in outcomes. `LedgerRecord.recalled_count` records how many
+  notes each iteration was given; `BlockAggregate.recall_effect` splits
+  authored iterations into "with a pack" and "cold" arms and compares their
+  merge rates in the block review brief, while the block whitepaper states the
+  same split over lesson pass rates. Independent reviews are excluded from the
+  A/B - they never receive a pack, so counting them would stuff the control
+  group. With only one arm populated both artifacts print the numbers and say
+  outright that it is not yet a comparison.
 
 Reference-set lineage: retrieval-before-planning from `assafelovic/gpt-researcher`,
 index-then-retrieve with metadata preserved from `run-llama/llama_index`, and

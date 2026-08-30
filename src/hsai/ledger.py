@@ -69,6 +69,11 @@ class LedgerRecord:
     # to "" so read_records() parses pre-existing records that lack them.
     failure_class: str = ""
     failure_detail: str = ""
+    # How many prior notes hsai.recall injected into this iteration's prompt.
+    # 0 means the worker started cold (recall disabled, empty corpus, or no
+    # note scored). Defaults to 0 so read_records() still parses the records
+    # written before retrieval existed.
+    recalled_count: int = 0
     created: str = field(default_factory=_now)
 
     def to_json(self) -> str:
@@ -137,6 +142,11 @@ def parse_tokens(output: str | dict | None) -> tuple[int, int] | None:
     return int(inp or 0), int(out or 0)
 
 
+def _rate(part: int, whole: int) -> str:
+    """``part/whole`` as a percentage ("n/a" when the denominator is zero)."""
+    return f"{100.0 * part / whole:.0f}%" if whole else "n/a"
+
+
 @dataclass
 class BlockAggregate:
     """Folded cost of one half-day block (input to the brief + budget gate)."""
@@ -154,10 +164,48 @@ class BlockAggregate:
     # Per-class failure counts this block (see hsai.postmortem.pareto_table for
     # the richer share/exemplar breakdown the review brief renders).
     failure_histogram: dict[str, int] = field(default_factory=dict)
+    # The lesson-recall A/B: authored iterations split by whether retrieval put
+    # a pitfall pack in the prompt, with how many of each merged.
+    recalled_iterations: int = 0
+    recalled_merged: int = 0
+    cold_iterations: int = 0
+    cold_merged: int = 0
 
     @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
+
+    def recall_effect(self) -> str:
+        """Merge rate with a retrieved pitfall pack vs without.
+
+        Lesson recall costs prompt budget on every iteration, so it has to pay
+        for itself in outcomes rather than in plausibility. This is the number
+        that says whether it does.
+
+        Independent-review iterations are excluded: they never receive a pack,
+        so counting them would load the "without" side with work that was never
+        eligible for one. A block where only one side is populated reports its
+        numbers but explicitly declines to call it a comparison - with no
+        control group there is nothing to compare against.
+        """
+        with_n, without_n = self.recalled_iterations, self.cold_iterations
+        if not with_n and not without_n:
+            return "_no authored iterations in this block_"
+        parts = []
+        if with_n:
+            parts.append(
+                f"with a pack: {self.recalled_merged}/{with_n} merged "
+                f"({_rate(self.recalled_merged, with_n)})"
+            )
+        if without_n:
+            parts.append(
+                f"without: {self.cold_merged}/{without_n} merged "
+                f"({_rate(self.cold_merged, without_n)})"
+            )
+        line = "; ".join(parts)
+        if not (with_n and without_n):
+            return f"{line} - not yet a comparison (one side of the A/B is empty)"
+        return line
 
     def tokens_per_merged_pr(self) -> float | None:
         """Quota spent per unit of delivered work - the block's efficiency.
@@ -202,6 +250,15 @@ def aggregate_block(records: list[LedgerRecord], block: int) -> BlockAggregate:
             agg.merged_iterations += 1
         if r.kind == "review":
             agg.review_iterations += 1
+        else:
+            # Authored work only - see BlockAggregate.recall_effect.
+            merged = 1 if r.outcome == "merged" else 0
+            if r.recalled_count:
+                agg.recalled_iterations += 1
+                agg.recalled_merged += merged
+            else:
+                agg.cold_iterations += 1
+                agg.cold_merged += merged
         if r.failure_class:
             agg.failure_histogram[r.failure_class] = (
                 agg.failure_histogram.get(r.failure_class, 0) + 1
