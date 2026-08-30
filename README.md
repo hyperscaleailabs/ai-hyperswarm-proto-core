@@ -61,6 +61,25 @@ knowledge/
 
 `hsai reindex` rebuilds the MOCs from what is on disk.
 
+**The vault is verified, not just written.** `hsai.verify` is an independent
+integrity gate over the whole knowledge base and the quota ledger: every
+`[[wikilink]]` under `knowledge/` must resolve, every committed MOC must match
+what `hsai reindex` would generate right now, every lesson must carry its
+required frontmatter tags and sections, every ledger JSONL line must parse,
+and every persona article must cite a whitepaper that still exists. `hsai
+verify` prints a grouped report and exits non-zero on any error-severity
+finding; a small, documented `LEGACY_ALLOWLIST` in `hsai/verify.py` downgrades
+pre-existing, understood violations to warnings so `main` doesn't turn red on
+historical notes, while any new violation of the same kind still fails the
+build. Because a worker's edit under `.github/workflows/` is always reverted,
+this ships as a plain assertion in `tests/test_verify_repo.py` instead of a
+new CI job - the existing `ruff + pytest` step is the enforcement point.
+
+```bash
+hsai verify              # grouped report, exit 0 iff no error-severity finding
+hsai verify --strict     # also fail on warning-severity (e.g. allowlisted) findings
+```
+
 **The synthesis planner has a memory of what it already adopted.** Every
 practice this loop has pulled from the reference set - cited to its source
 project, the kind of artifact that taught it (`source_code`, `commit_history`,
@@ -115,6 +134,7 @@ the vault records who *checked* the work, not only who wrote it. Tune it under
 pip install -e ".[dev]"
 hsai status        # config + invariants
 hsai doctor        # verify subscription-only guard + environment
+hsai verify        # knowledge-base + ledger integrity gate (see hsai.verify)
 hsai loop --dry-run   # a full iteration with no side effects
 hsai loop          # one real iteration (opens & merges a PR on green)
 hsai loop --max-parallel 3 -n 1   # ramp to the swarm (after proving one iteration)

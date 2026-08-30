@@ -87,6 +87,42 @@ def test_cycle_command_passes_resume_through(monkeypatch, capsys):
     assert "block 42 (resumed)" in out and "/tmp/j.jsonl" in out
 
 
+def test_parser_verify_defaults():
+    parser = build_parser()
+    args = parser.parse_args(["verify"])
+    assert args.command == "verify"
+    assert args.root == "." and args.strict is False
+
+
+def test_verify_command_passes_on_a_clean_synthetic_vault(tmp_path, capsys):
+    from hsai.knowledge import KnowledgeBase
+
+    kb = KnowledgeBase(tmp_path)
+    # The root MOC wikilinks [[hsai]] - the real repo carries that note at
+    # knowledge/hsai.md; a synthetic vault needs it too.
+    (tmp_path / "knowledge" / "hsai.md").write_text("# hsai\n\nThe loop.\n")
+    kb.reindex_mocs()
+
+    rc = main(["verify", "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "OK" in out
+
+
+def test_verify_command_exits_nonzero_on_a_dangling_wikilink(tmp_path, capsys):
+    lessons = tmp_path / "knowledge" / "lessons"
+    lessons.mkdir(parents=True)
+    (lessons / "a.md").write_text("# A\n\n[[does-not-exist]]\n")
+
+    rc = main(["verify", "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+
+    assert rc == 1
+    assert "wikilinks" in out
+    assert "does-not-exist" in out
+
+
 def test_parser_recall_defaults():
     parser = build_parser()
     args = parser.parse_args(["recall", "remote CI gate"])
