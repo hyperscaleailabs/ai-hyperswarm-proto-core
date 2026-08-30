@@ -29,11 +29,12 @@ import logging
 import re
 from dataclasses import dataclass, field, replace
 
-from . import github, retrieval
+from . import github, observatory, retrieval
 from .ai import run_agent
 from .config import CoreConfig
 from .knowledge import KnowledgeBase
 from .models import ModelChoice
+from .observatory import ADOPTED_FROM_HEADING, DELTA_HEADING
 from .practices import ADOPTED_HEADING, Practice, render_adopted_section
 from .proc import Runner, run
 from .retrieval import PRIOR_ART_HEADING, NoteIndex, PriorArt
@@ -81,39 +82,39 @@ def build_context_pack(
     repos: list[str],
     *,
     runner: Runner = run,
-    commits: int = 30,
+    commits: int | None = None,
     prior_art: tuple[PriorArt, ...] = (),
+    root: str = ".",
+    cfg: CoreConfig | None = None,
 ) -> ContextPack:
-    """Fetch a compact study digest for each repo via the GitHub API.
+    """Observe each rotated repo and render what the planner should study.
+
+    The observation itself is cached and diffed by :mod:`hsai.observatory`, so
+    each repo's section leads with what CHANGED since the last cycle, then the
+    standing digest, then the practices this repo has already taken from it -
+    ground the planner must not re-propose.
 
     ``prior_art`` is retrieved separately (:func:`gather_prior_art`) and passed
     in: everything here talks to the network, everything there is pure.
     """
+    ocfg = observatory.ObservatoryConfig.from_core(cfg)
+    directory = observatory.reference_dir(root, cfg)
+    try:
+        kb = KnowledgeBase.from_config(cfg, root) if cfg else None
+        adopted = (
+            observatory.build_adoption_index(kb.read_lessons(), kb.read_practices())
+            if kb else {}
+        )
+    except OSError:
+        adopted = {}
+
     sections: dict[str, str] = {}
     for repo in repos:
-        parts: list[str] = []
-        readme = runner(
-            ["gh", "api", f"repos/{repo}/readme", "-H", "Accept: application/vnd.github.raw"]
+        digest = observatory.observe(
+            directory, repo, runner=runner,
+            commits=commits or ocfg.commits, readme_bytes=ocfg.readme_bytes,
         )
-        if readme.ok:
-            parts.append("README (truncated):\n" + readme.stdout[:4000])
-        log = runner(
-            [
-                "gh", "api", f"repos/{repo}/commits?per_page={commits}",
-                "--jq", ".[].commit.message | split(\"\\n\")[0]",
-            ]
-        )
-        if log.ok and log.stdout.strip():
-            parts.append("Recent commit subjects:\n" + log.stdout[:2000])
-        workflows = runner(
-            [
-                "gh", "api", f"repos/{repo}/contents/.github/workflows",
-                "--jq", ".[].name",
-            ]
-        )
-        if workflows.ok and workflows.stdout.strip():
-            parts.append("CI workflows:\n" + workflows.stdout[:500])
-        sections[repo] = "\n\n".join(parts) or "(no data fetched)"
+        sections[repo] = observatory.render_section(digest, adopted)
     return ContextPack(repos=repos, sections=sections, prior_art=prior_art)
 
 
@@ -351,14 +352,24 @@ these by name - they are the evidence trail behind every claim you make about
 what this repo has already done:
 {prior_art_section}
 
-Study digest of reference projects for this cycle:
+Study digest of reference projects for this cycle. Each project is rendered in
+three parts: "{DELTA_HEADING}" (what moved since we last
+observed it - PREFER THIS, it is the only genuinely new evidence this cycle),
+then the standing baseline digest, then
+"{ADOPTED_FROM_HEADING}":
 {pack.render()}
 
 Work in three explicit phases and show them all in your output:
 
 PHASE 1 - DIVERGE: generate {ideas} candidate improvements. Each MUST combine
 practices from at least {combine} different reference projects (name them), be
-implementable inside this repo, and advance a named goal. For EACH candidate,
+implementable inside this repo, and advance a named goal. Ground each candidate
+in a DELTA where one exists - say which changed commit, workflow or README
+prompted it - and fall back to the baseline digest only when the delta is empty
+or a baseline observation. If a candidate overlaps anything listed under
+"{ADOPTED_FROM_HEADING}", you must
+JUSTIFY the overlap explicitly: say what it EXTENDS and why the adopted version
+is insufficient, or drop the candidate. For EACH candidate,
 CHECK IT AGAINST THE PRIOR ART above and say either which note(s) it builds on
 (cite them as [[note-name]]) or that no prior note covers it.
 
@@ -512,7 +523,9 @@ def synthesize(
     """
     repos = pick_rotation(cfg, cycle_index)
     index = retrieval.load_index(root, cfg)
-    pack = build_context_pack(repos, runner=runner, prior_art=gather_prior_art(cfg, index))
+    pack = build_context_pack(
+        repos, runner=runner, prior_art=gather_prior_art(cfg, index), root=root, cfg=cfg
+    )
     memory = MemoryPack.gather(cfg, root=root, runner=runner)
     try:
         practices = KnowledgeBase.from_config(cfg, root).read_practices()

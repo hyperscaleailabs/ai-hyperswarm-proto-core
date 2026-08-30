@@ -59,6 +59,7 @@ class CoreConfig:
     review: dict[str, Any]
     audit: dict[str, Any]
     postmortem: dict[str, Any]
+    observatory: dict[str, Any]
     personas: tuple[dict[str, Any], ...]
 
     # --- convenience accessors -------------------------------------------------
@@ -153,6 +154,7 @@ def load_config(path: str | Path | None = None) -> CoreConfig:
         review=data.get("review", {}),
         audit=data.get("audit", {}),
         postmortem=data.get("postmortem", {}),
+        observatory=data.get("observatory", {}),
         personas=tuple(data.get("personas", [])),
     )
 

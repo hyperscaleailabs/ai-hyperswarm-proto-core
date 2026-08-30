@@ -3,6 +3,8 @@ import json
 from hsai import cli as cli_module
 from hsai import trajectory
 from hsai.cli import build_parser, main
+from hsai.config import load_config
+from hsai.proc import Proc
 from hsai.repro import ReproResult
 from hsai.trajectory import Step, Trajectory
 
@@ -142,6 +144,78 @@ def test_reindex_rebuilds_the_mocs_and_the_retrieval_index(tmp_path, capsys):
     before = index.read_bytes()
     assert main(["reindex", "--root", str(tmp_path)]) == 0
     assert index.read_bytes() == before
+
+
+# --- observe (refreshes the reference-set observatory, spends no quota) ------
+
+def _observatory_runner():
+    """A fake `gh` answering the observatory's API calls for any repo."""
+    calls: list[list[str]] = []
+
+    def runner(cmd, *, cwd=None, env=None, env_remove=None, timeout=None, input_text=None):
+        calls.append(list(cmd))
+        path = cmd[2] if len(cmd) > 2 else ""
+        if path.endswith("/readme"):
+            return Proc(cmd, 0, "# a reference project\n", "")
+        if "/commits" in path:
+            return Proc(cmd, 0, "aaa1\tfeat: one\naaa0\tfix: zero\n", "")
+        if path.endswith("/workflows"):
+            return Proc(cmd, 0, "ci.yml\n", "")
+        return Proc(cmd, 0, "main\n", "")
+
+    runner.calls = calls  # type: ignore[attr-defined]
+    return runner
+
+
+def test_parser_observe_defaults():
+    args = build_parser().parse_args(["observe"])
+    assert args.command == "observe"
+    assert args.root == "." and args.refresh is False
+    assert build_parser().parse_args(["observe", "--refresh"]).refresh is True
+
+
+def test_observe_refreshes_digests_and_dossiers_and_touches_nothing_else(tmp_path, capsys):
+    cfg = load_config()
+    args = build_parser().parse_args(["observe", "--root", str(tmp_path)])
+    runner = _observatory_runner()
+
+    rc = cli_module.cmd_observe(args, runner=runner)
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert runner.calls and all(c[:2] == ["gh", "api"] for c in runner.calls)
+
+    reference = tmp_path / "knowledge" / "reference"
+    assert (reference / "run-llama__llama_index.json").is_file()
+    assert (reference / "llama_index.md").is_file()
+    assert (tmp_path / "knowledge" / "MOCs" / "Reference Set MOC.md").is_file()
+    assert "run-llama/llama_index: baseline (first observation)" in out
+    assert "all 10 reference project(s) observed within the last" in out
+
+    # Nothing outside the observatory's own artifacts was written.
+    allowed = {"knowledge/MOCs/Reference Set MOC.md"}
+    for path in tmp_path.rglob("*"):
+        if path.is_file():
+            rel = path.relative_to(tmp_path).as_posix()
+            assert rel.startswith("knowledge/reference/") or rel in allowed, rel
+
+    # Digest + dossier per configured project, and no stragglers.
+    assert len(list(reference.glob("*.json"))) == len(cfg.reference_top10)
+    assert len(list(reference.glob("*.md"))) == len(cfg.reference_top10)
+
+
+def test_observe_skips_fresh_projects_unless_refresh_is_asked_for(tmp_path):
+    args = build_parser().parse_args(["observe", "--root", str(tmp_path)])
+    cli_module.cmd_observe(args, runner=_observatory_runner())
+
+    cached = _observatory_runner()
+    cli_module.cmd_observe(args, runner=cached)
+    assert cached.calls == []                      # everything is fresh: no network
+
+    forced = build_parser().parse_args(["observe", "--root", str(tmp_path), "--refresh"])
+    refetch = _observatory_runner()
+    cli_module.cmd_observe(forced, runner=refetch)
+    assert refetch.calls
 
 
 def test_recall_command_reports_an_empty_vault_without_crashing(tmp_path, capsys):

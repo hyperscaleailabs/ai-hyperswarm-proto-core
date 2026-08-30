@@ -6,6 +6,7 @@ Commands:
   hsai status                                                  config + backlog snapshot
   hsai cycle [--cycle-index N] [--resume] [--dry-run]          one governance block
   hsai reindex [--root DIR]                                    rebuild knowledge MOCs + notes.json
+  hsai observe [--refresh]                                     refresh reference digests + dossiers
   hsai recall "<query>" [--k N] [--kind K]                     rank prior lessons/ADRs
   hsai practices list                                          show the adopted-practice registry
   hsai practices add --title T --source-project P ...          record a new adopted practice
@@ -25,6 +26,7 @@ from . import (
     __version__,
     ai,
     ledger,
+    observatory,
     postmortem,
     practices,
     recall,
@@ -35,6 +37,7 @@ from . import (
 from .config import CoreConfig, load_config, validate
 from .knowledge import KnowledgeBase
 from .orchestrator import run_loop
+from .proc import Runner, run
 from .swarm import run_parallel
 
 
@@ -101,6 +104,38 @@ def cmd_reindex(args: argparse.Namespace) -> int:
         print(f"reindexed {p}")
     index = retrieval.write_index(root, cfg)
     print(f"reindexed {index} ({len(retrieval.note_paths(root, cfg))} note(s))")
+    return 0
+
+
+def cmd_observe(args: argparse.Namespace, *, runner: Runner = run) -> int:
+    """Refresh the reference-set digests and dossiers without running a cycle.
+
+    Touches only the observatory's own artifacts: the digest cache, the
+    per-project dossiers, and the Reference Set MOC. No ticket, no PR, no model
+    call - the point is to make a stale reference set cheap to fix.
+    """
+    cfg = _load(args)
+    root = args.root
+    ocfg = observatory.ObservatoryConfig.from_core(cfg)
+    directory = observatory.reference_dir(root, cfg)
+    repos = [r.repo for r in cfg.reference_top10]
+
+    digests = observatory.observe_all(
+        directory, repos, runner=runner, refresh=args.refresh,
+        stale_after_days=ocfg.stale_after_days,
+        commits=ocfg.commits, readme_bytes=ocfg.readme_bytes,
+    )
+    for digest in digests:
+        delta = digest.delta
+        print(f"{digest.repo}: {delta.summary() if delta else 'cached (not re-observed)'}")
+
+    written = KnowledgeBase.from_config(cfg, root).write_reference_dossiers()
+    print(f"wrote {len(written)} reference note(s) under {directory}")
+    print(
+        observatory.stale_report(
+            directory, repos, stale_after_days=ocfg.stale_after_days
+        ).line()
+    )
     return 0
 
 
@@ -322,6 +357,16 @@ def build_parser() -> argparse.ArgumentParser:
     ri = sub.add_parser("reindex", help="rebuild knowledge-base MOCs + the retrieval index")
     ri.add_argument("--root", default=".", help="repo root holding knowledge/ and docs/adr")
     ri.set_defaults(func=cmd_reindex)
+
+    ob = sub.add_parser(
+        "observe", help="refresh the reference-set digests + dossiers (no cycle, no quota)"
+    )
+    ob.add_argument("--root", default=".", help="repo root holding knowledge/reference")
+    ob.add_argument(
+        "--refresh", action="store_true",
+        help="re-observe every project, not only the ones that have gone stale",
+    )
+    ob.set_defaults(func=cmd_observe)
 
     rl = sub.add_parser("recall", help="rank prior lessons/whitepapers/ADRs for a query")
     rl.add_argument("query", help="what the task is about, in plain words")
